@@ -7,7 +7,11 @@ INSTALL_DIR="/usr/local/bin"
 SERVICE_FILE="/etc/systemd/system/dantetimesync.service"
 TEMP_BIN="/tmp/$BIN_NAME"
 
+# Allow overriding NTP server via env var, default to 10.77.8.2
+NTP_SERVER="${NTP_SERVER:-10.77.8.2}"
+
 echo ">>> Dante Time Sync Web Installer <<<"
+echo ">>> Using NTP Server: $NTP_SERVER"
 
 if [ "$EUID" -ne 0 ]; then
   echo "Error: Please run as root (sudo bash ...)"
@@ -27,7 +31,6 @@ fi
 # 2. Install System Dependencies (Runtime only)
 echo ">>> Installing runtime dependencies..."
 apt-get update -qq
-# util-linux for hwclock (optional but good)
 apt-get install -y -qq util-linux curl
 
 # 3. Download Binary to Temp
@@ -59,7 +62,7 @@ Wants=network-online.target
 [Service]
 User=root
 Group=root
-ExecStart=$INSTALL_DIR/$BIN_NAME
+ExecStart=$INSTALL_DIR/$BIN_NAME --ntp-server $NTP_SERVER
 Restart=always
 RestartSec=5
 # Realtime Priority
