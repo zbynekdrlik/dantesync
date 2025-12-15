@@ -30,7 +30,9 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 #[cfg(windows)]
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 #[cfg(windows)]
-use windows::Win32::System::Pipes::{CreateNamedPipeW}; // Removed constants
+use windows::Win32::System::Pipes::{CreateNamedPipeW, NAMED_PIPE_MODE};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES};
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
@@ -319,8 +321,8 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
                         
                         let h = CreateNamedPipeW(
                             PCWSTR(pipe_name_wide.as_ptr()),
-                            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED, 
-                            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED), 
+                            NAMED_PIPE_MODE(PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT),
                             PIPE_UNLIMITED_INSTANCES,
                             1024,
                             1024,
