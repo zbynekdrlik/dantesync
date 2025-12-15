@@ -8,9 +8,9 @@ use windows::Win32::Security::{
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::SystemInformation::{
     GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise,
-    GetSystemTimeAsFileTime
+    GetSystemTimeAsFileTime, SetSystemTime
 };
-use windows::Win32::System::Time::{FileTimeToSystemTime, SetSystemTime}; 
+use windows::Win32::System::Time::{FileTimeToSystemTime}; 
 use windows::core::PCWSTR;
 use std::time::Duration;
 
@@ -59,11 +59,26 @@ impl WindowsClock {
 
             AdjustTokenPrivileges(token, BOOL(0), Some(&tp), 0, None, None)?;
             
-            // GetLastError returns WIN32_ERROR which wraps u32.
-            // Direct comparison should work.
-            let err = GetLastError();
-            if err == ERROR_NOT_ALL_ASSIGNED {
-                 return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED"));
+            // Compiler indicates GetLastError returns Result in this context (likely due to unsafe or windows crate version).
+            // We handle it as Result.
+            // If checking strict types: let err_res = GetLastError();
+            // But if GetLastError returns WIN32_ERROR (struct), we access it directly.
+            // The previous error "expected Result, found WIN32_ERROR" means comparison was against struct, but LHS was Result.
+            
+            // Attempt to unwrap if it is a Result, or use directly if it is a struct.
+            // Since Rust is strict, we can't do both.
+            // Given the error, I assume it returns Result<WIN32_ERROR>.
+            
+            // However, windows 0.52 docs say it returns WIN32_ERROR.
+            // The error might be misleading or I am misinterpreting.
+            // I will use `let err = GetLastError();` and then `if err.0 == ...`.
+            // But previous error said "no field 0 on Result".
+            // So it IS a Result.
+            
+            if let Ok(err) = GetLastError() {
+                if err == ERROR_NOT_ALL_ASSIGNED {
+                     return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED"));
+                }
             }
             
             CloseHandle(token)?;
@@ -83,7 +98,6 @@ impl SystemClock for WindowsClock {
 
     fn step_clock(&mut self, offset: Duration, sign: i8) -> Result<()> {
         unsafe {
-            // GetSystemTimeAsFileTime returns the struct in windows-rs (not void with pointer)
             let mut ft: FILETIME = GetSystemTimeAsFileTime();
             
             let mut u64_time = (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64);
@@ -103,9 +117,7 @@ impl SystemClock for WindowsClock {
             ft.dwHighDateTime = (u64_time >> 32) as u32;
             
             let mut st = SYSTEMTIME::default();
-            // FileTimeToSystemTime returns BOOL -> Result<()>
             FileTimeToSystemTime(&ft, &mut st)?;
-            // SetSystemTime returns BOOL -> Result<()>
             SetSystemTime(&st)?;
         }
 
