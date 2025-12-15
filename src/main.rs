@@ -25,6 +25,23 @@ use windows::Win32::System::Threading::{SetPriorityClass, GetCurrentProcess, REA
 #[cfg(windows)]
 use windows::Win32::Media::timeBeginPeriod;
 
+#[cfg(windows)]
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+#[cfg(windows)]
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+#[cfg(windows)]
+use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_ACCESS_OUTBOUND, PIPE_TYPE_MESSAGE, PIPE_READMODE_MESSAGE, PIPE_WAIT, PIPE_UNLIMITED_INSTANCES};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::System::Memory::LocalFree;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(windows)]
+use std::os::windows::io::FromRawHandle;
+
 // Service Imports
 #[cfg(windows)]
 use std::ffi::OsString;
@@ -257,25 +274,65 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
         
         rt.block_on(async move {
             use tokio::io::AsyncWriteExt;
-            use tokio::net::windows::named_pipe::ServerOptions;
             
             // Named pipe server loop
             loop {
-                // Create new instance for each connection
-                // Allow World (Everyone) to read/write (Generic All). 
-                // Necessary for User process to connect to System Service pipe.
-                let mut server = match unsafe { 
-                    ServerOptions::new()
-                        .access_outbound(true)
-                        .first_pipe_instance(false)
-                        .security_descriptor("D:(A;;GA;;;WD)") 
-                        .create(r"\\.\pipe\dantetimesync") 
+                // Create pipe manually with Security Descriptor to allow Users to connect to Service
+                // SDDL: D:(A;;GA;;;WD) -> DACL: Allow Generic All to World (Everyone)
+                // This is needed because Service runs as SYSTEM and Tray runs as User.
+                let pipe_name_wide: Vec<u16> = r"\\.\pipe\dantetimesync".encode_utf16().chain(std::iter::once(0)).collect();
+                let sddl_wide: Vec<u16> = "D:(A;;GA;;;WD)".encode_utf16().chain(std::iter::once(0)).collect();
+                
+                let mut sd = PSECURITY_DESCRIPTOR::default();
+                let mut sa = SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: std::ptr::null_mut(),
+                    bInheritHandle: false.into(),
+                };
+
+                let handle = unsafe {
+                    if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        PCWSTR(sddl_wide.as_ptr()),
+                        SDDL_REVISION_1, 
+                        &mut sd, 
+                        None
+                    ).as_bool() {
+                        sa.lpSecurityDescriptor = sd.0;
+                        
+                        let h = CreateNamedPipeW(
+                            PCWSTR(pipe_name_wide.as_ptr()),
+                            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED, 
+                            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                            PIPE_UNLIMITED_INSTANCES,
+                            1024,
+                            1024,
+                            0,
+                            Some(&sa)
+                        );
+                        
+                        let _ = LocalFree(std::mem::transmute(sd));
+                        h
+                    } else {
+                        // Fallback if SDDL fails (shouldn't happen)
+                        windows::Win32::Foundation::INVALID_HANDLE_VALUE
                     }
-                {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
+                };
+
+                if handle == windows::Win32::Foundation::INVALID_HANDLE_VALUE {
+                    error!("Failed to create named pipe with SDDL. Retrying...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                // Wrap in Tokio
+                let mut server = unsafe { 
+                    match NamedPipeServer::from_raw_handle(handle.0 as *mut std::ffi::c_void) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("Failed to wrap named pipe handle: {}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
                     }
                 };
 
@@ -430,7 +487,8 @@ fn run_service_logic(args: Args) -> Result<()> {
             process_id: None,
         });
 
-        let args = Args::parse(); 
+        // Use global args via simple parse if needed, but here we just need default or what logic needs
+        let args = Args::parse();
         
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
