@@ -14,6 +14,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # 1. Determine Download URL (Latest Release)
+
 echo ">>> Fetching latest release info..."
 LATEST_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep "browser_download_url" | grep "$BIN_NAME\"" | cut -d '"' -f 4)
 
@@ -24,17 +25,25 @@ if [ -z "$LATEST_URL" ]; then
 fi
 
 # 2. Install System Dependencies (Runtime only)
+
 echo ">>> Installing runtime dependencies..."
 apt-get update -qq
 # util-linux for hwclock (optional but good)
 apt-get install -y -qq util-linux curl
 
-# 3. Download Binary
+# 3. Stop Service (to release binary lock)
+
+echo ">>> Stopping existing service (if any)..."
+systemctl stop dantetimesync 2>/dev/null || true
+
+# 4. Download Binary
+
 echo ">>> Downloading $BIN_NAME from $LATEST_URL..."
 curl -L -o "$INSTALL_DIR/$BIN_NAME" "$LATEST_URL"
 chmod +x "$INSTALL_DIR/$BIN_NAME"
 
-# 4. Disable Conflicting Services
+# 5. Disable Conflicting Services
+
 echo ">>> Disabling conflicting time services..."
 systemctl stop systemd-timesyncd 2>/dev/null || true
 systemctl disable systemd-timesyncd 2>/dev/null || true
@@ -43,7 +52,8 @@ systemctl disable chrony 2>/dev/null || true
 systemctl stop ntp 2>/dev/null || true
 systemctl disable ntp 2>/dev/null || true
 
-# 5. Create Systemd Service
+# 6. Create Systemd Service
+
 echo ">>> Creating systemd service..."
 cat <<EOF > "$SERVICE_FILE"
 [Unit]
@@ -65,7 +75,8 @@ CPUSchedulingPriority=50
 WantedBy=multi-user.target
 EOF
 
-# 6. Enable and Start
+# 7. Enable and Start
+
 echo ">>> Starting service..."
 systemctl daemon-reload
 systemctl enable dantetimesync
