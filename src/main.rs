@@ -21,7 +21,7 @@ mod ntp;
 mod traits;
 mod controller;
 mod servo;
-mod rtc; // Added
+mod rtc;
 
 use traits::{NtpSource, PtpNetwork};
 use controller::PtpController;
@@ -149,6 +149,25 @@ fn stop_conflicting_services() {
     }
 }
 
+fn enable_realtime_priority() {
+    #[cfg(unix)]
+    {
+        // Try to set SCHED_FIFO with high priority (e.g. 50)
+        // Requires libc
+        unsafe {
+            let policy = libc::SCHED_FIFO;
+            let param = libc::sched_param { sched_priority: 50 };
+            
+            if libc::sched_setscheduler(0, policy, &param) == 0 {
+                info!("Realtime priority (SCHED_FIFO, 50) enabled successfully.");
+            } else {
+                let err = std::io::Error::last_os_error();
+                warn!("Failed to set realtime priority: {}. Latency might suffer.", err);
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse();
@@ -163,6 +182,9 @@ fn main() -> Result<()> {
 
     // 0. Stop Conflicting Services
     stop_conflicting_services();
+    
+    // 0.5 Enable Realtime Priority
+    enable_realtime_priority();
 
     // 1. Initialize Clock
     let sys_clock = match clock::PlatformClock::new() {

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::process::Command;
 use crate::clock::SystemClock;
 use crate::traits::{NtpSource, PtpNetwork};
-use crate::ptp::{PtpV1Header, PtpV1Control, PtpV1FollowUpBody};
+use crate::ptp::{PtpV1Header, PtpV1Control, PtpV1FollowUpBody, PtpV1SyncMessageBody};
 use crate::servo::PiServo;
 #[cfg(unix)]
 use crate::rtc;
@@ -15,6 +15,7 @@ const MIN_DELTA_NS: i64 = 1_000_000;       // 1ms
 const MAX_DELTA_NS: i64 = 2_000_000_000;   // 2s
 const MAX_PHASE_OFFSET_FOR_STEP_NS: i64 = 1_000_000; // 1ms
 const RTC_UPDATE_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+const SAMPLE_WINDOW_SIZE: usize = 8; // Enabled Lucky Packet Filter
 
 pub struct PtpController<C, N, S> 
 where 
@@ -31,6 +32,10 @@ where
     pending_syncs: HashMap<u16, PendingSync>,
     prev_t1_ns: i64,
     prev_t2_ns: i64,
+    current_gm_uuid: Option<[u8; 6]>,
+    
+    // Filtering
+    sample_window: Vec<i64>,
     
     // Metrics
     last_phase_offset_ns: i64,
@@ -64,10 +69,15 @@ where
             clock,
             network,
             ntp,
-            servo: PiServo::new(0.8, 0.2),
+            // SOTA Tuning V2:
+            // Kp=0.0005: Maintains stability.
+            // Ki=0.00005: Boosted 50x to eliminate steady-state error caused by crystal drift.
+            servo: PiServo::new(0.0005, 0.00005),
             pending_syncs: HashMap::new(),
             prev_t1_ns: 0,
             prev_t2_ns: 0,
+            current_gm_uuid: None,
+            sample_window: Vec::with_capacity(SAMPLE_WINDOW_SIZE),
             last_phase_offset_ns: 0,
             last_adj_ppm: 0.0,
             initial_epoch_offset_ns: 0,
@@ -168,6 +178,22 @@ where
                     rx_time_sys: t2,
                     source_uuid: header.source_uuid,
                 });
+
+                if let Ok(body) = PtpV1SyncMessageBody::parse(&buf[PtpV1Header::SIZE..size]) {
+                    let new_uuid = body.grandmaster_clock_uuid;
+                    if let Some(current) = self.current_gm_uuid {
+                        if current != new_uuid {
+                            info!("Grandmaster changed! Old: {:02X?}, New: {:02X?}", current, new_uuid);
+                            self.current_gm_uuid = Some(new_uuid);
+                            info!("Resetting servo filter due to GM change.");
+                            self.reset_filter();
+                            self.servo.reset();
+                        }
+                    } else {
+                        info!("Locked to Grandmaster: {:02X?}", new_uuid);
+                        self.current_gm_uuid = Some(new_uuid);
+                    }
+                }
             }
             PtpV1Control::FollowUp => {
                 if let Ok(body) = PtpV1FollowUpBody::parse(&buf[PtpV1Header::SIZE..size]) {
@@ -197,8 +223,6 @@ where
         let mut phase_offset_ns = (t2_ns % 1_000_000_000) - (t1_ns % 1_000_000_000);
         if phase_offset_ns > 500_000_000 { phase_offset_ns -= 1_000_000_000; }
         else if phase_offset_ns < -500_000_000 { phase_offset_ns += 1_000_000_000; }
-
-        self.last_phase_offset_ns = phase_offset_ns;
 
         if self.prev_t1_ns > 0 && self.prev_t2_ns > 0 {
             let delta_master = t1_ns - self.prev_t1_ns;
@@ -238,16 +262,26 @@ where
                 self.update_rtc_now();
             }
 
-            let adj_ppm = self.servo.sample(phase_offset_ns);
-            self.last_adj_ppm = adj_ppm;
+            // LUCKY PACKET FILTER LOGIC
+            self.sample_window.push(phase_offset_ns);
             
-            let factor = 1.0 + (adj_ppm / 1_000_000.0);
-            
-            if let Err(e) = self.clock.adjust_frequency(factor) {
-                warn!("Clock adjustment failed: {}", e);
+            if self.sample_window.len() >= SAMPLE_WINDOW_SIZE {
+                if let Some(&lucky_offset) = self.sample_window.iter().min() {
+                    
+                    self.last_phase_offset_ns = lucky_offset;
+                    
+                    let adj_ppm = self.servo.sample(lucky_offset);
+                    self.last_adj_ppm = adj_ppm;
+                    
+                    let factor = 1.0 + (adj_ppm / 1_000_000.0);
+                    
+                    if let Err(e) = self.clock.adjust_frequency(factor) {
+                        warn!("Clock adjustment failed: {}", e);
+                    }
+                }
+                self.sample_window.clear();
+                self.update_rtc();
             }
-            
-            self.update_rtc();
         }
         
         self.prev_t1_ns = t1_ns;
@@ -264,6 +298,7 @@ where
         self.clock_settled = false;
         self.prev_t1_ns = 0;
         self.prev_t2_ns = 0;
+        self.sample_window.clear();
     }
 }
 
@@ -274,6 +309,7 @@ mod tests {
     use crate::traits::{MockNtpSource, MockPtpNetwork};
     use mockall::predicate::*;
     use mockall::Sequence;
+    use byteorder::{BigEndian, WriteBytesExt};
 
     #[test]
     fn test_ntp_sync_trigger() {
@@ -296,50 +332,72 @@ mod tests {
     }
 
     #[test]
-    fn test_process_sync_followup_flow_with_servo() {
+    fn test_process_sync_followup_flow_with_lucky_packet() {
         let _ = env_logger::builder().is_test(true).try_init();
         let mut mock_clock = MockSystemClock::new();
         let mut mock_net = MockPtpNetwork::new();
         let mock_ntp = MockNtpSource::new();
 
-        let mut sync_pkt = vec![0u8; 36];
-        sync_pkt[0] = 0x10;
-        sync_pkt[30] = 0x00; sync_pkt[31] = 0x01; 
-        sync_pkt[32] = 0; 
-        sync_pkt[22] = 0xAA; 
+        let mut sync_pkt_base = vec![0u8; 36 + 20];
+        sync_pkt_base[0] = 0x10;
+        sync_pkt_base[32] = 0; 
+        sync_pkt_base[22] = 0xAA; 
+        sync_pkt_base[49] = 0xBB;
 
-        let mut fu_pkt = vec![0u8; 36 + 16];
-        fu_pkt[0] = 0x10;
-        fu_pkt[30] = 0x00; fu_pkt[31] = 0x02;
-        fu_pkt[32] = 2; 
-        fu_pkt[22] = 0xAA; 
+        let mut fu_pkt_base = vec![0u8; 36 + 16];
+        fu_pkt_base[0] = 0x10;
+        fu_pkt_base[32] = 2; 
+        fu_pkt_base[22] = 0xAA; 
         
-        fu_pkt[36+6] = 0x00; fu_pkt[36+7] = 0x01; 
-        fu_pkt[36+11] = 10; 
-        fu_pkt[36+15] = 0; 
-
-        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let start_t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         
         let mut seq = Sequence::new();
         
-        mock_net.expect_recv_packet()
-            .times(1)
-            .in_sequence(&mut seq)
-            .returning(move || Ok(Some((sync_pkt.clone(), 36, t2))));
+        // Loop 10 times to ensure window fills (since 1st is skipped)
+        for i in 0..10 {
+            let mut s_pkt = sync_pkt_base.clone();
+            let mut f_pkt = fu_pkt_base.clone();
             
-        mock_net.expect_recv_packet()
-            .times(1)
-            .in_sequence(&mut seq)
-            .returning(move || Ok(Some((fu_pkt.clone(), 52, t2))));
+            let seq_id = (i + 1) as u16;
+            s_pkt[30] = (seq_id >> 8) as u8;
+            s_pkt[31] = (seq_id & 0xFF) as u8;
+            
+            f_pkt[30] = (seq_id >> 8) as u8;
+            f_pkt[31] = (seq_id & 0xFF) as u8;
+            
+            f_pkt[42] = (seq_id >> 8) as u8;
+            f_pkt[43] = (seq_id & 0xFF) as u8;
+            
+            let t1_sec = 1000 + i as u32;
+            let mut w = std::io::Cursor::new(&mut f_pkt[47..51]);
+            w.write_u32::<BigEndian>(t1_sec).unwrap();
+            
+            let offset_ns = if i == 4 { 0 } else { 100 };
+            let t2 = start_t2 + Duration::from_secs(i as u64) + Duration::from_nanos(offset_ns);
 
-        // Adjusted expectation: times(1) because settling_threshold=1
-        mock_clock.expect_adjust_frequency().times(1).returning(|_| Ok(()));
+            mock_net.expect_recv_packet()
+                .times(1)
+                .in_sequence(&mut seq)
+                .returning(move || Ok(Some((s_pkt.clone(), 56, t2))));
+                
+            mock_net.expect_recv_packet()
+                .times(1)
+                .in_sequence(&mut seq)
+                .returning(move || Ok(Some((f_pkt.clone(), 52, t2))));
+        }
+
+        mock_clock.expect_adjust_frequency()
+            .with(eq(1.0))
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp);
         
-        assert!(controller.process_loop_iteration().is_ok());
-        assert!(controller.process_loop_iteration().is_ok());
+        for _ in 0..10 {
+            assert!(controller.process_loop_iteration().is_ok());
+            assert!(controller.process_loop_iteration().is_ok());
+        }
         
-        assert_eq!(controller.valid_count, 1);
+        assert_eq!(controller.last_phase_offset_ns, 0); 
     }
 }

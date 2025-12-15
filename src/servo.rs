@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::debug;
 
 pub struct PiServo {
     kp: f64,
@@ -13,7 +13,9 @@ impl PiServo {
             kp,
             ki,
             integral: 0.0,
-            max_integral: 1000.0, // PPM limit for integral term
+            // 200 PPM is a safe upper bound for standard crystal drift.
+            // Allowing more just invites instability (windup).
+            max_integral: 200.0, 
         }
     }
 
@@ -28,17 +30,16 @@ impl PiServo {
         // If offset_ns > 0 (ahead), we need to slow down (negative adj).
         // If offset_ns < 0 (behind), we need to speed up (positive adj).
         
-        let error = -offset_ns as f64; // Invert because positive offset -> negative frequency adjustment needed
+        let error = -offset_ns as f64; 
 
-        // Update Integral (Frequency drift estimate)
-        // Ki is usually small.
+        // Update Integral
         self.integral += error * self.ki;
         
-        // Clamp integral to prevent windup
+        // Clamp integral
         if self.integral > self.max_integral { self.integral = self.max_integral; }
         if self.integral < -self.max_integral { self.integral = -self.max_integral; }
 
-        // Proportional (Immediate phase correction)
+        // Proportional
         let proportional = error * self.kp;
 
         let adjustment_ppm = proportional + self.integral;

@@ -1,8 +1,0 @@
-[2025-12-15T19:26:31Z INFO  dantetimesync] System clock control initialized.
-[2025-12-15T19:26:31Z INFO  dantetimesync] Selected Interface: enp1s0 (10.77.9.21)
-[2025-12-15T19:26:31Z INFO  dantetimesync] Listening on 224.0.1.129 ports 319 (Event) and 320 (General)
-[2025-12-15T19:26:31Z INFO  dantetimesync::controller] NTP Offset: -1.690497ms
-[2025-12-15T19:26:31Z INFO  dantetimesync::controller] Clock offset small, skipping step.
-[2025-12-15T19:26:31Z INFO  dantetimesync] Starting PTP Loop...
-[2025-12-15T19:27:01Z INFO  dantetimesync] Ctrl+C received. Shutting down...
-[2025-12-15T19:27:01Z INFO  dantetimesync] Exiting.

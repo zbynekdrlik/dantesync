@@ -94,6 +94,40 @@ impl PtpTimestamp {
 }
 
 #[derive(Debug)]
+pub struct PtpV1SyncMessageBody {
+    // originTimestamp (8)
+    // epochNumber (2)
+    // currentUtcOffset (2)
+    // grandmasterCommTech (1)
+    pub grandmaster_clock_uuid: [u8; 6],
+    // ... others ignored
+}
+
+impl PtpV1SyncMessageBody {
+    // We only need up to GM UUID (offset 13 + 6 = 19 bytes)
+    pub const MIN_SIZE: usize = 19;
+
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        if data.len() < Self::MIN_SIZE {
+            return Err(anyhow!("Packet too short for Sync body"));
+        }
+        let mut rdr = Cursor::new(data);
+        
+        // Skip originTimestamp (8), epoch (2), utcOffset (2), commTech (1) = 13 bytes
+        rdr.set_position(13);
+        
+        let mut gm_uuid = [0u8; 6];
+        for i in 0..6 {
+            gm_uuid[i] = rdr.read_u8()?;
+        }
+
+        Ok(PtpV1SyncMessageBody {
+            grandmaster_clock_uuid: gm_uuid,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct PtpV1FollowUpBody {
     pub associated_sequence_id: u16,
     pub precise_origin_timestamp: PtpTimestamp,
@@ -201,5 +235,21 @@ mod tests {
         assert_eq!(body.associated_sequence_id, 5);
         assert_eq!(body.precise_origin_timestamp.seconds, 10);
         assert_eq!(body.precise_origin_timestamp.nanoseconds, 256);
+    }
+
+    #[test]
+    fn test_parse_sync_body_gm_uuid() {
+        let mut data = vec![0u8; 20];
+        // 13 bytes skip
+        // 13: GM UUID start
+        data[13] = 0x11;
+        data[14] = 0x22;
+        data[15] = 0x33;
+        data[16] = 0x44;
+        data[17] = 0x55;
+        data[18] = 0x66;
+
+        let body = PtpV1SyncMessageBody::parse(&data).unwrap();
+        assert_eq!(body.grandmaster_clock_uuid, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
     }
 }

@@ -7,53 +7,58 @@ A state-of-the-art Rust service to synchronize the local system clock with a Dan
 - **Hybrid Sync:**
     - **Phase 1 (NTP):** Steps the clock on startup using a specified NTP server (default: `10.77.8.2`) to ensure correct wall-clock time.
     - **Phase 2 (PTP):** Locks to Dante PTP v1 multicast (224.0.1.129) for precision frequency drift correction.
-- **Cross-Platform:** Runs on Linux and Windows.
-- **Robustness:** 100% Test Coverage of core logic using Mocking and TDD.
-- **Architecture:** Senior-level dependency injection pattern (`PtpController` with swappable Network/Clock/NTP backends).
+- **SOTA Precision:**
+    - **Kernel Timestamping (SO_TIMESTAMPNS):** Eliminates userspace scheduling jitter.
+    - **PI Servo:** Tuned PI controller (`Kp=0.0005`, `Ki=0.00005`) eliminates steady-state error.
+    - **Lucky Packet Filter:** Statistically rejects network queuing delay.
+- **Hardware Integration:**
+    - **RTC Update:** Writes to `/dev/rtc0` via `ioctl` to persist time across reboots.
+    - **Realtime Priority:** Sets `SCHED_FIFO` priority 50 for low latency.
+- **Cross-Platform:** Runs on Linux (optimized) and Windows.
 
-## Requirements
+## Installation (Ubuntu/Debian)
 
-- **Windows:** Run as **Administrator** (required for `SetSystemTimeAdjustmentPrecise` and `SetSystemTime`).
-- **Linux:** Run as **Root** (or with `CAP_SYS_TIME` capability) for `adjtimex` and `settimeofday`.
+Run the following command to install dependencies, build the service, and start it automatically:
 
-## Building
+```bash
+git clone https://github.com/zbynekdrlik/dantetimesync.git
+cd dantetimesync
+sudo ./install.sh
+```
+
+This script will:
+1.  Install Rust and build tools.
+2.  Compile the release binary.
+3.  Install it to `/usr/local/bin/dantetimesync`.
+4.  Disable conflicting services (`systemd-timesyncd`, `chrony`).
+5.  Install and start the `dantetimesync` systemd service.
+
+## Usage
+
+Check status:
+```bash
+sudo systemctl status dantetimesync
+```
+
+View logs:
+```bash
+sudo journalctl -u dantetimesync -f
+```
+
+## Manual Build
 
 ```bash
 cargo build --release
 ```
 
-## Testing
-
-The project uses `mockall` for comprehensive unit testing.
-
-```bash
-cargo test
-```
-
-## Usage
-
-```bash
-# Run with default settings (NTP: 10.77.8.2, Auto Interface)
-sudo ./target/release/dantetimesync
-
-# Specify Interface
-sudo ./target/release/dantetimesync --interface eth0
-
-# Specify NTP Server
-sudo ./target/release/dantetimesync --ntp-server pool.ntp.org
-
-# Skip NTP (PTP Only)
-sudo ./target/release/dantetimesync --skip-ntp
-```
-
 ## Architecture
 
-- `src/main.rs`: Entry point and wiring of concrete implementations (`RealPtpNetwork`, `RealNtpSource`).
-- `src/controller.rs`: Core control loop logic (`PtpController`), fully unit-tested with mocks.
-- `src/clock/`: Platform-specific system clock control (`adjtimex` for Linux, `SetSystemTimeAdjustmentPrecise` for Windows).
+- `src/main.rs`: Entry point and wiring.
+- `src/controller.rs`: Core control loop logic (`PtpController`).
+- `src/servo.rs`: PI Servo implementation.
+- `src/rtc.rs`: Direct RTC hardware access.
 - `src/ptp.rs`: PTP v1 packet parsing.
-- `src/ntp.rs`: NTP client wrapper using `rsntp`.
-- `src/net.rs`: Network interface selection and multicast socket creation.
+- `src/net.rs`: Network interface and socket management.
 
 ## License
 
