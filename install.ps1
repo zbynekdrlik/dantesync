@@ -32,11 +32,12 @@ try {
     Write-Error "Failed to fetch release info. Check internet connection."
 }
 
-$Asset = $ReleaseInfo.assets | Where-Object { $_.name -like "*windows-amd64.exe" }
-$TrayAsset = $ReleaseInfo.assets | Where-Object { $_.name -like "*dantetray-windows-amd64.exe" }
+# Use exact matching to avoid ambiguity
+$Asset = $ReleaseInfo.assets | Where-Object { $_.name -eq "dantetimesync-windows-amd64.exe" } | Select-Object -First 1
+$TrayAsset = $ReleaseInfo.assets | Where-Object { $_.name -eq "dantetray-windows-amd64.exe" } | Select-Object -First 1
 
 if (!$Asset) {
-    Write-Error "Could not find Windows asset in latest release."
+    Write-Error "Could not find 'dantetimesync-windows-amd64.exe' in latest release."
 }
 
 $ExePath = "$InstallDir\dantetimesync.exe"
@@ -49,7 +50,7 @@ if ($TrayAsset) {
     Write-Host "Downloading $($TrayAsset.name)..."
     Invoke-WebRequest -Uri $TrayAsset.browser_download_url -OutFile $TrayPath
 } else {
-    Write-Warning "Tray application not found in release."
+    Write-Warning "Tray application ('dantetray-windows-amd64.exe') not found in release."
 }
 
 # 4. Install Service
