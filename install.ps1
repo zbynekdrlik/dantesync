@@ -32,6 +32,9 @@ try {
     Write-Error "Failed to fetch release info. Check internet connection."
 }
 
+$Version = $ReleaseInfo.tag_name
+Write-Host "Installing Version: $Version" -ForegroundColor Green
+
 # Use exact matching to avoid ambiguity
 $Asset = $ReleaseInfo.assets | Where-Object { $_.name -eq "dantetimesync-windows-amd64.exe" } | Select-Object -First 1
 $TrayAsset = $ReleaseInfo.assets | Where-Object { $_.name -eq "dantetray-windows-amd64.exe" } | Select-Object -First 1

@@ -262,15 +262,18 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
             // Named pipe server loop
             loop {
                 // Create new instance for each connection
-                // First instance should set first_pipe_instance(true) but if we just loop it might fail if one exists?
-                // Actually tokio ServerOptions handles creating instances.
-                // We create one, connect, handle, loop.
-                let mut server = match ServerOptions::new()
-                    .create(r"\\.\pipe\dantetimesync") 
+                // Allow World (Everyone) to read/write (Generic All). 
+                // Necessary for User process to connect to System Service pipe.
+                let mut server = match unsafe { 
+                    ServerOptions::new()
+                        .access_outbound(true)
+                        .first_pipe_instance(false)
+                        .security_descriptor("D:(A;;GA;;;WD)") 
+                        .create(r"\\.\pipe\dantetimesync") 
+                    }
                 {
                     Ok(s) => s,
                     Err(_) => {
-                        // Maybe pipe exists? Wait a bit.
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -413,7 +416,7 @@ fn run_service_logic(args: Args) -> Result<()> {
 
         let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
             Ok(h) => h,
-            Err(_) => return, // Can't log easily if logger not set up?
+            Err(_) => return, 
         };
 
         // Set Running
@@ -427,11 +430,7 @@ fn run_service_logic(args: Args) -> Result<()> {
             process_id: None,
         });
 
-        // Parse args again or use global? 
-        // We can't pass args into service_main easily.
-        // We'll parse defaults or basic args.
-        let args = Args::parse(); // Should work from command line params passed to service?
-        // Service args are passed in `arguments`.
+        let args = Args::parse(); 
         
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
@@ -466,6 +465,29 @@ fn run_service_logic(args: Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    #[cfg(windows)]
+    if args.service {
+        // Initialize File Logging for Service
+        let log_path = r"C:\Program Files\DanteTimeSync\dantetimesync.log";
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).write(true).open(log_path) {
+             let target = env_logger::Target::Pipe(Box::new(file));
+             env_logger::builder()
+                .target(target)
+                .filter_level(log::LevelFilter::Info)
+                .format_timestamp_millis()
+                .init();
+        } else {
+             // Fallback
+             env_logger::builder().filter_level(log::LevelFilter::Info).init();
+        }
+        
+        info!("Service Started: v{}", env!("CARGO_PKG_VERSION"));
+        return run_service_logic(args);
+    }
+
+    // Console Mode Logging
     env_logger::builder()
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Info)
@@ -473,13 +495,6 @@ fn main() -> Result<()> {
 
     // Log Version immediately
     info!("Dante Time Sync v{}", env!("CARGO_PKG_VERSION"));
-
-    let args = Args::parse();
-
-    #[cfg(windows)]
-    if args.service {
-        return run_service_logic(args);
-    }
 
     // Console Mode
     let _lock_file = match acquire_singleton_lock() {
