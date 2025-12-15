@@ -296,6 +296,12 @@ fn start_ipc_server(_status: Arc<RwLock<SyncStatus>>) {
 
 // --- Sync Loop ---
 fn run_sync_loop(args: Args, running: Arc<AtomicBool>) -> Result<()> {
+    // Notify systemd (Linux) that we are starting
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Status(format!("v{} | Starting...", env!("CARGO_PKG_VERSION")))]);
+    }
+
     stop_conflicting_services();
     enable_realtime_priority();
 
@@ -332,11 +338,36 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>) -> Result<()> {
     controller.run_ntp_sync(args.skip_ntp);
 
     info!("Starting PTP Loop...");
+    
+    // Notify systemd we are ready and loop is running
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(false, &[
+            sd_notify::NotifyState::Ready, 
+            sd_notify::NotifyState::Status(format!("v{} | PTP Loop Running", env!("CARGO_PKG_VERSION")))
+        ]);
+    }
+
     let mut last_log = Instant::now();
     
     while running.load(Ordering::SeqCst) {
         if last_log.elapsed() >= Duration::from_secs(10) {
             controller.log_status();
+            
+            // Update systemd status with latest metrics
+            #[cfg(unix)]
+            {
+                let s = controller.get_status_shared();
+                if let Ok(status) = s.read() {
+                    let status_str = if status.settled {
+                        format!("v{} | Locked | Offset: {:.3} µs", env!("CARGO_PKG_VERSION"), status.offset_ns as f64 / 1000.0)
+                    } else {
+                        format!("v{} | Settling...", env!("CARGO_PKG_VERSION"))
+                    };
+                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Status(status_str)]);
+                }
+            }
+            
             last_log = Instant::now();
         }
 
@@ -348,6 +379,10 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>) -> Result<()> {
     }
 
     info!("Sync Loop Exiting.");
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+    }
     Ok(())
 }
 
@@ -392,7 +427,7 @@ fn run_service_logic(args: Args) -> Result<()> {
             process_id: None,
         });
 
-        // Parse args again or use global?
+        // Parse args again or use global? 
         // We can't pass args into service_main easily.
         // We'll parse defaults or basic args.
         let args = Args::parse(); // Should work from command line params passed to service?
