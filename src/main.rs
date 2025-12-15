@@ -16,7 +16,7 @@ use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned, SockaddrStorage};
 #[cfg(unix)]
 use nix::sys::time::TimeSpec;
 #[cfg(unix)]
-use nix::fcntl::{flock, FlockArg}; // For Singleton Lock
+use nix::fcntl::{flock, FlockArg};
 
 mod ptp;
 mod net;
@@ -170,17 +170,20 @@ fn acquire_singleton_lock() -> Result<File> {
     }
     #[cfg(not(unix))]
     {
-        // Windows needs named mutex or similar. Skipping for now as requested context is Linux.
         Ok(File::create("dantetimesync.lock")?)
     }
 }
 
 fn main() -> Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    // Customize logger to remove timestamp (journald provides it) and reduce verbosity
+    env_logger::builder()
+        .format_timestamp(None)
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
     let args = Args::parse();
 
     // 0. Singleton Check
-    // We hold the file handle. Lock is released when file is closed (process exit).
     let _lock_file = match acquire_singleton_lock() {
         Ok(f) => f,
         Err(e) => {
