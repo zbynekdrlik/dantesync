@@ -59,10 +59,16 @@ impl WindowsClock {
 
             AdjustTokenPrivileges(token, BOOL(0), Some(&tp), 0, None, None)?;
             
-            // Explicit type to force compiler to tell us if GetLastError returns Result
-            let err: WIN32_ERROR = GetLastError();
-            if err == ERROR_NOT_ALL_ASSIGNED {
-                 return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED"));
+            // Compiler indicates GetLastError returns Result<()> in this environment.
+            // We verify if the result is an error matching ERROR_NOT_ALL_ASSIGNED.
+            if let Err(e) = GetLastError() {
+                // ERROR_NOT_ALL_ASSIGNED is WIN32_ERROR. Convert to HRESULT for comparison if needed, 
+                // or check if WIN32_ERROR impls PartialEq with Error code.
+                // windows::core::Error.code() returns HRESULT.
+                // WIN32_ERROR.to_hresult() returns HRESULT.
+                if e.code() == ERROR_NOT_ALL_ASSIGNED.to_hresult() {
+                     return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED"));
+                }
             }
             
             CloseHandle(token)?;
