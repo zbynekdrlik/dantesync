@@ -2,7 +2,6 @@ use std::io::Cursor;
 use byteorder::{BigEndian, ReadBytesExt};
 use anyhow::{Result, anyhow};
 
-pub const PTP_MULTICAST_ADDR: &str = "224.0.1.129";
 pub const PTP_EVENT_PORT: u16 = 319;
 pub const PTP_GENERAL_PORT: u16 = 320;
 
@@ -29,7 +28,7 @@ impl From<u8> for PtpV1Control {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PtpV1Header {
     pub version_ptp: u8,
     pub message_length: u16,
@@ -57,7 +56,7 @@ impl PtpV1Header {
         // Skip subdomain (16 bytes)
         rdr.set_position(rdr.position() + 16);
         
-        let msg_type_val = rdr.read_u8()?;
+        let _msg_type_val = rdr.read_u8()?;
         let _src_comm_tech = rdr.read_u8()?;
         
         let mut source_uuid = [0u8; 6];
@@ -69,13 +68,6 @@ impl PtpV1Header {
         let sequence_id = rdr.read_u16::<BigEndian>()?;
         let control = rdr.read_u8()?;
         
-        // Remaining: reservedByte33, flags...
-
-        // Map control field to enum if it matches message type, 
-        // but the C++ code checks 'control' byte specifically for Sync/FollowUp.
-        // Actually, in PTPv1, the 'messageTypeValue' often aligns with 'control' for the main types.
-        // We'll use the 'control' field as the primary type indicator as per C++ reference:
-        // enum class PtpV1Control : uint8_t { ... }
         let message_type = PtpV1Control::from(control);
 
         Ok(PtpV1Header {
@@ -89,7 +81,7 @@ impl PtpV1Header {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PtpTimestamp {
     pub seconds: u32,
     pub nanoseconds: u32,
@@ -108,11 +100,6 @@ pub struct PtpV1FollowUpBody {
 }
 
 impl PtpV1FollowUpBody {
-    // 2 bytes padding + 2 bytes seq + 8 bytes timestamp = 12 bytes minimum
-    // But struct in C++ has 'uint8_t reserved_padding1[6]' (6 bytes)
-    // Then 'uint16_t associatedSequenceId'
-    // Then 'PtpTimestamp preciseOriginTimestamp' (8 bytes)
-    // Total = 6 + 2 + 8 = 16 bytes.
     pub const SIZE: usize = 16;
 
     pub fn parse(data: &[u8]) -> Result<Self> {
@@ -135,5 +122,84 @@ impl PtpV1FollowUpBody {
                 nanoseconds,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ptp_v1_control_from() {
+        assert_eq!(PtpV1Control::from(0), PtpV1Control::Sync);
+        assert_eq!(PtpV1Control::from(1), PtpV1Control::DelayReq);
+        assert_eq!(PtpV1Control::from(2), PtpV1Control::FollowUp);
+        assert_eq!(PtpV1Control::from(3), PtpV1Control::DelayResp);
+        assert_eq!(PtpV1Control::from(4), PtpV1Control::Management);
+        assert_eq!(PtpV1Control::from(5), PtpV1Control::Other);
+        assert_eq!(PtpV1Control::from(99), PtpV1Control::Other);
+    }
+
+    #[test]
+    fn test_parse_header_too_short() {
+        let data = [0u8; 35];
+        assert!(PtpV1Header::parse(&data).is_err());
+    }
+
+    #[test]
+    fn test_parse_header_valid_sync() {
+        // Construct a mock PTPv1 Sync Header
+        let mut data = vec![0u8; 36];
+        data[0] = 0x10; // Version PTP = 1
+        data[3] = 0; // msg length high
+        data[32] = 0; // Control = Sync (Offset 32)
+
+        // UUID
+        data[22] = 0xAA;
+        data[23] = 0xBB;
+        data[24] = 0xCC;
+        data[25] = 0xDD;
+        data[26] = 0xEE;
+        data[27] = 0xFF;
+
+        // Sequence ID (bytes 30, 31)
+        data[30] = 0x01;
+        data[31] = 0x02; // 0x0102 = 258
+
+        let header = PtpV1Header::parse(&data).unwrap();
+        assert_eq!(header.version_ptp, 1);
+        assert_eq!(header.message_type, PtpV1Control::Sync);
+        assert_eq!(header.sequence_id, 258);
+        assert_eq!(header.source_uuid, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    #[test]
+    fn test_ptp_timestamp_to_nanos() {
+        let ts = PtpTimestamp { seconds: 1, nanoseconds: 500 };
+        assert_eq!(ts.to_nanos(), 1_000_000_500);
+    }
+
+    #[test]
+    fn test_parse_followup_body() {
+        let mut data = vec![0u8; 16];
+        // Padding 6 bytes (0..6)
+        // Associated Seq ID (6,7)
+        data[6] = 0x00;
+        data[7] = 0x05; 
+        // Seconds (8..11)
+        data[8] = 0x00;
+        data[9] = 0x00;
+        data[10] = 0x00;
+        data[11] = 0x0A; // 10 seconds
+        // Nanos (12..15)
+        data[12] = 0x00;
+        data[13] = 0x00;
+        data[14] = 0x01;
+        data[15] = 0x00; // 256 nanos
+
+        let body = PtpV1FollowUpBody::parse(&data).unwrap();
+        assert_eq!(body.associated_sequence_id, 5);
+        assert_eq!(body.precise_origin_timestamp.seconds, 10);
+        assert_eq!(body.precise_origin_timestamp.nanoseconds, 256);
     }
 }

@@ -1,37 +1,157 @@
 use anyhow::Result;
 use clap::Parser;
 use log::{info, warn, error};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use std::process::Command;
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned, SockaddrStorage};
+#[cfg(unix)]
+use nix::sys::time::TimeSpec;
 
 mod ptp;
 mod net;
 mod clock;
+mod ntp;
+mod traits;
+mod controller;
+mod servo;
+mod rtc; // Added
 
-use ptp::{PtpV1Header, PtpV1Control, PtpV1FollowUpBody};
-use clock::SystemClock;
+use traits::{NtpSource, PtpNetwork};
+use controller::PtpController;
 use std::io::ErrorKind;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Interface name to bind to (optional, auto-detected if not provided)
     #[arg(short, long)]
     interface: Option<String>,
+
+    #[arg(long, default_value = "10.77.8.2")]
+    ntp_server: String,
+
+    #[arg(long, default_value_t = false)]
+    skip_ntp: bool,
 }
 
-struct PendingSync {
-    // rx_time: Instant, // Unused
-    rx_time_sys: std::time::SystemTime,
-    source_uuid: [u8; 6],
+// Concrete Implementations for Traits
+struct RealNtpSource {
+    client: ntp::NtpClient,
+}
+
+impl NtpSource for RealNtpSource {
+    fn get_offset(&self) -> Result<(Duration, i8)> {
+        self.client.get_offset()
+    }
+}
+
+struct RealPtpNetwork {
+    sock_event: std::net::UdpSocket,
+    sock_general: std::net::UdpSocket,
+}
+
+impl RealPtpNetwork {
+    #[cfg(unix)]
+    fn recv_with_timestamp(sock: &std::net::UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, SystemTime)>> {
+        let fd = sock.as_raw_fd();
+        let mut iov = [std::io::IoSliceMut::new(buf)];
+        // Space for CMSG (Timestamp)
+        let mut cmsg_buf = nix::cmsg_space!(TimeSpec);
+        
+        match recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty()) {
+            Ok(msg) => {
+                // Check if we got a timestamp
+                let timestamp = msg.cmsgs().find_map(|cmsg| {
+                    if let ControlMessageOwned::ScmTimestampns(ts) = cmsg {
+                        // ts is TimeSpec (tv_sec(), tv_nsec())
+                        let duration = Duration::new(ts.tv_sec() as u64, ts.tv_nsec() as u32);
+                        Some(SystemTime::UNIX_EPOCH + duration)
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| SystemTime::now());
+                
+                Ok(Some((msg.bytes, timestamp)))
+            }
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn recv_with_timestamp(sock: &std::net::UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, SystemTime)>> {
+        match sock.recv_from(buf) {
+            Ok((size, _)) => Ok(Some((size, SystemTime::now()))),
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl PtpNetwork for RealPtpNetwork {
+    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+        let mut buf = [0u8; 2048];
+        
+        loop {
+            // Check Event Socket
+            match Self::recv_with_timestamp(&self.sock_event, &mut buf) {
+                Ok(Some((size, ts))) => {
+                    return Ok(Some((buf[..size].to_vec(), size, ts)));
+                }
+                Ok(None) => {} // Continue to check general
+                Err(e) => return Err(e),
+            }
+
+            // Check General Socket
+            match Self::recv_with_timestamp(&self.sock_general, &mut buf) {
+                Ok(Some((size, ts))) => {
+                    return Ok(Some((buf[..size].to_vec(), size, ts)));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+
+            return Ok(None);
+        }
+    }
+}
+
+fn stop_conflicting_services() {
+    #[cfg(windows)]
+    {
+        info!("Attempting to stop W32Time service...");
+        match Command::new("net").args(["stop", "w32time"]).output() {
+            Ok(out) => {
+                if out.status.success() {
+                    info!("W32Time stopped successfully.");
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    warn!("Failed to stop W32Time (ignoring if already stopped): {}", err);
+                }
+            }
+            Err(e) => warn!("Failed to execute 'net stop w32time': {}", e),
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        info!("Ensuring system NTP is disabled (timedatectl set-ntp false)...");
+        match Command::new("timedatectl").args(["set-ntp", "false"]).output() {
+             Ok(_) => info!("NTP service disabled via timedatectl."),
+             Err(e) => warn!("Failed to disable NTP via timedatectl (ignoring): {}", e),
+        }
+    }
 }
 
 fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    let _args = Args::parse(); // interface currently auto-detected, args unused for now
+    let args = Args::parse();
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -41,11 +161,15 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
+    // 0. Stop Conflicting Services
+    stop_conflicting_services();
+
     // 1. Initialize Clock
-    let mut sys_clock: Box<dyn SystemClock> = match clock::PlatformClock::new() {
-        Ok(c) => Box::new(c),
+    let sys_clock = match clock::PlatformClock::new() {
+        Ok(c) => c,
         Err(e) => {
             error!("Failed to initialize system clock adjustment: {}", e);
+            error!("Ensure you are running as Administrator/Root.");
             return Err(e);
         }
     };
@@ -58,142 +182,37 @@ fn main() -> Result<()> {
     // 3. Sockets
     let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
     let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
-    
     info!("Listening on 224.0.1.129 ports 319 (Event) and 320 (General)");
 
-    // 4. Main Loop
-    let mut buf = [0u8; 2048];
-    let mut pending_syncs: HashMap<u16, PendingSync> = HashMap::new();
+    let network = RealPtpNetwork {
+        sock_event,
+        sock_general,
+    };
     
-    // State for filtering
-    let mut prev_t1_ns: i64 = 0;
-    let mut prev_t2_ns: i64 = 0;
-    let mut smoothed_factor = 1.0;
-    let alpha = 0.005;
-    let mut valid_count = 0;
-    let settling_threshold = 10;
-    let mut clock_settled = false;
+    let ntp_source = RealNtpSource {
+        client: ntp::NtpClient::new(&args.ntp_server),
+    };
 
+    let mut controller = PtpController::new(sys_clock, network, ntp_source);
+
+    // 4. NTP Sync
+    controller.run_ntp_sync(args.skip_ntp);
+
+    // 5. Main Loop
+    info!("Starting PTP Loop...");
     let mut last_log = Instant::now();
     
     while running.load(Ordering::SeqCst) {
-        // Logging
         if last_log.elapsed() >= Duration::from_secs(10) {
-            let adj_ppm = (smoothed_factor - 1.0) * 1_000_000.0;
-            if !clock_settled {
-                info!("[Status] Settling... ({}/{})", valid_count, settling_threshold);
-            } else {
-                info!("[Status] Factor: {:.9} ({:+.3} ppm). Adjustment active.", smoothed_factor, adj_ppm);
-            }
+            controller.log_status();
             last_log = Instant::now();
         }
 
-        // Poll sockets
-        let sockets = [&sock_event, &sock_general];
-        let mut did_work = false;
-
-        for sock in sockets {
-            match sock.recv_from(&mut buf) {
-                Ok((size, _src)) => {
-                    did_work = true;
-                    // Capture T2 immediately
-                    let t2 = std::time::SystemTime::now();
-
-                    if size < ptp::PtpV1Header::SIZE {
-                        continue;
-                    }
-                    
-                    let header = match PtpV1Header::parse(&buf[..size]) {
-                        Ok(h) => h,
-                        Err(_) => continue,
-                    };
-
-                    match header.message_type {
-                        PtpV1Control::Sync => {
-                            // Store Sync T2
-                            pending_syncs.insert(header.sequence_id, PendingSync {
-                                rx_time_sys: t2,
-                                source_uuid: header.source_uuid,
-                            });
-                        }
-                        PtpV1Control::FollowUp => {
-                            // Parse body
-                            if let Ok(body) = PtpV1FollowUpBody::parse(&buf[ptp::PtpV1Header::SIZE..size]) {
-                                if let Some(sync_info) = pending_syncs.remove(&body.associated_sequence_id) {
-                                    if sync_info.source_uuid == header.source_uuid {
-                                        // Process Valid Pair
-                                        let t1_ns = body.precise_origin_timestamp.to_nanos();
-                                        
-                                        let t2_ns = sync_info.rx_time_sys.duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_nanos() as i64;
-
-                                        valid_count += 1;
-                                        if valid_count > settling_threshold {
-                                            clock_settled = true;
-                                        }
-
-                                        if prev_t1_ns > 0 && prev_t2_ns > 0 {
-                                            // Ensure monotonicity
-                                            if t1_ns > prev_t1_ns && t2_ns > prev_t2_ns {
-                                                let delta_master = t1_ns - prev_t1_ns;
-                                                let delta_slave = t2_ns - prev_t2_ns;
-
-                                                if delta_master > 0 && delta_slave > 0 {
-                                                    let current_factor = delta_master as f64 / delta_slave as f64;
-                                                    
-                                                    // Sanity check (max 10% drift)
-                                                    if (current_factor - 1.0).abs() < 0.1 {
-                                                        smoothed_factor = alpha * current_factor + (1.0 - alpha) * smoothed_factor;
-                                                        
-                                                        if clock_settled {
-                                                            if let Err(e) = sys_clock.adjust_frequency(smoothed_factor) {
-                                                                warn!("Clock adjustment failed: {}", e);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        warn!("Excessive drift detected (factor {}). Resetting filter.", current_factor);
-                                                        smoothed_factor = 1.0;
-                                                        valid_count = 0;
-                                                        clock_settled = false;
-                                                    }
-                                                }
-                                            } else {
-                                                warn!("Time went backwards or duplicate packet. Resetting.");
-                                                valid_count = 0;
-                                                clock_settled = false;
-                                                smoothed_factor = 1.0;
-                                            }
-                                        }
-                                        
-                                        prev_t1_ns = t1_ns;
-                                        prev_t2_ns = t2_ns;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    // Nothing
-                }
-                Err(e) => {
-                    warn!("Socket recv error: {}", e);
-                }
-            }
-        }
-
-        if !did_work {
-            thread::sleep(Duration::from_millis(1));
+        if let Err(e) = controller.process_loop_iteration() {
+            warn!("Error in loop: {}", e);
         }
         
-        // Cleanup old pending syncs
-        if pending_syncs.len() > 100 {
-            let now_sys = std::time::SystemTime::now();
-            pending_syncs.retain(|_, v| now_sys.duration_since(v.rx_time_sys).unwrap_or(Duration::ZERO) < Duration::from_secs(5));
-        }
+        thread::sleep(Duration::from_millis(1));
     }
 
     info!("Exiting.");

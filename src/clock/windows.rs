@@ -7,9 +7,11 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise,
+    GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise, GetSystemTime, SetSystemTime
 };
+use windows::Win32::System::Time::SYSTEMTIME;
 use windows::core::PCWSTR;
+use std::time::Duration;
 
 pub struct WindowsClock {
     original_adjustment: u64,
@@ -30,60 +32,11 @@ impl WindowsClock {
             GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled)?;
         }
 
-        // Nominal frequency is usually what the system uses when not adjusted.
-        // However, we need a baseline. The C++ code used 10,000,000.
-        // If 'disabled' is TRUE, the current 'adj' might be meaningless or default.
-        // If 'disabled' is FALSE, 'adj' is the current running value.
-        
-        // We'll use 10,000,000 (1 second in 100ns units) as our baseline 
-        // assuming the increment interrupt is targeting that.
-        // Actually, SetSystemTimeAdjustmentPrecise expects the value to be added 
-        // *every time increment*.
-        // If the time increment is, say, 15.625ms (156,250 units), then 
-        // to keep time 1:1, we should add 156,250 units.
-        
-        // Wait, the C++ code uses 10,000,000 as "FIXED_NOMINAL_1_SECOND".
-        // And sets that as the adjustment.
-        // If the interrupt period is 15.6ms, adding 1 second every 15.6ms 
-        // would make the clock run 64x fast.
-        // This implies the C++ code assumes the interrupt period IS 1 second?
-        // OR, the "adjustment" value is NOT "per interrupt" but "per second"?
-        
-        // Docs for SetSystemTimeAdjustment:
-        // "dwTimeAdjustment: The number of 100-nanosecond units added to the time-of-day clock 
-        // for each lpTimeIncrement period of time that actually passes."
-        
-        // So if increment is 15.6ms, we should add 15.6ms.
-        // If we add 10,000,000 (1s), we fly.
-        
-        // UNLESS the 'increment' is 1 second? No, that's huge latency.
-        
-        // Maybe the C++ code is using `SetSystemTimeAdjustmentPrecise` differently or I misunderstand the constant.
-        // Let's look at C++ code again:
-        // `GetSystemTimeAdjustmentPrecise(&original_adjustment_, &original_interval_, ...)`
-        // `original_interval_` (increment) is retrieved.
-        // `FIXED_NOMINAL_1_SECOND` is defined as 10,000,000.
-        // `SetSystemTimeAdjustmentPrecise(FIXED_NOMINAL_1_SECOND, TRUE)`
-        
-        // If `TRUE` is passed (disabled), the value 10,000,000 is IGNORED.
-        // So the C++ code was likely just resetting it to system default.
-        // AND THEN later:
-        // `SetSystemTimeAdjustmentPrecise(new_adjustment_value, TRUE)`
-        // It keeps passing TRUE. 
-        // This implies the C++ code DOES NOT WORK for adjustment, 
-        // it just calculates the value and then disables adjustment (effectively doing nothing).
-        // That explains why they might not have noticed the "1 second per interrupt" issue if it was never enabled.
-        
-        // BUT, if I am to "improve it", I must make it work.
-        // To make it work, I need to know the `dwTimeIncrement`.
-        // I should use `original_increment` as the base.
-        // If I want to speed up by 1%, I set `dwTimeAdjustment = original_increment * 1.01`.
-        
         Ok(WindowsClock {
             original_adjustment: adj,
             original_increment: inc,
             original_disabled: disabled,
-            nominal_frequency: inc, // Use the system reported increment as nominal
+            nominal_frequency: inc, 
         })
     }
 
@@ -105,11 +58,6 @@ impl WindowsClock {
 
             AdjustTokenPrivileges(token, BOOL(0), Some(&tp), 0, None, None)?;
             if GetLastError().is_err() {
-                 // AdjustTokenPrivileges returns success even if it failed to adjust, 
-                 // we must check GetLastError. 
-                 // Wait, windows crate usually handles this via `?` if it returns BOOL?
-                 // AdjustTokenPrivileges returns BOOL. 
-                 // If it returns TRUE, we still check GetLastError for ERROR_NOT_ALL_ASSIGNED.
                  let err = GetLastError();
                  if err.0 != 0 {
                      return Err(anyhow!("Failed to adjust privilege: {:?}", err));
@@ -124,11 +72,49 @@ impl WindowsClock {
 impl SystemClock for WindowsClock {
     fn adjust_frequency(&mut self, factor: f64) -> Result<()> {
         let new_adj = (self.nominal_frequency as f64 * factor).round() as u64;
-        
-        // We MUST pass FALSE to enable adjustment.
         unsafe {
             SetSystemTimeAdjustmentPrecise(new_adj, BOOL(0))?;
         }
+        Ok(())
+    }
+
+    fn step_clock(&mut self, offset: Duration, sign: i8) -> Result<()> {
+        // Windows SetSystemTime uses SYSTEMTIME struct which is broken down (Y/M/D H:M:S.ms)
+        // Calculating offsets in SYSTEMTIME is painful.
+        // Easier: Get SystemTime as FileTime (u64), add offset, convert back to SystemTime, Set.
+        
+        use windows::Win32::System::Time::{GetSystemTimeAsFileTime, FileTimeToSystemTime, FILETIME};
+        
+        unsafe {
+            let mut ft = FILETIME::default();
+            GetSystemTimeAsFileTime(&mut ft);
+            
+            let mut u64_time = (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64);
+            let offset_100ns = offset.as_nanos() as u64 / 100;
+            
+            if sign > 0 {
+                u64_time += offset_100ns;
+            } else {
+                if u64_time > offset_100ns {
+                    u64_time -= offset_100ns;
+                } else {
+                    return Err(anyhow!("Clock step would result in negative time"));
+                }
+            }
+            
+            ft.dwLowDateTime = (u64_time & 0xFFFFFFFF) as u32;
+            ft.dwHighDateTime = (u64_time >> 32) as u32;
+            
+            let mut st = SYSTEMTIME::default();
+            if FileTimeToSystemTime(&ft, &mut st).as_bool() {
+                if !SetSystemTime(&st).as_bool() {
+                    return Err(anyhow!("SetSystemTime failed"));
+                }
+            } else {
+                 return Err(anyhow!("FileTimeToSystemTime failed"));
+            }
+        }
+
         Ok(())
     }
 }

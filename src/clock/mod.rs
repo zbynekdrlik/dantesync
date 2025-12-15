@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+#[cfg_attr(test, mockall::automock)]
 pub trait SystemClock {
     /// Adjusts the system clock frequency.
     /// `factor`: The ratio of master speed to local speed.
@@ -7,6 +8,9 @@ pub trait SystemClock {
     /// > 1.0 means local clock is too slow, speed up.
     /// < 1.0 means local clock is too fast, slow down.
     fn adjust_frequency(&mut self, factor: f64) -> Result<()>;
+    
+    /// Stepping the clock (for NTP initial sync)
+    fn step_clock(&mut self, offset: std::time::Duration, sign: i8) -> Result<()>;
 }
 
 #[cfg(windows)]

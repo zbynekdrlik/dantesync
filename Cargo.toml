@@ -12,7 +12,14 @@ socket2 = "0.5"
 pnet_datalink = "0.34"
 byteorder = "1.5"
 uuid = { version = "1.0", features = ["v4"] }
-ctrlc = "3.5.1"
+rsntp = "4.0"
+chrono = "0.4"
+ctrlc = "3.4"
+nix = { version = "0.27", features = ["socket", "net", "uio", "fs", "ioctl"] }
+
+[dev-dependencies]
+mockall = "0.12"
+tempfile = "3.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [

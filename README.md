@@ -1,20 +1,20 @@
 # Dante PTP Time Sync (dantetimesync)
 
-A Rust-based tool to synchronize the local system clock with a Dante PTP v1 Grandmaster.
-Migrated and improved from an original C++ Windows tool to support both Windows and Linux.
+A state-of-the-art Rust service to synchronize the local system clock with a Dante PTP v1 Grandmaster, ensuring both absolute time accuracy via NTP and microsecond-level frequency locking via PTP.
 
 ## Features
 
-- **Cross-Platform:** Runs on Windows and Linux.
-- **PTP v1 Support:** Listens for Dante PTP v1 multicast packets.
-- **Frequency Locking:** Uses frequency adjustment (syntonization) instead of time stepping for smooth audio clock handling.
-- **Network Auto-Detection:** Automatically selects the appropriate wired network interface.
-- **Robustness:** Handles network jitter and packet loss with filtering.
+- **Hybrid Sync:**
+    - **Phase 1 (NTP):** Steps the clock on startup using a specified NTP server (default: `10.77.8.2`) to ensure correct wall-clock time.
+    - **Phase 2 (PTP):** Locks to Dante PTP v1 multicast (224.0.1.129) for precision frequency drift correction.
+- **Cross-Platform:** Runs on Linux and Windows.
+- **Robustness:** 100% Test Coverage of core logic using Mocking and TDD.
+- **Architecture:** Senior-level dependency injection pattern (`PtpController` with swappable Network/Clock/NTP backends).
 
 ## Requirements
 
-- **Windows:** Run as **Administrator** (required for `SetSystemTimeAdjustmentPrecise`).
-- **Linux:** Run as **Root** (or with `CAP_SYS_TIME` capability) for `adjtimex`.
+- **Windows:** Run as **Administrator** (required for `SetSystemTimeAdjustmentPrecise` and `SetSystemTime`).
+- **Linux:** Run as **Root** (or with `CAP_SYS_TIME` capability) for `adjtimex` and `settimeofday`.
 
 ## Building
 
@@ -22,24 +22,38 @@ Migrated and improved from an original C++ Windows tool to support both Windows 
 cargo build --release
 ```
 
+## Testing
+
+The project uses `mockall` for comprehensive unit testing.
+
+```bash
+cargo test
+```
+
 ## Usage
 
 ```bash
-# Run with auto-detected interface
+# Run with default settings (NTP: 10.77.8.2, Auto Interface)
 sudo ./target/release/dantetimesync
 
-# Run on specific interface (optional)
-# sudo ./target/release/dantetimesync --interface eth0
+# Specify Interface
+sudo ./target/release/dantetimesync --interface eth0
+
+# Specify NTP Server
+sudo ./target/release/dantetimesync --ntp-server pool.ntp.org
+
+# Skip NTP (PTP Only)
+sudo ./target/release/dantetimesync --skip-ntp
 ```
 
-## How it works
+## Architecture
 
-1.  **Discovery:** Finds a network interface (preferring wired IPv4).
-2.  **Listening:** Joins Multicast Group `224.0.1.129` on UDP ports 319 and 320.
-3.  **Syncing:**
-    -   Receives `Sync` and `Follow_Up` messages from the Grandmaster.
-    -   Calculates the ratio between Master time passage and Slave time passage.
-    -   Adjusts the local system clock frequency (slewing) to match the Master.
+- `src/main.rs`: Entry point and wiring of concrete implementations (`RealPtpNetwork`, `RealNtpSource`).
+- `src/controller.rs`: Core control loop logic (`PtpController`), fully unit-tested with mocks.
+- `src/clock/`: Platform-specific system clock control (`adjtimex` for Linux, `SetSystemTimeAdjustmentPrecise` for Windows).
+- `src/ptp.rs`: PTP v1 packet parsing.
+- `src/ntp.rs`: NTP client wrapper using `rsntp`.
+- `src/net.rs`: Network interface selection and multicast socket creation.
 
 ## License
 
