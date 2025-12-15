@@ -30,6 +30,7 @@ mod ntp;
 mod traits;
 mod controller;
 mod servo;
+#[cfg(unix)]
 mod rtc;
 
 use traits::{NtpSource, PtpNetwork};
@@ -206,7 +207,7 @@ fn acquire_singleton_lock() -> Result<File> {
         
         match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
             Ok(_) => Ok(file),
-            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EWOULDBLOCK) => {
+            Err(nix::errno::Errno::EAGAIN) => {
                 Err(anyhow!("Another instance of dantetimesync is already running! (Lockfile: {})", lock_path))
             }
             Err(e) => Err(e.into()),

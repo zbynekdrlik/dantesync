@@ -1,6 +1,6 @@
 use super::SystemClock;
 use anyhow::{Result, anyhow};
-use windows::Win32::Foundation::{BOOL, HANDLE, LUID, CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED};
+use windows::Win32::Foundation::{BOOL, HANDLE, LUID, CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, SYSTEMTIME, FILETIME};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
     TOKEN_PRIVILEGES, SE_PRIVILEGE_ENABLED
@@ -9,7 +9,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::SystemInformation::{
     GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise
 };
-use windows::Win32::System::Time::{GetSystemTimeAsFileTime, FileTimeToSystemTime, SetSystemTime, SYSTEMTIME, FILETIME};
+use windows::Win32::System::Time::{GetSystemTimeAsFileTime, FileTimeToSystemTime, SetSystemTime};
 use windows::core::PCWSTR;
 use std::time::Duration;
 
@@ -58,7 +58,7 @@ impl WindowsClock {
 
             AdjustTokenPrivileges(token, BOOL(0), Some(&tp), 0, None, None)?;
             
-            if GetLastError() == ERROR_NOT_ALL_ASSIGNED {
+            if GetLastError().0 == ERROR_NOT_ALL_ASSIGNED.0 {
                  return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED"));
             }
             
