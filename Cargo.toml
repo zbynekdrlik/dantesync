@@ -1,6 +1,6 @@
 [package]
 name = "dantetimesync"
-version = "1.0.15"
+version = "1.1.0"
 edition = "2021"
 
 [dependencies]
@@ -16,10 +16,8 @@ rsntp = "4.0"
 chrono = "0.4"
 ctrlc = "3.4"
 nix = { version = "0.27", features = ["socket", "net", "uio", "fs", "ioctl"] }
-
-[dev-dependencies]
-mockall = "0.12"
-tempfile = "3.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
@@ -35,6 +33,22 @@ windows = { version = "0.52", features = [
     "Win32_UI_Shell",
     "Win32_Media",
 ] }
+windows-service = "0.7"
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros", "rt-multi-thread"] }
+tray-icon = "0.14"
+winit = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+mockall = "0.12"
+tempfile = "3.10"
+
+[[bin]]
+name = "dantetimesync"
+path = "src/main.rs"
+
+[[bin]]
+name = "dantetray"
+path = "src/bin/tray.rs"

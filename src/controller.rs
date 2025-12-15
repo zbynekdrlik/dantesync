@@ -2,11 +2,13 @@ use anyhow::Result;
 use log::{info, warn, error, debug};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, RwLock};
 use std::process::Command;
 use crate::clock::SystemClock;
 use crate::traits::{NtpSource, PtpNetwork};
 use crate::ptp::{PtpV1Header, PtpV1Control, PtpV1FollowUpBody, PtpV1SyncMessageBody};
 use crate::servo::PiServo;
+use crate::status::SyncStatus;
 #[cfg(unix)]
 use crate::rtc;
 
@@ -51,6 +53,9 @@ where
     valid_count: usize,
     clock_settled: bool,
     settling_threshold: usize,
+
+    // Status for IPC/Tray
+    status_shared: Arc<RwLock<SyncStatus>>,
 }
 
 struct PendingSync {
@@ -83,6 +88,24 @@ where
             valid_count: 0,
             clock_settled: false,
             settling_threshold: 1, 
+            status_shared: Arc::new(RwLock::new(SyncStatus::default())),
+        }
+    }
+
+    pub fn get_status_shared(&self) -> Arc<RwLock<SyncStatus>> {
+        self.status_shared.clone()
+    }
+
+    fn update_shared_status(&self) {
+        if let Ok(mut status) = self.status_shared.write() {
+            status.offset_ns = self.last_phase_offset_ns;
+            status.drift_ppm = self.last_adj_ppm;
+            status.gm_uuid = self.current_gm_uuid;
+            status.settled = self.clock_settled;
+            status.updated_ts = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
         }
     }
 
@@ -112,6 +135,9 @@ where
     }
 
     pub fn log_status(&self) {
+        // Also ensure shared status is up to date periodically
+        self.update_shared_status();
+
         if !self.clock_settled {
             info!("[Status] Settling... ({}/{}) Waiting for valid PTP pairs...", self.valid_count, self.settling_threshold);
         } else {
@@ -275,6 +301,9 @@ where
                     if let Err(e) = self.clock.adjust_frequency(factor) {
                         warn!("Clock adjustment failed: {}", e);
                     }
+                    
+                    // Update shared status here (once every 8 packets)
+                    self.update_shared_status();
                 }
                 self.sample_window.clear();
                 self.update_rtc();
@@ -296,6 +325,7 @@ where
         self.prev_t1_ns = 0;
         self.prev_t2_ns = 0;
         self.sample_window.clear();
+        self.update_shared_status();
     }
 }
 
