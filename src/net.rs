@@ -11,18 +11,27 @@ use nix::sys::socket::{setsockopt, sockopt};
 pub fn get_default_interface() -> Result<(NetworkInterface, Ipv4Addr)> {
     let interfaces = pnet_datalink::interfaces();
     let usable_interfaces: Vec<&NetworkInterface> = interfaces.iter()
-        .filter(|iface| iface.is_up() && !iface.is_loopback() && !iface.ips.is_empty())
+        .filter(|iface| {
+            let has_ip = !iface.ips.is_empty();
+            let is_loopback = iface.is_loopback();
+            // On Windows, Npcap often reports interfaces as "Down" (is_up() == false)
+            // even when they are working. We relax the check if IPs are present.
+            let is_up = iface.is_up() || (cfg!(windows) && has_ip);
+            
+            is_up && !is_loopback && has_ip
+        })
         .collect();
 
     if usable_interfaces.is_empty() {
         log::warn!("No suitable network interface found. Diagnostics:");
         for iface in &interfaces {
-            log::warn!(" - Name: '{}', Up: {}, Loopback: {}, IPs: {:?} (Wireless: {})", 
+            log::warn!(" - Name: '{}', Desc: '{}', Up: {}, Loop: {}, IPs: {:?} (Wireless: {})", 
                 iface.name, 
+                iface.description,
                 iface.is_up(), 
                 iface.is_loopback(), 
                 iface.ips,
-                iface.name.to_lowercase().contains("wifi") || iface.name.to_lowercase().contains("wlan")
+                iface.name.to_lowercase().contains("wifi") || iface.description.to_lowercase().contains("wifi")
             );
         }
         return Err(anyhow!("No suitable network interface found"));
@@ -56,18 +65,11 @@ pub fn get_default_interface() -> Result<(NetworkInterface, Ipv4Addr)> {
     match (best_iface, best_ip) {
         (Some(iface), Some(ip)) => Ok((iface, ip)),
         _ => {
-            log::warn!("No suitable network interface found. Diagnostics:");
+            log::warn!("No suitable IPv4 interface selected from candidates:");
             for iface in &interfaces {
-                log::warn!(" - Name: '{}', Desc: '{}', Up: {}, Loop: {}, IPs: {:?} (Wireless: {})", 
-                    iface.name, 
-                    iface.description,
-                    iface.is_up(), 
-                    iface.is_loopback(), 
-                    iface.ips,
-                    iface.name.to_lowercase().contains("wifi") || iface.description.to_lowercase().contains("wifi")
-                );
+                log::warn!(" - Name: '{}', Desc: '{}', IPs: {:?}", iface.name, iface.description, iface.ips);
             }
-            Err(anyhow!("No suitable network interface found"))
+            Err(anyhow!("No suitable IPv4 interface found"))
         }
     }
 }
