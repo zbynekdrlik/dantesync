@@ -97,6 +97,38 @@ use traits::{NtpSource, PtpNetwork};
 use controller::PtpController;
 use status::SyncStatus;
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Config {
+    ntp_server: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ntp_server: "10.77.8.2".to_string(),
+        }
+    }
+}
+
+fn load_config() -> Config {
+    #[cfg(windows)]
+    let path = r"C:\ProgramData\DanteTimeSync\config.json";
+    #[cfg(not(windows))]
+    let path = "dantetimesync.json"; 
+
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(cfg) = serde_json::from_str(&content) {
+            return cfg;
+        }
+    }
+    
+    let cfg = Config::default();
+    if let Ok(bytes) = serde_json::to_string_pretty(&cfg) {
+        let _ = std::fs::write(path, bytes);
+    }
+    cfg
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -560,12 +592,18 @@ fn run_service_logic(_args: Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let config = load_config();
+
+    // Use config if arg is default
+    if args.ntp_server == "10.77.8.2" {
+        args.ntp_server = config.ntp_server;
+    }
 
     #[cfg(windows)]
     if args.service {
         // Initialize File Logging for Service
-        let log_path = r"C:\Program Files\DanteTimeSync\dantetimesync.log";
+        let log_path = r"C:\ProgramData\DanteTimeSync\dantetimesync.log";
         if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).write(true).open(log_path) {
              let target = env_logger::Target::Pipe(Box::new(file));
              env_logger::builder()

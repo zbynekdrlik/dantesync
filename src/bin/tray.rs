@@ -86,11 +86,13 @@ mod app {
         let quit_i = MenuItem::new("Quit", true, None);
         let status_i = MenuItem::new("Status: Connecting...", false, None);
         let log_i = MenuItem::new("Open Log File", true, None);
+        let config_i = MenuItem::new("Edit Configuration", true, None);
         
         let menu = Menu::new();
         menu.append(&status_i).unwrap();
         menu.append(&tray_icon::menu::PredefinedMenuItem::separator()).unwrap();
         menu.append(&log_i).unwrap();
+        menu.append(&config_i).unwrap();
         menu.append(&tray_icon::menu::PredefinedMenuItem::separator()).unwrap();
         menu.append(&quit_i).unwrap();
 
@@ -181,7 +183,11 @@ mod app {
                             elwt.exit();
                         } else if event.id == log_i.id() {
                             let _ = std::process::Command::new("notepad.exe")
-                                .arg(r"C:\Program Files\DanteTimeSync\dantetimesync.log")
+                                .arg(r"C:\ProgramData\DanteTimeSync\dantetimesync.log")
+                                .spawn();
+                        } else if event.id == config_i.id() {
+                            let _ = std::process::Command::new("notepad.exe")
+                                .arg(r"C:\ProgramData\DanteTimeSync\config.json")
                                 .spawn();
                         }
                     }

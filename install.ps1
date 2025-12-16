@@ -7,6 +7,7 @@ $RepoOwner = "zbynekdrlik"
 $RepoName = "dantetimesync"
 $InstallDir = "C:\Program Files\DanteTimeSync"
 $ServiceName = "dantetimesync"
+$DataDir = "C:\ProgramData\DanteTimeSync"
 
 Write-Host ">>> Dante Time Sync Windows Installer <<<" -ForegroundColor Cyan
 
@@ -18,9 +19,24 @@ if (!(Test-Path "C:\Windows\System32\Packet.dll")) {
     Read-Host
 }
 
-# 2. Create Directory
+# 2. Create Directories
 if (!(Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+}
+
+# Create Data Directory (ProgramData) and set permissions
+if (!(Test-Path $DataDir)) {
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+}
+
+# Grant Users Modify access to DataDir (for Config editing)
+try {
+    $Acl = Get-Acl $DataDir
+    $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users","Modify","ContainerInherit,ObjectInherit","None","Allow")
+    $Acl.AddAccessRule($Rule)
+    Set-Acl $DataDir $Acl
+} catch {
+    Write-Warning "Failed to set permissions on $DataDir. You might need Admin rights to edit config."
 }
 
 # 3. Fetch Latest Release Info
@@ -134,4 +150,5 @@ if (Test-Path $TrayPath) {
 
 Write-Host "Installation Complete!" -ForegroundColor Green
 Write-Host "Service '$ServiceName' is running."
-Write-Host "Logs available at: $InstallDir\dantetimesync.log" -ForegroundColor Gray
+Write-Host "Logs available at: $DataDir\dantetimesync.log" -ForegroundColor Gray
+Write-Host "Config available at: $DataDir\config.json" -ForegroundColor Gray
