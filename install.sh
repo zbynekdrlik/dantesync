@@ -34,6 +34,11 @@ echo ">>> Installing binary to /usr/local/bin/..."
 cp target/release/dantetimesync /usr/local/bin/
 chmod +x /usr/local/bin/dantetimesync
 
+echo ">>> Creating configuration directory..."
+mkdir -p /etc/dantetimesync
+# Default config creation could go here, but app creates it if missing (if writable)
+# We need to ensure the service user (root) can write to it? Yes, root can.
+
 # 5. Disable Conflicting Services
 echo ">>> Disabling conflicting time services..."
 # We disable these to prevent them from fighting for the clock

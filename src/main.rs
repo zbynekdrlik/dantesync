@@ -112,7 +112,7 @@ fn load_config() -> Config {
     #[cfg(windows)]
     let path = r"C:\ProgramData\DanteTimeSync\config.json";
     #[cfg(not(windows))]
-    let path = "dantetimesync.json"; 
+    let path = "/etc/dantetimesync/config.json"; 
 
     if let Ok(content) = std::fs::read_to_string(path) {
         if let Ok(cfg) = serde_json::from_str(&content) {
