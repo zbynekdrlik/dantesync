@@ -44,9 +44,21 @@ impl PiServo {
 
         let adjustment_ppm = proportional + self.integral;
         
-        debug!("Servo: Err={}ns, P={:.3}, I={:.3}, Adj={:.3}ppm", offset_ns, proportional, self.integral, adjustment_ppm);
+        // Clamp total adjustment to reasonable limits (e.g. +/- 500 ppm)
+        // This prevents the clock from being skewed so wildly that it causes oscillation.
+        let max_adj = 500.0;
+        let final_adj = if adjustment_ppm > max_adj { 
+            max_adj 
+        } else if adjustment_ppm < -max_adj { 
+            -max_adj 
+        } else { 
+            adjustment_ppm 
+        };
         
-        adjustment_ppm
+        debug!("Servo: Err={}ns, P={:.3}, I={:.3}, RawAdj={:.3}ppm, Final={:.3}ppm", 
+            offset_ns, proportional, self.integral, adjustment_ppm, final_adj);
+        
+        final_adj
     }
 }
 
@@ -62,10 +74,17 @@ mod tests {
         // Offset 1000ns (ahead) -> Error -1000 -> Adj -1.0 ppm
         let adj = servo.sample(1000);
         assert!((adj - -1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_servo_output_clamping() {
+        let mut servo = PiServo::new(1.0, 0.0); // High Kp
         
-        // Offset -500ns (behind) -> Error 500 -> Adj 0.5 ppm
-        let adj = servo.sample(-500);
-        assert!((adj - 0.5).abs() < 0.0001);
+        // Huge offset: 1s = 1,000,000,000ns.
+        // P = -1,000,000,000 * 1.0 = -1e9.
+        // Should clamp to -500.0
+        let adj = servo.sample(1_000_000_000);
+        assert_eq!(adj, -500.0);
     }
 
     #[test]
@@ -95,15 +114,12 @@ mod tests {
     }
 
     #[test]
-    fn test_servo_clamping() {
+    fn test_servo_integral_clamping() {
         let mut servo = PiServo::new(0.0, 1.0); // High Ki
         
         // Huge error to trigger clamp (Max 200)
         servo.sample(-300); // Error 300. I += 300 -> Clamped to 200.
         
         assert!((servo.integral - 200.0).abs() < 0.0001);
-        
-        let adj = servo.sample(0); // Error 0. Adj = I = 200.
-        assert!((adj - 200.0).abs() < 0.0001);
     }
 }

@@ -282,6 +282,21 @@ where
                 
                 info!("Sync established. Updating RTC...");
                 self.update_rtc_now();
+            } else {
+                // Check for massive drift while settled (> 50ms)
+                if phase_offset_ns.abs() > 50_000_000 {
+                     warn!("Large offset {}ms detected while settled. Stepping clock and resetting servo.", phase_offset_ns / 1_000_000);
+                     
+                     let step_duration = Duration::from_nanos(phase_offset_ns.abs() as u64);
+                     let sign = if phase_offset_ns > 0 { -1 } else { 1 };
+                     if let Err(e) = self.clock.step_clock(step_duration, sign) {
+                         error!("Failed to step clock: {}", e);
+                     }
+                     
+                     self.servo.reset();
+                     self.reset_filter();
+                     return;
+                }
             }
 
             // LUCKY PACKET FILTER LOGIC
