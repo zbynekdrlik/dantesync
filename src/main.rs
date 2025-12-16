@@ -7,12 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use std::process::Command;
 use std::fs::File;
-use std::io::ErrorKind;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
-use std::os::fd::RawFd;
 #[cfg(unix)]
 use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned, SockaddrStorage};
 #[cfg(unix)]

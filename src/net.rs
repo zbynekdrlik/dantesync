@@ -4,8 +4,6 @@ use socket2::{Socket, Domain, Type, Protocol};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 
 #[cfg(unix)]
-use std::os::fd::AsFd;
-#[cfg(unix)]
 use nix::sys::socket::{setsockopt, sockopt};
 
 pub fn get_default_interface() -> Result<(NetworkInterface, Ipv4Addr)> {

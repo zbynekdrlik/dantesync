@@ -1,9 +1,8 @@
 use anyhow::Result;
-use log::{info, warn, error, debug};
+use log::{info, warn, error};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::{Arc, RwLock};
-use std::process::Command;
 use crate::clock::SystemClock;
 use crate::traits::{NtpSource, PtpNetwork};
 use crate::ptp::{PtpV1Header, PtpV1Control, PtpV1FollowUpBody, PtpV1SyncMessageBody};
@@ -335,14 +334,12 @@ mod tests {
     use crate::clock::MockSystemClock;
     use crate::traits::{MockNtpSource, MockPtpNetwork};
     use mockall::predicate::*;
-    use mockall::Sequence;
-    use byteorder::{BigEndian, WriteBytesExt};
 
     #[test]
     fn test_ntp_sync_trigger() {
         let _ = env_logger::builder().is_test(true).try_init();
         let mut mock_clock = MockSystemClock::new();
-        let mut mock_net = MockPtpNetwork::new();
+        let mock_net = MockPtpNetwork::new();
         let mut mock_ntp = MockNtpSource::new();
 
         mock_ntp.expect_get_offset()
@@ -357,5 +354,90 @@ mod tests {
         let status = Arc::new(RwLock::new(SyncStatus::default()));
         let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status);
         controller.run_ntp_sync(false);
+    }
+
+    #[test]
+    fn test_ptp_locking_flow() {
+        use byteorder::{BigEndian, WriteBytesExt};
+        
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mut mock_net = MockPtpNetwork::new();
+        let mock_ntp = MockNtpSource::new();
+
+        // GM UUID
+        let gm_uuid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+
+        // Helper to construct Sync packet
+        let make_sync = move |seq: u16| -> Vec<u8> {
+            let mut buf = vec![0u8; 60]; 
+            buf[0] = 0x10; // Version 1
+            buf[32] = 0x00; // Control: Sync
+            buf[22..28].copy_from_slice(&gm_uuid);
+            let mut w = &mut buf[30..32];
+            w.write_u16::<BigEndian>(seq).unwrap();
+            
+            // Body starts at 36. GM UUID at 36 + 13 = 49.
+            buf[49..55].copy_from_slice(&gm_uuid);
+            buf
+        };
+
+        // Helper for FollowUp
+        let make_followup = move |seq: u16, t1_ns: u64| -> Vec<u8> {
+            let mut buf = vec![0u8; 60]; 
+            buf[0] = 0x10; // Version 1
+            buf[32] = 0x02; // Control: FollowUp
+            buf[22..28].copy_from_slice(&gm_uuid);
+            let mut w = &mut buf[30..32];
+            w.write_u16::<BigEndian>(seq).unwrap();
+            
+            // Body starts at 36. Assoc Seq at 36 + 6 = 42.
+            let mut w = &mut buf[42..44];
+            w.write_u16::<BigEndian>(seq).unwrap();
+            
+            // Timestamp at 44.
+            let mut w = &mut buf[44..52];
+            let s = (t1_ns / 1_000_000_000) as u32;
+            let n = (t1_ns % 1_000_000_000) as u32;
+            w.write_u32::<BigEndian>(s).unwrap();
+            w.write_u32::<BigEndian>(n).unwrap();
+            
+            buf
+        };
+
+        // Sequence of packets
+        for i in 0..8 { 
+            let t1 = 1_000_000_000 + i as u64 * 1_000_000_000; 
+            let t2 = SystemTime::UNIX_EPOCH + Duration::from_nanos(t1 + 1000); // 1us offset
+            
+            let sync_pkt = make_sync(i as u16);
+            let follow_pkt = make_followup(i as u16, t1);
+
+            mock_net.expect_recv_packet()
+                .times(1)
+                .returning(move || Ok(Some((sync_pkt.clone(), 60, t2))));
+            
+            mock_net.expect_recv_packet()
+                .times(1)
+                .returning(move || Ok(Some((follow_pkt.clone(), 60, t2))));
+        }
+        
+        mock_net.expect_recv_packet()
+            .returning(|| Ok(None));
+
+        mock_clock.expect_adjust_frequency()
+            .times(1) 
+            .returning(|_| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status);
+        
+        // Process 16 packets (8 Sync + 8 FollowUp)
+        for _ in 0..16 {
+            let _ = controller.process_loop_iteration();
+        }
+        
+        // Check settled status
+        assert!(controller.get_status_shared().read().unwrap().settled);
     }
 }

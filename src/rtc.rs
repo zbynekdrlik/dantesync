@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::time::SystemTime;

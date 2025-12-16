@@ -552,7 +552,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dantetimesync"
-version = "1.1.0"
+version = "1.1.21"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -566,6 +566,7 @@ dependencies = [
  "nix 0.27.1",
  "pnet_datalink",
  "rsntp",
+ "sd-notify",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -1947,6 +1948,15 @@ dependencies = [
  "memmap2",
  "smithay-client-toolkit",
  "tiny-skia",
+]
+
+[[package]]
+name = "sd-notify"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b943eadf71d8b69e661330cb0e2656e31040acf21ee7708e2c238a0ec6af2bf4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
