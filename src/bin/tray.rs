@@ -138,6 +138,8 @@ mod app {
                                     let _ = proxy.send_event(AppEvent::Update(status));
                                 }
                             }
+                            // Connection closed by server (one-shot). Sleep before reconnecting to prevent UI freeze.
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                         Err(_) => {
                             let _ = proxy.send_event(AppEvent::Offline);
@@ -149,6 +151,7 @@ mod app {
         });
 
         let menu_channel = MenuEvent::receiver();
+        let version = env!("CARGO_PKG_VERSION");
 
         event_loop.run(move |event, elwt| {
             elwt.set_control_flow(ControlFlow::Wait);
@@ -165,8 +168,8 @@ mod app {
                                 red_icon.clone()
                             };
                             
-                            let text = format!("Offset: {} µs\nDrift: {:.3} ppm", status.offset_ns / 1000, status.drift_ppm);
-                            let short_text = format!("Offset: {} µs", status.offset_ns / 1000);
+                            let text = format!("v{} | Offset: {} µs\nDrift: {:.3} ppm", version, status.offset_ns / 1000, status.drift_ppm);
+                            let short_text = format!("v{} | Offset: {} µs", version, status.offset_ns / 1000);
                             
                             let _ = tray_icon.set_icon(Some(icon));
                             let _ = tray_icon.set_tooltip(Some(format!("Dante Time Sync\n{}", text)));
@@ -174,8 +177,8 @@ mod app {
                         }
                         AppEvent::Offline => {
                             let _ = tray_icon.set_icon(Some(red_icon.clone()));
-                            let _ = tray_icon.set_tooltip(Some("Dante Time Sync - Service Offline".to_string()));
-                            status_i.set_text("Service Offline");
+                            let _ = tray_icon.set_tooltip(Some(format!("Dante Time Sync v{}\nService Offline", version)));
+                            status_i.set_text(format!("v{} | Service Offline", version));
                         }
                     }
                 }
