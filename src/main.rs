@@ -322,7 +322,7 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
                         let h = CreateNamedPipeW(
                             PCWSTR(pipe_name_wide.as_ptr()),
                             FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED), 
-                            NAMED_PIPE_MODE(PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT),
+                            NAMED_PIPE_MODE(0), // Byte mode (0) for Tokio compatibility
                             PIPE_UNLIMITED_INSTANCES,
                             1024,
                             1024,
