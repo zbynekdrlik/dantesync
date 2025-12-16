@@ -115,7 +115,13 @@ mod app {
             
             rt.block_on(async move {
                 loop {
-                    match ClientOptions::new().open(r"\\.\pipe\dantetimesync") {
+                    // Server pipe is outbound-only (Server -> Client).
+                    // We must open as read-only, otherwise we get ACCESS_DENIED.
+                    match ClientOptions::new()
+                        .write(false)
+                        .read(true)
+                        .open(r"\\.\pipe\dantetimesync") 
+                    {
                         Ok(mut client) => {
                             loop {
                                 let mut len_buf = [0u8; 4];
