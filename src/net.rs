@@ -15,6 +15,16 @@ pub fn get_default_interface() -> Result<(NetworkInterface, Ipv4Addr)> {
         .collect();
 
     if usable_interfaces.is_empty() {
+        log::warn!("No suitable network interface found. Diagnostics:");
+        for iface in &interfaces {
+            log::warn!(" - Name: '{}', Up: {}, Loopback: {}, IPs: {:?} (Wireless: {})", 
+                iface.name, 
+                iface.is_up(), 
+                iface.is_loopback(), 
+                iface.ips,
+                iface.name.to_lowercase().contains("wifi") || iface.name.to_lowercase().contains("wlan")
+            );
+        }
         return Err(anyhow!("No suitable network interface found"));
     }
 
