@@ -69,7 +69,7 @@ where
     N: PtpNetwork,
     S: NtpSource
 {
-    pub fn new(clock: C, network: N, ntp: S) -> Self {
+    pub fn new(clock: C, network: N, ntp: S, status_shared: Arc<RwLock<SyncStatus>>) -> Self {
         PtpController {
             clock,
             network,
@@ -88,7 +88,7 @@ where
             valid_count: 0,
             clock_settled: false,
             settling_threshold: 1, 
-            status_shared: Arc::new(RwLock::new(SyncStatus::default())),
+            status_shared,
         }
     }
 
@@ -354,7 +354,8 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp);
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status);
         controller.run_ntp_sync(false);
     }
 }

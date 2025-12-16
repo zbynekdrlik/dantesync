@@ -382,6 +382,12 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>) -> Result<()> {
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Status(format!("v{} | Starting...", env!("CARGO_PKG_VERSION")).as_str())]);
     }
 
+    // Initialize Shared Status
+    let status_shared = Arc::new(RwLock::new(SyncStatus::default()));
+
+    // Start IPC Server immediately (so Tray App can connect even if network is down)
+    start_ipc_server(status_shared.clone());
+
     stop_conflicting_services();
     enable_realtime_priority();
 
@@ -394,12 +400,23 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>) -> Result<()> {
     };
     info!("System clock control initialized.");
 
-    let (_, iface_ip) = net::get_default_interface()?;
-    // info!("Selected Interface IP: {}", iface_ip);
+    // Network Interface Selection (Retry Loop)
+    let (_, iface_ip) = loop {
+        match net::get_default_interface() {
+            Ok(res) => break res,
+            Err(e) => {
+                if !running.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                warn!("Waiting for network interface... ({})", e);
+                thread::sleep(Duration::from_secs(5));
+            }
+        }
+    };
     
     let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
     let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
-    info!("Listening on 224.0.1.129 ports 319/320");
+    info!("Listening on 224.0.1.129 ports 319/320 on {}", iface_ip);
 
     let network = RealPtpNetwork {
         sock_event,
@@ -410,11 +427,8 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>) -> Result<()> {
         client: ntp::NtpClient::new(&args.ntp_server),
     };
 
-    let mut controller = PtpController::new(sys_clock, network, ntp_source);
+    let mut controller = PtpController::new(sys_clock, network, ntp_source, status_shared);
     
-    // Start IPC Server with shared status
-    start_ipc_server(controller.get_status_shared());
-
     controller.run_ntp_sync(args.skip_ntp);
 
     info!("Starting PTP Loop...");
