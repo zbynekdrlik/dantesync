@@ -604,6 +604,15 @@ fn main() -> Result<()> {
     if args.service {
         // Initialize File Logging for Service
         let log_path = r"C:\ProgramData\DanteTimeSync\dantetimesync.log";
+        
+        // Log Rotation (Simple: 1MB limit check on startup)
+        if let Ok(metadata) = std::fs::metadata(log_path) {
+            if metadata.len() > 1_000_000 {
+                let old_path = format!("{}.old", log_path);
+                let _ = std::fs::rename(log_path, old_path);
+            }
+        }
+
         if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).write(true).open(log_path) {
              let target = env_logger::Target::Pipe(Box::new(file));
              env_logger::builder()
