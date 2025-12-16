@@ -30,6 +30,9 @@ export PATH="$HOME/.cargo/bin:/root/.cargo/bin:$PATH"
 cargo build --release
 
 # 4. Install Binary
+echo ">>> Stopping existing service (if running)..."
+systemctl stop dantetimesync 2>/dev/null || true
+
 echo ">>> Installing binary to /usr/local/bin/..."
 cp target/release/dantetimesync /usr/local/bin/
 chmod +x /usr/local/bin/dantetimesync
