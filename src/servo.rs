@@ -13,9 +13,8 @@ impl PiServo {
             kp,
             ki,
             integral: 0.0,
-            // 200 PPM is a safe upper bound for standard crystal drift.
-            // Allowing more just invites instability (windup).
-            max_integral: 200.0, 
+            // 5000 PPM allowance for VM/Hardware drift.
+            max_integral: 5000.0, 
         }
     }
 
