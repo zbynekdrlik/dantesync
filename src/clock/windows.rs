@@ -47,6 +47,14 @@ impl WindowsClock {
         
         info!("Windows Clock Initial State: Adj={}, Inc={}, Disabled={}", adj, inc, disabled.as_bool());
 
+        // Sanity check: If Inc is unreasonably large (e.g., 10,000,000 = 1s), it implies 
+        // the OS reports a value inconsistent with the actual interrupt rate (typically 64Hz/15.6ms).
+        // Using 1s Inc with 64Hz interrupts causes 64x time acceleration.
+        if inc > 200_000 {
+            log::warn!("Reported Time Increment {} is too large (>20ms). Suspect timer mismatch. Forcing standard 156,250 (15.625ms).", inc);
+            inc = 156_250;
+        }
+
         Ok(WindowsClock {
             original_adjustment: adj,
             original_increment: inc,
