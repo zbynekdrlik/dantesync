@@ -13,8 +13,8 @@ impl PiServo {
             kp,
             ki,
             integral: 0.0,
-            // 5000 PPM allowance for VM/Hardware drift.
-            max_integral: 5000.0, 
+            // 15000 PPM allowance for VM/Hardware drift.
+            max_integral: 15000.0, 
         }
     }
 
@@ -118,12 +118,12 @@ mod tests {
     fn test_servo_integral_clamping() {
         let mut servo = PiServo::new(0.0, 1.0); // High Ki
         
-        // Huge error to trigger clamp (Max 5000)
-        servo.sample(-6000); // Error 6000. I += 6000 -> Clamped to 5000.
+        // Huge error to trigger clamp (Max 15000)
+        servo.sample(-16000); // Error 16000. I += 16000 -> Clamped to 15000.
         
-        assert!((servo.integral - 5000.0).abs() < 0.0001);
+        assert!((servo.integral - 15000.0).abs() < 0.0001);
         
-        let adj = servo.sample(0); // Error 0. Adj = I = 5000.
-        assert!((adj - 5000.0).abs() < 0.0001);
+        let adj = servo.sample(0); // Error 0. Adj = I = 15000.
+        assert!((adj - 15000.0).abs() < 0.0001);
     }
 }
