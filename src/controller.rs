@@ -275,7 +275,7 @@ where
                     } else {
                         info!("Phase step complete.");
                         self.reset_filter();
-                        self.servo.reset();
+                        // Do NOT reset servo integral. Frequency drift is constant.
                         return;
                     }
                 }
@@ -285,7 +285,7 @@ where
             } else {
                 // Check for massive drift while settled (> 50ms)
                 if phase_offset_ns.abs() > 50_000_000 {
-                     warn!("Large offset {}ms detected while settled. Stepping clock and resetting servo.", phase_offset_ns / 1_000_000);
+                     warn!("Large offset {}ms detected while settled. Stepping clock (Servo Integral maintained).", phase_offset_ns / 1_000_000);
                      
                      let step_duration = Duration::from_nanos(phase_offset_ns.abs() as u64);
                      let sign = if phase_offset_ns > 0 { -1 } else { 1 };
@@ -293,8 +293,8 @@ where
                          error!("Failed to step clock: {}", e);
                      }
                      
-                     self.servo.reset();
                      self.reset_filter();
+                     // Do NOT reset servo integral.
                      return;
                 }
             }
