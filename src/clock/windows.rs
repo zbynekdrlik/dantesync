@@ -97,21 +97,22 @@ impl SystemClock for WindowsClock {
     fn adjust_frequency(&mut self, ppm: f64) -> Result<()> {
         // Calculate new adjustment based on nominal frequency (increment)
         // Adj = Inc + (Inc * ppm / 1e6)
-        let adj_delta = (self.nominal_frequency as f64 * ppm / 1_000_000.0) as i64;
-        let val = self.nominal_frequency as i64 + adj_delta;
-        let new_adj = if val < 0 { 0 } else { val } as u64;
+        let adj_delta = (self.nominal_frequency as f64 * ppm / 1_000_000.0) as i32;
+        let val = self.nominal_frequency as i32 + adj_delta;
+        // Clamp to u32 range and ensure positive
+        let new_adj = if val < 0 { 0 } else { val } as u32;
 
         unsafe {
             // Log the adjustment attempt for debugging
-            log::debug!("Adjusting frequency (Precise): PPM={:.3}, Base={}, NewAdj={}", ppm, self.nominal_frequency, new_adj);
+            log::debug!("Adjusting frequency (Legacy): PPM={:.3}, Base={}, NewAdj={}", ppm, self.nominal_frequency, new_adj);
 
-            // Use Precise API
-            if SetSystemTimeAdjustmentPrecise(new_adj, false).is_ok() {
+            // Use Legacy API as Precise API seems to ignore the sanitized increment on this VM
+            if SetSystemTimeAdjustment(new_adj, false).is_ok() {
                 Ok(())
             } else {
                 let err = GetLastError();
-                log::error!("SetSystemTimeAdjustmentPrecise failed! Error: {:?}", err);
-                Err(anyhow::anyhow!("SetSystemTimeAdjustmentPrecise failed: {:?}", err))
+                log::error!("SetSystemTimeAdjustment failed! Error: {:?}", err);
+                Err(anyhow::anyhow!("SetSystemTimeAdjustment failed: {:?}", err))
             }
         }
     }
