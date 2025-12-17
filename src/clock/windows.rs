@@ -82,7 +82,22 @@ impl WindowsClock {
 
 impl SystemClock for WindowsClock {
     fn adjust_frequency(&mut self, factor: f64) -> Result<()> {
-        let new_adj = (self.nominal_frequency as f64 * factor).round() as u64;
+        // Normalization for systems reporting 10M increment (1s) but running at 64Hz (15.6ms).
+        // If nominal is ~10M, and we apply factor directly, we get 64x gain.
+        // We scale the deviation by (156250 / nominal) to normalize to standard Windows tick.
+        
+        let ppm_part = factor - 1.0;
+        let scale = if self.nominal_frequency > 1_000_000 {
+            156250.0 / self.nominal_frequency as f64
+        } else {
+            1.0
+        };
+        
+        let effective_ppm = ppm_part * scale;
+        let effective_factor = 1.0 + effective_ppm;
+
+        let new_adj = (self.nominal_frequency as f64 * effective_factor).round() as u64;
+        
         unsafe {
             SetSystemTimeAdjustmentPrecise(new_adj, BOOL(0))?;
         }
