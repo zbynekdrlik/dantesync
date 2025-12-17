@@ -136,7 +136,8 @@ impl PtpNetwork for PcapPtpNetwork {
                     
                     if data.len() > payload_offset {
                         let payload = data[payload_offset..].to_vec();
-                        return Ok(Some((payload, payload.len(), timestamp)));
+                        let len = payload.len();
+                        return Ok(Some((payload, len, timestamp)));
                     }
                 }
                 Ok(None)
