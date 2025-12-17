@@ -20,8 +20,6 @@ use nix::fcntl::{flock, FlockArg};
 
 #[cfg(windows)]
 use windows::Win32::System::Threading::{SetPriorityClass, GetCurrentProcess, REALTIME_PRIORITY_CLASS, HIGH_PRIORITY_CLASS};
-#[cfg(windows)]
-use windows::Win32::Media::timeBeginPeriod;
 
 #[cfg(windows)]
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
@@ -279,11 +277,12 @@ fn enable_realtime_priority() {
                     warn!("Failed to set Windows priority.");
                 }
             }
-            if timeBeginPeriod(1) == 0 { 
-                info!("Windows High-Res Timer (1ms) enabled.");
-            } else {
-                warn!("Failed to set Windows High-Res Timer.");
-            }
+            // timeBeginPeriod(1) removed to avoid conflict with SetSystemTimeAdjustment
+            // if timeBeginPeriod(1) == 0 { 
+            //    info!("Windows High-Res Timer (1ms) enabled.");
+            // } else {
+            //    warn!("Failed to set Windows High-Res Timer.");
+            // }
         }
     }
 }

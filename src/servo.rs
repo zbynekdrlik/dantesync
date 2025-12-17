@@ -44,9 +44,10 @@ impl PiServo {
 
         let adjustment_ppm = proportional + self.integral;
         
-        // Clamp total adjustment to reasonable limits (e.g. +/- 5000 ppm)
-        // 500 ppm was too tight for some Windows systems. 5000 ppm (0.5%) is safe.
-        let max_adj = 5000.0;
+        // Clamp total adjustment to reasonable limits (e.g. +/- 20,000 ppm)
+        // Some Windows systems (especially VMs or specific hardware) have drift > 0.5%.
+        // We allow up to 2% (20,000 ppm) to ensure we can lock.
+        let max_adj = 20000.0;
         let final_adj = if adjustment_ppm > max_adj { 
             max_adj 
         } else if adjustment_ppm < -max_adj { 
@@ -82,9 +83,9 @@ mod tests {
         
         // Huge offset: 1s = 1,000,000,000ns.
         // P = -1e9.
-        // Should clamp to -5000.0
+        // Should clamp to -20000.0
         let adj = servo.sample(1_000_000_000);
-        assert_eq!(adj, -5000.0);
+        assert_eq!(adj, -20000.0);
     }
 
     #[test]
