@@ -12,7 +12,7 @@ use crate::status::SyncStatus;
 use crate::rtc;
 
 // Constants
-const MIN_DELTA_NS: i64 = 1_000_000;       // 1ms
+const MIN_DELTA_NS: i64 = 0;               // Allow 0ms (bursts/quantization)
 const MAX_DELTA_NS: i64 = 2_000_000_000;   // 2s
 const MAX_PHASE_OFFSET_FOR_STEP_NS: i64 = 1_000_000; // 1ms (Reduced from 10ms to force tighter initial alignment)
 const RTC_UPDATE_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
@@ -252,7 +252,7 @@ where
             
             if delta_master < MIN_DELTA_NS || delta_master > MAX_DELTA_NS ||
                delta_slave < MIN_DELTA_NS || delta_slave > MAX_DELTA_NS {
-                warn!("Delta out of range. Skipping.");
+                warn!("Delta out of range. Skipping. Master={}ns, Slave={}ns", delta_master, delta_slave);
                 self.prev_t1_ns = t1_ns;
                 self.prev_t2_ns = t2_ns;
                 return;
