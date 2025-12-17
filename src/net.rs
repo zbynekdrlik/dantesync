@@ -104,3 +104,41 @@ pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpS
 
     Ok(udp_socket)
 }
+
+#[cfg(unix)]
+pub fn recv_with_timestamp(sock: &UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, std::time::SystemTime)>> {
+    use std::os::fd::AsRawFd;
+    use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned, SockaddrStorage};
+    use nix::sys::time::TimeSpec;
+    use std::time::{Duration, SystemTime};
+
+    let fd = sock.as_raw_fd();
+    let mut iov = [std::io::IoSliceMut::new(buf)];
+    let mut cmsg_buf = nix::cmsg_space!(TimeSpec);
+    
+    match recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty()) {
+        Ok(msg) => {
+            let timestamp = msg.cmsgs().find_map(|cmsg| {
+                if let ControlMessageOwned::ScmTimestampns(ts) = cmsg {
+                    let duration = Duration::new(ts.tv_sec() as u64, ts.tv_nsec() as u32);
+                    Some(SystemTime::UNIX_EPOCH + duration)
+                } else {
+                    None
+                }
+            }).unwrap_or_else(SystemTime::now);
+            
+            Ok(Some((msg.bytes, timestamp)))
+        }
+        Err(nix::errno::Errno::EAGAIN) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn recv_with_timestamp(sock: &UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, std::time::SystemTime)>> {
+    match sock.recv_from(buf) {
+        Ok((size, _)) => Ok(Some((size, std::time::SystemTime::now()))),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}

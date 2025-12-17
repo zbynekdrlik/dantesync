@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::process::Command;
 use std::fs::File;
 use std::io::ErrorKind;
+use std::net::UdpSocket;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -271,77 +272,6 @@ struct RealNtpSource {
 impl NtpSource for RealNtpSource {
     fn get_offset(&self) -> Result<(Duration, i8)> {
         self.client.get_offset()
-    }
-}
-
-struct RealPtpNetwork {
-    sock_event: std::net::UdpSocket,
-    sock_general: std::net::UdpSocket,
-}
-
-impl RealPtpNetwork {
-    #[cfg(unix)]
-    fn recv_with_timestamp(sock: &std::net::UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, SystemTime)>> {
-        let fd = sock.as_raw_fd();
-        let mut iov = [std::io::IoSliceMut::new(buf)];
-        // Space for CMSG (Timestamp)
-        let mut cmsg_buf = nix::cmsg_space!(TimeSpec);
-        
-        match recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty()) {
-            Ok(msg) => {
-                // Check if we got a timestamp
-                let timestamp = msg.cmsgs().find_map(|cmsg| {
-                    if let ControlMessageOwned::ScmTimestampns(ts) = cmsg {
-                        // ts is TimeSpec (tv_sec(), tv_nsec())
-                        let duration = Duration::new(ts.tv_sec() as u64, ts.tv_nsec() as u32);
-                        Some(SystemTime::UNIX_EPOCH + duration)
-                    } else {
-                        None
-                    }
-                }).unwrap_or_else(|| SystemTime::now());
-                
-                Ok(Some((msg.bytes, timestamp)))
-            }
-            Err(nix::errno::Errno::EAGAIN) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn recv_with_timestamp(sock: &std::net::UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, SystemTime)>> {
-        match sock.recv_from(buf) {
-            Ok((size, _)) => Ok(Some((size, SystemTime::now()))),
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-impl PtpNetwork for RealPtpNetwork {
-    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
-        let mut buf = [0u8; 2048];
-        
-        loop {
-            // Check Event Socket
-            match Self::recv_with_timestamp(&self.sock_event, &mut buf) {
-                Ok(Some((size, ts))) => {
-                    return Ok(Some((buf[..size].to_vec(), size, ts)));
-                }
-                Ok(None) => {} // Continue to check general
-                Err(e) => return Err(e),
-            }
-
-            // Check General Socket
-            match Self::recv_with_timestamp(&self.sock_general, &mut buf) {
-                Ok(Some((size, ts))) => {
-                    return Ok(Some((buf[..size].to_vec(), size, ts)));
-                }
-                Ok(None) => {}
-                Err(e) => return Err(e),
-            }
-
-            return Ok(None);
-        }
     }
 }
 
