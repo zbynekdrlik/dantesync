@@ -118,12 +118,12 @@ mod tests {
     fn test_servo_integral_clamping() {
         let mut servo = PiServo::new(0.0, 1.0); // High Ki
         
-        // Huge error to trigger clamp (Max 200)
-        servo.sample(-300); // Error 300. I += 300 -> Clamped to 200.
+        // Huge error to trigger clamp (Max 5000)
+        servo.sample(-6000); // Error 6000. I += 6000 -> Clamped to 5000.
         
-        assert!((servo.integral - 200.0).abs() < 0.0001);
+        assert!((servo.integral - 5000.0).abs() < 0.0001);
         
-        let adj = servo.sample(0); // Error 0. Adj = I = 200.
-        assert!((adj - 200.0).abs() < 0.0001);
+        let adj = servo.sample(0); // Error 0. Adj = I = 5000.
+        assert!((adj - 5000.0).abs() < 0.0001);
     }
 }
