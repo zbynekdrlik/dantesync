@@ -73,7 +73,7 @@ where
             clock,
             network,
             ntp,
-            servo: PiServo::new(0.0005, 0.00005),
+            servo: PiServo::new(0.1, 0.001), // More aggressive gains for VM environments
             pending_syncs: HashMap::new(),
             prev_t1_ns: 0,
             prev_t2_ns: 0,
@@ -283,8 +283,8 @@ where
                 info!("Sync established. Updating RTC...");
                 self.update_rtc_now();
             } else {
-                // Check for massive drift while settled (> 2ms)
-                if phase_offset_ns.abs() > 2_000_000 {
+                // Check for massive drift while settled (> 100ms)
+                if phase_offset_ns.abs() > 100_000_000 {
                      warn!("Large offset {}ms detected while settled. Stepping clock (Servo Integral maintained).", phase_offset_ns / 1_000_000);
                      
                      let step_duration = Duration::from_nanos(phase_offset_ns.abs() as u64);
