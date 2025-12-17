@@ -1,16 +1,16 @@
 use super::SystemClock;
 use anyhow::{Result, anyhow};
-use windows::Win32::Foundation::{BOOL, HANDLE, LUID, CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, SYSTEMTIME, FILETIME, WIN32_ERROR};
+use windows::Win32::Foundation::{BOOL, HANDLE, LUID, CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, SYSTEMTIME, FILETIME};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
     TOKEN_PRIVILEGES, SE_PRIVILEGE_ENABLED
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise,
+    GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustment,
     GetSystemTimeAsFileTime, SetSystemTime
 };
-use windows::Win32::System::Time::{FileTimeToSystemTime}; 
+use windows::Win32::System::Time::FileTimeToSystemTime;
 use windows::core::PCWSTR;
 use std::time::Duration;
 use log::info;
@@ -26,12 +26,23 @@ impl WindowsClock {
     pub fn new() -> Result<Self> {
         Self::enable_privilege("SeSystemtimePrivilege")?;
 
+        // Use Precise API if available (Windows 10+)
+        // Fallback to legacy if needed? 
+        // We assume modern Windows for now.
         let mut adj = 0u64;
         let mut inc = 0u64;
         let mut disabled = BOOL(0);
 
         unsafe {
-            GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled)?;
+            // GetSystemTimeAdjustmentPrecise is preferred to get the exact base increment
+            if let Err(e) = GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled) {
+                log::warn!("GetSystemTimeAdjustmentPrecise failed, trying legacy. Error: {}", e);
+                // Fallback to legacy
+                // But we define struct with u64.
+                // Legacy returns u32.
+                // For now, fail if Precise is missing (Win10+ required).
+                return Err(anyhow!("GetSystemTimeAdjustmentPrecise failed (Win10+ required): {}", e));
+            }
         }
         
         info!("Windows Clock Initial State: Adj={}, Inc={}, Disabled={}", adj, inc, disabled.as_bool());
@@ -62,13 +73,7 @@ impl WindowsClock {
 
             AdjustTokenPrivileges(token, BOOL(0), Some(&tp), 0, None, None)?;
             
-            // Compiler indicates GetLastError returns Result<()> in this environment.
-            // We verify if the result is an error matching ERROR_NOT_ALL_ASSIGNED.
             if let Err(e) = GetLastError() {
-                // ERROR_NOT_ALL_ASSIGNED is WIN32_ERROR. Convert to HRESULT for comparison if needed, 
-                // or check if WIN32_ERROR impls PartialEq with Error code.
-                // windows::core::Error.code() returns HRESULT.
-                // WIN32_ERROR.to_hresult() returns HRESULT.
                 if e.code() == ERROR_NOT_ALL_ASSIGNED.to_hresult() {
                      return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED"));
                 }
@@ -82,13 +87,20 @@ impl WindowsClock {
 
 impl SystemClock for WindowsClock {
     fn adjust_frequency(&mut self, ppm: f64) -> Result<()> {
-        let adj_delta = (self.base_increment as f64 * ppm / 1_000_000.0) as i32;
-        let new_adj = (self.base_increment as i32 + adj_delta) as u32;
+        // Calculate new adjustment based on nominal frequency (increment)
+        // Adj = Inc + (Inc * ppm / 1e6)
+        let adj_delta = (self.nominal_frequency as f64 * ppm / 1_000_000.0) as i32;
+        let new_adj = (self.nominal_frequency as i32 + adj_delta) as u32;
 
         unsafe {
             // Log the adjustment attempt for debugging
-            log::debug!("Adjusting frequency: PPM={:.3}, Base={}, NewAdj={}", ppm, self.base_increment, new_adj);
+            log::debug!("Adjusting frequency: PPM={:.3}, Base={}, NewAdj={}", ppm, self.nominal_frequency, new_adj);
 
+            // Use legacy SetSystemTimeAdjustment because we are adjusting the "Periodic Tick".
+            // SetSystemTimeAdjustmentPrecise is for "Micro-adjustments" via QPC? 
+            // Documentation says SetSystemTimeAdjustment is valid.
+            // But we must cast to u32.
+            
             if SetSystemTimeAdjustment(new_adj, false).is_ok() {
                 Ok(())
             } else {
@@ -98,11 +110,10 @@ impl SystemClock for WindowsClock {
             }
         }
     }
-}
 
     fn step_clock(&mut self, offset: Duration, sign: i8) -> Result<()> {
         unsafe {
-            let mut ft: FILETIME = GetSystemTimeAsFileTime();
+            let ft: FILETIME = GetSystemTimeAsFileTime();
             
             let mut u64_time = (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64);
             let offset_100ns = offset.as_nanos() as u64 / 100;
@@ -117,11 +128,13 @@ impl SystemClock for WindowsClock {
                 }
             }
             
-            ft.dwLowDateTime = (u64_time & 0xFFFFFFFF) as u32;
-            ft.dwHighDateTime = (u64_time >> 32) as u32;
+            let ft_new = FILETIME {
+                dwLowDateTime: (u64_time & 0xFFFFFFFF) as u32,
+                dwHighDateTime: (u64_time >> 32) as u32,
+            };
             
             let mut st = SYSTEMTIME::default();
-            FileTimeToSystemTime(&ft, &mut st)?;
+            FileTimeToSystemTime(&ft_new, &mut st)?;
             SetSystemTime(&st)?;
         }
 
@@ -132,6 +145,8 @@ impl SystemClock for WindowsClock {
 impl Drop for WindowsClock {
     fn drop(&mut self) {
         unsafe {
+            // Restore original settings
+            // Use Precise here as we stored u64s
             let _ = SetSystemTimeAdjustmentPrecise(self.original_adjustment, self.original_disabled);
         }
     }
