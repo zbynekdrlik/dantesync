@@ -221,11 +221,16 @@ pub fn parse_ptp_from_pcap(data: &[u8], ts_sec: i64, ts_usec: i64) -> Option<(Ve
 pub fn recv_pcap_packet(cap: &mut Capture<Active>) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
     match cap.next_packet() {
         Ok(packet) => {
-            // Capture SystemTime immediately when packet arrives
-            // Pcap timestamps on Windows have systematic offset issues
-            let timestamp = SystemTime::now();
-            if let Some((payload, size, _pcap_ts)) = parse_ptp_from_pcap(packet.data, 0, 0) {
-                Ok(Some((payload, size, timestamp)))
+            let ts = &packet.header.ts;
+            // Use pcap timestamp - it's closer to actual packet arrival time
+            // even if it has a systematic offset, that offset is consistent
+            // and will be absorbed by the servo integral term
+            // tv_sec is i32 on Windows, i64 on Linux - convert safely
+            let secs: i64 = ts.tv_sec.into();
+            let pcap_ts = SystemTime::UNIX_EPOCH + Duration::new(secs as u64, (ts.tv_usec * 1000) as u32);
+
+            if let Some((payload, size, _)) = parse_ptp_from_pcap(packet.data, 0, 0) {
+                Ok(Some((payload, size, pcap_ts)))
             } else {
                 Ok(None)
             }

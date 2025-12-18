@@ -34,7 +34,7 @@ impl Default for SystemConfig {
                     max_integral_ppm: 100_000.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 100_000_000, // 100ms - relaxed for Windows timing jitter
+                    step_threshold_ns: 150_000_000, // 150ms - allow servo to handle offset
                     panic_threshold_ns: 500_000_000, // 500ms
                     sample_window_size: 8, // Increase window to filter jitter
                     min_delta_ns: 0,
