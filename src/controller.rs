@@ -43,7 +43,7 @@ where
     // Epoch Alignment
     initial_epoch_offset_ns: i64, // t2 - t1 at first lock
     epoch_aligned: bool,
-    
+
     // RTC
     last_rtc_update: Instant,
 
@@ -53,6 +53,11 @@ where
 
     // Status for IPC/Tray
     status_shared: Arc<RwLock<SyncStatus>>,
+
+    // Timestamp Calibration (Windows only - compensates for pcap timestamp offset)
+    calibration_samples: Vec<i64>,
+    calibration_offset_ns: i64,
+    calibration_complete: bool,
 }
 
 struct PendingSync {
@@ -70,6 +75,10 @@ where
         let servo = PiServo::new(config.servo.clone());
         let window_size = config.filters.sample_window_size;
 
+        // Determine if calibration is needed (config.filters.calibration_samples > 0)
+        let calibration_count = config.filters.calibration_samples;
+        let calibration_complete = calibration_count == 0;
+
         PtpController {
             clock,
             network,
@@ -85,11 +94,14 @@ where
             last_adj_ppm: 0.0,
             initial_epoch_offset_ns: 0,
             epoch_aligned: false,
-            last_rtc_update: Instant::now(), 
+            last_rtc_update: Instant::now(),
             valid_count: 0,
             clock_settled: false,
-            settling_threshold: 1, 
+            settling_threshold: 1,
             status_shared,
+            calibration_samples: Vec::with_capacity(calibration_count),
+            calibration_offset_ns: 0,
+            calibration_complete,
         }
     }
 
@@ -138,6 +150,12 @@ where
     pub fn log_status(&self) {
         // Also ensure shared status is up to date periodically
         self.update_shared_status();
+
+        if !self.calibration_complete {
+            info!("[Status] Calibrating timestamp offset... ({}/{} samples)",
+                  self.calibration_samples.len(), self.config.filters.calibration_samples);
+            return;
+        }
 
         if !self.clock_settled {
             info!("[Status] Settling... ({}/{}) Waiting for valid PTP pairs...", self.valid_count, self.settling_threshold);
@@ -243,10 +261,33 @@ where
          let t2_ns = t2_sys.duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as i64;
-        
-        let mut phase_offset_ns = (t2_ns % 1_000_000_000) - (t1_ns % 1_000_000_000);
-        if phase_offset_ns > 500_000_000 { phase_offset_ns -= 1_000_000_000; }
-        else if phase_offset_ns < -500_000_000 { phase_offset_ns += 1_000_000_000; }
+
+        // Calculate raw phase offset (before calibration)
+        let mut raw_phase_offset_ns = (t2_ns % 1_000_000_000) - (t1_ns % 1_000_000_000);
+        if raw_phase_offset_ns > 500_000_000 { raw_phase_offset_ns -= 1_000_000_000; }
+        else if raw_phase_offset_ns < -500_000_000 { raw_phase_offset_ns += 1_000_000_000; }
+
+        // Calibration phase: collect samples to measure systematic timestamp offset
+        let calibration_count = self.config.filters.calibration_samples;
+        if !self.calibration_complete {
+            self.calibration_samples.push(raw_phase_offset_ns);
+
+            if self.calibration_samples.len() >= calibration_count {
+                // Calculate median as calibration offset (more robust than mean)
+                let mut sorted = self.calibration_samples.clone();
+                sorted.sort();
+                self.calibration_offset_ns = sorted[sorted.len() / 2];
+                self.calibration_complete = true;
+
+                info!("Timestamp calibration complete. Systematic offset: {:.3} ms ({} samples, median)",
+                      self.calibration_offset_ns as f64 / 1_000_000.0,
+                      calibration_count);
+            }
+            return; // Don't process further during calibration
+        }
+
+        // Apply calibration offset to get corrected phase offset
+        let phase_offset_ns = raw_phase_offset_ns - self.calibration_offset_ns;
 
         if self.prev_t1_ns > 0 && self.prev_t2_ns > 0 {
             let delta_master = t1_ns - self.prev_t1_ns;
@@ -452,11 +493,12 @@ mod tests {
             .returning(|_| Ok(()));
 
         let status = Arc::new(RwLock::new(SyncStatus::default()));
-        
-        // Force window size to 4 for this test
+
+        // Force window size to 4 for this test, disable calibration
         let mut config = SystemConfig::default();
         config.filters.sample_window_size = 4;
-        
+        config.filters.calibration_samples = 0; // Disable calibration for unit test
+
         let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
         
         // Process 16 packets (8 Sync + 8 FollowUp)

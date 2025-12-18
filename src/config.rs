@@ -20,6 +20,7 @@ pub struct FilterConfig {
     pub panic_threshold_ns: i64,     // "MAX_PHASE_OFFSET_FOR_STEP_NS"
     pub sample_window_size: usize,
     pub min_delta_ns: i64,
+    pub calibration_samples: usize,  // Number of samples for timestamp calibration (0 = disabled)
 }
 
 impl Default for SystemConfig {
@@ -34,10 +35,11 @@ impl Default for SystemConfig {
                     max_integral_ppm: 100_000.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 150_000_000, // 150ms - allow servo to handle offset
-                    panic_threshold_ns: 500_000_000, // 500ms
+                    step_threshold_ns: 10_000_000, // 10ms - with calibration, offsets should be small
+                    panic_threshold_ns: 50_000_000, // 50ms
                     sample_window_size: 8, // Increase window to filter jitter
                     min_delta_ns: 0,
+                    calibration_samples: 32, // Calibrate pcap timestamp offset
                 },
             }
         }
@@ -52,10 +54,11 @@ impl Default for SystemConfig {
                     max_integral_ppm: 100.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 5_000_000,  // 5ms 
+                    step_threshold_ns: 5_000_000,  // 5ms
                     panic_threshold_ns: 10_000_000, // 10ms
                     sample_window_size: 4,
                     min_delta_ns: 1_000_000, // 1ms
+                    calibration_samples: 0, // Linux uses kernel timestamping, no calibration needed
                 },
             }
         }
