@@ -205,19 +205,19 @@ fn test_windows_stability_high_jitter() {
     let mut config = SystemConfig::default();
     config.servo.kp = 0.005; // New Stable Gain
     config.servo.ki = 0.0005;
-    config.servo.max_freq_adj_ppm = 500_000.0; // Windows-like high adjustment range
-    config.filters.step_threshold_ns = 50_000_000;
+    config.servo.max_freq_adj_ppm = 10_000.0; // Windows-like 1% max adjustment
+    config.filters.step_threshold_ns = 150_000_000; // 150ms step threshold
+    config.filters.panic_threshold_ns = 500_000_000; // 500ms panic threshold
     config.filters.calibration_samples = 0; // Disable calibration for test
     config.filters.sample_window_size = 4; // Consistent window size across platforms
 
-    // 2ms jitter, 100ppm drift (reduced from 500ppm for frequency-only mode)
-    // Without stepping, the servo alone must handle drift via frequency adjustment
+    // 2ms jitter, 100ppm drift
+    // With stepping enabled, large initial offsets are handled quickly
     let (final_off, max_off) = run_simulation(config, 2_000_000.0, 100.0, 200);
 
     println!("Windows Stable: Final {:.3}ms, Max {:.3}ms", final_off/1_000_000.0, max_off/1_000_000.0);
-    // Relaxed threshold to 400ms for frequency-only convergence with high jitter
-    // Windows uses frequency-only mode (no stepping), so convergence is slower
-    assert!(final_off < 400_000_000.0, "Final offset too high");
+    // With stepping enabled and reasonable max adjustment, should converge well
+    assert!(final_off < 50_000_000.0, "Final offset too high");
 }
 
 #[test]

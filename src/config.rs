@@ -31,8 +31,10 @@ impl Default for SystemConfig {
                 servo: ServoConfig {
                     kp: 0.005, // Reduced from 0.1 to prevent oscillation (8Hz limit ~0.008)
                     ki: 0.0005,
-                    max_freq_adj_ppm: 500_000.0,
-                    max_integral_ppm: 100_000.0,
+                    // Windows SetSystemTimeAdjustmentPrecise may not support extreme adjustments.
+                    // Use stepping for large offsets, frequency adjustment for fine-tuning.
+                    max_freq_adj_ppm: 10_000.0,  // 1% max adjustment (reasonable for Windows)
+                    max_integral_ppm: 5_000.0,
                 },
                 filters: FilterConfig {
                     step_threshold_ns: 150_000_000, // 150ms - Windows timestamps have high jitter

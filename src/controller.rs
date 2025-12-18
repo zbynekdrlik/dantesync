@@ -309,10 +309,10 @@ where
                 self.initial_epoch_offset_ns = t2_ns - t1_ns;
                 self.epoch_aligned = true;
 
-                // On Windows, SystemTime::now() is affected by clock stepping, which corrupts
-                // subsequent phase measurements. Only use stepping on Unix where kernel timestamps
-                // are independent of clock adjustments.
-                #[cfg(unix)]
+                // Step clock for large initial offsets.
+                // With calibration disabled, stepping works correctly on all platforms:
+                // after a step, SystemTime::now() reflects the new time and subsequent
+                // measurements are relative to the stepped clock.
                 if phase_offset_ns.abs() > self.config.filters.panic_threshold_ns {
                     info!("Initial Phase Offset {}ms is large. Stepping clock to align phase...", phase_offset_ns / 1_000_000);
                     let step_duration = Duration::from_nanos(phase_offset_ns.abs() as u64);
@@ -327,18 +327,10 @@ where
                     }
                 }
 
-                #[cfg(windows)]
-                if phase_offset_ns.abs() > self.config.filters.panic_threshold_ns {
-                    info!("Large initial offset {}ms detected. Using frequency-only mode (no stepping on Windows).",
-                          phase_offset_ns / 1_000_000);
-                }
-
                 info!("Sync established. Updating RTC...");
                 self.update_rtc_now();
             } else {
                 // Check for massive drift while settled
-                // On Windows, skip stepping entirely - rely on frequency adjustment only
-                #[cfg(unix)]
                 if phase_offset_ns.abs() > self.config.filters.step_threshold_ns {
                      warn!("Large offset {}us detected while settled. Stepping clock (Servo Integral maintained).", phase_offset_ns / 1_000);
 
