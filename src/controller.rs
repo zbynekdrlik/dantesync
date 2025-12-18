@@ -58,6 +58,10 @@ where
     calibration_samples: Vec<i64>,
     calibration_offset_ns: i64,
     calibration_complete: bool,
+
+    // Phase unwrapping (handles second-boundary crossing artifacts)
+    prev_raw_phase_ns: i64,
+    phase_unwrap_correction_ns: i64,
 }
 
 struct PendingSync {
@@ -102,6 +106,8 @@ where
             calibration_samples: Vec::with_capacity(calibration_count),
             calibration_offset_ns: 0,
             calibration_complete,
+            prev_raw_phase_ns: 0,
+            phase_unwrap_correction_ns: 0,
         }
     }
 
@@ -293,7 +299,30 @@ where
         }
 
         // Apply calibration offset to get corrected phase offset
-        let phase_offset_ns = raw_phase_offset_ns - self.calibration_offset_ns;
+        let calibrated_phase_ns = raw_phase_offset_ns - self.calibration_offset_ns;
+
+        // Phase unwrapping: detect and compensate for second-boundary jumps.
+        // When NTP and Dante epochs differ, the phase measurement can jump by ~1 second
+        // when timestamps cross second boundaries at different times.
+        // This unwrapping gives us a continuous phase signal the servo can track.
+        if self.prev_raw_phase_ns != 0 {
+            let phase_jump = calibrated_phase_ns - self.prev_raw_phase_ns;
+            if phase_jump > 500_000_000 {
+                // Positive jump of ~1 second detected, compensate
+                self.phase_unwrap_correction_ns -= 1_000_000_000;
+                debug!("Phase unwrap: jump of {}ms detected, correction now {}ms",
+                       phase_jump / 1_000_000, self.phase_unwrap_correction_ns / 1_000_000);
+            } else if phase_jump < -500_000_000 {
+                // Negative jump of ~1 second detected, compensate
+                self.phase_unwrap_correction_ns += 1_000_000_000;
+                debug!("Phase unwrap: jump of {}ms detected, correction now {}ms",
+                       phase_jump / 1_000_000, self.phase_unwrap_correction_ns / 1_000_000);
+            }
+        }
+        self.prev_raw_phase_ns = calibrated_phase_ns;
+
+        // Apply unwrap correction for continuous phase
+        let phase_offset_ns = calibrated_phase_ns + self.phase_unwrap_correction_ns;
 
         if self.prev_t1_ns > 0 && self.prev_t2_ns > 0 {
             let delta_master = t1_ns - self.prev_t1_ns;
@@ -395,11 +424,14 @@ where
         self.prev_t1_ns = 0;
         self.prev_t2_ns = 0;
         self.sample_window.clear();
-        
+        // Reset phase unwrapping state
+        self.prev_raw_phase_ns = 0;
+        self.phase_unwrap_correction_ns = 0;
+
         if let Err(e) = self.network.reset() {
             warn!("Failed to reset network buffers: {}", e);
         }
-        
+
         self.update_shared_status();
     }
 }
