@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::{Arc, RwLock};
@@ -266,6 +266,12 @@ where
         let mut raw_phase_offset_ns = (t2_ns % 1_000_000_000) - (t1_ns % 1_000_000_000);
         if raw_phase_offset_ns > 500_000_000 { raw_phase_offset_ns -= 1_000_000_000; }
         else if raw_phase_offset_ns < -500_000_000 { raw_phase_offset_ns += 1_000_000_000; }
+
+        // Debug: Log raw T1, T2, and phase calculation
+        debug!("T1={} T2={} T1_mod={} T2_mod={} raw_offset={}us",
+               t1_ns, t2_ns,
+               t1_ns % 1_000_000_000, t2_ns % 1_000_000_000,
+               raw_phase_offset_ns / 1000);
 
         // Calibration phase: collect samples to measure systematic timestamp offset
         let calibration_count = self.config.filters.calibration_samples;
