@@ -35,11 +35,11 @@ impl Default for SystemConfig {
                     max_integral_ppm: 100_000.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 50_000_000, // 50ms - allow servo to converge
-                    panic_threshold_ns: 200_000_000, // 200ms
-                    sample_window_size: 8, // Increase window to filter jitter
+                    step_threshold_ns: 150_000_000, // 150ms - Windows timestamps have high jitter
+                    panic_threshold_ns: 500_000_000, // 500ms
+                    sample_window_size: 16, // Larger window to filter Windows jitter
                     min_delta_ns: 0,
-                    calibration_samples: 32, // Calibrate SystemTime offset
+                    calibration_samples: 64, // More samples for stable calibration
                 },
             }
         }
