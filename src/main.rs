@@ -210,6 +210,9 @@ impl PtpNetwork for RealPtpNetwork {
 #[cfg(windows)]
 struct RealPtpNetwork {
     pcap_capture: pcap::Capture<pcap::Active>,
+    // Keep UDP sockets alive to maintain IGMP multicast membership
+    _sock_event: UdpSocket,
+    _sock_general: UdpSocket,
 }
 
 #[cfg(windows)]
@@ -461,9 +464,10 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
     #[cfg(windows)]
     let network = {
         // Use pcap for accurate packet timestamps on Windows
-        // First, still join multicast via UDP sockets (for IGMP membership)
-        let _sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
-        let _sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
+        // First, join multicast via UDP sockets (for IGMP membership)
+        // These sockets MUST stay alive to maintain IGMP membership!
+        let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
+        let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
         info!("IGMP multicast joined on {} ({})", iface_name, iface_ip);
 
         // Create pcap capture for accurate timestamps
@@ -472,6 +476,8 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
 
         RealPtpNetwork {
             pcap_capture,
+            _sock_event: sock_event,
+            _sock_general: sock_general,
         }
     };
     
