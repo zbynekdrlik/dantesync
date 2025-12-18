@@ -500,75 +500,79 @@ const SERVICE_NAME: &str = "dantetimesync";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 #[cfg(windows)]
+fn my_service_main(_arguments: Vec<OsString>) {
+    // We need to reload config or pass it?
+    // Windows Service entry doesn't allow easy closure capture without unsafe global.
+    // But we can just reload it, it's cheap.
+    let config = load_config();
+
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Stop => {
+                let _ = shutdown_tx.send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    // Set Running
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    });
+
+    // Use global args via simple parse if needed, but here we just need default or what logic needs
+    let args = Args::parse();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    // Spawn the sync loop in a thread
+    let handle = thread::spawn(move || {
+        if let Err(e) = run_sync_loop(args, r, config.system) {
+            error!("Service loop failed: {}", e);
+        }
+    });
+
+    // Wait for stop signal
+    let _ = shutdown_rx.recv();
+
+    // Stop
+    running.store(false, Ordering::SeqCst);
+    let _ = handle.join();
+
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    });
+}
+
+// Generate FFI wrapper for Windows service entry point
+#[cfg(windows)]
+define_windows_service!(ffi_service_main, my_service_main);
+
+#[cfg(windows)]
 fn run_service_logic(_args: Args, _config: Config) -> Result<()> {
     info!("Service logic starting...");
-
-    fn my_service_main(_arguments: Vec<OsString>) {
-        // We need to reload config or pass it? 
-        // Windows Service entry doesn't allow easy closure capture without unsafe global.
-        // But we can just reload it, it's cheap.
-        let config = load_config();
-        
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
-
-        let event_handler = move |control_event| -> ServiceControlHandlerResult {
-            match control_event {
-                ServiceControl::Stop => {
-                    let _ = shutdown_tx.send(());
-                    ServiceControlHandlerResult::NoError
-                }
-                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-                _ => ServiceControlHandlerResult::NotImplemented,
-            }
-        };
-
-        let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
-            Ok(h) => h,
-            Err(_) => return, 
-        };
-
-        // Set Running
-        let _ = status_handle.set_service_status(ServiceStatus {
-            service_type: SERVICE_TYPE,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        });
-
-        // Use global args via simple parse if needed, but here we just need default or what logic needs
-        let args = Args::parse();
-        
-        let running = Arc::new(AtomicBool::new(true));
-        let r = running.clone();
-        
-        // Spawn the sync loop in a thread
-        let handle = thread::spawn(move || {
-            if let Err(e) = run_sync_loop(args, r, config.system) {
-                error!("Service loop failed: {}", e);
-            }
-        });
-
-        // Wait for stop signal
-        let _ = shutdown_rx.recv();
-        
-        // Stop
-        running.store(false, Ordering::SeqCst);
-        let _ = handle.join();
-
-        let _ = status_handle.set_service_status(ServiceStatus {
-            service_type: SERVICE_TYPE,
-            current_state: ServiceState::Stopped,
-            controls_accepted: ServiceControlAccept::empty(),
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        });
-    }
-
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
     Ok(())
 }
