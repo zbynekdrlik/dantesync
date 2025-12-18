@@ -452,7 +452,12 @@ mod tests {
             .returning(|_| Ok(()));
 
         let status = Arc::new(RwLock::new(SyncStatus::default()));
-        let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status, SystemConfig::default());
+        
+        // Force window size to 4 for this test
+        let mut config = SystemConfig::default();
+        config.filters.sample_window_size = 4;
+        
+        let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
         
         // Process 16 packets (8 Sync + 8 FollowUp)
         for _ in 0..16 {
