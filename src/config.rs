@@ -21,6 +21,7 @@ pub struct FilterConfig {
     pub sample_window_size: usize,
     pub min_delta_ns: i64,
     pub calibration_samples: usize,  // Number of samples for timestamp calibration (0 = disabled)
+    pub ptp_stepping_enabled: bool,  // Enable stepping based on PTP offset (disable for frequency-only sync)
 }
 
 impl Default for SystemConfig {
@@ -37,13 +38,14 @@ impl Default for SystemConfig {
                     max_integral_ppm: 5_000.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 250_000_000, // 250ms - Windows timestamps have extreme jitter
-                    panic_threshold_ns: 1_000_000_000, // 1s - initial alignment threshold
-                    sample_window_size: 32, // Larger window to filter Windows jitter spikes
+                    step_threshold_ns: 250_000_000, // 250ms - not used when ptp_stepping_enabled=false
+                    panic_threshold_ns: 1_000_000_000, // 1s - not used when ptp_stepping_enabled=false
+                    sample_window_size: 32, // Larger window to filter Windows jitter
                     min_delta_ns: 0,
-                    // Calibration disabled: we use SystemTime::now() which measures the actual
-                    // system clock. Calibration would subtract the real offset, hiding it from servo.
                     calibration_samples: 0,
+                    // Disable PTP stepping on Windows - Dante time is not "real" time.
+                    // Use NTP for absolute time, PTP only for frequency sync.
+                    ptp_stepping_enabled: false,
                 },
             }
         }
@@ -63,6 +65,7 @@ impl Default for SystemConfig {
                     sample_window_size: 4,
                     min_delta_ns: 1_000_000, // 1ms
                     calibration_samples: 0, // Linux uses kernel timestamping, no calibration needed
+                    ptp_stepping_enabled: true, // Linux kernel timestamps are accurate, stepping works
                 },
             }
         }

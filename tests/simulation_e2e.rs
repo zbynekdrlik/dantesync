@@ -197,6 +197,7 @@ fn test_linux_stability_low_jitter() {
     config.filters.step_threshold_ns = 5_000_000;
     config.filters.sample_window_size = 4; // Small window for low-jitter environment
     config.filters.calibration_samples = 0;
+    config.filters.ptp_stepping_enabled = true; // Linux kernel timestamps allow stepping
 
     // 50us jitter, 50ppm drift
     let (final_off, max_off) = run_simulation(config, 50_000.0, 50.0, 100);
@@ -215,6 +216,7 @@ fn test_windows_stability_high_jitter() {
     config.filters.panic_threshold_ns = 500_000_000; // 500ms panic threshold
     config.filters.calibration_samples = 0; // Disable calibration for test
     config.filters.sample_window_size = 4; // Consistent window size across platforms
+    config.filters.ptp_stepping_enabled = true; // Enable stepping for simulation test
 
     // 2ms jitter, 100ppm drift
     // With stepping enabled, large initial offsets are handled quickly

@@ -315,11 +315,10 @@ where
                 self.initial_epoch_offset_ns = t2_ns - t1_ns;
                 self.epoch_aligned = true;
 
-                // Step clock for large initial offsets.
-                // With calibration disabled, stepping works correctly on all platforms:
-                // after a step, SystemTime::now() reflects the new time and subsequent
-                // measurements are relative to the stepped clock.
-                if phase_offset_ns.abs() > self.config.filters.panic_threshold_ns {
+                // Step clock for large initial offsets (only if PTP stepping is enabled).
+                // On Windows, PTP stepping is disabled because Dante time is not "real" time.
+                // Use NTP for absolute time alignment, PTP only for frequency sync.
+                if self.config.filters.ptp_stepping_enabled && phase_offset_ns.abs() > self.config.filters.panic_threshold_ns {
                     info!("Initial Phase Offset {}ms is large. Stepping clock to align phase...", phase_offset_ns / 1_000_000);
                     let step_duration = Duration::from_nanos(phase_offset_ns.abs() as u64);
                     let sign = if phase_offset_ns > 0 { -1 } else { 1 };
@@ -336,8 +335,8 @@ where
                 info!("Sync established. Updating RTC...");
                 self.update_rtc_now();
             } else {
-                // Check for massive drift while settled
-                if phase_offset_ns.abs() > self.config.filters.step_threshold_ns {
+                // Check for massive drift while settled (only if PTP stepping is enabled)
+                if self.config.filters.ptp_stepping_enabled && phase_offset_ns.abs() > self.config.filters.step_threshold_ns {
                      warn!("Large offset {}us detected while settled. Stepping clock (Servo Integral maintained).", phase_offset_ns / 1_000);
 
                      let step_duration = Duration::from_nanos(phase_offset_ns.abs() as u64);
