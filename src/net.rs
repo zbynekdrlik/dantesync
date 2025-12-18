@@ -217,20 +217,19 @@ pub fn parse_ptp_from_pcap(data: &[u8], ts_sec: i64, ts_usec: i64) -> Option<(Ve
     Some((ptp_payload, ptp_size, timestamp))
 }
 
-/// Receive a PTP packet from pcap capture with accurate kernel timestamp
+/// Receive a PTP packet from pcap capture with timestamp
+/// Uses SystemTime::now() for timestamps because pcap timestamps on Windows
+/// can drift relative to system time. The constant processing delay is
+/// handled by the calibration mechanism in the controller.
 pub fn recv_pcap_packet(cap: &mut Capture<Active>) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
     match cap.next_packet() {
         Ok(packet) => {
-            let ts = &packet.header.ts;
-            // Use pcap timestamp - it's closer to actual packet arrival time
-            // even if it has a systematic offset, that offset is consistent
-            // and will be absorbed by the servo integral term
-            // tv_sec is i32 on Windows, i64 on Linux - convert safely
-            let secs: i64 = ts.tv_sec.into();
-            let pcap_ts = SystemTime::UNIX_EPOCH + Duration::new(secs as u64, (ts.tv_usec * 1000) as u32);
+            // Capture timestamp immediately after packet arrives
+            // This is in the same time domain as our clock adjustments
+            let rx_time = SystemTime::now();
 
             if let Some((payload, size, _)) = parse_ptp_from_pcap(packet.data, 0, 0) {
-                Ok(Some((payload, size, pcap_ts)))
+                Ok(Some((payload, size, rx_time)))
             } else {
                 Ok(None)
             }
