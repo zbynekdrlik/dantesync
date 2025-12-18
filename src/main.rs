@@ -206,24 +206,61 @@ impl PtpNetwork for RealPtpNetwork {
     }
 }
 
-// Pcap-based PTP network (used on Windows for accurate timestamps)
+// UDP-based PTP network for Windows
+// Using standard UDP sockets instead of pcap eliminates buffering latency.
+// The UDP recv_from() returns immediately when a packet arrives, giving us
+// accurate timestamps via SystemTime::now().
 #[cfg(windows)]
 struct RealPtpNetwork {
-    pcap_capture: pcap::Capture<pcap::Active>,
-    // Keep UDP sockets alive to maintain IGMP multicast membership
-    _sock_event: UdpSocket,
-    _sock_general: UdpSocket,
+    sock_event: UdpSocket,
+    sock_general: UdpSocket,
 }
 
 #[cfg(windows)]
 impl PtpNetwork for RealPtpNetwork {
     fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
-        net::recv_pcap_packet(&mut self.pcap_capture)
+        let mut buf = [0u8; 2048];
+
+        // Check Event Socket (port 319)
+        match self.sock_event.recv_from(&mut buf) {
+            Ok((size, _)) => {
+                let ts = SystemTime::now();
+                return Ok(Some((buf[..size].to_vec(), size, ts)));
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // Check General Socket (port 320)
+        match self.sock_general.recv_from(&mut buf) {
+            Ok((size, _)) => {
+                let ts = SystemTime::now();
+                return Ok(Some((buf[..size].to_vec(), size, ts)));
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        Ok(None)
     }
 
     fn reset(&mut self) -> Result<()> {
-        // Pcap doesn't have a buffer drain concept in the same way
-        // The filter ensures we only get PTP packets anyway
+        // Drain buffers to prevent processing old packets after a clock step
+        let mut buf = [0u8; 2048];
+        loop {
+            match self.sock_event.recv_from(&mut buf) {
+                Ok(_) => continue,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        loop {
+            match self.sock_general.recv_from(&mut buf) {
+                Ok(_) => continue,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
         Ok(())
     }
 }
@@ -463,21 +500,15 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
 
     #[cfg(windows)]
     let network = {
-        // Use pcap for accurate packet timestamps on Windows
-        // First, join multicast via UDP sockets (for IGMP membership)
-        // These sockets MUST stay alive to maintain IGMP membership!
+        // Use UDP sockets directly on Windows (no pcap buffering)
+        // This eliminates the variable latency from pcap's internal buffer
         let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
         let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
-        info!("IGMP multicast joined on {} ({})", iface_name, iface_ip);
-
-        // Create pcap capture for accurate timestamps
-        let pcap_capture = net::create_pcap_capture(&iface_name)?;
-        info!("Using PCAP capture for PTP timestamps on Windows");
+        info!("Joined multicast groups on {} ({}) using UDP sockets", iface_name, iface_ip);
 
         RealPtpNetwork {
-            pcap_capture,
-            _sock_event: sock_event,
-            _sock_general: sock_general,
+            sock_event,
+            sock_general,
         }
     };
     
