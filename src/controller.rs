@@ -20,7 +20,7 @@ const MIN_DELTA_NS: i64 = 1_000_000;       // 1ms on Linux
 #[cfg(windows)]
 const MASSIVE_DRIFT_THRESHOLD_NS: i64 = 10_000_000; // 10ms on Windows (High Jitter/Drift)
 #[cfg(not(windows))]
-const MASSIVE_DRIFT_THRESHOLD_NS: i64 = 500_000;    // 500us on Linux (Precision)
+const MASSIVE_DRIFT_THRESHOLD_NS: i64 = 5_000_000;    // 5ms on Linux (Allow capture of high drift)
 
 const MAX_DELTA_NS: i64 = 2_000_000_000;   // 2s
 const MAX_PHASE_OFFSET_FOR_STEP_NS: i64 = 10_000_000; // 10ms (Initial alignment)
