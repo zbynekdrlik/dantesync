@@ -28,15 +28,15 @@ impl Default for SystemConfig {
         {
             SystemConfig {
                 servo: ServoConfig {
-                    kp: 0.1,
-                    ki: 0.001,
+                    kp: 0.005, // Reduced from 0.1 to prevent oscillation (8Hz limit ~0.008)
+                    ki: 0.0005,
                     max_freq_adj_ppm: 500_000.0,
-                    max_integral_ppm: 100_000.0, // Windows needs massive integral range for VM drift
+                    max_integral_ppm: 100_000.0, 
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 10_000_000, // 10ms
-                    panic_threshold_ns: 50_000_000, // 50ms
-                    sample_window_size: 4,
+                    step_threshold_ns: 50_000_000, // 50ms (Very relaxed for Windows)
+                    panic_threshold_ns: 500_000_000, // 500ms
+                    sample_window_size: 8, // Increase window to filter jitter
                     min_delta_ns: 0,
                 },
             }
@@ -48,11 +48,11 @@ impl Default for SystemConfig {
                 servo: ServoConfig {
                     kp: 0.0005,
                     ki: 0.00005,
-                    max_freq_adj_ppm: 500.0,    // Standard Crystal Limits
+                    max_freq_adj_ppm: 500.0,    
                     max_integral_ppm: 100.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 5_000_000,  // 5ms (Relaxed to catch initial drift)
+                    step_threshold_ns: 5_000_000,  // 5ms 
                     panic_threshold_ns: 10_000_000, // 10ms
                     sample_window_size: 4,
                     min_delta_ns: 1_000_000, // 1ms
