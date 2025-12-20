@@ -7,7 +7,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise,
+    GetSystemTimeAdjustment, SetSystemTimeAdjustment,
     GetSystemTimeAsFileTime, SetSystemTime
 };
 use windows::Win32::System::Time::FileTimeToSystemTime;
@@ -16,45 +16,39 @@ use std::time::Duration;
 use log::{info, warn, debug, error};
 
 pub struct WindowsClock {
-    original_adjustment: u64,
-    original_increment: u64,
+    original_adjustment: u32,
+    original_increment: u32,
     original_disabled: BOOL,
-    nominal_frequency: u64,
+    nominal_frequency: u32,
 }
 
 impl WindowsClock {
     pub fn new() -> Result<Self> {
         Self::enable_privilege("SeSystemtimePrivilege")?;
 
-        let mut adj = 0u64;
-        let mut inc = 0u64;
+        let mut adj = 0u32;
+        let mut inc = 0u32;
         let mut disabled = BOOL(0);
 
         unsafe {
-            if let Err(e) = GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled) {
-                error!("GetSystemTimeAdjustmentPrecise failed: {}", e);
-                return Err(anyhow!("GetSystemTimeAdjustmentPrecise failed: {}", e));
-            }
+            // Use the OLD API - it uses 100ns units and is more widely supported
+            GetSystemTimeAdjustment(&mut adj, &mut inc, &mut disabled)?;
         }
-        
-        info!("Windows Clock Initial State: Adj={}, Inc={}, Disabled={}", adj, inc, disabled.as_bool());
 
-        // The reported Inc value from broken HALs (10,000,000) represents the actual
-        // clock divisor the Windows kernel uses. We must use this value for our adjustments
-        // to maintain correct time rate.
+        info!("Windows Clock Initial State (Old API): Adj={}, Inc={}, Disabled={}", adj, inc, disabled.as_bool());
+        info!("  Inc in ms: {:.3}", inc as f64 / 10_000.0);
+
+        // The increment is in 100ns units. Typical value is ~156,250 (15.625ms)
         let nominal = inc;
-        info!("Using HAL-reported increment {} as nominal frequency", nominal);
+        info!("Using increment {} (100ns units) as nominal frequency", nominal);
 
         // If adjustment is currently disabled, enable it with the nominal value
         if disabled.as_bool() {
-            info!("Setting initial clock adjustment to nominal={}", nominal);
+            info!("Enabling time adjustment with nominal={}", nominal);
             unsafe {
-                if let Err(e) = SetSystemTimeAdjustmentPrecise(nominal, false) {
-                    error!("Failed to set initial adjustment: {}", e);
-                    return Err(anyhow!("Failed to set initial adjustment: {}", e));
-                }
+                SetSystemTimeAdjustment(nominal, false)?;
             }
-            info!("Initial clock adjustment set successfully.");
+            info!("Time adjustment enabled successfully.");
         }
 
         Ok(WindowsClock {
@@ -98,26 +92,24 @@ impl WindowsClock {
 impl SystemClock for WindowsClock {
     fn adjust_frequency(&mut self, factor: f64) -> Result<()> {
         // factor is the ratio: 1.0 = no change, 1.001 = speed up by 1000 ppm
-        // Adjustment = Nominal * factor
-        let new_adj = (self.nominal_frequency as f64 * factor).round() as u64;
+        // Adjustment = Nominal * factor (in 100ns units)
+        // OLD API: dwTimeAdjustment = number of 100ns units added per lpTimeIncrement period
+        let new_adj = (self.nominal_frequency as f64 * factor).round() as u32;
 
         // Convert factor to PPM for logging
         let ppm = (factor - 1.0) * 1_000_000.0;
 
         unsafe {
-            debug!("Adjusting frequency (Precise): Factor={:.9}, PPM={:.3}, Base={}, NewAdj={}",
+            debug!("Adjusting frequency (Old API): Factor={:.9}, PPM={:.3}, Base={}, NewAdj={}",
                    factor, ppm, self.nominal_frequency, new_adj);
 
-            if let Err(e) = SetSystemTimeAdjustmentPrecise(new_adj, false) {
-                error!("SetSystemTimeAdjustmentPrecise failed: {}", e);
-                return Err(anyhow!("SetSystemTimeAdjustmentPrecise failed: {}", e));
-            }
+            SetSystemTimeAdjustment(new_adj, false)?;
 
             // Verify the adjustment was actually applied
-            let mut verify_adj = 0u64;
-            let mut verify_inc = 0u64;
+            let mut verify_adj = 0u32;
+            let mut verify_inc = 0u32;
             let mut verify_disabled = BOOL(0);
-            if GetSystemTimeAdjustmentPrecise(&mut verify_adj, &mut verify_inc, &mut verify_disabled).is_ok() {
+            if GetSystemTimeAdjustment(&mut verify_adj, &mut verify_inc, &mut verify_disabled).is_ok() {
                 if verify_adj != new_adj {
                     warn!("Adjustment mismatch! Requested={}, Actual={}", new_adj, verify_adj);
                 }
@@ -164,10 +156,9 @@ impl SystemClock for WindowsClock {
 impl Drop for WindowsClock {
     fn drop(&mut self) {
         unsafe {
-            // On exit, set clock to run at 1x speed using the corrected nominal frequency
-            // DO NOT restore the original (potentially broken) HAL settings
+            // On exit, set clock to run at 1x speed using the nominal frequency
             // This ensures the system clock runs correctly even after the service stops
-            let _ = SetSystemTimeAdjustmentPrecise(self.nominal_frequency, false);
+            let _ = SetSystemTimeAdjustment(self.nominal_frequency, false);
         }
     }
 }
