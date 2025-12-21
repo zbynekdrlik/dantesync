@@ -1,6 +1,6 @@
 use anyhow::Result;
 use log::{info, warn, error, debug};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 use std::sync::{Arc, RwLock};
 use crate::clock::SystemClock;
@@ -17,13 +17,26 @@ const NTP_CHECK_INTERVAL: Duration = Duration::from_secs(60);   // Check NTP eve
 const NTP_BIAS_MAX_PPM: f64 = 100.0;  // Max bias to correct NTP drift (gentle correction)
 const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 
-// Two-phase sync parameters - tuned for Windows timestamp jitter
+// Two-phase sync parameters
 const ACQUISITION_FILTER_WEIGHT: f64 = 0.2;  // Slower filter: less reactive to jitter
 const PRODUCTION_FILTER_WEIGHT: f64 = 0.05; // Very slow filter for production stability
 const ACQUISITION_MAX_PPM: f64 = 200.0;      // Allow large corrections during acquisition
 const PRODUCTION_MAX_PPM: f64 = 50.0;        // Conservative corrections in production
 const ACQUISITION_STABLE_COUNT: usize = 3;   // Require 3 stable samples to switch to production
 const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 20.0;  // Allow more variation due to jitter
+
+// Adaptive gain tuning parameters
+const ADAPTIVE_HISTORY_SIZE: usize = 10;     // Number of samples to track for oscillation detection
+const OSCILLATION_SIGN_CHANGES: usize = 3;   // Sign changes in history that indicate oscillation
+const STABLE_OFFSET_THRESHOLD_US: f64 = 100.0; // Offset threshold to consider stable (microseconds)
+const GAIN_DECREASE_FACTOR: f64 = 0.7;       // Multiply gains by this when oscillating
+const GAIN_INCREASE_FACTOR: f64 = 1.1;       // Multiply gains by this when stable
+const MIN_P_GAIN: f64 = 0.0005;              // Minimum P gain
+const MAX_P_GAIN: f64 = 0.05;                // Maximum P gain
+const MIN_I_GAIN: f64 = 0.02;                // Minimum I gain
+const MAX_I_GAIN: f64 = 0.5;                 // Maximum I gain
+const BASELINE_P_GAIN: f64 = 0.005;          // Starting P gain
+const BASELINE_I_GAIN: f64 = 0.1;            // Starting I gain
 
 pub struct PtpController<C, N, S>
 where
@@ -87,6 +100,14 @@ where
     in_production_mode: bool,
     stable_drift_count: usize,    // Count of stable drift samples
     last_drift_for_stability: f64,
+
+    // Adaptive gain tuning
+    adaptive_p_gain: f64,           // Current adaptive P gain
+    adaptive_i_gain: f64,           // Current adaptive I gain
+    offset_history: VecDeque<i64>,  // Recent offsets for oscillation detection
+    last_correction_sign: i8,       // Sign of last correction (-1, 0, or 1)
+    sign_change_count: usize,       // Number of recent sign changes
+    stable_sample_count: usize,     // Count of samples with small offset
 }
 
 struct PendingSync {
@@ -109,12 +130,12 @@ where
 
         // Log configuration at startup
         info!("=== PTP Controller Initialization ===");
-        info!("Mode: Dante frequency lock (NTP bias DISABLED)");
+        info!("Mode: Dante frequency lock with ADAPTIVE PI control");
         info!("Filter Config: WindowSize={}, MinDelta={}ns",
               config.filters.sample_window_size,
               config.filters.min_delta_ns);
-        info!("Two-Phase Sync: Acquisition(max {} PPM, filter {}) -> Production(max {} PPM, filter {})",
-              ACQUISITION_MAX_PPM, ACQUISITION_FILTER_WEIGHT, PRODUCTION_MAX_PPM, PRODUCTION_FILTER_WEIGHT);
+        info!("Adaptive Gains: P={:.4} (range {:.4}-{:.4}), I={:.3} (range {:.3}-{:.3})",
+              BASELINE_P_GAIN, MIN_P_GAIN, MAX_P_GAIN, BASELINE_I_GAIN, MIN_I_GAIN, MAX_I_GAIN);
         info!("Calibration: {} samples ({})",
               config.filters.calibration_samples,
               if config.filters.calibration_samples > 0 { "enabled" } else { "disabled" });
@@ -160,6 +181,13 @@ where
             in_production_mode: false,
             stable_drift_count: 0,
             last_drift_for_stability: 0.0,
+            // Adaptive gain tuning
+            adaptive_p_gain: BASELINE_P_GAIN,
+            adaptive_i_gain: BASELINE_I_GAIN,
+            offset_history: VecDeque::with_capacity(ADAPTIVE_HISTORY_SIZE),
+            last_correction_sign: 0,
+            sign_change_count: 0,
+            stable_sample_count: 0,
         }
     }
 
@@ -555,34 +583,94 @@ where
                     // NTP is only used for initial time alignment at startup
                     // self.check_ntp_offset();  // Disabled
 
-                    // FREQUENCY CORRECTION with PI control:
-                    // P-term: responds to offset magnitude (bring offset toward zero)
-                    // I-term: accumulates to correct steady-state drift
-                    //
-                    // The key insight: when offset is near zero, we should HOLD the
-                    // correction, not reduce it. Use offset-proportional adjustment.
+                    // FREQUENCY CORRECTION with ADAPTIVE PI control:
+                    // Gains automatically adjust based on observed system behavior.
+                    // Oscillation detection reduces gains; stability increases them.
 
                     let offset_us = lucky_offset as f64 / 1000.0;
 
-                    // P-term: proportional to offset
-                    // If behind (negative offset), add positive correction to speed up
-                    // If ahead (positive offset), add negative correction to slow down
-                    // Gain is in PPM per microsecond of offset (very small to prevent oscillation)
-                    let p_gain = if self.in_production_mode { 0.002 } else { 0.01 };
+                    // Track offset history for oscillation detection
+                    self.offset_history.push_back(lucky_offset);
+                    if self.offset_history.len() > ADAPTIVE_HISTORY_SIZE {
+                        self.offset_history.pop_front();
+                    }
+
+                    // Use adaptive gains (automatically tuned)
+                    let p_gain = if self.in_production_mode {
+                        self.adaptive_p_gain
+                    } else {
+                        self.adaptive_p_gain * 2.0  // More aggressive in acquisition
+                    };
                     let p_term = -offset_us * p_gain;
 
-                    // I-term: responds to drift rate
-                    // Only active when drift is significant (> 1 ppm)
-                    // This accumulates to find the steady-state correction needed
-                    let i_gain = if self.in_production_mode { 0.1 } else { 0.3 };
+                    let i_gain = if self.in_production_mode {
+                        self.adaptive_i_gain
+                    } else {
+                        self.adaptive_i_gain * 2.0  // More aggressive in acquisition
+                    };
                     let i_term = if self.measured_drift_ppm.abs() > 1.0 {
                         -self.measured_drift_ppm * i_gain
                     } else {
                         0.0  // Hold correction when drift is minimal
                     };
 
-                    self.applied_freq_ppm += p_term + i_term;
+                    let correction_change = p_term + i_term;
+                    self.applied_freq_ppm += correction_change;
                     let total_correction = self.applied_freq_ppm;
+
+                    // Detect oscillation by tracking correction sign changes
+                    let current_sign = if correction_change > 0.5 { 1i8 }
+                                       else if correction_change < -0.5 { -1i8 }
+                                       else { 0i8 };
+
+                    if current_sign != 0 && self.last_correction_sign != 0 && current_sign != self.last_correction_sign {
+                        self.sign_change_count += 1;
+                    }
+                    if current_sign != 0 {
+                        self.last_correction_sign = current_sign;
+                    }
+
+                    // Adaptive gain adjustment (only in production mode)
+                    if self.in_production_mode {
+                        // Check for oscillation
+                        if self.sign_change_count >= OSCILLATION_SIGN_CHANGES {
+                            // Oscillating - reduce gains
+                            let old_p = self.adaptive_p_gain;
+                            let old_i = self.adaptive_i_gain;
+                            self.adaptive_p_gain = (self.adaptive_p_gain * GAIN_DECREASE_FACTOR).max(MIN_P_GAIN);
+                            self.adaptive_i_gain = (self.adaptive_i_gain * GAIN_DECREASE_FACTOR).max(MIN_I_GAIN);
+                            info!("[Adaptive] Oscillation detected! Reducing gains: P {:.4}->{:.4}, I {:.3}->{:.3}",
+                                  old_p, self.adaptive_p_gain, old_i, self.adaptive_i_gain);
+                            self.sign_change_count = 0;
+                            self.stable_sample_count = 0;
+                        }
+
+                        // Check for stability
+                        if offset_us.abs() < STABLE_OFFSET_THRESHOLD_US {
+                            self.stable_sample_count += 1;
+                            if self.stable_sample_count >= 20 && self.sign_change_count == 0 {
+                                // Very stable - can increase gains slightly
+                                let old_p = self.adaptive_p_gain;
+                                let old_i = self.adaptive_i_gain;
+                                self.adaptive_p_gain = (self.adaptive_p_gain * GAIN_INCREASE_FACTOR).min(MAX_P_GAIN);
+                                self.adaptive_i_gain = (self.adaptive_i_gain * GAIN_INCREASE_FACTOR).min(MAX_I_GAIN);
+                                if old_p != self.adaptive_p_gain || old_i != self.adaptive_i_gain {
+                                    info!("[Adaptive] Stable! Increasing gains: P {:.4}->{:.4}, I {:.3}->{:.3}",
+                                          old_p, self.adaptive_p_gain, old_i, self.adaptive_i_gain);
+                                }
+                                self.stable_sample_count = 0;
+                            }
+                        } else {
+                            // Offset still large - reset stability counter but don't change gains
+                            self.stable_sample_count = 0;
+                        }
+
+                        // Decay sign change count over time (forget old oscillations)
+                        if self.offset_history.len() == ADAPTIVE_HISTORY_SIZE && self.sign_change_count > 0 {
+                            // Every full history window, decay the count
+                            self.sign_change_count = self.sign_change_count.saturating_sub(1);
+                        }
+                    }
 
                     // Two-phase clamping: aggressive during acquisition, gentle during production
                     let max_ppm = if self.in_production_mode {
@@ -597,12 +685,12 @@ where
 
                     let factor = 1.0 + (clamped_correction / 1_000_000.0);
 
-                    // Log the correction with P and I terms
+                    // Log the correction with adaptive gain info
                     let mode_str = if self.in_production_mode { "PROD" } else { "ACQ" };
-                    debug!("[Sync-{}] P={:+.2} I={:+.2} Total={:+.1}ppm",
-                           mode_str, p_term, i_term, clamped_correction);
-                    info!("[Sync-{}] Offset={:+.1}us | Drift={:+.1}ppm | Correction={:+.1}ppm | Factor={:.9}",
-                          mode_str, lucky_us, self.measured_drift_ppm, clamped_correction, factor);
+                    debug!("[Sync-{}] P={:+.2} I={:+.2} Gains(P={:.4},I={:.3})",
+                           mode_str, p_term, i_term, self.adaptive_p_gain, self.adaptive_i_gain);
+                    info!("[Sync-{}] Offset={:+.1}us | Drift={:+.1}ppm | Correction={:+.1}ppm | Gains(P={:.4},I={:.3})",
+                          mode_str, lucky_us, self.measured_drift_ppm, clamped_correction, self.adaptive_p_gain, self.adaptive_i_gain);
 
                     if let Err(e) = self.clock.adjust_frequency(factor) {
                         warn!("Clock adjustment failed: {}", e);
@@ -642,6 +730,13 @@ where
         self.in_production_mode = false;
         self.stable_drift_count = 0;
         self.last_drift_for_stability = 0.0;
+        // Reset adaptive tuning (start fresh with baseline gains)
+        self.adaptive_p_gain = BASELINE_P_GAIN;
+        self.adaptive_i_gain = BASELINE_I_GAIN;
+        self.offset_history.clear();
+        self.last_correction_sign = 0;
+        self.sign_change_count = 0;
+        self.stable_sample_count = 0;
 
         if let Err(e) = self.network.reset() {
             warn!("Failed to reset network buffers: {}", e);
