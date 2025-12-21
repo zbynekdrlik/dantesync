@@ -608,10 +608,14 @@ where
                     } else {
                         self.adaptive_i_gain * 2.0  // More aggressive in acquisition
                     };
-                    let i_term = if self.measured_drift_ppm.abs() > 1.0 {
+                    // I-term only active when:
+                    // 1. Drift is significant (> 1 ppm), AND
+                    // 2. Offset is large (> 50us) - prevents oscillation when near target
+                    // This creates a "dead zone" where correction is held when close to target
+                    let i_term = if self.measured_drift_ppm.abs() > 1.0 && offset_us.abs() > 50.0 {
                         -self.measured_drift_ppm * i_gain
                     } else {
-                        0.0  // Hold correction when drift is minimal
+                        0.0  // Hold correction when offset is small or drift is minimal
                     };
 
                     let correction_change = p_term + i_term;
