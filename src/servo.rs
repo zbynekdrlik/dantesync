@@ -13,8 +13,8 @@ impl PiServo {
     pub fn new(config: ServoConfig) -> Self {
         info!("=== PI Servo Initialization ===");
         info!("Kp={}, Ki={}", config.kp, config.ki);
-        info!("Max Frequency Adjustment: ±{:.0} PPM", config.max_freq_adj_ppm);
-        info!("Max Integral: ±{:.0} PPM", config.max_integral_ppm);
+        info!("Max Frequency Adjustment: +/-{:.0} PPM", config.max_freq_adj_ppm);
+        info!("Max Integral: +/-{:.0} PPM", config.max_integral_ppm);
         info!("=== PI Servo Ready ===");
 
         PiServo {
@@ -94,7 +94,7 @@ impl PiServo {
         self.output_clamped = output_clamped_now;
 
         // Detailed debug logging
-        debug!("[Servo #{}] Offset={:+.1}µs → Error={:.0}ns | P={:+.3}ppm (Kp*err) | I={:+.3}ppm (was {:+.3}) | Raw={:+.3}ppm | Final={:+.3}ppm{}",
+        debug!("[Servo #{}] Offset={:+.1}us -> Error={:.0}ns | P={:+.3}ppm (Kp*err) | I={:+.3}ppm (was {:+.3}) | Raw={:+.3}ppm | Final={:+.3}ppm{}",
                self.sample_count,
                error_us,
                offset_ns,

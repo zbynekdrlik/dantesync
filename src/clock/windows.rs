@@ -48,7 +48,7 @@ impl WindowsClock {
         // Calculate timing parameters
         let inc_ms = inc as f64 / 10_000.0;
         let inc_us = inc as f64 / 10.0;
-        info!("Tick Increment: {:.3} ms ({:.1} µs, {} 100ns units)", inc_ms, inc_us, inc);
+        info!("Tick Increment: {:.3} ms ({:.1} us, {} 100ns units)", inc_ms, inc_us, inc);
 
         // Calculate PPM per adjustment unit
         // One unit of adjustment = one 100ns unit added per tick period
@@ -71,10 +71,10 @@ impl WindowsClock {
         info!("Nominal Frequency: {} (100ns units per tick)", nominal);
 
         // Calculate adjustment range info
-        // Max practical adjustment is typically ±10% (±100,000 PPM)
+        // Max practical adjustment is typically +/-10% (+/-100,000 PPM)
         let max_ppm_10pct = 100_000.0;
         let adj_for_10pct = (nominal as f64 * 0.1) as u32;
-        info!("Adjustment Range: Nominal ± {} units = ±{:.0} PPM (±10%)", adj_for_10pct, max_ppm_10pct);
+        info!("Adjustment Range: Nominal +/- {} units = +/-{:.0} PPM (+/-10%)", adj_for_10pct, max_ppm_10pct);
         info!("  For +10000 PPM: Adjustment = {}", (nominal as f64 * 1.01) as u32);
         info!("  For -10000 PPM: Adjustment = {}", (nominal as f64 * 0.99) as u32);
 
@@ -192,7 +192,7 @@ impl SystemClock for WindowsClock {
             let log_detailed = self.adjustment_count % 10 == 1 || delta_from_last.abs() > 10;
 
             if log_detailed {
-                info!("[FreqAdj #{}] Factor={:.9} PPM={:+.3} | Adj: {} → {} (Δ{:+}) | Nominal={}",
+                info!("[FreqAdj #{}] Factor={:.9} PPM={:+.3} | Adj: {}->{} (delta {:+}) | Nominal={}",
                       self.adjustment_count, factor, ppm, self.last_adjustment, new_adj, delta_units, self.nominal_frequency);
 
                 if elapsed.as_millis() > 100 {
@@ -208,7 +208,7 @@ impl SystemClock for WindowsClock {
                     }
                 }
             } else {
-                debug!("[FreqAdj #{}] PPM={:+.3} Adj={} (Δ{:+})",
+                debug!("[FreqAdj #{}] PPM={:+.3} Adj={} (delta {:+})",
                        self.adjustment_count, ppm, new_adj, delta_units);
             }
 

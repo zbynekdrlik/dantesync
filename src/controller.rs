@@ -17,6 +17,14 @@ const NTP_CHECK_INTERVAL: Duration = Duration::from_secs(60);   // Check NTP eve
 const NTP_BIAS_MAX_PPM: f64 = 100.0;  // Max bias to correct NTP drift (gentle correction)
 const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 
+// Two-phase sync parameters
+const ACQUISITION_FILTER_WEIGHT: f64 = 0.7;  // Fast filter: 0.7 new + 0.3 old
+const PRODUCTION_FILTER_WEIGHT: f64 = 0.3;   // Slow filter: 0.3 new + 0.7 old
+const ACQUISITION_MAX_PPM: f64 = 500.0;      // Aggressive during acquisition
+const PRODUCTION_MAX_PPM: f64 = 50.0;        // Gentle during production (avoid audio glitches)
+const ACQUISITION_STABLE_COUNT: usize = 5;   // Require 5 stable samples to switch to production
+const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 10.0;  // Drift must be stable within 10 PPM
+
 pub struct PtpController<C, N, S>
 where
     C: SystemClock,
@@ -74,6 +82,11 @@ where
     last_ntp_check: Instant,
     ntp_bias_ppm: f64,            // Bias to slowly correct NTP drift
     last_ntp_offset_ms: f64,      // Last measured NTP offset
+
+    // Two-phase sync (acquisition -> production)
+    in_production_mode: bool,
+    stable_drift_count: usize,    // Count of stable drift samples
+    last_drift_for_stability: f64,
 }
 
 struct PendingSync {
@@ -100,8 +113,10 @@ where
         info!("Filter Config: WindowSize={}, MinDelta={}ns",
               config.filters.sample_window_size,
               config.filters.min_delta_ns);
-        info!("NTP Check: Every {}s, Bias threshold: {}ms, Max bias: ±{} PPM",
+        info!("NTP Check: Every {}s, Bias threshold: {}ms, Max bias: +/-{} PPM",
               NTP_CHECK_INTERVAL.as_secs(), NTP_BIAS_THRESHOLD_MS, NTP_BIAS_MAX_PPM);
+        info!("Two-Phase Sync: Acquisition(max {} PPM, filter {}) -> Production(max {} PPM, filter {})",
+              ACQUISITION_MAX_PPM, ACQUISITION_FILTER_WEIGHT, PRODUCTION_MAX_PPM, PRODUCTION_FILTER_WEIGHT);
         info!("Calibration: {} samples ({})",
               config.filters.calibration_samples,
               if config.filters.calibration_samples > 0 { "enabled" } else { "disabled" });
@@ -143,6 +158,10 @@ where
             last_ntp_check: now,
             ntp_bias_ppm: 0.0,
             last_ntp_offset_ms: 0.0,
+            // Two-phase sync
+            in_production_mode: false,
+            stable_drift_count: 0,
+            last_drift_for_stability: 0.0,
         }
     }
 
@@ -212,7 +231,7 @@ where
 
             let factor = 1.0 + (self.last_adj_ppm / 1_000_000.0);
 
-            info!("[Status] {} | PTP Offset: {:.1}µs | NTP Offset: {:.1}ms | Drift: {:.1}ppm | Bias: {:.1}ppm | Factor: {:.9}",
+            info!("[Status] {} | PTP Offset: {:.1}us | NTP Offset: {:.1}ms | Drift: {:.1}ppm | Bias: {:.1}ppm | Factor: {:.9}",
                 action_str, phase_offset_us, self.last_ntp_offset_ms,
                 self.measured_drift_ppm, self.ntp_bias_ppm, factor);
         }
@@ -476,8 +495,8 @@ where
                 // Detect if there's a bimodal distribution (second boundary crossing)
                 let bimodal = spread_us > 100_000.0; // > 100ms spread suggests boundary crossing
 
-                debug!("[Window] Samples(µs): {:?}", window_us.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
-                debug!("[Window] Min={:.1}µs, Max={:.1}µs, Mean={:.1}µs, Spread={:.1}µs {}",
+                debug!("[Window] Samples(us): {:?}", window_us.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
+                debug!("[Window] Min={:.1}us, Max={:.1}us, Mean={:.1}us, Spread={:.1}us {}",
                        min_us, max_us, mean_us, spread_us,
                        if bimodal { "(BIMODAL - boundary crossing detected)" } else { "" });
 
@@ -499,12 +518,35 @@ where
                         let offset_change = lucky_offset - self.prev_offset_ns;
                         let raw_drift_ppm = (offset_change as f64 / elapsed_ns) * 1_000_000.0;
 
-                        // Smooth the drift measurement (low-pass filter)
-                        // New = 0.3 * measured + 0.7 * previous
-                        self.measured_drift_ppm = 0.3 * raw_drift_ppm + 0.7 * self.measured_drift_ppm;
+                        // Two-phase filter: aggressive during acquisition, gentle during production
+                        let filter_weight = if self.in_production_mode {
+                            PRODUCTION_FILTER_WEIGHT
+                        } else {
+                            ACQUISITION_FILTER_WEIGHT
+                        };
 
-                        debug!("[Drift] OffsetChange={:.1}µs, Elapsed={:.1}ms, RawDrift={:.1}ppm, SmoothedDrift={:.1}ppm",
-                               offset_change as f64 / 1000.0, elapsed.as_secs_f64() * 1000.0,
+                        // Smooth the drift measurement (low-pass filter)
+                        self.measured_drift_ppm = filter_weight * raw_drift_ppm + (1.0 - filter_weight) * self.measured_drift_ppm;
+
+                        // Check for stability to switch to production mode
+                        if !self.in_production_mode {
+                            let drift_change = (self.measured_drift_ppm - self.last_drift_for_stability).abs();
+                            if drift_change < ACQUISITION_STABLE_THRESHOLD_PPM {
+                                self.stable_drift_count += 1;
+                                if self.stable_drift_count >= ACQUISITION_STABLE_COUNT {
+                                    self.in_production_mode = true;
+                                    info!("[Sync] === SWITCHING TO PRODUCTION MODE === Drift stable at {:.1} PPM",
+                                          self.measured_drift_ppm);
+                                }
+                            } else {
+                                self.stable_drift_count = 0; // Reset if not stable
+                            }
+                            self.last_drift_for_stability = self.measured_drift_ppm;
+                        }
+
+                        let mode_str = if self.in_production_mode { "PROD" } else { "ACQ" };
+                        debug!("[Drift-{}] OffsetChange={:.1}us, Elapsed={:.1}ms, RawDrift={:.1}ppm, SmoothedDrift={:.1}ppm",
+                               mode_str, offset_change as f64 / 1000.0, elapsed.as_secs_f64() * 1000.0,
                                raw_drift_ppm, self.measured_drift_ppm);
                     }
 
@@ -521,8 +563,12 @@ where
                     let ptp_correction = -self.measured_drift_ppm;
                     let total_correction = ptp_correction + self.ntp_bias_ppm;
 
-                    // Clamp total correction to reasonable range
-                    let max_ppm = self.config.servo.max_freq_adj_ppm;
+                    // Two-phase clamping: aggressive during acquisition, gentle during production
+                    let max_ppm = if self.in_production_mode {
+                        PRODUCTION_MAX_PPM
+                    } else {
+                        ACQUISITION_MAX_PPM
+                    };
                     let clamped_correction = total_correction.clamp(-max_ppm, max_ppm);
 
                     self.last_adj_ppm = clamped_correction;
@@ -531,8 +577,9 @@ where
                     let factor = 1.0 + (clamped_correction / 1_000_000.0);
 
                     // Log the correction
-                    info!("[Sync] PTPOffset={:+.1}µs | Drift={:+.1}ppm | NTPBias={:+.1}ppm | Total={:+.1}ppm | Factor={:.9}",
-                          lucky_us, ptp_correction, self.ntp_bias_ppm, clamped_correction, factor);
+                    let mode_str = if self.in_production_mode { "PROD" } else { "ACQ" };
+                    info!("[Sync-{}] Offset={:+.1}us | Drift={:+.1}ppm | Bias={:+.1}ppm | Corr={:+.1}ppm | Factor={:.9}",
+                          mode_str, lucky_us, ptp_correction, self.ntp_bias_ppm, clamped_correction, factor);
 
                     if let Err(e) = self.clock.adjust_frequency(factor) {
                         warn!("Clock adjustment failed: {}", e);
@@ -568,6 +615,10 @@ where
         self.prev_offset_ns = 0;
         self.prev_offset_time = Instant::now();
         self.measured_drift_ppm = 0.0;
+        // Reset two-phase state (go back to acquisition)
+        self.in_production_mode = false;
+        self.stable_drift_count = 0;
+        self.last_drift_for_stability = 0.0;
 
         if let Err(e) = self.network.reset() {
             warn!("Failed to reset network buffers: {}", e);
