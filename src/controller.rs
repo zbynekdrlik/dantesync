@@ -6,7 +6,6 @@ use std::sync::{Arc, RwLock};
 use crate::clock::SystemClock;
 use crate::traits::{NtpSource, PtpNetwork};
 use crate::ptp::{PtpV1Header, PtpV1Control, PtpV1FollowUpBody, PtpV1SyncMessageBody};
-use crate::servo::PiServo;
 use crate::status::SyncStatus;
 use crate::config::SystemConfig;
 #[cfg(unix)]
@@ -14,9 +13,12 @@ use crate::rtc;
 
 const MAX_DELTA_NS: i64 = 2_000_000_000;   // 2s (Hard safety limit)
 const RTC_UPDATE_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+const NTP_CHECK_INTERVAL: Duration = Duration::from_secs(60);   // Check NTP every 60 seconds
+const NTP_BIAS_MAX_PPM: f64 = 100.0;  // Max bias to correct NTP drift (gentle correction)
+const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 
-pub struct PtpController<C, N, S> 
-where 
+pub struct PtpController<C, N, S>
+where
     C: SystemClock,
     N: PtpNetwork,
     S: NtpSource
@@ -24,22 +26,21 @@ where
     clock: C,
     network: N,
     ntp: S,
-    servo: PiServo,
     config: SystemConfig,
-    
+
     // State
     pending_syncs: HashMap<u16, PendingSync>,
     prev_t1_ns: i64,
     prev_t2_ns: i64,
     current_gm_uuid: Option<[u8; 6]>,
-    
+
     // Filtering
     sample_window: Vec<i64>,
-    
+
     // Metrics
     last_phase_offset_ns: i64,
     last_adj_ppm: f64,
-    
+
     // Epoch Alignment
     initial_epoch_offset_ns: i64, // t2 - t1 at first lock
     epoch_aligned: bool,
@@ -62,6 +63,17 @@ where
     // Phase unwrapping (handles second-boundary crossing artifacts)
     prev_raw_phase_ns: i64,
     phase_unwrap_correction_ns: i64,
+
+    // Drift-based frequency lock (replaces PI servo)
+    prev_offset_ns: i64,
+    prev_offset_time: Instant,
+    measured_drift_ppm: f64,      // Current measured drift rate
+    applied_freq_ppm: f64,        // Currently applied frequency correction
+
+    // NTP bias correction (keeps UTC in sync)
+    last_ntp_check: Instant,
+    ntp_bias_ppm: f64,            // Bias to slowly correct NTP drift
+    last_ntp_offset_ms: f64,      // Last measured NTP offset
 }
 
 struct PendingSync {
@@ -70,13 +82,12 @@ struct PendingSync {
 }
 
 impl<C, N, S> PtpController<C, N, S>
-where 
+where
     C: SystemClock,
     N: PtpNetwork,
     S: NtpSource
 {
     pub fn new(clock: C, network: N, ntp: S, status_shared: Arc<RwLock<SyncStatus>>, config: SystemConfig) -> Self {
-        let servo = PiServo::new(config.servo.clone());
         let window_size = config.filters.sample_window_size;
 
         // Determine if calibration is needed (config.filters.calibration_samples > 0)
@@ -84,26 +95,25 @@ where
         let calibration_complete = calibration_count == 0;
 
         // Log configuration at startup
-        info!("=== PTP Controller Initialization ===");
-        info!("Servo Config: Kp={}, Ki={}, MaxFreq={:.0} PPM, MaxIntegral={:.0} PPM",
-              config.servo.kp, config.servo.ki,
-              config.servo.max_freq_adj_ppm, config.servo.max_integral_ppm);
-        info!("Filter Config: StepThreshold={:.1}ms, PanicThreshold={:.1}ms, WindowSize={}, MinDelta={}ns",
-              config.filters.step_threshold_ns as f64 / 1_000_000.0,
-              config.filters.panic_threshold_ns as f64 / 1_000_000.0,
+        info!("=== PTP Controller Initialization (Dual-Loop) ===");
+        info!("Mode: Drift-based frequency lock + NTP UTC correction");
+        info!("Filter Config: WindowSize={}, MinDelta={}ns",
               config.filters.sample_window_size,
               config.filters.min_delta_ns);
+        info!("NTP Check: Every {}s, Bias threshold: {}ms, Max bias: ±{} PPM",
+              NTP_CHECK_INTERVAL.as_secs(), NTP_BIAS_THRESHOLD_MS, NTP_BIAS_MAX_PPM);
         info!("Calibration: {} samples ({})",
               config.filters.calibration_samples,
               if config.filters.calibration_samples > 0 { "enabled" } else { "disabled" });
         info!("PTP Stepping: {}", if config.filters.ptp_stepping_enabled { "enabled" } else { "DISABLED (frequency-only sync)" });
         info!("=== PTP Controller Ready ===");
 
+        let now = Instant::now();
+
         PtpController {
             clock,
             network,
             ntp,
-            servo,
             config,
             pending_syncs: HashMap::new(),
             prev_t1_ns: 0,
@@ -114,7 +124,7 @@ where
             last_adj_ppm: 0.0,
             initial_epoch_offset_ns: 0,
             epoch_aligned: false,
-            last_rtc_update: Instant::now(),
+            last_rtc_update: now,
             valid_count: 0,
             clock_settled: false,
             settling_threshold: 1,
@@ -124,6 +134,15 @@ where
             calibration_complete,
             prev_raw_phase_ns: 0,
             phase_unwrap_correction_ns: 0,
+            // New drift-based fields
+            prev_offset_ns: 0,
+            prev_offset_time: now,
+            measured_drift_ppm: 0.0,
+            applied_freq_ppm: 0.0,
+            // NTP bias fields
+            last_ntp_check: now,
+            ntp_bias_ppm: 0.0,
+            last_ntp_offset_ms: 0.0,
         }
     }
 
@@ -184,17 +203,58 @@ where
         } else {
             let phase_offset_us = self.last_phase_offset_ns as f64 / 1_000.0;
             let action_str = if self.last_adj_ppm.abs() < 0.01 {
-                format!("Locked (Stable)")
+                "Locked (Stable)".to_string()
             } else if self.last_adj_ppm > 0.0 {
                 format!("Speeding up ({:+.3} ppm)", self.last_adj_ppm)
             } else {
                 format!("Slowing down ({:+.3} ppm)", self.last_adj_ppm)
             };
-            
+
             let factor = 1.0 + (self.last_adj_ppm / 1_000_000.0);
 
-            info!("[Status] {} | Phase Offset: {:.3} µs | Factor: {:.9}", 
-                action_str, phase_offset_us, factor);
+            info!("[Status] {} | PTP Offset: {:.1}µs | NTP Offset: {:.1}ms | Drift: {:.1}ppm | Bias: {:.1}ppm | Factor: {:.9}",
+                action_str, phase_offset_us, self.last_ntp_offset_ms,
+                self.measured_drift_ppm, self.ntp_bias_ppm, factor);
+        }
+    }
+
+    /// Check NTP offset and update bias correction
+    pub fn check_ntp_offset(&mut self) {
+        if self.last_ntp_check.elapsed() < NTP_CHECK_INTERVAL {
+            return;
+        }
+        self.last_ntp_check = Instant::now();
+
+        match self.ntp.get_offset() {
+            Ok((offset, sign)) => {
+                let offset_ms = offset.as_secs_f64() * 1000.0 * sign as f64;
+                self.last_ntp_offset_ms = offset_ms;
+
+                // Calculate bias to slowly correct NTP drift
+                // Positive offset means we're ahead, need to slow down (negative bias)
+                // Negative offset means we're behind, need to speed up (positive bias)
+                if offset_ms.abs() > NTP_BIAS_THRESHOLD_MS {
+                    // Proportional bias based on offset magnitude
+                    // Scale: 10ms offset → ~10 PPM bias (will correct in ~1000 seconds)
+                    let raw_bias = -offset_ms * 1.0;  // 1 PPM per ms of offset
+                    self.ntp_bias_ppm = raw_bias.clamp(-NTP_BIAS_MAX_PPM, NTP_BIAS_MAX_PPM);
+
+                    info!("[NTP Check] Offset: {:.1}ms, Applying bias: {:+.1} PPM to correct UTC drift",
+                          offset_ms, self.ntp_bias_ppm);
+                } else {
+                    // Within threshold, reduce bias gradually
+                    self.ntp_bias_ppm *= 0.5;
+                    if self.ntp_bias_ppm.abs() < 0.1 {
+                        self.ntp_bias_ppm = 0.0;
+                    }
+                    debug!("[NTP Check] Offset: {:.1}ms (within threshold), bias: {:+.1} PPM",
+                           offset_ms, self.ntp_bias_ppm);
+                }
+            }
+            Err(e) => {
+                warn!("[NTP Check] Failed to get NTP offset: {}. Keeping current bias: {:+.1} PPM",
+                      e, self.ntp_bias_ppm);
+            }
         }
     }
 
@@ -249,9 +309,8 @@ where
                         if current != new_uuid {
                             info!("Grandmaster changed! Old: {:02X?}, New: {:02X?}", current, new_uuid);
                             self.current_gm_uuid = Some(new_uuid);
-                            info!("Resetting servo filter due to GM change.");
+                            info!("Resetting filter due to GM change.");
                             self.reset_filter();
-                            self.servo.reset();
                         }
                     } else {
                         info!("Locked to Grandmaster: {:02X?}", new_uuid);
@@ -424,20 +483,56 @@ where
 
                 if let Some(&lucky_offset) = self.sample_window.iter().min_by_key(|&&x| x.abs()) {
                     let lucky_us = lucky_offset as f64 / 1000.0;
+                    let now = Instant::now();
 
                     self.last_phase_offset_ns = lucky_offset;
 
-                    // Log before servo calculation
-                    debug!("[LuckyPacket] Selected={:.1}µs (|abs|={:.1}µs)", lucky_us, lucky_us.abs());
+                    // DRIFT-BASED FREQUENCY LOCK
+                    // Calculate drift rate from consecutive offset measurements
+                    let elapsed = now.duration_since(self.prev_offset_time);
+                    let elapsed_ns = elapsed.as_nanos() as f64;
 
-                    let adj_ppm = self.servo.sample(lucky_offset);
-                    self.last_adj_ppm = adj_ppm;
+                    if self.prev_offset_ns != 0 && elapsed_ns > 0.0 {
+                        // Drift = change in offset over time
+                        // If offset is increasing (getting more behind), we need to speed up
+                        // drift_ppm = (offset_change_ns / elapsed_ns) * 1_000_000
+                        let offset_change = lucky_offset - self.prev_offset_ns;
+                        let raw_drift_ppm = (offset_change as f64 / elapsed_ns) * 1_000_000.0;
 
-                    let factor = 1.0 + (adj_ppm / 1_000_000.0);
+                        // Smooth the drift measurement (low-pass filter)
+                        // New = 0.3 * measured + 0.7 * previous
+                        self.measured_drift_ppm = 0.3 * raw_drift_ppm + 0.7 * self.measured_drift_ppm;
 
-                    // Log the servo output and correction
-                    info!("[Sync] Offset={:+.1}µs | Correction={:+.3}ppm | Factor={:.9}",
-                          lucky_us, adj_ppm, factor);
+                        debug!("[Drift] OffsetChange={:.1}µs, Elapsed={:.1}ms, RawDrift={:.1}ppm, SmoothedDrift={:.1}ppm",
+                               offset_change as f64 / 1000.0, elapsed.as_secs_f64() * 1000.0,
+                               raw_drift_ppm, self.measured_drift_ppm);
+                    }
+
+                    // Store current offset for next drift calculation
+                    self.prev_offset_ns = lucky_offset;
+                    self.prev_offset_time = now;
+
+                    // Check NTP and update bias
+                    self.check_ntp_offset();
+
+                    // COMBINE CORRECTIONS:
+                    // 1. PTP drift correction: counter the measured drift rate
+                    // 2. NTP bias: slowly correct absolute UTC offset
+                    let ptp_correction = -self.measured_drift_ppm;
+                    let total_correction = ptp_correction + self.ntp_bias_ppm;
+
+                    // Clamp total correction to reasonable range
+                    let max_ppm = self.config.servo.max_freq_adj_ppm;
+                    let clamped_correction = total_correction.clamp(-max_ppm, max_ppm);
+
+                    self.last_adj_ppm = clamped_correction;
+                    self.applied_freq_ppm = clamped_correction;
+
+                    let factor = 1.0 + (clamped_correction / 1_000_000.0);
+
+                    // Log the correction
+                    info!("[Sync] PTPOffset={:+.1}µs | Drift={:+.1}ppm | NTPBias={:+.1}ppm | Total={:+.1}ppm | Factor={:.9}",
+                          lucky_us, ptp_correction, self.ntp_bias_ppm, clamped_correction, factor);
 
                     if let Err(e) = self.clock.adjust_frequency(factor) {
                         warn!("Clock adjustment failed: {}", e);
@@ -469,6 +564,10 @@ where
         // Reset phase unwrapping state
         self.prev_raw_phase_ns = 0;
         self.phase_unwrap_correction_ns = 0;
+        // Reset drift tracking
+        self.prev_offset_ns = 0;
+        self.prev_offset_time = Instant::now();
+        self.measured_drift_ppm = 0.0;
 
         if let Err(e) = self.network.reset() {
             warn!("Failed to reset network buffers: {}", e);
