@@ -20,8 +20,8 @@ const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 // Two-phase sync parameters - tuned for Windows timestamp jitter
 const ACQUISITION_FILTER_WEIGHT: f64 = 0.2;  // Slower filter: less reactive to jitter
 const PRODUCTION_FILTER_WEIGHT: f64 = 0.05; // Very slow filter for production stability
-const ACQUISITION_MAX_PPM: f64 = 100.0;      // Moderate during acquisition
-const PRODUCTION_MAX_PPM: f64 = 20.0;        // Very gentle during production
+const ACQUISITION_MAX_PPM: f64 = 500.0;      // Allow large corrections during acquisition
+const PRODUCTION_MAX_PPM: f64 = 100.0;       // Allow reasonable corrections in production
 const ACQUISITION_STABLE_COUNT: usize = 3;   // Require 3 stable samples to switch to production
 const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 20.0;  // Allow more variation due to jitter
 
@@ -555,10 +555,14 @@ where
                     // NTP is only used for initial time alignment at startup
                     // self.check_ntp_offset();  // Disabled
 
-                    // FREQUENCY CORRECTION:
-                    // Counter the measured drift rate to lock frequency to Dante master
-                    let ptp_correction = -self.measured_drift_ppm;
-                    let total_correction = ptp_correction;  // No NTP bias
+                    // FREQUENCY CORRECTION with integral action:
+                    // The measured drift is the NET drift after our correction.
+                    // To drive it to zero, we must ACCUMULATE corrections.
+                    // Each sample, add a fraction of measured drift to our running correction.
+                    // This acts like an integral term in a PI controller.
+                    let integral_gain = if self.in_production_mode { 0.3 } else { 0.5 };
+                    self.applied_freq_ppm += -self.measured_drift_ppm * integral_gain;
+                    let total_correction = self.applied_freq_ppm;
 
                     // Two-phase clamping: aggressive during acquisition, gentle during production
                     let max_ppm = if self.in_production_mode {
