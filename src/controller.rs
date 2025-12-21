@@ -38,6 +38,15 @@ const MAX_I_GAIN: f64 = 0.5;                 // Maximum I gain
 const BASELINE_P_GAIN: f64 = 0.005;          // Starting P gain
 const BASELINE_I_GAIN: f64 = 0.1;            // Starting I gain
 
+// Soft dead zone parameters (graduated I-term strength)
+const DEAD_ZONE_INNER_US: f64 = 30.0;        // 0-30µs: no I-term correction (truly locked)
+const DEAD_ZONE_MID_US: f64 = 100.0;         // 30-100µs: 25% I-term strength (gentle correction)
+const DEAD_ZONE_OUTER_US: f64 = 200.0;       // 100-200µs: 50% I-term strength
+                                              // >200µs: full I-term strength
+
+// Rate limiting - max correction change per sample (prevents overshoot)
+const MAX_CORRECTION_CHANGE_PPM: f64 = 2.0;  // Max 2 PPM change per sample (~8 seconds)
+
 pub struct PtpController<C, N, S>
 where
     C: SystemClock,
@@ -608,18 +617,42 @@ where
                     } else {
                         self.adaptive_i_gain * 2.0  // More aggressive in acquisition
                     };
-                    // I-term only active when:
-                    // 1. Drift is significant (> 1 ppm), AND
-                    // 2. Offset is large (> 100us) - prevents oscillation when near target
-                    // This creates a "dead zone" where correction is held when close to target
-                    // The 100us threshold is chosen to be larger than typical jitter amplitude
-                    let i_term = if self.measured_drift_ppm.abs() > 1.0 && offset_us.abs() > 100.0 {
-                        -self.measured_drift_ppm * i_gain
+
+                    // SOFT DEAD ZONE: Graduated I-term strength based on offset magnitude.
+                    // This prevents oscillation when close to target while still allowing
+                    // gentle corrections when drift changes.
+                    //
+                    // Zones:
+                    //   0-30µs:   0% I-term (truly locked, hold correction)
+                    //   30-100µs: 25% I-term (gentle adjustment for small drifts)
+                    //   100-200µs: 50% I-term (moderate adjustment)
+                    //   >200µs:  100% I-term (full correction)
+                    let offset_abs = offset_us.abs();
+                    let i_strength = if offset_abs < DEAD_ZONE_INNER_US {
+                        0.0  // Inner dead zone - no correction
+                    } else if offset_abs < DEAD_ZONE_MID_US {
+                        0.25  // 25% strength
+                    } else if offset_abs < DEAD_ZONE_OUTER_US {
+                        0.50  // 50% strength
                     } else {
-                        0.0  // Hold correction when offset is small or drift is minimal
+                        1.0   // Full strength
                     };
 
-                    let correction_change = p_term + i_term;
+                    let i_term = if self.measured_drift_ppm.abs() > 0.5 {
+                        -self.measured_drift_ppm * i_gain * i_strength
+                    } else {
+                        0.0  // Drift too small to correct
+                    };
+
+                    let raw_correction_change = p_term + i_term;
+
+                    // RATE LIMITING: Prevent correction from changing too fast
+                    // This avoids overshoot when drift suddenly changes
+                    let correction_change = raw_correction_change.clamp(
+                        -MAX_CORRECTION_CHANGE_PPM,
+                        MAX_CORRECTION_CHANGE_PPM
+                    );
+
                     self.applied_freq_ppm += correction_change;
                     let total_correction = self.applied_freq_ppm;
 
@@ -692,10 +725,11 @@ where
 
                     // Log the correction with adaptive gain info
                     let mode_str = if self.in_production_mode { "PROD" } else { "ACQ" };
-                    debug!("[Sync-{}] P={:+.2} I={:+.2} Gains(P={:.4},I={:.3})",
-                           mode_str, p_term, i_term, self.adaptive_p_gain, self.adaptive_i_gain);
-                    info!("[Sync-{}] Offset={:+.1}us | Drift={:+.1}ppm | Correction={:+.1}ppm | Gains(P={:.4},I={:.3})",
-                          mode_str, lucky_us, self.measured_drift_ppm, clamped_correction, self.adaptive_p_gain, self.adaptive_i_gain);
+                    debug!("[Sync-{}] P={:+.2} I={:+.2}*{:.0}% RateLimit={:+.2}->{:+.2}",
+                           mode_str, p_term, i_term / i_strength.max(0.01), i_strength * 100.0,
+                           raw_correction_change, correction_change);
+                    info!("[Sync-{}] Offset={:+.1}us | Drift={:+.1}ppm | Correction={:+.1}ppm | I-str={:.0}%",
+                          mode_str, lucky_us, self.measured_drift_ppm, clamped_correction, i_strength * 100.0);
 
                     if let Err(e) = self.clock.adjust_frequency(factor) {
                         warn!("Clock adjustment failed: {}", e);
