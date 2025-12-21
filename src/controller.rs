@@ -108,13 +108,11 @@ where
         let calibration_complete = calibration_count == 0;
 
         // Log configuration at startup
-        info!("=== PTP Controller Initialization (Dual-Loop) ===");
-        info!("Mode: Drift-based frequency lock + NTP UTC correction");
+        info!("=== PTP Controller Initialization ===");
+        info!("Mode: Dante frequency lock (NTP bias DISABLED)");
         info!("Filter Config: WindowSize={}, MinDelta={}ns",
               config.filters.sample_window_size,
               config.filters.min_delta_ns);
-        info!("NTP Check: Every {}s, Bias threshold: {}ms, Max bias: +/-{} PPM",
-              NTP_CHECK_INTERVAL.as_secs(), NTP_BIAS_THRESHOLD_MS, NTP_BIAS_MAX_PPM);
         info!("Two-Phase Sync: Acquisition(max {} PPM, filter {}) -> Production(max {} PPM, filter {})",
               ACQUISITION_MAX_PPM, ACQUISITION_FILTER_WEIGHT, PRODUCTION_MAX_PPM, PRODUCTION_FILTER_WEIGHT);
         info!("Calibration: {} samples ({})",
@@ -231,9 +229,8 @@ where
 
             let factor = 1.0 + (self.last_adj_ppm / 1_000_000.0);
 
-            info!("[Status] {} | PTP Offset: {:.1}us | NTP Offset: {:.1}ms | Drift: {:.1}ppm | Bias: {:.1}ppm | Factor: {:.9}",
-                action_str, phase_offset_us, self.last_ntp_offset_ms,
-                self.measured_drift_ppm, self.ntp_bias_ppm, factor);
+            info!("[Status] {} | PTP Offset: {:.1}us | Drift: {:.1}ppm | Correction: {:.1}ppm | Factor: {:.9}",
+                action_str, phase_offset_us, self.measured_drift_ppm, self.last_adj_ppm, factor);
         }
     }
 
@@ -554,14 +551,14 @@ where
                     self.prev_offset_ns = lucky_offset;
                     self.prev_offset_time = now;
 
-                    // Check NTP and update bias
-                    self.check_ntp_offset();
+                    // NTP bias is DISABLED - focus purely on Dante frequency lock
+                    // NTP is only used for initial time alignment at startup
+                    // self.check_ntp_offset();  // Disabled
 
-                    // COMBINE CORRECTIONS:
-                    // 1. PTP drift correction: counter the measured drift rate
-                    // 2. NTP bias: slowly correct absolute UTC offset
+                    // FREQUENCY CORRECTION:
+                    // Counter the measured drift rate to lock frequency to Dante master
                     let ptp_correction = -self.measured_drift_ppm;
-                    let total_correction = ptp_correction + self.ntp_bias_ppm;
+                    let total_correction = ptp_correction;  // No NTP bias
 
                     // Two-phase clamping: aggressive during acquisition, gentle during production
                     let max_ppm = if self.in_production_mode {
@@ -578,8 +575,8 @@ where
 
                     // Log the correction
                     let mode_str = if self.in_production_mode { "PROD" } else { "ACQ" };
-                    info!("[Sync-{}] Offset={:+.1}us | Drift={:+.1}ppm | Bias={:+.1}ppm | Corr={:+.1}ppm | Factor={:.9}",
-                          mode_str, lucky_us, ptp_correction, self.ntp_bias_ppm, clamped_correction, factor);
+                    info!("[Sync-{}] Offset={:+.1}us | MeasuredDrift={:+.1}ppm | Correction={:+.1}ppm | Factor={:.9}",
+                          mode_str, lucky_us, self.measured_drift_ppm, clamped_correction, factor);
 
                     if let Err(e) = self.clock.adjust_frequency(factor) {
                         warn!("Clock adjustment failed: {}", e);
