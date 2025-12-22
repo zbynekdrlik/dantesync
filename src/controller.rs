@@ -21,7 +21,7 @@ const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 const ACQUISITION_FILTER_WEIGHT: f64 = 0.2;  // Slower filter: less reactive to jitter
 const PRODUCTION_FILTER_WEIGHT: f64 = 0.05; // Very slow filter for production stability
 const ACQUISITION_MAX_PPM: f64 = 200.0;      // Allow large corrections during acquisition
-const PRODUCTION_MAX_PPM: f64 = 50.0;        // Conservative corrections in production
+const PRODUCTION_MAX_PPM: f64 = 200.0;       // Same max - rate limiting handles stability
 const ACQUISITION_STABLE_COUNT: usize = 3;   // Require 3 stable samples to switch to production
 const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 20.0;  // Allow more variation due to jitter
 
