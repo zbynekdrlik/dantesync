@@ -10,3 +10,6 @@ pub mod config;
 
 #[cfg(unix)]
 pub mod rtc;
+
+// Note: net_pcap module exists but is not used - Npcap timestamps use monotonic
+// clock that doesn't respect system clock steps, making it unsuitable for PTP.

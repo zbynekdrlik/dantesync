@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::Parser;
 use log::{info, warn, error};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -500,8 +500,9 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
 
     #[cfg(windows)]
     let network = {
-        // Use UDP sockets directly on Windows (no pcap buffering)
-        // This eliminates the variable latency from pcap's internal buffer
+        // Use standard UDP sockets on Windows with multicast join
+        // Note: Npcap timestamps use monotonic clock that doesn't respect clock steps,
+        // making it unsuitable for PTP sync. Socket-based approach provides better results.
         let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
         let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
         info!("Joined multicast groups on {} ({}) using UDP sockets", iface_name, iface_ip);
