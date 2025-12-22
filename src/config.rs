@@ -40,7 +40,7 @@ impl Default for SystemConfig {
                 filters: FilterConfig {
                     step_threshold_ns: 1_000_000, // 1ms - step if offset exceeds this
                     panic_threshold_ns: 10_000_000, // 10ms - initial step threshold
-                    sample_window_size: 32, // Larger window to filter Windows jitter
+                    sample_window_size: 8, // 8 samples = ~2 sec feedback (was 32 = ~8 sec, too slow)
                     min_delta_ns: 0,
                     calibration_samples: 0,
                     ptp_stepping_enabled: true, // Enable stepping to achieve <50us offset

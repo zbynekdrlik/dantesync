@@ -45,7 +45,10 @@ const DEAD_ZONE_OUTER_US: f64 = 200.0;       // 100-200µs: 50% I-term strength
                                               // >200µs: full I-term strength
 
 // Rate limiting - max correction change per sample (prevents overshoot)
-const MAX_CORRECTION_CHANGE_PPM: f64 = 2.0;  // Max 2 PPM change per sample (~8 seconds)
+// Acquisition: fast convergence, allow large corrections
+// Production: gentle corrections to maintain stability
+const ACQUISITION_MAX_CORRECTION_CHANGE_PPM: f64 = 50.0;  // Fast: up to 50 PPM per sample
+const PRODUCTION_MAX_CORRECTION_CHANGE_PPM: f64 = 2.0;    // Gentle: max 2 PPM per sample
 
 pub struct PtpController<C, N, S>
 where
@@ -619,16 +622,17 @@ where
                     };
 
                     // SOFT DEAD ZONE: Graduated I-term strength based on offset magnitude.
-                    // This prevents oscillation when close to target while still allowing
-                    // gentle corrections when drift changes.
+                    // Only applied in PRODUCTION mode - acquisition uses full strength for fast convergence.
                     //
-                    // Zones:
+                    // Production zones:
                     //   0-30µs:   0% I-term (truly locked, hold correction)
                     //   30-100µs: 25% I-term (gentle adjustment for small drifts)
                     //   100-200µs: 50% I-term (moderate adjustment)
                     //   >200µs:  100% I-term (full correction)
                     let offset_abs = offset_us.abs();
-                    let i_strength = if offset_abs < DEAD_ZONE_INNER_US {
+                    let i_strength = if !self.in_production_mode {
+                        1.0  // Acquisition: full strength for fast convergence
+                    } else if offset_abs < DEAD_ZONE_INNER_US {
                         0.0  // Inner dead zone - no correction
                     } else if offset_abs < DEAD_ZONE_MID_US {
                         0.25  // 25% strength
@@ -647,11 +651,14 @@ where
                     let raw_correction_change = p_term + i_term;
 
                     // RATE LIMITING: Prevent correction from changing too fast
-                    // This avoids overshoot when drift suddenly changes
-                    let correction_change = raw_correction_change.clamp(
-                        -MAX_CORRECTION_CHANGE_PPM,
-                        MAX_CORRECTION_CHANGE_PPM
-                    );
+                    // Acquisition: allow large changes for fast convergence
+                    // Production: gentle changes to maintain stability
+                    let max_change = if self.in_production_mode {
+                        PRODUCTION_MAX_CORRECTION_CHANGE_PPM
+                    } else {
+                        ACQUISITION_MAX_CORRECTION_CHANGE_PPM
+                    };
+                    let correction_change = raw_correction_change.clamp(-max_change, max_change);
 
                     self.applied_freq_ppm += correction_change;
                     let total_correction = self.applied_freq_ppm;
