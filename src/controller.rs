@@ -20,15 +20,16 @@ const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 // Two-phase sync parameters
 const ACQUISITION_FILTER_WEIGHT: f64 = 0.2;  // Slower filter: less reactive to jitter
 const PRODUCTION_FILTER_WEIGHT: f64 = 0.05; // Very slow filter for production stability
-const ACQUISITION_MAX_PPM: f64 = 200.0;      // Allow large corrections during acquisition
-const PRODUCTION_MAX_PPM: f64 = 200.0;       // Same max - rate limiting handles stability
-const ACQUISITION_STABLE_COUNT: usize = 3;   // Require 3 stable samples to switch to production
-const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 20.0;  // Allow more variation due to jitter
+const ACQUISITION_MAX_PPM: f64 = 500.0;      // Allow large corrections during acquisition
+const PRODUCTION_MAX_PPM: f64 = 200.0;       // Gentler in production mode
+const ACQUISITION_STABLE_COUNT: usize = 5;   // Require 5 stable samples before production
+const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 10.0;  // Require tight drift stability
+const PRODUCTION_ENTRY_OFFSET_US: i64 = 50;  // Require <50µs offset before production mode
 
 // Adaptive gain tuning parameters
 const ADAPTIVE_HISTORY_SIZE: usize = 10;     // Number of samples to track for oscillation detection
 const OSCILLATION_SIGN_CHANGES: usize = 3;   // Sign changes in history that indicate oscillation
-const STABLE_OFFSET_THRESHOLD_US: f64 = 100.0; // Offset threshold to consider stable (microseconds)
+const STABLE_OFFSET_THRESHOLD_US: f64 = 50.0; // Offset threshold to consider stable (<50µs for 96kHz)
 const GAIN_DECREASE_FACTOR: f64 = 0.7;       // Multiply gains by this when oscillating
 const GAIN_INCREASE_FACTOR: f64 = 1.1;       // Multiply gains by this when stable
 const MIN_P_GAIN: f64 = 0.0005;              // Minimum P gain
@@ -39,16 +40,17 @@ const BASELINE_P_GAIN: f64 = 0.005;          // Starting P gain
 const BASELINE_I_GAIN: f64 = 0.1;            // Starting I gain
 
 // Soft dead zone parameters (graduated I-term strength)
-const DEAD_ZONE_INNER_US: f64 = 30.0;        // 0-30µs: no I-term correction (truly locked)
-const DEAD_ZONE_MID_US: f64 = 100.0;         // 30-100µs: 25% I-term strength (gentle correction)
-const DEAD_ZONE_OUTER_US: f64 = 200.0;       // 100-200µs: 50% I-term strength
-                                              // >200µs: full I-term strength
+// Tuned for 96kHz audio where 1 sample = 10.4µs
+const DEAD_ZONE_INNER_US: f64 = 10.0;        // 0-10µs: no I-term correction (truly locked, <1 sample)
+const DEAD_ZONE_MID_US: f64 = 30.0;          // 10-30µs: 25% I-term strength (~3 samples)
+const DEAD_ZONE_OUTER_US: f64 = 50.0;        // 30-50µs: 50% I-term strength (~5 samples)
+                                              // >50µs: full I-term strength
 
 // Rate limiting - max correction change per sample (prevents overshoot)
 // Acquisition: fast convergence, allow large corrections
-// Production: gentle corrections to maintain stability
+// Production: more aggressive on Windows due to timestamp jitter
 const ACQUISITION_MAX_CORRECTION_CHANGE_PPM: f64 = 50.0;  // Fast: up to 50 PPM per sample
-const PRODUCTION_MAX_CORRECTION_CHANGE_PPM: f64 = 2.0;    // Gentle: max 2 PPM per sample
+const PRODUCTION_MAX_CORRECTION_CHANGE_PPM: f64 = 10.0;   // 10 PPM per sample (increased for Windows jitter)
 
 pub struct PtpController<C, N, S>
 where
@@ -569,10 +571,10 @@ where
                         self.measured_drift_ppm = filter_weight * raw_drift_ppm + (1.0 - filter_weight) * self.measured_drift_ppm;
 
                         // Check for stability to switch to production mode
-                        // Requirements: 1) drift is stable, AND 2) offset is small
+                        // Requirements: 1) drift is stable, AND 2) offset is small (<50µs for 96kHz audio)
                         if !self.in_production_mode {
                             let drift_change = (self.measured_drift_ppm - self.last_drift_for_stability).abs();
-                            let offset_small = lucky_offset.abs() < 200_000; // < 200µs
+                            let offset_small = lucky_offset.abs() < (PRODUCTION_ENTRY_OFFSET_US * 1000); // Use constant
 
                             if drift_change < ACQUISITION_STABLE_THRESHOLD_PPM && offset_small {
                                 self.stable_drift_count += 1;

@@ -28,29 +28,25 @@ impl Default for SystemConfig {
     fn default() -> Self {
         #[cfg(windows)]
         {
-            // WINDOWS FREQUENCY ADJUSTMENT LIMITATION:
-            // Both SetSystemTimeAdjustment (legacy 32-bit) and SetSystemTimeAdjustmentPrecise (64-bit)
-            // APIs accept frequency adjustment values but have ZERO effect on actual clock speed on
-            // most Windows systems. Testing shows: requested +50 PPM often results in observed -50 PPM.
-            // This is a known Windows limitation - the APIs exist but the kernel doesn't honor them.
-            //
-            // SOLUTION: Use PTP stepping for all convergence. Frequency adjustment serves only as
-            // a "best effort" assist. The stepping mechanism maintains ±200µs accuracy between steps.
+            // WINDOWS CONFIGURATION
+            // Uses SetSystemTimeAdjustmentPrecise for frequency adjustment (with inverted sign).
+            // Frequency adjustment IS working - use stepping only for initial alignment (>50ms offset)
+            // and as fallback if offset exceeds 5ms during operation.
             SystemConfig {
                 servo: ServoConfig {
-                    kp: 0.005,   // Low gain - frequency adjustment has minimal effect
-                    ki: 0.0005,  // Low integral - prevents runaway since freq adj doesn't work
-                    max_freq_adj_ppm: 10_000.0,  // Allow large values (won't hurt, API ignores them)
-                    max_integral_ppm: 5_000.0,
+                    kp: 0.0005,   // Same as Linux - P gain for offset correction
+                    ki: 0.00005,  // Same as Linux - I gain for drift correction
+                    max_freq_adj_ppm: 500.0,    // Same as Linux
+                    max_integral_ppm: 100.0,    // Same as Linux
                 },
                 filters: FilterConfig {
-                    // Stepping is the PRIMARY correction mechanism on Windows
-                    step_threshold_ns: 1_500_000, // 1.5ms - step when offset exceeds this
-                    panic_threshold_ns: 5_000_000, // 5ms - initial coarse step threshold
-                    sample_window_size: 8, // 8 samples for lucky packet filter
-                    min_delta_ns: 0,
+                    // Match Linux configuration for comparable results
+                    step_threshold_ns: 5_000_000,  // 5ms - only step if freq adjustment can't keep up
+                    panic_threshold_ns: 50_000_000, // 50ms - initial coarse step threshold
+                    sample_window_size: 4, // 4 samples like Linux
+                    min_delta_ns: 0, // No minimum (Windows timestamps are less precise)
                     calibration_samples: 0,
-                    ptp_stepping_enabled: true, // CRITICAL: Must be true - only way to converge on Windows
+                    ptp_stepping_enabled: true, // Enable stepping for initial alignment and large drifts
                 },
             }
         }

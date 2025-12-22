@@ -16,7 +16,7 @@ serde_json = "1.0"
 
 [package]
 name = "dantetimesync"
-version = "1.2.29"
+version = "1.4.0"
 edition = "2021"
 
 [target.'cfg(windows)'.dependencies]
@@ -58,3 +58,19 @@ path = "src/main.rs"
 [[bin]]
 name = "dantetray"
 path = "src/bin/tray.rs"
+
+[[bin]]
+name = "clocktest"
+path = "src/bin/clocktest.rs"
+
+[[bin]]
+name = "timetest"
+path = "src/bin/timetest.rs"
+
+[[bin]]
+name = "recvtest"
+path = "src/bin/recvtest.rs"
+
+[[bin]]
+name = "ptplog"
+path = "src/bin/ptplog.rs"

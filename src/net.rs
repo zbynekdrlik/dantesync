@@ -1,7 +1,6 @@
 use anyhow::{Result, anyhow};
 use socket2::{Socket, Domain, Type, Protocol};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use nix::sys::socket::{setsockopt, sockopt};

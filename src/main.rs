@@ -560,7 +560,12 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
         if let Err(e) = controller.process_loop_iteration() {
             warn!("Error in loop: {}", e);
         }
-        
+
+        // On Windows, use tight polling for lower jitter (50µs = ~5% CPU)
+        // On Linux, 1ms is fine since we use kernel timestamps
+        #[cfg(windows)]
+        thread::sleep(Duration::from_micros(50));
+        #[cfg(not(windows))]
         thread::sleep(Duration::from_millis(1));
     }
 
