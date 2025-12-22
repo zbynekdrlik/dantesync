@@ -18,12 +18,12 @@ const NTP_BIAS_MAX_PPM: f64 = 100.0;  // Max bias to correct NTP drift (gentle c
 const NTP_BIAS_THRESHOLD_MS: f64 = 5.0;  // Start correcting if NTP offset > 5ms
 
 // Two-phase sync parameters
-const ACQUISITION_FILTER_WEIGHT: f64 = 0.2;  // Slower filter: less reactive to jitter
-const PRODUCTION_FILTER_WEIGHT: f64 = 0.05; // Very slow filter for production stability
+const ACQUISITION_FILTER_WEIGHT: f64 = 0.1;  // Gentler filter: reduces noise in drift estimate
+const PRODUCTION_FILTER_WEIGHT: f64 = 0.03; // Very slow filter for production stability
 const ACQUISITION_MAX_PPM: f64 = 500.0;      // Allow large corrections during acquisition
 const PRODUCTION_MAX_PPM: f64 = 200.0;       // Gentler in production mode
 const ACQUISITION_STABLE_COUNT: usize = 5;   // Require 5 stable samples before production
-const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 10.0;  // Require tight drift stability
+const ACQUISITION_STABLE_THRESHOLD_PPM: f64 = 15.0;  // Slightly relaxed for Windows jitter
 const PRODUCTION_ENTRY_OFFSET_US: i64 = 50;  // Require <50µs offset before production mode
 
 // Adaptive gain tuning parameters
@@ -34,10 +34,10 @@ const GAIN_DECREASE_FACTOR: f64 = 0.7;       // Multiply gains by this when osci
 const GAIN_INCREASE_FACTOR: f64 = 1.1;       // Multiply gains by this when stable
 const MIN_P_GAIN: f64 = 0.0005;              // Minimum P gain
 const MAX_P_GAIN: f64 = 0.05;                // Maximum P gain
-const MIN_I_GAIN: f64 = 0.02;                // Minimum I gain
-const MAX_I_GAIN: f64 = 0.5;                 // Maximum I gain
+const MIN_I_GAIN: f64 = 0.01;                // Minimum I gain
+const MAX_I_GAIN: f64 = 0.2;                 // Maximum I gain
 const BASELINE_P_GAIN: f64 = 0.005;          // Starting P gain
-const BASELINE_I_GAIN: f64 = 0.1;            // Starting I gain
+const BASELINE_I_GAIN: f64 = 0.05;           // Starting I gain (moderate for Windows)
 
 // Soft dead zone parameters (graduated I-term strength)
 // Tuned for 96kHz audio where 1 sample = 10.4µs
@@ -516,33 +516,43 @@ where
                 }
             }
 
-            // LUCKY PACKET FILTER LOGIC
+            // LUCKY PACKET FILTER LOGIC with SPIKE REJECTION
             self.sample_window.push(phase_offset_ns);
 
             if self.sample_window.len() >= self.config.filters.sample_window_size {
-                // Select the offset with minimum absolute value.
-                // This handles second-boundary crossing artifacts where measurements
-                // can flip between e.g. +300ms and -700ms due to T1/T2 crossing
-                // different second boundaries.
-
                 // Log sample window contents for diagnostics
                 let window_us: Vec<f64> = self.sample_window.iter()
                     .map(|&x| x as f64 / 1000.0)
                     .collect();
                 let min_us = window_us.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max_us = window_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let mean_us: f64 = window_us.iter().sum::<f64>() / window_us.len() as f64;
                 let spread_us = max_us - min_us;
 
-                // Detect if there's a bimodal distribution (second boundary crossing)
-                let bimodal = spread_us > 100_000.0; // > 100ms spread suggests boundary crossing
+                // Calculate median for spike rejection
+                let mut sorted_window = self.sample_window.clone();
+                sorted_window.sort_by_key(|&x| x.abs());
+                let median_offset = sorted_window[sorted_window.len() / 2];
+                let median_us = median_offset as f64 / 1000.0;
 
-                debug!("[Window] Samples(us): {:?}", window_us.iter().map(|x| format!("{:.1}", x)).collect::<Vec<_>>());
-                debug!("[Window] Min={:.1}us, Max={:.1}us, Mean={:.1}us, Spread={:.1}us {}",
-                       min_us, max_us, mean_us, spread_us,
-                       if bimodal { "(BIMODAL - boundary crossing detected)" } else { "" });
+                // Spike rejection: remove samples that deviate >200µs from median
+                // This filters network jitter spikes while keeping valid measurements
+                const SPIKE_THRESHOLD_NS: i64 = 200_000; // 200µs
+                let filtered: Vec<i64> = self.sample_window.iter()
+                    .filter(|&&x| (x - median_offset).abs() < SPIKE_THRESHOLD_NS)
+                    .copied()
+                    .collect();
 
-                if let Some(&lucky_offset) = self.sample_window.iter().min_by_key(|&&x| x.abs()) {
+                let rejected_count = self.sample_window.len() - filtered.len();
+                debug!("[Filter] Window: min={:.1}us max={:.1}us median={:.1}us spread={:.1}us rejected={}",
+                       min_us, max_us, median_us, spread_us, rejected_count);
+
+                // Use MEDIAN instead of minimum for stability (more robust to jitter)
+                // Minimum is too easily pulled by occasional network delay spikes
+                let candidates = if filtered.len() >= 2 { filtered } else { self.sample_window.clone() };
+                let mut sorted_candidates = candidates;
+                sorted_candidates.sort();
+                let lucky_offset = sorted_candidates[sorted_candidates.len() / 2];
+                {
                     let lucky_us = lucky_offset as f64 / 1000.0;
                     let now = Instant::now();
 
@@ -619,14 +629,14 @@ where
                     let p_gain = if self.in_production_mode {
                         self.adaptive_p_gain
                     } else {
-                        self.adaptive_p_gain * 2.0  // More aggressive in acquisition
+                        self.adaptive_p_gain * 1.5  // Moderately more aggressive in acquisition
                     };
                     let p_term = -offset_us * p_gain;
 
                     let i_gain = if self.in_production_mode {
                         self.adaptive_i_gain
                     } else {
-                        self.adaptive_i_gain * 2.0  // More aggressive in acquisition
+                        self.adaptive_i_gain  // No boost - Windows jitter needs gentle I-term
                     };
 
                     // SOFT DEAD ZONE: Graduated I-term strength based on offset magnitude.

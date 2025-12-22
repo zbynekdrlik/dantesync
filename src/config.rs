@@ -40,10 +40,10 @@ impl Default for SystemConfig {
                     max_integral_ppm: 100.0,    // Same as Linux
                 },
                 filters: FilterConfig {
-                    // Match Linux configuration for comparable results
+                    // Windows needs much larger sample window due to high timestamp jitter
                     step_threshold_ns: 5_000_000,  // 5ms - only step if freq adjustment can't keep up
                     panic_threshold_ns: 50_000_000, // 50ms - initial coarse step threshold
-                    sample_window_size: 4, // 4 samples like Linux
+                    sample_window_size: 16, // 16 samples with median selection for jitter rejection
                     min_delta_ns: 0, // No minimum (Windows timestamps are less precise)
                     calibration_samples: 0,
                     ptp_stepping_enabled: true, // Enable stepping for initial alignment and large drifts
