@@ -566,17 +566,20 @@ where
                         self.measured_drift_ppm = filter_weight * raw_drift_ppm + (1.0 - filter_weight) * self.measured_drift_ppm;
 
                         // Check for stability to switch to production mode
+                        // Requirements: 1) drift is stable, AND 2) offset is small
                         if !self.in_production_mode {
                             let drift_change = (self.measured_drift_ppm - self.last_drift_for_stability).abs();
-                            if drift_change < ACQUISITION_STABLE_THRESHOLD_PPM {
+                            let offset_small = lucky_offset.abs() < 200_000; // < 200µs
+
+                            if drift_change < ACQUISITION_STABLE_THRESHOLD_PPM && offset_small {
                                 self.stable_drift_count += 1;
                                 if self.stable_drift_count >= ACQUISITION_STABLE_COUNT {
                                     self.in_production_mode = true;
-                                    info!("[Sync] === SWITCHING TO PRODUCTION MODE === Drift stable at {:.1} PPM",
-                                          self.measured_drift_ppm);
+                                    info!("[Sync] === SWITCHING TO PRODUCTION MODE === Drift={:.1}ppm, Offset={:.1}us",
+                                          self.measured_drift_ppm, lucky_offset as f64 / 1000.0);
                                 }
                             } else {
-                                self.stable_drift_count = 0; // Reset if not stable
+                                self.stable_drift_count = 0; // Reset if not stable or offset too large
                             }
                             self.last_drift_for_stability = self.measured_drift_ppm;
                         }
