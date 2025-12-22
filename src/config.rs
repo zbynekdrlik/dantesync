@@ -38,12 +38,14 @@ impl Default for SystemConfig {
                     max_integral_ppm: 5_000.0,
                 },
                 filters: FilterConfig {
-                    step_threshold_ns: 1_000_000, // 1ms - step if offset exceeds this
-                    panic_threshold_ns: 10_000_000, // 10ms - initial step threshold
-                    sample_window_size: 8, // 8 samples = ~2 sec feedback (was 32 = ~8 sec, too slow)
+                    // Windows SetSystemTimeAdjustment has limited effect (~6 PPM max actual change)
+                    // So we rely on stepping more aggressively for convergence
+                    step_threshold_ns: 500_000, // 500µs - step if offset exceeds this (lower for faster convergence)
+                    panic_threshold_ns: 2_000_000, // 2ms - initial step threshold
+                    sample_window_size: 8, // 8 samples = ~2 sec feedback
                     min_delta_ns: 0,
                     calibration_samples: 0,
-                    ptp_stepping_enabled: true, // Enable stepping to achieve <50us offset
+                    ptp_stepping_enabled: true, // Enable stepping - critical for Windows due to API limits
                 },
             }
         }
