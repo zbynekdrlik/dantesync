@@ -27,9 +27,14 @@ ARCH=$(uname -m)
 SKIP_BUILD=false
 
 if [ "$ARCH" == "x86_64" ]; then
-    echo ">>> Detected x86_64 architecture. Attempting to download latest release..."
+    echo ">>> Detected x86_64 architecture. Fetching latest release..."
+
+    # Get release version from GitHub API
+    RELEASE_VERSION=$(curl -sL https://api.github.com/repos/zbynekdrlik/dantetimesync/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || echo "latest")
+    echo ">>> Installing Version: $RELEASE_VERSION"
+
     DOWNLOAD_URL="https://github.com/zbynekdrlik/dantetimesync/releases/latest/download/dantetimesync-linux-amd64"
-    
+
     if curl --fail -L -o dantetimesync_bin "$DOWNLOAD_URL"; then
         echo ">>> Download successful."
         

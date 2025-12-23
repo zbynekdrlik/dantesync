@@ -58,7 +58,7 @@ const MAX_DELTA_NS: i64 = 2_000_000_000;  // 2s - reject obviously invalid delta
 // ==========================================================================
 
 // Acquisition phase (fast convergence)
-const P_GAIN_ACQ: f64 = 0.3;              // Moderate P-term during acquisition (prevents oscillation)
+const P_GAIN_ACQ: f64 = 0.5;              // Faster P-term during acquisition
 const P_MAX_ACQ_PPM: f64 = 200.0;         // Limit to prevent wild swings
 
 // Production phase (gentle stability)

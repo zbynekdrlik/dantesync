@@ -40,7 +40,7 @@ impl Default for SystemConfig {
 
         // Platform-specific values
         #[cfg(windows)]
-        let (calibration, min_delta) = (10, 0_i64);  // Windows: calibrate pcap, accept all samples
+        let (calibration, min_delta) = (3, 0_i64);  // Windows: quick calibration (3 samples ≈ 3s), accept all samples
         #[cfg(not(windows))]
         let (calibration, min_delta) = (0, 1_000_000_i64);  // Linux: no calibration, 1ms rate limit
 
@@ -97,7 +97,7 @@ mod tests {
         // Platform-specific values
         #[cfg(windows)]
         {
-            assert_eq!(config.filters.calibration_samples, 10);
+            assert_eq!(config.filters.calibration_samples, 3);  // Quick calibration
             assert_eq!(config.filters.min_delta_ns, 0);
         }
         #[cfg(not(windows))]

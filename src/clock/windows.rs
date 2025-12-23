@@ -218,9 +218,9 @@ impl WindowsClock {
                 if observed_ppm.abs() < 10.0 { 1.0 } else { 0.0 }
             };
 
-            // Log every 10 seconds worth of measurements
+            // Log every 10 seconds worth of measurements (debug level - matches Linux simplicity)
             if elapsed.as_secs() >= 10 {
-                info!("[FreqMeasure] Elapsed: {:.1}s | Requested: {:+.1} PPM | Observed: {:+.1} PPM | Effectiveness: {:.0}%",
+                debug!("[FreqMeasure] Elapsed: {:.1}s | Requested: {:+.1} PPM | Observed: {:+.1} PPM | Effectiveness: {:.0}%",
                       wall_time_ns / 1_000_000_000.0, self.last_requested_ppm, observed_ppm, effectiveness * 100.0);
 
                 if effectiveness.abs() < 0.3 && self.last_requested_ppm.abs() > 10.0 {
@@ -248,19 +248,12 @@ impl SystemClock for WindowsClock {
 
         self.adjustment_count += 1;
 
-        // Calculate deltas for logging
+        // Calculate delta for logging
         let delta_from_nominal = new_adj as i64 - self.original_increment as i64;
-        let delta_from_last = new_adj as i64 - self.last_adjustment as i64;
 
-        // Log every adjustment with full details
-        let log_detailed = self.adjustment_count % 10 == 1 || delta_from_last.abs() > 100;
-
-        if log_detailed {
-            info!("[FreqAdj #{}] Requested: {:+.3} PPM | Adj: {} → {} (Δ{:+} from nominal)",
-                  self.adjustment_count, ppm, self.last_adjustment, new_adj, delta_from_nominal);
-        } else {
-            debug!("[FreqAdj #{}] {:+.3} PPM | Adj={}", self.adjustment_count, ppm, new_adj);
-        }
+        // Log adjustments at debug level (matches Linux simplicity)
+        debug!("[FreqAdj #{}] {:+.3} PPM | Adj: {} → {} (Δ{:+} from nominal)",
+               self.adjustment_count, ppm, self.last_adjustment, new_adj, delta_from_nominal);
 
         unsafe {
             // Apply adjustment

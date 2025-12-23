@@ -9,3 +9,4 @@ The following nodes must be updated and verified after every successful CI/CD ru
 | strih.lan | 10.77.9.202 | Windows | newlevel | newlevel | Verified (Console) |
 | stream.lan | 10.77.9.204 | Windows | newlevel | newlevel | Verified (Console) |
 | ableton-foh | 10.77.9.230 | Windows | ableton-foh | newlevel | Pending |
+| mbc.lan | 10.77.9.232 | Windows | newlevel | newlevel | Pending |
