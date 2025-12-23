@@ -96,10 +96,22 @@ Write-Host "Disabling Windows Time service (W32Time)..."
 Stop-Service -Name "W32Time" -Force -ErrorAction SilentlyContinue
 Set-Service -Name "W32Time" -StartupType Disabled -ErrorAction SilentlyContinue
 
-# Kill processes forcefully to release file locks
+# Kill processes - try graceful close for tray first to avoid ghost icons
 Write-Host "Checking for running processes..."
 Stop-Process -Name "dantetimesync" -Force -ErrorAction SilentlyContinue
-Stop-Process -Name "dantetray" -Force -ErrorAction SilentlyContinue
+
+# Gracefully close dantetray by sending close message to its window
+$trayProc = Get-Process -Name "dantetray" -ErrorAction SilentlyContinue
+if ($trayProc) {
+    Write-Host "  - Closing tray application gracefully..."
+    # Try to close main window first (allows cleanup of tray icon)
+    $trayProc.CloseMainWindow() | Out-Null
+    Start-Sleep -Seconds 2
+    # If still running, force kill
+    if (!$trayProc.HasExited) {
+        Stop-Process -Name "dantetray" -Force -ErrorAction SilentlyContinue
+    }
+}
 Start-Sleep -Seconds 1
 
 # 5. Download Files
@@ -173,11 +185,35 @@ if (Test-Path $TrayPath) {
         Write-Warning "Failed to add machine-wide registry entry: $_"
     }
 
-    # Start it now if not running
+    # Start tray in user's interactive session (works over SSH/remote)
+    # Using scheduled task ensures it runs on the logged-in user's desktop
     $TrayProcess = Get-Process -Name "dantetray" -ErrorAction SilentlyContinue
     if (!$TrayProcess) {
-        Write-Host "Starting Tray App..."
-        Start-Process -FilePath $TrayPath
+        Write-Host "Starting Tray App in interactive session..."
+
+        # Get the currently logged-in user
+        $LoggedInUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
+        if ($LoggedInUser) {
+            # Create a one-time scheduled task to run immediately in user's session
+            $TrayTaskName = "DanteTrayStart"
+            Unregister-ScheduledTask -TaskName $TrayTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+            $Action = New-ScheduledTaskAction -Execute $TrayPath
+            $Principal = New-ScheduledTaskPrincipal -UserId $LoggedInUser -LogonType Interactive -RunLevel Limited
+            $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+            Register-ScheduledTask -TaskName $TrayTaskName -Action $Action -Principal $Principal -Settings $Settings -Force | Out-Null
+            Start-ScheduledTask -TaskName $TrayTaskName -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+
+            # Clean up the one-time task
+            Unregister-ScheduledTask -TaskName $TrayTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "    Tray started for user: $LoggedInUser" -ForegroundColor Gray
+        } else {
+            # Fallback: try direct start (works if running interactively)
+            Write-Host "    No interactive user detected, starting directly..."
+            Start-Process -FilePath $TrayPath -ErrorAction SilentlyContinue
+        }
     } else {
         Write-Host "Tray App is already running."
     }
