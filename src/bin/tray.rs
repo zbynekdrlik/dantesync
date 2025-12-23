@@ -232,12 +232,13 @@ mod app {
         let yellow_icon = generate_icon(255, 193, 7); // Warning Yellow - Acquiring
         let cyan_icon = generate_icon(0, 188, 212);   // Cyan - NANO mode (ultra-precise)
 
-        let tray_icon = TrayIconBuilder::new()
+        // Wrap in RefCell so we can explicitly drop it on exit to clean up tray icon
+        let tray_icon = RefCell::new(Some(TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
             .with_tooltip("Dante Time Sync - Connecting...")
             .with_icon(yellow_icon.clone())
             .build()
-            .unwrap();
+            .unwrap()));
 
         // Spawn poller thread... (kept same)
         std::thread::spawn(move || {
@@ -401,8 +402,10 @@ mod app {
                             let status_text = format!("{} | Drift: {}", mode_str, drift_str);
                             let mode_text = format!("Mode: {} | Adj: {:+.1}ppm", mode_str, status.drift_ppm);
 
-                            let _ = tray_icon.set_icon(Some(icon));
-                            let _ = tray_icon.set_tooltip(Some(tooltip));
+                            if let Some(ref ti) = *tray_icon.borrow() {
+                                let _ = ti.set_icon(Some(icon));
+                                let _ = ti.set_tooltip(Some(tooltip));
+                            }
                             status_i.set_text(status_text);
                             mode_i.set_text(mode_text);
                         }
@@ -420,8 +423,10 @@ mod app {
                                 state.was_locked = false;
                             }
 
-                            let _ = tray_icon.set_icon(Some(red_icon.clone()));
-                            let _ = tray_icon.set_tooltip(Some(format!("Dante Time Sync v{}\nService Offline", version)));
+                            if let Some(ref ti) = *tray_icon.borrow() {
+                                let _ = ti.set_icon(Some(red_icon.clone()));
+                                let _ = ti.set_tooltip(Some(format!("Dante Time Sync v{}\nService Offline", version)));
+                            }
                             status_i.set_text("Service Offline".to_string());
                             mode_i.set_text("--".to_string());
                         }
@@ -430,6 +435,8 @@ mod app {
                 _ => {
                     if let Ok(event) = menu_channel.try_recv() {
                         if event.id == quit_i.id() {
+                            // Explicitly drop tray icon to clean up system tray
+                            tray_icon.borrow_mut().take();
                             elwt.exit();
                         } else if event.id == restart_i.id() {
                             // Restart service using PowerShell (requires elevation)
