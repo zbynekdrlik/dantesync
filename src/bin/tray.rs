@@ -16,6 +16,50 @@ mod app {
     use std::time::Duration;
     use std::cell::RefCell;
     use winrt_notification::{Toast, Sound};
+    use windows::Win32::Foundation::{HANDLE, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::PCWSTR;
+
+    // ========================================================================
+    // SINGLE INSTANCE CHECK - Prevent multiple tray apps
+    // ========================================================================
+
+    struct SingleInstanceGuard {
+        _handle: HANDLE,
+    }
+
+    impl SingleInstanceGuard {
+        /// Try to acquire single-instance lock. Returns None if another instance is running.
+        fn try_acquire() -> Option<Self> {
+            unsafe {
+                let mutex_name: Vec<u16> = "Global\\DanteTrayMutex\0".encode_utf16().collect();
+                let handle = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()));
+
+                match handle {
+                    Ok(h) => {
+                        // Check if mutex already existed
+                        if let Err(e) = GetLastError() {
+                            if e.code() == ERROR_ALREADY_EXISTS.to_hresult() {
+                                // Another instance is running - close handle and return None
+                                let _ = CloseHandle(h);
+                                return None;
+                            }
+                        }
+                        Some(SingleInstanceGuard { _handle: h })
+                    }
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+
+    impl Drop for SingleInstanceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self._handle);
+            }
+        }
+    }
 
     // ========================================================================
     // SYNC STATUS - Extended struct matching service
@@ -138,6 +182,15 @@ mod app {
     // ========================================================================
 
     pub fn main() {
+        // Single-instance check - exit silently if another instance is running
+        let _guard = match SingleInstanceGuard::try_acquire() {
+            Some(guard) => guard,
+            None => {
+                // Another instance is already running - exit silently
+                return;
+            }
+        };
+
         let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build().unwrap();
         let proxy = event_loop.create_proxy();
 
