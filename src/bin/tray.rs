@@ -110,6 +110,7 @@ mod app {
     #[derive(Default)]
     struct NotificationState {
         was_locked: bool,
+        was_nano: bool,
         was_online: bool,
         first_update: bool,
     }
@@ -229,6 +230,7 @@ mod app {
         let red_icon = generate_icon(220, 53, 69);    // Danger Red - Offline
         let green_icon = generate_icon(40, 167, 69);  // Success Green - Locked
         let yellow_icon = generate_icon(255, 193, 7); // Warning Yellow - Acquiring
+        let cyan_icon = generate_icon(0, 188, 212);   // Cyan - NANO mode (ultra-precise)
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
@@ -300,14 +302,29 @@ mod app {
                             {
                                 let mut state = notification_state.borrow_mut();
 
-                                // Check for lock state changes (skip first update)
+                                let is_nano = status.mode == "NANO";
+
+                                // Check for state changes (skip first update)
                                 if !state.first_update {
-                                    if status.is_locked && !state.was_locked {
+                                    // NANO mode transitions
+                                    if is_nano && !state.was_nano {
+                                        show_notification(
+                                            "Dante Time Sync",
+                                            "NANO mode - ultra-precise sync achieved"
+                                        );
+                                    } else if !is_nano && state.was_nano {
+                                        show_notification(
+                                            "Dante Time Sync",
+                                            "Exited NANO mode"
+                                        );
+                                    }
+                                    // Lock state changes (only if not NANO transition)
+                                    else if status.is_locked && !state.was_locked {
                                         show_notification(
                                             "Dante Time Sync",
                                             "Frequency locked - sync achieved"
                                         );
-                                    } else if !status.is_locked && state.was_locked {
+                                    } else if !status.is_locked && state.was_locked && !is_nano {
                                         show_notification(
                                             "Dante Time Sync",
                                             "Lock lost - reacquiring..."
@@ -324,19 +341,30 @@ mod app {
                                 }
 
                                 state.was_locked = status.is_locked;
+                                state.was_nano = is_nano;
                                 state.was_online = true;
                                 state.first_update = false;
                             }
 
                             // ================================================
-                            // ICON SELECTION - Based on lock state and drift
+                            // ICON SELECTION - Based on mode and drift
                             // ================================================
 
                             // Calculate pulse intensity from drift rate (0-1 range)
                             // Higher drift rate = more visible ring
                             let pulse_intensity = (status.smoothed_rate_ppm.abs() / 20.0).min(1.0) as f32;
 
-                            let icon = if status.is_locked {
+                            let is_nano = status.mode == "NANO";
+                            let icon = if is_nano {
+                                // NANO mode: Cyan - ultra-precise sync
+                                // Very small pulse since drift is minimal in NANO
+                                let nano_pulse = (status.smoothed_rate_ppm.abs() / 5.0).min(1.0) as f32;
+                                if nano_pulse > 0.1 {
+                                    generate_icon_with_ring(0, 188, 212, nano_pulse)
+                                } else {
+                                    cyan_icon.clone()
+                                }
+                            } else if status.is_locked {
                                 // Locked: Green with optional ring if there's drift
                                 if pulse_intensity > 0.1 {
                                     generate_icon_with_ring(40, 167, 69, pulse_intensity)
