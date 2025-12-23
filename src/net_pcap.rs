@@ -96,7 +96,7 @@ impl NpcapPtpNetwork {
         info!("[TS] Requesting HostHighPrec timestamps (KeQuerySystemTimePrecise)");
 
         let capture = Capture::from_device(device.clone())?
-            .promisc(true)         // Required to see multicast traffic
+            .promisc(false)        // Don't use promiscuous - rely on IGMP multicast join
             .immediate_mode(true)  // Critical: disable buffering for lowest latency
             .snaplen(256)          // PTP packets are small
             .timeout(1)            // 1ms timeout for responsiveness
