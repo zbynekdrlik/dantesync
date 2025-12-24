@@ -21,6 +21,18 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 // ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/// Format a 6-byte UUID/MAC as a readable string (e.g., "00:1D:C1:AB:CD:EF")
+fn format_mac(uuid: &[u8; 6]) -> String {
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]
+    )
+}
+
+// ============================================================================
 // CONSTANTS - Organized by functional area
 // ============================================================================
 
@@ -113,6 +125,8 @@ where
     prev_t1_ns: i64,
     prev_t2_ns: i64,
     current_gm_uuid: Option<[u8; 6]>,
+    /// The source UUID of the device sending Sync messages (may differ from grandmaster_clock_uuid)
+    current_sync_source: Option<[u8; 6]>,
 
     // Sample filtering
     sample_window: Vec<i64>,
@@ -233,6 +247,7 @@ where
             prev_t1_ns: 0,
             prev_t2_ns: 0,
             current_gm_uuid: None,
+            current_sync_source: None,
             sample_window: Vec::with_capacity(window_size),
             last_phase_offset_ns: 0,
             last_adj_ppm: 0.0,
@@ -430,6 +445,27 @@ where
     // ========================================================================
 
     fn handle_sync_message(&mut self, header: &PtpV1Header, buf: &[u8], t2: SystemTime) {
+        // Check if Sync source changed (different device sending PTP)
+        let source_uuid = header.source_uuid;
+        match self.current_sync_source {
+            Some(current) if current != source_uuid => {
+                warn!(
+                    ">>> SYNC SOURCE CHANGED: {} -> {} - Resetting to ACQ mode <<<",
+                    format_mac(&current),
+                    format_mac(&source_uuid)
+                );
+                self.current_sync_source = Some(source_uuid);
+                // Clear pending syncs from old source to avoid stale data
+                self.pending_syncs.clear();
+                self.reset_filter();
+            }
+            None => {
+                info!("Sync source: {}", format_mac(&source_uuid));
+                self.current_sync_source = Some(source_uuid);
+            }
+            _ => {}
+        }
+
         self.pending_syncs.insert(
             header.sequence_id,
             PendingSync {
@@ -442,12 +478,20 @@ where
             let new_uuid = body.grandmaster_clock_uuid;
             match self.current_gm_uuid {
                 Some(current) if current != new_uuid => {
-                    info!("Grandmaster changed: {:02X?} -> {:02X?}", current, new_uuid);
+                    warn!(
+                        ">>> GRANDMASTER UUID CHANGED: {} -> {} <<<",
+                        format_mac(&current),
+                        format_mac(&new_uuid)
+                    );
                     self.current_gm_uuid = Some(new_uuid);
-                    self.reset_filter();
+                    // Already reset by sync source change above, but ensure it happens
+                    if self.current_sync_source.is_some() {
+                        self.pending_syncs.clear();
+                        self.reset_filter();
+                    }
                 }
                 None => {
-                    info!("Locked to Grandmaster: {:02X?}", new_uuid);
+                    info!("Grandmaster UUID: {}", format_mac(&new_uuid));
                     self.current_gm_uuid = Some(new_uuid);
                 }
                 _ => {}
@@ -933,6 +977,7 @@ where
         self.in_production_mode = false;
         self.in_nano_mode = false;
         self.nano_sustain_count = 0;
+        self.nano_exit_count = 0;
         self.applied_freq_ppm = 0.0;
         self.last_offset_us = None;
         self.last_offset_time = None;
