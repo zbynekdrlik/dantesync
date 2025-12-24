@@ -1483,8 +1483,14 @@ mod tests {
             controller.sample_window.is_empty(),
             "Soft reset should clear sample_window"
         );
-        assert_eq!(controller.prev_t1_ns, 0, "Soft reset should clear prev_t1_ns");
-        assert_eq!(controller.prev_t2_ns, 0, "Soft reset should clear prev_t2_ns");
+        assert_eq!(
+            controller.prev_t1_ns, 0,
+            "Soft reset should clear prev_t1_ns"
+        );
+        assert_eq!(
+            controller.prev_t2_ns, 0,
+            "Soft reset should clear prev_t2_ns"
+        );
     }
 
     #[test]
@@ -1618,13 +1624,7 @@ mod tests {
             (hard_controller.applied_freq_ppm - 0.0).abs() < 0.01,
             "Hard reset clears frequency to 0"
         );
-        assert!(
-            soft_controller.is_locked,
-            "Soft reset stays locked"
-        );
-        assert!(
-            !hard_controller.is_locked,
-            "Hard reset loses lock"
-        );
+        assert!(soft_controller.is_locked, "Soft reset stays locked");
+        assert!(!hard_controller.is_locked, "Hard reset loses lock");
     }
 }
