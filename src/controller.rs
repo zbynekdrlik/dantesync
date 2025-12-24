@@ -450,14 +450,24 @@ where
         match self.current_sync_source {
             Some(current) if current != source_uuid => {
                 warn!(
-                    ">>> SYNC SOURCE CHANGED: {} -> {} - Resetting to ACQ mode <<<",
+                    ">>> SYNC SOURCE CHANGED: {} -> {} <<<",
                     format_mac(&current),
                     format_mac(&source_uuid)
                 );
                 self.current_sync_source = Some(source_uuid);
-                // Clear pending syncs from old source to avoid stale data
+                // Soft reset: clear stale data but KEEP current frequency
+                // Both Dante devices should have similar frequencies since they're
+                // synchronized to the same grandmaster time
                 self.pending_syncs.clear();
-                self.reset_filter();
+                self.sample_window.clear();
+                self.prev_t1_ns = 0;
+                self.prev_t2_ns = 0;
+                // Keep: applied_freq_ppm, drift_baseline_ppm (learned values)
+                // Stay in production mode - let servo naturally adjust if needed
+                info!(
+                    "Soft reset: keeping freq={:.1}ppm, drift_baseline={:.1}ppm",
+                    self.applied_freq_ppm, self.drift_baseline_ppm
+                );
             }
             None => {
                 info!("Sync source: {}", format_mac(&source_uuid));
@@ -484,11 +494,7 @@ where
                         format_mac(&new_uuid)
                     );
                     self.current_gm_uuid = Some(new_uuid);
-                    // Already reset by sync source change above, but ensure it happens
-                    if self.current_sync_source.is_some() {
-                        self.pending_syncs.clear();
-                        self.reset_filter();
-                    }
+                    // Note: sync source change already did soft reset if needed
                 }
                 None => {
                     info!("Grandmaster UUID: {}", format_mac(&new_uuid));
@@ -961,6 +967,9 @@ where
         }
     }
 
+    /// Full filter reset - currently unused but kept for edge cases
+    /// (major NTP step correction, config reload, etc.)
+    #[allow(dead_code)]
     fn reset_filter(&mut self) {
         self.valid_count = 0;
         self.clock_settled = false;
