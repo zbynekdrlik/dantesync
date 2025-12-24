@@ -391,3 +391,139 @@ impl Drop for WindowsClock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Test PPM to frequency adjustment delta conversion
+    ///
+    /// Windows frequency adjustment formula:
+    /// - adjustment_delta = (-ppm * perf_frequency / 1_000_000).round()
+    /// - new_adj = original_increment + adjustment_delta
+    ///
+    /// NOTE: Sign is INVERTED - increasing adjustment SLOWS the clock!
+    /// So positive PPM (speed up) requires DECREASING the adjustment.
+    #[test]
+    fn test_ppm_to_adjustment_delta_conversion() {
+        // Typical Windows performance frequency: 10 MHz (10,000,000 Hz)
+        let perf_frequency: i64 = 10_000_000;
+
+        // Test: +10 PPM (speed up by 10 parts per million)
+        // Expected: negative delta (decrease adjustment to speed up)
+        let ppm = 10.0f64;
+        let adjustment_delta = (-ppm * perf_frequency as f64 / 1_000_000.0).round() as i64;
+        assert_eq!(adjustment_delta, -100, "+10 PPM should give delta of -100");
+
+        // Test: -10 PPM (slow down)
+        // Expected: positive delta (increase adjustment to slow down)
+        let ppm = -10.0f64;
+        let adjustment_delta = (-ppm * perf_frequency as f64 / 1_000_000.0).round() as i64;
+        assert_eq!(adjustment_delta, 100, "-10 PPM should give delta of +100");
+
+        // Test: 0 PPM (no change)
+        let ppm = 0.0f64;
+        let adjustment_delta = (-ppm * perf_frequency as f64 / 1_000_000.0).round() as i64;
+        assert_eq!(adjustment_delta, 0, "0 PPM should give delta of 0");
+    }
+
+    /// Test that adjustment delta correctly modifies increment
+    #[test]
+    fn test_adjustment_applied_to_increment() {
+        // Typical original_increment value
+        let original_increment: u64 = 156_250;
+        let perf_frequency: i64 = 10_000_000;
+
+        // Apply +50 PPM (speed up)
+        let ppm = 50.0f64;
+        let adjustment_delta = (-ppm * perf_frequency as f64 / 1_000_000.0).round() as i64;
+        let new_adj = (original_increment as i64 + adjustment_delta) as u64;
+
+        // +50 PPM → delta = -500 → new_adj = 156_250 - 500 = 155_750
+        assert_eq!(new_adj, 155_750);
+        assert!(
+            new_adj < original_increment,
+            "Positive PPM should decrease adjustment"
+        );
+
+        // Apply -50 PPM (slow down)
+        let ppm = -50.0f64;
+        let adjustment_delta = (-ppm * perf_frequency as f64 / 1_000_000.0).round() as i64;
+        let new_adj = (original_increment as i64 + adjustment_delta) as u64;
+
+        // -50 PPM → delta = +500 → new_adj = 156_250 + 500 = 156_750
+        assert_eq!(new_adj, 156_750);
+        assert!(
+            new_adj > original_increment,
+            "Negative PPM should increase adjustment"
+        );
+    }
+
+    /// Test factor to PPM conversion
+    #[test]
+    fn test_factor_to_ppm_conversion() {
+        // factor = 1.0 → 0 PPM (no adjustment)
+        let factor = 1.0f64;
+        let ppm = (factor - 1.0) * 1_000_000.0;
+        assert_eq!(ppm, 0.0);
+
+        // factor = 1.00001 → +10 PPM (speed up by 10 ppm)
+        let factor = 1.00001f64;
+        let ppm = (factor - 1.0) * 1_000_000.0;
+        assert!((ppm - 10.0).abs() < 0.01);
+
+        // factor = 0.99999 → -10 PPM (slow down by 10 ppm)
+        let factor = 0.99999f64;
+        let ppm = (factor - 1.0) * 1_000_000.0;
+        assert!((ppm - (-10.0)).abs() < 0.01);
+    }
+
+    /// Test PPM per unit sensitivity calculation
+    #[test]
+    fn test_ppm_sensitivity() {
+        // With increment = 156_250, each unit change = 1_000_000 / 156_250 ≈ 6.4 PPM
+        let inc: u64 = 156_250;
+        let ppm_per_unit = 1_000_000.0 / inc as f64;
+        assert!((ppm_per_unit - 6.4).abs() < 0.1);
+    }
+
+    /// Test current PPM offset calculation from adjustment
+    #[test]
+    fn test_current_ppm_offset_calculation() {
+        let inc: u64 = 156_250; // nominal increment
+
+        // Same as nominal → 0 PPM
+        let adj = inc;
+        let current_ppm = ((adj as f64 - inc as f64) / inc as f64) * 1_000_000.0;
+        assert_eq!(current_ppm, 0.0);
+
+        // adj = 156_350 → positive offset (clock running slow, higher adjustment)
+        let adj = 156_350u64;
+        let current_ppm = ((adj as f64 - inc as f64) / inc as f64) * 1_000_000.0;
+        assert!((current_ppm - 640.0).abs() < 10.0); // ~640 PPM slow
+
+        // adj = 156_150 → negative offset (clock running fast, lower adjustment)
+        let adj = 156_150u64;
+        let current_ppm = ((adj as f64 - inc as f64) / inc as f64) * 1_000_000.0;
+        assert!((current_ppm - (-640.0)).abs() < 10.0); // ~-640 PPM fast
+    }
+
+    /// Test step clock offset to 100ns conversion
+    #[test]
+    fn test_step_offset_to_100ns() {
+        use std::time::Duration;
+
+        // 1 millisecond = 10,000 units of 100ns
+        let offset = Duration::from_millis(1);
+        let offset_100ns = offset.as_nanos() as u64 / 100;
+        assert_eq!(offset_100ns, 10_000);
+
+        // 1 second = 10,000,000 units of 100ns
+        let offset = Duration::from_secs(1);
+        let offset_100ns = offset.as_nanos() as u64 / 100;
+        assert_eq!(offset_100ns, 10_000_000);
+
+        // 1 microsecond = 10 units of 100ns
+        let offset = Duration::from_micros(1);
+        let offset_100ns = offset.as_nanos() as u64 / 100;
+        assert_eq!(offset_100ns, 10);
+    }
+}

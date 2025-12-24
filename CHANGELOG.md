@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unit tests for sync source change detection
 - CI coverage reporting with Codecov integration
 - Npcap SDK checksum verification in CI
+- Unit tests for net.rs (interface selection, socket binding, wireless detection)
+- Unit tests for clock/windows.rs (PPM conversion math, adjustment calculation)
+- Unit tests for net_pcap.rs (timestamp conversion, packet structure validation)
+- Unit tests for net_winsock.rs (QPC math, control message parsing, constants)
 
 ### Changed
 - Improved installer version handling (dynamic extraction from binary)

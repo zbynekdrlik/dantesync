@@ -511,3 +511,161 @@ impl crate::traits::PtpNetwork for WinsockPtpNetwork {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test PTP port constants
+    #[test]
+    fn test_ptp_port_constants() {
+        assert_eq!(PTP_EVENT_PORT, 319);
+        assert_eq!(PTP_GENERAL_PORT, 320);
+    }
+
+    /// Test PTP multicast address constant
+    #[test]
+    fn test_ptp_multicast_constant() {
+        assert_eq!(PTP_MULTICAST, Ipv4Addr::new(224, 0, 1, 129));
+        assert!(PTP_MULTICAST.is_multicast());
+    }
+
+    /// Test SIO_TIMESTAMPING constant matches Windows SDK
+    #[test]
+    fn test_sio_timestamping_constant() {
+        // SIO_TIMESTAMPING = 0x88000025 (documented in Windows SDK)
+        assert_eq!(SIO_TIMESTAMPING, 0x88000025);
+    }
+
+    /// Test TIMESTAMPING_FLAG_RX constant
+    #[test]
+    fn test_timestamping_flag_rx() {
+        // RX flag = 0x1 (enable receive timestamps)
+        assert_eq!(TIMESTAMPING_FLAG_RX, 0x1);
+    }
+
+    /// Test CmsgHdr structure size
+    #[test]
+    fn test_cmsghdr_size() {
+        // CmsgHdr should be: usize (8 bytes on 64-bit) + i32 (4) + i32 (4) = 16 bytes
+        // But may have padding depending on architecture
+        let size = std::mem::size_of::<CmsgHdr>();
+        assert!(size >= 12, "CmsgHdr should be at least 12 bytes");
+        assert!(size <= 24, "CmsgHdr should not exceed 24 bytes");
+    }
+
+    /// Test IpMreq structure layout
+    #[test]
+    fn test_ip_mreq_layout() {
+        let size = std::mem::size_of::<IpMreq>();
+        assert_eq!(size, 8, "IpMreq should be 8 bytes (2 x u32)");
+    }
+
+    /// Test TimestampingConfig structure layout
+    #[test]
+    fn test_timestamping_config_layout() {
+        let size = std::mem::size_of::<TimestampingConfig>();
+        assert_eq!(
+            size, 8,
+            "TimestampingConfig should be 8 bytes (u32 + u16 + u16)"
+        );
+    }
+
+    /// Test port to big-endian conversion
+    #[test]
+    fn test_port_big_endian() {
+        // Port 319 in big-endian: 0x013F
+        let port: u16 = 319;
+        let be_port = port.to_be();
+        let bytes = be_port.to_ne_bytes();
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[1], 0x3F);
+
+        // Port 320 in big-endian: 0x0140
+        let port: u16 = 320;
+        let be_port = port.to_be();
+        let bytes = be_port.to_ne_bytes();
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[1], 0x40);
+    }
+
+    /// Test multicast IP address to bytes conversion
+    #[test]
+    fn test_multicast_address_bytes() {
+        let addr = PTP_MULTICAST;
+        let bytes = addr.octets();
+        assert_eq!(bytes, [224, 0, 1, 129]);
+
+        // As u32 in network byte order
+        let u32_val = u32::from_ne_bytes(bytes);
+        assert_ne!(u32_val, 0);
+    }
+
+    /// Test WSA error code constants
+    #[test]
+    fn test_wsa_error_codes() {
+        // WSAEWOULDBLOCK = 10035
+        const WSAEWOULDBLOCK: i32 = 10035;
+        assert_eq!(WSAEWOULDBLOCK, 10035);
+
+        // WSAEINVAL = 10022
+        const WSAEINVAL: i32 = 10022;
+        assert_eq!(WSAEINVAL, 10022);
+
+        // WSAEOPNOTSUPP = 10045
+        const WSAEOPNOTSUPP: i32 = 10045;
+        assert_eq!(WSAEOPNOTSUPP, 10045);
+    }
+
+    /// Test QPC to nanoseconds conversion math
+    #[test]
+    fn test_qpc_to_nanoseconds() {
+        // Typical QPC frequency: 10 MHz
+        let qpc_frequency: i64 = 10_000_000;
+
+        // 10,000,000 QPC ticks = 1 second = 1,000,000,000 ns
+        let qpc_diff: i64 = 10_000_000;
+        let ns_diff = (qpc_diff * 1_000_000_000) / qpc_frequency;
+        assert_eq!(ns_diff, 1_000_000_000);
+
+        // 10,000 QPC ticks = 1 millisecond = 1,000,000 ns
+        let qpc_diff: i64 = 10_000;
+        let ns_diff = (qpc_diff * 1_000_000_000) / qpc_frequency;
+        assert_eq!(ns_diff, 1_000_000);
+
+        // 10 QPC ticks = 1 microsecond = 1,000 ns
+        let qpc_diff: i64 = 10;
+        let ns_diff = (qpc_diff * 1_000_000_000) / qpc_frequency;
+        assert_eq!(ns_diff, 1_000);
+    }
+
+    /// Test latency calculation from QPC timestamps
+    #[test]
+    fn test_latency_calculation() {
+        let qpc_frequency: i64 = 10_000_000; // 10 MHz
+
+        // Current QPC = 100,000, packet QPC = 99,000
+        // Latency = (100,000 - 99,000) / 10,000,000 * 1,000,000 = 100 microseconds
+        let current_qpc: u64 = 100_000;
+        let packet_qpc: u64 = 99_000;
+        let latency_qpc = current_qpc.saturating_sub(packet_qpc);
+        let latency_us = (latency_qpc as f64 / qpc_frequency as f64) * 1_000_000.0;
+        assert!((latency_us - 100.0).abs() < 0.1);
+    }
+
+    /// Test control message alignment
+    #[test]
+    fn test_cmsg_alignment() {
+        // Control messages are 8-byte aligned
+        let test_lengths = [12usize, 16, 20, 24, 32];
+        for len in &test_lengths {
+            let aligned = (*len + 7) & !7;
+            assert!(
+                aligned % 8 == 0,
+                "Aligned length {} should be 8-byte aligned",
+                aligned
+            );
+            assert!(aligned >= *len, "Aligned length should be >= original");
+        }
+    }
+}

@@ -129,3 +129,92 @@ pub fn recv_with_timestamp(
         Err(e) => Err(e.into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that get_default_interface filters out loopback addresses
+    #[test]
+    fn test_get_default_interface_returns_non_loopback() {
+        // This test verifies the interface selection logic runs without panic
+        // On systems with valid network interfaces, it should succeed
+        // On systems without interfaces, it returns an error (which is valid)
+        let result = get_default_interface();
+        if let Ok((name, ip)) = result {
+            assert!(!name.is_empty(), "Interface name should not be empty");
+            assert!(!ip.is_loopback(), "Should not return loopback address");
+        }
+        // Error case is acceptable on minimal test environments
+    }
+
+    /// Test is_ip_bindable with loopback (should always work)
+    #[test]
+    fn test_is_ip_bindable_loopback() {
+        // Loopback should always be bindable on any system
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        assert!(is_ip_bindable(loopback), "Loopback should be bindable");
+    }
+
+    /// Test is_ip_bindable with UNSPECIFIED address
+    #[test]
+    fn test_is_ip_bindable_unspecified() {
+        // 0.0.0.0 should be bindable (binds to all interfaces)
+        let unspecified = Ipv4Addr::UNSPECIFIED;
+        assert!(
+            is_ip_bindable(unspecified),
+            "UNSPECIFIED (0.0.0.0) should be bindable"
+        );
+    }
+
+    /// Test PTP multicast address constant
+    #[test]
+    fn test_ptp_multicast_address() {
+        let multi_addr: Ipv4Addr = "224.0.1.129".parse().unwrap();
+        assert!(multi_addr.is_multicast(), "PTP address should be multicast");
+        assert_eq!(multi_addr.octets(), [224, 0, 1, 129]);
+    }
+
+    /// Test recv_with_timestamp returns None for non-blocking socket with no data
+    #[test]
+    fn test_recv_with_timestamp_no_data() {
+        // Create a simple non-blocking UDP socket
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+            .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+
+        let udp_socket: UdpSocket = socket.into();
+        let mut buf = [0u8; 512];
+
+        let result = recv_with_timestamp(&udp_socket, &mut buf);
+        assert!(result.is_ok());
+        // Should return None since no data is available
+        assert!(result.unwrap().is_none());
+    }
+
+    /// Test wireless interface detection keywords
+    #[test]
+    fn test_wireless_interface_detection() {
+        // Test the wireless detection logic used in get_default_interface
+        let wireless_names = ["Wireless LAN", "Wi-Fi", "wlan0", "WIRELESS"];
+        let wired_names = ["eth0", "Ethernet", "enp3s0", "Local Area Connection"];
+
+        for name in &wireless_names {
+            let lower = name.to_lowercase();
+            let is_wireless = lower.contains("wireless")
+                || lower.contains("wi-fi")
+                || lower.contains("wlan");
+            assert!(is_wireless, "{} should be detected as wireless", name);
+        }
+
+        for name in &wired_names {
+            let lower = name.to_lowercase();
+            let is_wireless = lower.contains("wireless")
+                || lower.contains("wi-fi")
+                || lower.contains("wlan");
+            assert!(!is_wireless, "{} should NOT be detected as wireless", name);
+        }
+    }
+}

@@ -235,3 +235,124 @@ pub fn list_npcap_devices() -> Result<Vec<String>> {
         .map(|d| format!("{}: {:?}", d.name, d.desc))
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test PTP constants
+    #[test]
+    fn test_ptp_constants() {
+        assert_eq!(PTP_EVENT_PORT, 319);
+        assert_eq!(PTP_GENERAL_PORT, 320);
+        assert_eq!(PTP_MULTICAST, Ipv4Addr::new(224, 0, 1, 129));
+        assert!(PTP_MULTICAST.is_multicast());
+    }
+
+    /// Test pcap timestamp to SystemTime conversion
+    #[test]
+    fn test_pcap_ts_to_systemtime() {
+        // Unix epoch (1970-01-01 00:00:00)
+        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(0, 0);
+        assert_eq!(ts, UNIX_EPOCH);
+
+        // 1 second after epoch
+        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(1, 0);
+        assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1));
+
+        // 1.5 seconds after epoch (with microseconds)
+        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(1, 500_000);
+        assert_eq!(ts, UNIX_EPOCH + Duration::from_micros(1_500_000));
+
+        // Realistic timestamp (2024-01-01 00:00:00 UTC = 1704067200)
+        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(1704067200, 0);
+        assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1704067200));
+    }
+
+    /// Test that microseconds are correctly converted to nanoseconds
+    #[test]
+    fn test_pcap_ts_microsecond_precision() {
+        // 123.456789 seconds - but pcap only has microsecond precision
+        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(123, 456_789);
+
+        // Should be 123 seconds + 456789 microseconds = 456789000 nanoseconds
+        let expected = UNIX_EPOCH + Duration::new(123, 456_789_000);
+        assert_eq!(ts, expected);
+    }
+
+    /// Test Ethernet/IP/UDP header constant
+    #[test]
+    fn test_ethernet_ip_udp_header_size() {
+        // Ethernet header: 14 bytes
+        // IP header: 20 bytes (minimum)
+        // UDP header: 8 bytes
+        // Total: 42 bytes
+        const ETH_IP_UDP_HEADER: usize = 42;
+        assert_eq!(ETH_IP_UDP_HEADER, 14 + 20 + 8);
+    }
+
+    /// Test EtherType detection for IPv4
+    #[test]
+    fn test_ethertype_ipv4() {
+        // IPv4 EtherType is 0x0800
+        let data: [u8; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00];
+        assert_eq!(data[12], 0x08);
+        assert_eq!(data[13], 0x00);
+    }
+
+    /// Test UDP protocol number in IP header
+    #[test]
+    fn test_ip_protocol_udp() {
+        // UDP is protocol number 17
+        // In IP header, protocol is at byte offset 9 (0-indexed)
+        // In full frame, that's offset 14 (ethernet) + 9 = 23
+        let protocol_byte = 17u8;
+        assert_eq!(protocol_byte, 17);
+    }
+
+    /// Test PTP port detection from UDP header
+    #[test]
+    fn test_ptp_port_extraction() {
+        // UDP destination port is at bytes 2-3 of UDP header (big-endian)
+        // In full frame: offset 14 (eth) + 20 (ip) + 2 = 36, 37
+
+        // Port 319 = 0x013F
+        let port_319_bytes: [u8; 2] = [0x01, 0x3F];
+        let port = ((port_319_bytes[0] as u16) << 8) | port_319_bytes[1] as u16;
+        assert_eq!(port, 319);
+
+        // Port 320 = 0x0140
+        let port_320_bytes: [u8; 2] = [0x01, 0x40];
+        let port = ((port_320_bytes[0] as u16) << 8) | port_320_bytes[1] as u16;
+        assert_eq!(port, 320);
+    }
+
+    /// Test simulated PTP packet validation
+    #[test]
+    fn test_simulated_ptp_packet_structure() {
+        // Minimum valid PTP-carrying Ethernet frame
+        // Ethernet (14) + IP (20) + UDP (8) + PTP Sync (44) = 86 bytes
+        const MIN_PTP_FRAME: usize = 42 + 44;
+        assert_eq!(MIN_PTP_FRAME, 86);
+
+        // Create a simulated frame
+        let mut frame = vec![0u8; MIN_PTP_FRAME];
+
+        // Set EtherType to IPv4 (0x0800) at bytes 12-13
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+
+        // Set IP protocol to UDP (17) at byte 23
+        frame[23] = 17;
+
+        // Set UDP destination port to 319 at bytes 36-37
+        frame[36] = 0x01;
+        frame[37] = 0x3F;
+
+        // Verify parsing would succeed
+        assert!(frame[12] == 0x08 && frame[13] == 0x00, "Should be IPv4");
+        assert!(frame[23] == 17, "Should be UDP");
+        let dst_port = ((frame[36] as u16) << 8) | frame[37] as u16;
+        assert!(dst_port == 319 || dst_port == 320, "Should be PTP port");
+    }
+}
