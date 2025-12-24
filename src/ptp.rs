@@ -60,8 +60,8 @@ impl PtpV1Header {
         let _src_comm_tech = rdr.read_u8()?;
 
         let mut source_uuid = [0u8; 6];
-        for i in 0..6 {
-            source_uuid[i] = rdr.read_u8()?;
+        for byte in &mut source_uuid {
+            *byte = rdr.read_u8()?;
         }
 
         let _source_port_id = rdr.read_u16::<BigEndian>()?;
@@ -117,8 +117,8 @@ impl PtpV1SyncMessageBody {
         rdr.set_position(13);
 
         let mut gm_uuid = [0u8; 6];
-        for i in 0..6 {
-            gm_uuid[i] = rdr.read_u8()?;
+        for byte in &mut gm_uuid {
+            *byte = rdr.read_u8()?;
         }
 
         Ok(PtpV1SyncMessageBody {

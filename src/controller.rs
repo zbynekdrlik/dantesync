@@ -312,6 +312,7 @@ where
     /// Key insight: step_clock() and adjust_frequency() are independent:
     /// - step_clock() = SetSystemTime() - sets absolute time value
     /// - adjust_frequency() = SetSystemTimeAdjustmentPrecise() - sets tick rate
+    ///
     /// Stepping time does NOT affect the Dante-tuned frequency!
     pub fn check_ntp_utc_tracking(&mut self) {
         // Only check NTP once locked (tracking is stable) and tracking is enabled
@@ -350,7 +351,7 @@ where
                     let step_us = offset_us;
 
                     // Apply the step (sets time, does NOT change frequency)
-                    let step_dur = Duration::from_micros(step_us.abs() as u64);
+                    let step_dur = Duration::from_micros(step_us.unsigned_abs());
                     let step_sign = if step_us > 0 { 1 } else { -1 };
 
                     if let Err(e) = self.clock.step_clock(step_dur, step_sign) {
@@ -577,7 +578,7 @@ where
 
             if delta_master > 0 && delta_master < MAX_DELTA_NS {
                 let ratio = delta_slave as f64 / delta_master as f64;
-                if ratio < 0.5 || ratio > 2.0 {
+                if !(0.5..=2.0).contains(&ratio) {
                     debug!(
                         "[Jitter] master={}ms slave={}ms ratio={:.2}x",
                         delta_master / 1_000_000,
@@ -738,6 +739,7 @@ where
                 self.nano_sustain_count += 1;
                 self.nano_exit_count = 0; // Reset exit counter when drift is good
                                           // Log progress towards NANO every 10 samples
+                #[allow(clippy::manual_is_multiple_of)]
                 if self.nano_sustain_count % 10 == 0 && !self.in_nano_mode {
                     debug!(
                         "[NANO] Sustain count: {}/{}",
