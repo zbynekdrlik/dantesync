@@ -1,6 +1,6 @@
-use std::io::Cursor;
+use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt};
-use anyhow::{Result, anyhow};
+use std::io::Cursor;
 
 pub const PTP_EVENT_PORT: u16 = 319;
 pub const PTP_GENERAL_PORT: u16 = 320;
@@ -49,25 +49,25 @@ impl PtpV1Header {
 
         let v_r1 = rdr.read_u8()?;
         let version_ptp = (v_r1 >> 4) & 0x0F;
-        
+
         let _v_n_r2 = rdr.read_u8()?; // versionNetwork
         let message_length = rdr.read_u16::<BigEndian>()?;
-        
+
         // Skip subdomain (16 bytes)
         rdr.set_position(rdr.position() + 16);
-        
+
         let _msg_type_val = rdr.read_u8()?;
         let _src_comm_tech = rdr.read_u8()?;
-        
+
         let mut source_uuid = [0u8; 6];
         for i in 0..6 {
             source_uuid[i] = rdr.read_u8()?;
         }
-        
+
         let _source_port_id = rdr.read_u16::<BigEndian>()?;
         let sequence_id = rdr.read_u16::<BigEndian>()?;
         let control = rdr.read_u8()?;
-        
+
         let message_type = PtpV1Control::from(control);
 
         Ok(PtpV1Header {
@@ -112,10 +112,10 @@ impl PtpV1SyncMessageBody {
             return Err(anyhow!("Packet too short for Sync body"));
         }
         let mut rdr = Cursor::new(data);
-        
+
         // Skip originTimestamp (8), epoch (2), utcOffset (2), commTech (1) = 13 bytes
         rdr.set_position(13);
-        
+
         let mut gm_uuid = [0u8; 6];
         for i in 0..6 {
             gm_uuid[i] = rdr.read_u8()?;
@@ -141,10 +141,10 @@ impl PtpV1FollowUpBody {
             return Err(anyhow!("Packet too short for FollowUp body"));
         }
         let mut rdr = Cursor::new(data);
-        
+
         // Skip padding (6 bytes)
         rdr.set_position(rdr.position() + 6);
-        
+
         let associated_sequence_id = rdr.read_u16::<BigEndian>()?;
         let seconds = rdr.read_u32::<BigEndian>()?;
         let nanoseconds = rdr.read_u32::<BigEndian>()?;
@@ -209,7 +209,10 @@ mod tests {
 
     #[test]
     fn test_ptp_timestamp_to_nanos() {
-        let ts = PtpTimestamp { seconds: 1, nanoseconds: 500 };
+        let ts = PtpTimestamp {
+            seconds: 1,
+            nanoseconds: 500,
+        };
         assert_eq!(ts.to_nanos(), 1_000_000_500);
     }
 
@@ -219,13 +222,13 @@ mod tests {
         // Padding 6 bytes (0..6)
         // Associated Seq ID (6,7)
         data[6] = 0x00;
-        data[7] = 0x05; 
+        data[7] = 0x05;
         // Seconds (8..11)
         data[8] = 0x00;
         data[9] = 0x00;
         data[10] = 0x00;
         data[11] = 0x0A; // 10 seconds
-        // Nanos (12..15)
+                         // Nanos (12..15)
         data[12] = 0x00;
         data[13] = 0x00;
         data[14] = 0x01;
@@ -250,6 +253,9 @@ mod tests {
         data[18] = 0x66;
 
         let body = PtpV1SyncMessageBody::parse(&data).unwrap();
-        assert_eq!(body.grandmaster_clock_uuid, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        assert_eq!(
+            body.grandmaster_clock_uuid,
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
     }
 }

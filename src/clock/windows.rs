@@ -4,22 +4,24 @@
 //! adjustment actually affects clock speed.
 
 use super::SystemClock;
-use anyhow::{Result, anyhow};
-use windows::Win32::Foundation::{BOOL, HANDLE, LUID, CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, SYSTEMTIME, FILETIME};
+use anyhow::{anyhow, Result};
+use log::{debug, error, info, warn};
+use std::time::{Duration, Instant};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, BOOL, ERROR_NOT_ALL_ASSIGNED, FILETIME, HANDLE, LUID, SYSTEMTIME,
+};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
-    TOKEN_PRIVILEGES, SE_PRIVILEGE_ENABLED
+    AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::SystemInformation::{
+    GetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime, SetSystemTime,
+    SetSystemTimeAdjustmentPrecise,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise,
-    GetSystemTimeAsFileTime, SetSystemTime
-};
-use windows::Win32::System::Performance::{QueryPerformanceFrequency, QueryPerformanceCounter};
 use windows::Win32::System::Time::FileTimeToSystemTime;
-use windows::core::PCWSTR;
-use std::time::{Duration, Instant};
-use log::{info, warn, debug, error};
 
 pub struct WindowsClock {
     original_increment: u64,
@@ -56,12 +58,18 @@ impl WindowsClock {
 
         // Calculate PPM sensitivity
         let ppm_per_unit = 1_000_000.0 / inc as f64;
-        debug!("[Clock] Windows API initialized: PerfFreq={:.1}MHz, Sensitivity={:.6}PPM/unit",
-               perf_freq as f64 / 1_000_000.0, ppm_per_unit);
+        debug!(
+            "[Clock] Windows API initialized: PerfFreq={:.1}MHz, Sensitivity={:.6}PPM/unit",
+            perf_freq as f64 / 1_000_000.0,
+            ppm_per_unit
+        );
 
         // Current PPM offset from nominal
         let current_ppm = ((adj as f64 - inc as f64) / inc as f64) * 1_000_000.0;
-        debug!("Current PPM offset: {:+.3} PPM (Adj {} vs Nominal {})", current_ppm, adj, inc);
+        debug!(
+            "Current PPM offset: {:+.3} PPM (Adj {} vs Nominal {})",
+            current_ppm, adj, inc
+        );
 
         // Enable adjustment if disabled
         if disabled.as_bool() {
@@ -114,12 +122,17 @@ impl WindowsClock {
             Ok(output) => {
                 let output_str = String::from_utf8_lossy(&output.stdout);
                 if output_str.contains("RUNNING") {
-                    error!("⚠ W32Time service is RUNNING! This will interfere with time adjustment.");
+                    error!(
+                        "⚠ W32Time service is RUNNING! This will interfere with time adjustment."
+                    );
                     error!("  Run: net stop w32time");
                 } else if output_str.contains("STOPPED") {
                     info!("✓ W32Time service is stopped.");
                 } else {
-                    info!("  W32Time status: {}", output_str.lines().next().unwrap_or("unknown"));
+                    info!(
+                        "  W32Time status: {}",
+                        output_str.lines().next().unwrap_or("unknown")
+                    );
                 }
             }
             Err(e) => {
@@ -146,7 +159,11 @@ impl WindowsClock {
     fn enable_privilege(name: &str) -> Result<()> {
         unsafe {
             let mut token = HANDLE::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)?;
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            )?;
 
             let mut luid = LUID::default();
             let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -163,7 +180,9 @@ impl WindowsClock {
 
             if let Err(e) = GetLastError() {
                 if e.code() == ERROR_NOT_ALL_ASSIGNED.to_hresult() {
-                     return Err(anyhow!("Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED. Run as Administrator!"));
+                    return Err(anyhow!(
+                        "Failed to adjust privilege: ERROR_NOT_ALL_ASSIGNED. Run as Administrator!"
+                    ));
                 }
             }
 
@@ -190,7 +209,8 @@ impl WindowsClock {
             }
 
             let current_ft = GetSystemTimeAsFileTime();
-            let current_ft_u64 = (current_ft.dwHighDateTime as u64) << 32 | (current_ft.dwLowDateTime as u64);
+            let current_ft_u64 =
+                (current_ft.dwHighDateTime as u64) << 32 | (current_ft.dwLowDateTime as u64);
 
             // Calculate elapsed times
             let pc_elapsed = current_pc - self.baseline_perf_counter;
@@ -207,7 +227,11 @@ impl WindowsClock {
             let effectiveness = if self.last_requested_ppm.abs() > 0.1 {
                 observed_ppm / self.last_requested_ppm
             } else {
-                if observed_ppm.abs() < 10.0 { 1.0 } else { 0.0 }
+                if observed_ppm.abs() < 10.0 {
+                    1.0
+                } else {
+                    0.0
+                }
             };
 
             // Log every 10 seconds worth of measurements (debug level - matches Linux simplicity)
@@ -216,7 +240,9 @@ impl WindowsClock {
                       wall_time_ns / 1_000_000_000.0, self.last_requested_ppm, observed_ppm, effectiveness * 100.0);
 
                 if effectiveness.abs() < 0.3 && self.last_requested_ppm.abs() > 10.0 {
-                    debug!("[FreqMeasure] LOW EFFECTIVENESS! Frequency adjustment may not be working.");
+                    debug!(
+                        "[FreqMeasure] LOW EFFECTIVENESS! Frequency adjustment may not be working."
+                    );
                 }
 
                 // Reset baseline for next measurement period
@@ -244,8 +270,10 @@ impl SystemClock for WindowsClock {
         let delta_from_nominal = new_adj as i64 - self.original_increment as i64;
 
         // Log adjustments at debug level (matches Linux simplicity)
-        debug!("[FreqAdj #{}] {:+.3} PPM | Adj: {} → {} (Δ{:+} from nominal)",
-               self.adjustment_count, ppm, self.last_adjustment, new_adj, delta_from_nominal);
+        debug!(
+            "[FreqAdj #{}] {:+.3} PPM | Adj: {} → {} (Δ{:+} from nominal)",
+            self.adjustment_count, ppm, self.last_adjustment, new_adj, delta_from_nominal
+        );
 
         unsafe {
             // Apply adjustment
@@ -256,9 +284,18 @@ impl SystemClock for WindowsClock {
             let mut verify_inc = 0u64;
             let mut verify_disabled = BOOL(0);
 
-            if GetSystemTimeAdjustmentPrecise(&mut verify_adj, &mut verify_inc, &mut verify_disabled).is_ok() {
+            if GetSystemTimeAdjustmentPrecise(
+                &mut verify_adj,
+                &mut verify_inc,
+                &mut verify_disabled,
+            )
+            .is_ok()
+            {
                 if verify_adj != new_adj {
-                    error!("[FreqAdj] MISMATCH! Requested={}, Actual={}", new_adj, verify_adj);
+                    error!(
+                        "[FreqAdj] MISMATCH! Requested={}, Actual={}",
+                        new_adj, verify_adj
+                    );
                 }
                 if verify_disabled.as_bool() {
                     error!("[FreqAdj] TIME ADJUSTMENT DISABLED! Interference detected!");
@@ -279,7 +316,11 @@ impl SystemClock for WindowsClock {
 
     fn step_clock(&mut self, offset: Duration, sign: i8) -> Result<()> {
         let sign_str = if sign > 0 { "+" } else { "-" };
-        info!("[StepClock] Stepping by {}{:.3}ms", sign_str, offset.as_secs_f64() * 1000.0);
+        info!(
+            "[StepClock] Stepping by {}{:.3}ms",
+            sign_str,
+            offset.as_secs_f64() * 1000.0
+        );
 
         unsafe {
             let ft = GetSystemTimeAsFileTime();
@@ -309,11 +350,19 @@ impl SystemClock for WindowsClock {
 
             // Verify
             let ft_after = GetSystemTimeAsFileTime();
-            let after_u64 = (ft_after.dwHighDateTime as u64) << 32 | (ft_after.dwLowDateTime as u64);
+            let after_u64 =
+                (ft_after.dwHighDateTime as u64) << 32 | (ft_after.dwLowDateTime as u64);
             let actual_step = after_u64 as i64 - before_u64 as i64;
-            let expected_step = if sign > 0 { offset_100ns as i64 } else { -(offset_100ns as i64) };
+            let expected_step = if sign > 0 {
+                offset_100ns as i64
+            } else {
+                -(offset_100ns as i64)
+            };
 
-            info!("[StepClock] Actual step: {} (expected: {})", actual_step, expected_step);
+            info!(
+                "[StepClock] Actual step: {} (expected: {})",
+                actual_step, expected_step
+            );
 
             // Reset measurement baseline after step
             let mut pc: i64 = 0;
@@ -329,7 +378,10 @@ impl SystemClock for WindowsClock {
 
 impl Drop for WindowsClock {
     fn drop(&mut self) {
-        debug!("[Clock] Shutdown: {} adjustments, resetting to nominal", self.adjustment_count);
+        debug!(
+            "[Clock] Shutdown: {} adjustments, resetting to nominal",
+            self.adjustment_count
+        );
 
         unsafe {
             match SetSystemTimeAdjustmentPrecise(self.original_increment, false) {

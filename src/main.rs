@@ -1,17 +1,17 @@
 use anyhow::Result;
 use clap::Parser;
-use log::{info, warn, error};
+use log::{error, info, warn};
+use std::fs::File;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::process::Command;
-use std::fs::File;
 
 #[cfg(unix)]
 use anyhow::anyhow;
 #[cfg(unix)]
-use std::time::SystemTime;
+use nix::fcntl::{flock, FlockArg};
 #[cfg(unix)]
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -19,27 +19,31 @@ use std::net::UdpSocket;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
-use nix::fcntl::{flock, FlockArg};
+use std::time::SystemTime;
 
-#[cfg(windows)]
-use windows::Win32::System::Threading::{SetPriorityClass, GetCurrentProcess, REALTIME_PRIORITY_CLASS, HIGH_PRIORITY_CLASS};
 #[cfg(windows)]
 use windows::Win32::Media::timeBeginPeriod;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+};
 
 #[cfg(windows)]
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-#[cfg(windows)]
-use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
-#[cfg(windows)]
-use windows::Win32::System::Pipes::{CreateNamedPipeW, NAMED_PIPE_MODE};
-#[cfg(windows)]
-use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
 use windows::Win32::Foundation::HLOCAL;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::NamedPipeServer;
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+#[cfg(windows)]
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+#[cfg(windows)]
+use windows::Win32::System::Pipes::{CreateNamedPipeW, NAMED_PIPE_MODE};
 
 // Constants for Pipe (Manual definition to avoid import issues)
 #[cfg(windows)]
@@ -59,36 +63,30 @@ extern "system" {
 #[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(windows)]
-use windows_service::
-    {
-        define_windows_service,
-        service::
-            {
-                ServiceControl,
-                ServiceControlAccept,
-                ServiceExitCode,
-                ServiceState,
-                ServiceStatus,
-                ServiceType,
-            },
-        service_control_handler::{self, ServiceControlHandlerResult},
-        service_dispatcher,
-    };
+use windows_service::{
+    define_windows_service,
+    service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    },
+    service_control_handler::{self, ServiceControlHandlerResult},
+    service_dispatcher,
+};
 
 // Use library crate modules
-use dantetimesync::{net, clock, ntp, traits, controller, status, config};
-#[cfg(unix)]
-use dantetimesync::ptp;
 #[cfg(windows)]
 use dantetimesync::net_pcap;
+#[cfg(unix)]
+use dantetimesync::ptp;
+use dantetimesync::{clock, config, controller, net, ntp, status, traits};
 
+use config::SystemConfig;
+use controller::PtpController;
+use serde::{Deserialize, Serialize};
+use status::SyncStatus;
 use traits::NtpSource;
 #[cfg(unix)]
 use traits::PtpNetwork;
-use controller::PtpController;
-use status::SyncStatus;
-use config::SystemConfig;
-use serde::{Serialize, Deserialize};
 
 /// Simplified configuration - only NTP server needs to be managed
 /// All other parameters auto-adjust based on platform defaults
@@ -234,9 +232,12 @@ fn stop_conflicting_services() {
     #[cfg(unix)]
     {
         info!("Ensuring system NTP is disabled (timedatectl set-ntp false)...");
-        match Command::new("timedatectl").args(["set-ntp", "false"]).output() {
-             Ok(_) => info!("NTP service disabled via timedatectl."),
-             Err(e) => warn!("Failed to disable NTP via timedatectl (ignoring): {}", e),
+        match Command::new("timedatectl")
+            .args(["set-ntp", "false"])
+            .output()
+        {
+            Ok(_) => info!("NTP service disabled via timedatectl."),
+            Err(e) => warn!("Failed to disable NTP via timedatectl (ignoring): {}", e),
         }
     }
 }
@@ -247,12 +248,15 @@ fn enable_realtime_priority() {
         unsafe {
             let policy = libc::SCHED_FIFO;
             let param = libc::sched_param { sched_priority: 50 };
-            
+
             if libc::sched_setscheduler(0, policy, &param) == 0 {
                 info!("Realtime priority (SCHED_FIFO, 50) enabled successfully.");
             } else {
                 let err = std::io::Error::last_os_error();
-                warn!("Failed to set realtime priority: {}. Latency might suffer.", err);
+                warn!(
+                    "Failed to set realtime priority: {}. Latency might suffer.",
+                    err
+                );
             }
         }
     }
@@ -269,10 +273,10 @@ fn enable_realtime_priority() {
                     warn!("Failed to set Windows priority.");
                 }
             }
-            if timeBeginPeriod(1) == 0 { 
-               info!("Windows High-Res Timer (1ms) enabled.");
+            if timeBeginPeriod(1) == 0 {
+                info!("Windows High-Res Timer (1ms) enabled.");
             } else {
-               warn!("Failed to set Windows High-Res Timer.");
+                warn!("Failed to set Windows High-Res Timer.");
             }
         }
     }
@@ -282,13 +286,15 @@ fn acquire_singleton_lock() -> Result<File> {
     #[cfg(unix)]
     {
         let lock_path = "/var/run/dantetimesync.lock";
-        let file = File::create(lock_path).map_err(|e| anyhow!("Failed to create lock file {}: {}", lock_path, e))?;
-        
+        let file = File::create(lock_path)
+            .map_err(|e| anyhow!("Failed to create lock file {}: {}", lock_path, e))?;
+
         match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
             Ok(_) => Ok(file),
-            Err(nix::errno::Errno::EAGAIN) => {
-                Err(anyhow!("Another instance of dantetimesync is already running! (Lockfile: {})", lock_path))
-            }
+            Err(nix::errno::Errno::EAGAIN) => Err(anyhow!(
+                "Another instance of dantetimesync is already running! (Lockfile: {})",
+                lock_path
+            )),
             Err(e) => Err(e.into()),
         }
     }
@@ -311,18 +317,24 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
             .enable_all()
             .build()
             .expect("Failed to build tokio runtime for IPC");
-        
+
         rt.block_on(async move {
             use tokio::io::AsyncWriteExt;
-            
+
             // Named pipe server loop
             loop {
                 // Create pipe manually with Security Descriptor to allow Users to connect to Service
                 // SDDL: D:(A;;GA;;;WD) -> DACL: Allow Generic All to World (Everyone)
                 // This is needed because Service runs as SYSTEM and Tray runs as User.
-                let pipe_name_wide: Vec<u16> = r"\\.\pipe\dantetimesync".encode_utf16().chain(std::iter::once(0)).collect();
-                let sddl_wide: Vec<u16> = "D:(A;;GA;;;WD)".encode_utf16().chain(std::iter::once(0)).collect();
-                
+                let pipe_name_wide: Vec<u16> = r"\\.\pipe\dantetimesync"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let sddl_wide: Vec<u16> = "D:(A;;GA;;;WD)"
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+
                 let mut sd = PSECURITY_DESCRIPTOR::default();
                 let mut sa = SECURITY_ATTRIBUTES {
                     nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -333,23 +345,25 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
                 let handle = unsafe {
                     if ConvertStringSecurityDescriptorToSecurityDescriptorW(
                         PCWSTR(sddl_wide.as_ptr()),
-                        SDDL_REVISION_1, 
-                        &mut sd, 
-                        None
-                    ).is_ok() {
+                        SDDL_REVISION_1,
+                        &mut sd,
+                        None,
+                    )
+                    .is_ok()
+                    {
                         sa.lpSecurityDescriptor = sd.0;
-                        
+
                         let h = CreateNamedPipeW(
                             PCWSTR(pipe_name_wide.as_ptr()),
-                            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED), 
+                            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED),
                             NAMED_PIPE_MODE(0), // Byte mode (0) for Tokio compatibility
                             PIPE_UNLIMITED_INSTANCES,
                             1024,
                             1024,
                             0,
-                            Some(&sa)
+                            Some(&sa),
                         );
-                        
+
                         let _ = LocalFree(std::mem::transmute(sd));
                         h
                     } else {
@@ -365,7 +379,7 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
                 }
 
                 // Wrap in Tokio
-                let mut server = unsafe { 
+                let mut server = unsafe {
                     match NamedPipeServer::from_raw_handle(handle.0 as *mut std::ffi::c_void) {
                         Ok(s) => s,
                         Err(e) => {
@@ -399,7 +413,12 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
     // Notify systemd (Linux) that we are starting
     #[cfg(unix)]
     {
-        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Status(format!("v{} | Starting...", env!("CARGO_PKG_VERSION")).as_str())]);
+        let _ = sd_notify::notify(
+            false,
+            &[sd_notify::NotifyState::Status(
+                format!("v{} | Starting...", env!("CARGO_PKG_VERSION")).as_str(),
+            )],
+        );
     }
 
     // Initialize Shared Status
@@ -440,7 +459,10 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
         // Create sockets to join multicast groups (IGMP) with kernel timestamping
         let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
         let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
-        info!("Joined Multicast Groups on {} ({}) - Kernel timestamping", iface_name, iface_ip);
+        info!(
+            "Joined Multicast Groups on {} ({}) - Kernel timestamping",
+            iface_name, iface_ip
+        );
 
         RealPtpNetwork {
             sock_event,
@@ -454,58 +476,75 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
         // This provides driver-level timestamps that are both precise AND synced with system time
         match net_pcap::NpcapPtpNetwork::new(&iface_name) {
             Ok(npcap_net) => {
-                info!("Using Npcap HostHighPrec timestamps on {} ({})", iface_name, iface_ip);
+                info!(
+                    "Using Npcap HostHighPrec timestamps on {} ({})",
+                    iface_name, iface_ip
+                );
                 npcap_net
             }
             Err(e) => {
-                error!("Failed to initialize Npcap: {}. Npcap is required on Windows.", e);
+                error!(
+                    "Failed to initialize Npcap: {}. Npcap is required on Windows.",
+                    e
+                );
                 return Err(e);
             }
         }
     };
-    
+
     let ntp_source = RealNtpSource {
         client: ntp::NtpClient::new(&args.ntp_server),
     };
 
-    let mut controller = PtpController::new(sys_clock, network, ntp_source, status_shared, system_config);
-    
+    let mut controller =
+        PtpController::new(sys_clock, network, ntp_source, status_shared, system_config);
+
     if !args.skip_ntp {
         info!("Using NTP Server: {}", args.ntp_server);
     }
     controller.run_ntp_sync(args.skip_ntp);
 
     info!("Starting PTP Loop...");
-    
+
     // Notify systemd we are ready and loop is running
     #[cfg(unix)]
     {
-        let _ = sd_notify::notify(false, &[
-            sd_notify::NotifyState::Ready, 
-            sd_notify::NotifyState::Status(format!("v{} | PTP Loop Running", env!("CARGO_PKG_VERSION")).as_str())
-        ]);
+        let _ = sd_notify::notify(
+            false,
+            &[
+                sd_notify::NotifyState::Ready,
+                sd_notify::NotifyState::Status(
+                    format!("v{} | PTP Loop Running", env!("CARGO_PKG_VERSION")).as_str(),
+                ),
+            ],
+        );
     }
 
     let mut last_log = Instant::now();
-    
+
     while running.load(Ordering::SeqCst) {
         if last_log.elapsed() >= Duration::from_secs(10) {
             controller.log_status();
-            
+
             // Update systemd status with latest metrics
             #[cfg(unix)]
             {
                 let s = controller.get_status_shared();
                 if let Ok(status) = s.read() {
                     let status_str = if status.settled {
-                        format!("v{} | Locked | Offset: {:.3} µs", env!("CARGO_PKG_VERSION"), status.offset_ns as f64 / 1000.0)
+                        format!(
+                            "v{} | Locked | Offset: {:.3} µs",
+                            env!("CARGO_PKG_VERSION"),
+                            status.offset_ns as f64 / 1000.0
+                        )
                     } else {
                         format!("v{} | Settling...", env!("CARGO_PKG_VERSION"))
                     };
-                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Status(&status_str)]);
+                    let _ =
+                        sd_notify::notify(false, &[sd_notify::NotifyState::Status(&status_str)]);
                 };
             }
-            
+
             last_log = Instant::now();
         }
 
@@ -627,7 +666,7 @@ fn main() -> Result<()> {
     if args.service {
         // Initialize File Logging for Service
         let log_path = r"C:\ProgramData\DanteTimeSync\dantetimesync.log";
-        
+
         // Log Rotation (Simple: 1MB limit check on startup)
         if let Ok(metadata) = std::fs::metadata(log_path) {
             if metadata.len() > 1_000_000 {
@@ -636,20 +675,27 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).write(true).open(log_path) {
-             let target = env_logger::Target::Pipe(Box::new(file));
-             env_logger::builder()
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .write(true)
+            .open(log_path)
+        {
+            let target = env_logger::Target::Pipe(Box::new(file));
+            env_logger::builder()
                 .target(target)
                 .filter_level(log::LevelFilter::Info)
                 .format_timestamp_millis()
-                .format_target(false)  // Remove module path from logs
-                .format_level(false)   // Remove INFO/WARN prefix
+                .format_target(false) // Remove module path from logs
+                .format_level(false) // Remove INFO/WARN prefix
                 .init();
         } else {
-             // Fallback
-             env_logger::builder().filter_level(log::LevelFilter::Info).init();
+            // Fallback
+            env_logger::builder()
+                .filter_level(log::LevelFilter::Info)
+                .init();
         }
-        
+
         info!("Service Started: v{}", env!("CARGO_PKG_VERSION"));
         return run_service_logic(args, config);
     }
@@ -657,8 +703,8 @@ fn main() -> Result<()> {
     // Console Mode Logging (clean format)
     env_logger::builder()
         .format_timestamp(None)
-        .format_target(false)  // Remove module path
-        .format_level(false)   // Remove INFO/WARN prefix
+        .format_target(false) // Remove module path
+        .format_level(false) // Remove INFO/WARN prefix
         .filter_level(log::LevelFilter::Info)
         .init();
 

@@ -1,13 +1,13 @@
 use anyhow::Result;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
-use std::cell::RefCell;
 use dantetimesync::clock::SystemClock;
-use dantetimesync::traits::{NtpSource, PtpNetwork};
 use dantetimesync::config::SystemConfig;
 use dantetimesync::controller::PtpController;
 use dantetimesync::status::SyncStatus;
+use dantetimesync::traits::{NtpSource, PtpNetwork};
+use std::cell::RefCell;
 use std::f64::consts::PI;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 
 // ============================================================================
 // RATE-BASED SERVO E2E TESTS
@@ -23,7 +23,7 @@ use std::f64::consts::PI;
 // --- Physics Engine ---
 
 struct PhysicsEngine {
-    time: f64, // seconds
+    time: f64,      // seconds
     offset_ns: f64, // Local - Master
 
     natural_drift_ppm: f64,
@@ -133,7 +133,9 @@ impl PtpNetwork for StatefulNetwork {
         Ok(Some((buf, 60, t2_sys)))
     }
 
-    fn reset(&mut self) -> Result<()> { Ok(()) }
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct SimNtp {
@@ -150,8 +152,8 @@ impl NtpSource for SimNtp {
 
 /// NTP source with independent drift (simulates Dante frequency ≠ NTP reference)
 struct DriftingNtp {
-    offset_us: std::cell::Cell<i64>,  // Grows over time if Dante and NTP disagree
-    drift_us_per_call: i64,           // How much NTP offset grows per query
+    offset_us: std::cell::Cell<i64>, // Grows over time if Dante and NTP disagree
+    drift_us_per_call: i64,          // How much NTP offset grows per query
 }
 
 impl NtpSource for DriftingNtp {
@@ -189,7 +191,7 @@ fn run_simulation(
     config: SystemConfig,
     jitter_ns: f64,
     drift_ppm: f64,
-    duration_secs: usize
+    duration_secs: usize,
 ) -> SimulationResult {
     let physics = Arc::new(SharedPhysics {
         engine: RefCell::new(PhysicsEngine::new(drift_ppm)),
@@ -204,7 +206,9 @@ fn run_simulation(
         pending_followup: None,
     };
 
-    let ntp = SimNtp { physics: physics.clone() };
+    let ntp = SimNtp {
+        physics: physics.clone(),
+    };
     let clock = SimClockRef(physics.clone());
 
     // Save window_size before config is moved into controller
@@ -292,14 +296,22 @@ fn test_linux_stability_low_jitter() {
     // Duration in "simulated seconds" - actual wall time = duration/8 * 0.12 ≈ 15 seconds
     let result = run_simulation(config, 50_000.0, 50.0, 100);
 
-    println!("Linux Stable: AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
-             result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked);
-    println!("  (Offset: Final={:.1}us Max={:.1}us - may drift, NTP handles UTC)",
-             result.final_offset_ns/1000.0, result.max_offset_steady_ns/1000.0);
+    println!(
+        "Linux Stable: AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
+        result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked
+    );
+    println!(
+        "  (Offset: Final={:.1}us Max={:.1}us - may drift, NTP handles UTC)",
+        result.final_offset_ns / 1000.0,
+        result.max_offset_steady_ns / 1000.0
+    );
 
     // Rate must converge (frequencies matched)
-    assert!(result.avg_rate_us_per_s.abs() < 20.0,
-            "Average drift rate {:.2}us/s too high - servo not converging!", result.avg_rate_us_per_s);
+    assert!(
+        result.avg_rate_us_per_s.abs() < 20.0,
+        "Average drift rate {:.2}us/s too high - servo not converging!",
+        result.avg_rate_us_per_s
+    );
 }
 
 /// Test rate-based servo stability with high jitter (Windows-like conditions)
@@ -317,14 +329,22 @@ fn test_windows_stability_high_jitter() {
     // Reduced from 2ms/100ppm to be more reliable in CI environments
     let result = run_simulation(config, 1_000_000.0, 50.0, 150);
 
-    println!("Windows Stable: AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
-             result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked);
-    println!("  (Offset: Final={:.1}ms Max={:.1}ms - may drift, NTP handles UTC)",
-             result.final_offset_ns/1_000_000.0, result.max_offset_steady_ns/1_000_000.0);
+    println!(
+        "Windows Stable: AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
+        result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked
+    );
+    println!(
+        "  (Offset: Final={:.1}ms Max={:.1}ms - may drift, NTP handles UTC)",
+        result.final_offset_ns / 1_000_000.0,
+        result.max_offset_steady_ns / 1_000_000.0
+    );
 
     // Relaxed threshold for high-jitter environment (CI VMs can have timing variance)
-    assert!(result.avg_rate_us_per_s.abs() < 150.0,
-            "Average drift rate {:.2}us/s too high - servo unstable!", result.avg_rate_us_per_s);
+    assert!(
+        result.avg_rate_us_per_s.abs() < 150.0,
+        "Average drift rate {:.2}us/s too high - servo unstable!",
+        result.avg_rate_us_per_s
+    );
 }
 
 /// Regression test: verify high-gain settings cause rate instability
@@ -338,8 +358,10 @@ fn test_regression_high_gain_low_jitter() {
     // 10us jitter - should expose instability
     let result = run_simulation(config, 10_000.0, 50.0, 100);
 
-    println!("Regression Check (Kp=0.1): AvgRate={:.2}us/s MaxRate={:.2}us/s",
-             result.avg_rate_us_per_s, result.max_rate_us_per_s);
+    println!(
+        "Regression Check (Kp=0.1): AvgRate={:.2}us/s MaxRate={:.2}us/s",
+        result.avg_rate_us_per_s, result.max_rate_us_per_s
+    );
     // High gain causes rate oscillation - this is expected to show instability
     // Note: With rate-based servo, the hardcoded P_GAIN constants override config,
     // so this test may not show the same instability as before
@@ -358,7 +380,7 @@ fn test_rate_convergence_stability() {
     config.filters.sample_window_size = 4;
     config.filters.calibration_samples = 0;
     config.filters.warmup_secs = 0.0;
-    config.filters.min_delta_ns = 100_000_000;  // 100ms - allow samples at Dante rate
+    config.filters.min_delta_ns = 100_000_000; // 100ms - allow samples at Dante rate
 
     let physics = Arc::new(SharedPhysics {
         engine: RefCell::new(PhysicsEngine::new(20.0)), // 20ppm drift
@@ -373,7 +395,9 @@ fn test_rate_convergence_stability() {
         pending_followup: None,
     };
 
-    let ntp = SimNtp { physics: physics.clone() };
+    let ntp = SimNtp {
+        physics: physics.clone(),
+    };
     let clock = SimClockRef(physics.clone());
 
     let mut controller = PtpController::new(clock, network, ntp, status, config);
@@ -397,14 +421,17 @@ fn test_rate_convergence_stability() {
         if !offsets.is_empty() {
             let prev = *offsets.last().unwrap();
             let delta_us = (offset - prev) / 1000.0;
-            let dt_s = 0.125;  // 125ms per packet pair (Dante interval)
-            let rate = delta_us / dt_s;  // us/s
+            let dt_s = 0.125; // 125ms per packet pair (Dante interval)
+            let rate = delta_us / dt_s; // us/s
             rates.push(rate);
         }
 
         if i < 5 || i > 195 {
-            let rate_str = if rates.is_empty() { "N/A".to_string() }
-                          else { format!("{:.1}", rates.last().unwrap()) };
+            let rate_str = if rates.is_empty() {
+                "N/A".to_string()
+            } else {
+                format!("{:.1}", rates.last().unwrap())
+            };
             println!("  Step {}: rate={}us/s, adj={:.2}ppm", i, rate_str, adj);
         }
         offsets.push(offset);
@@ -413,7 +440,8 @@ fn test_rate_convergence_stability() {
     // Calculate rate statistics
     let avg_rate: f64 = rates.iter().sum::<f64>() / rates.len() as f64;
     let max_rate = rates.iter().map(|r| r.abs()).fold(0.0f64, f64::max);
-    let rate_variance: f64 = rates.iter().map(|r| (r - avg_rate).powi(2)).sum::<f64>() / rates.len() as f64;
+    let rate_variance: f64 =
+        rates.iter().map(|r| (r - avg_rate).powi(2)).sum::<f64>() / rates.len() as f64;
     let rate_stddev = rate_variance.sqrt();
 
     println!("Rate convergence test:");
@@ -423,16 +451,25 @@ fn test_rate_convergence_stability() {
 
     // CRITICAL ASSERTIONS for rate-based servo:
     // 1. Average rate must be near zero (frequencies matched)
-    assert!(avg_rate.abs() < 10.0,
-            "Average drift rate {:.2}us/s too high - frequencies not matched!", avg_rate);
+    assert!(
+        avg_rate.abs() < 10.0,
+        "Average drift rate {:.2}us/s too high - frequencies not matched!",
+        avg_rate
+    );
 
     // 2. Max rate must be bounded (no wild oscillations)
-    assert!(max_rate < 50.0,
-            "Max drift rate {:.2}us/s too high - servo unstable!", max_rate);
+    assert!(
+        max_rate < 50.0,
+        "Max drift rate {:.2}us/s too high - servo unstable!",
+        max_rate
+    );
 
     // 3. Rate stddev shows stability (low variance = locked)
-    assert!(rate_stddev < 20.0,
-            "Rate stddev {:.2}us/s too high - servo not stable!", rate_stddev);
+    assert!(
+        rate_stddev < 20.0,
+        "Rate stddev {:.2}us/s too high - servo not stable!",
+        rate_stddev
+    );
 }
 
 /// Test that the rate-based servo works across a range of natural drift rates
@@ -444,10 +481,10 @@ fn test_auto_adaptive_drift_rates() {
     // Higher drifts need more convergence iterations
     // Format: (drift_ppm, convergence_iters, max_rate_threshold_us_s)
     let test_cases = [
-        (5.0, 8000, 15.0),      // 5ppm - easy case
-        (20.0, 12000, 20.0),    // 20ppm - moderate
-        (50.0, 18000, 30.0),    // 50ppm - challenging
-        (100.0, 25000, 50.0),   // 100ppm - extreme
+        (5.0, 8000, 15.0),    // 5ppm - easy case
+        (20.0, 12000, 20.0),  // 20ppm - moderate
+        (50.0, 18000, 30.0),  // 50ppm - challenging
+        (100.0, 25000, 50.0), // 100ppm - extreme
     ];
 
     for (drift_ppm, convergence_iters, max_rate_threshold) in test_cases {
@@ -470,7 +507,9 @@ fn test_auto_adaptive_drift_rates() {
             pending_followup: None,
         };
 
-        let ntp = SimNtp { physics: physics.clone() };
+        let ntp = SimNtp {
+            physics: physics.clone(),
+        };
         let clock = SimClockRef(physics.clone());
 
         let mut controller = PtpController::new(clock, network, ntp, status, config);
@@ -493,8 +532,8 @@ fn test_auto_adaptive_drift_rates() {
             if !offsets.is_empty() {
                 let prev = *offsets.last().unwrap();
                 let delta_us = (offset - prev) / 1000.0;
-                let dt_s = 0.125;  // 125ms per packet pair
-                let rate = delta_us / dt_s;  // us/s
+                let dt_s = 0.125; // 125ms per packet pair
+                let rate = delta_us / dt_s; // us/s
                 rates.push(rate);
             }
             offsets.push(offset);
@@ -504,8 +543,10 @@ fn test_auto_adaptive_drift_rates() {
         let avg_rate: f64 = rates.iter().sum::<f64>() / rates.len() as f64;
         let max_rate = rates.iter().map(|r| r.abs()).fold(0.0f64, f64::max);
 
-        println!("Drift {}ppm: AvgRate={:.2}us/s, MaxRate={:.2}us/s (threshold={:.0}us/s)",
-                 drift_ppm, avg_rate, max_rate, max_rate_threshold);
+        println!(
+            "Drift {}ppm: AvgRate={:.2}us/s, MaxRate={:.2}us/s (threshold={:.0}us/s)",
+            drift_ppm, avg_rate, max_rate, max_rate_threshold
+        );
 
         // Must achieve rate convergence (frequencies matched)
         assert!(avg_rate.abs() < max_rate_threshold,
@@ -546,7 +587,7 @@ fn test_ptp_rate_stable_during_ntp_drift() {
     // NTP handles UTC alignment via stepping, PTP handles frequency
     let ntp = DriftingNtp {
         offset_us: std::cell::Cell::new(0),
-        drift_us_per_call: 1500,  // 1.5ms drift per NTP check
+        drift_us_per_call: 1500, // 1.5ms drift per NTP check
     };
     let clock = SimClockRef(physics.clone());
 
@@ -571,7 +612,7 @@ fn test_ptp_rate_stable_during_ntp_drift() {
         if !offsets.is_empty() {
             let prev = *offsets.last().unwrap();
             let delta_us = (offset - prev) / 1000.0;
-            let rate = delta_us / 0.125;  // us/s
+            let rate = delta_us / 0.125; // us/s
             rates.push(rate);
         }
         offsets.push(offset);
@@ -582,15 +623,20 @@ fn test_ptp_rate_stable_during_ntp_drift() {
     let max_rate = rates.iter().map(|r| r.abs()).fold(0.0f64, f64::max);
 
     println!("NTP drift test:");
-    println!("  PTP rate: avg={:.2}us/s, max={:.2}us/s", avg_rate, max_rate);
+    println!(
+        "  PTP rate: avg={:.2}us/s, max={:.2}us/s",
+        avg_rate, max_rate
+    );
     println!("  (NTP drift simulated independently - PTP should stay locked)");
 
     // KEY ASSERTION: PTP rate stays stable despite NTP drift
     // The servo should maintain frequency lock (rate near zero)
     // NTP stepping doesn't affect PTP frequency control
-    assert!(avg_rate.abs() < 20.0,
-            "PTP avg rate {:.2}us/s too high - servo lost lock during NTP drift!",
-            avg_rate);
+    assert!(
+        avg_rate.abs() < 20.0,
+        "PTP avg rate {:.2}us/s too high - servo lost lock during NTP drift!",
+        avg_rate
+    );
 }
 
 // ============================================================================
@@ -614,19 +660,21 @@ fn test_nano_mode_achievable_with_low_jitter() {
 
     // Ultra-low jitter (1µs) and low drift (5ppm) - ideal for NANO mode
     let physics = Arc::new(SharedPhysics {
-        engine: RefCell::new(PhysicsEngine::new(5.0)),  // 5ppm drift
+        engine: RefCell::new(PhysicsEngine::new(5.0)), // 5ppm drift
     });
 
     let status = Arc::new(RwLock::new(SyncStatus::default()));
 
     let network = StatefulNetwork {
         physics: physics.clone(),
-        jitter_sigma_ns: 1_000.0,  // 1µs jitter - very low
+        jitter_sigma_ns: 1_000.0, // 1µs jitter - very low
         seq: 0,
         pending_followup: None,
     };
 
-    let ntp = SimNtp { physics: physics.clone() };
+    let ntp = SimNtp {
+        physics: physics.clone(),
+    };
     let clock = SimClockRef(physics.clone());
 
     let mut controller = PtpController::new(clock, network, ntp, status.clone(), config);
@@ -648,12 +696,18 @@ fn test_nano_mode_achievable_with_low_jitter() {
     println!("  (NANO requires sustained drift < 0.5 µs/s)");
 
     // Should at least be in LOCK mode
-    assert!(mode == "LOCK" || mode == "NANO" || mode == "PROD",
-            "Should reach LOCK/NANO with low jitter, got: {}", mode);
+    assert!(
+        mode == "LOCK" || mode == "NANO" || mode == "PROD",
+        "Should reach LOCK/NANO with low jitter, got: {}",
+        mode
+    );
 
     // Drift rate should be very low with this setup
-    assert!(drift_rate.abs() < 5.0,
-            "Drift rate {:.3} µs/s too high for low-jitter environment", drift_rate);
+    assert!(
+        drift_rate.abs() < 5.0,
+        "Drift rate {:.3} µs/s too high for low-jitter environment",
+        drift_rate
+    );
 }
 
 /// Test that high jitter affects rate stability
@@ -669,19 +723,21 @@ fn test_high_jitter_affects_rate_variance() {
 
     // High jitter (500µs) - causes rate variance
     let physics = Arc::new(SharedPhysics {
-        engine: RefCell::new(PhysicsEngine::new(20.0)),  // 20ppm drift
+        engine: RefCell::new(PhysicsEngine::new(20.0)), // 20ppm drift
     });
 
     let status = Arc::new(RwLock::new(SyncStatus::default()));
 
     let network = StatefulNetwork {
         physics: physics.clone(),
-        jitter_sigma_ns: 500_000.0,  // 500µs jitter - high
+        jitter_sigma_ns: 500_000.0, // 500µs jitter - high
         seq: 0,
         pending_followup: None,
     };
 
-    let ntp = SimNtp { physics: physics.clone() };
+    let ntp = SimNtp {
+        physics: physics.clone(),
+    };
     let clock = SimClockRef(physics.clone());
 
     let mut controller = PtpController::new(clock, network, ntp, status.clone(), config);
@@ -703,7 +759,7 @@ fn test_high_jitter_affects_rate_variance() {
         if !offsets.is_empty() {
             let prev = *offsets.last().unwrap();
             let delta_us = (offset - prev) / 1000.0;
-            let rate = delta_us / 0.125;  // us/s
+            let rate = delta_us / 0.125; // us/s
             rates.push(rate);
         }
         offsets.push(offset);
@@ -711,11 +767,15 @@ fn test_high_jitter_affects_rate_variance() {
 
     // Calculate rate variance
     let avg_rate: f64 = rates.iter().sum::<f64>() / rates.len() as f64;
-    let variance: f64 = rates.iter().map(|r| (r - avg_rate).powi(2)).sum::<f64>() / rates.len() as f64;
+    let variance: f64 =
+        rates.iter().map(|r| (r - avg_rate).powi(2)).sum::<f64>() / rates.len() as f64;
     let stddev = variance.sqrt();
 
     println!("High jitter rate variance test:");
-    println!("  Avg rate: {:.2} µs/s, StdDev: {:.2} µs/s", avg_rate, stddev);
+    println!(
+        "  Avg rate: {:.2} µs/s, StdDev: {:.2} µs/s",
+        avg_rate, stddev
+    );
 
     // High jitter should produce measurable rate variance
     // (The exact variance depends on simulation timing, so we just verify it runs)
@@ -735,19 +795,21 @@ fn test_mode_stability_during_extended_operation() {
 
     // Moderate jitter for realistic simulation
     let physics = Arc::new(SharedPhysics {
-        engine: RefCell::new(PhysicsEngine::new(15.0)),  // 15ppm drift
+        engine: RefCell::new(PhysicsEngine::new(15.0)), // 15ppm drift
     });
 
     let status = Arc::new(RwLock::new(SyncStatus::default()));
 
     let network = StatefulNetwork {
         physics: physics.clone(),
-        jitter_sigma_ns: 50_000.0,  // 50µs jitter - moderate
+        jitter_sigma_ns: 50_000.0, // 50µs jitter - moderate
         seq: 0,
         pending_followup: None,
     };
 
-    let ntp = SimNtp { physics: physics.clone() };
+    let ntp = SimNtp {
+        physics: physics.clone(),
+    };
     let clock = SimClockRef(physics.clone());
 
     let mut controller = PtpController::new(clock, network, ntp, status.clone(), config);
@@ -758,7 +820,8 @@ fn test_mode_stability_during_extended_operation() {
     }
 
     // Collect mode history during steady state
-    let mut mode_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut mode_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut mode_transitions = 0;
     let mut last_mode = String::new();
 
@@ -775,12 +838,20 @@ fn test_mode_stability_during_extended_operation() {
 
     println!("Mode stability test:");
     for (mode, count) in &mode_counts {
-        println!("  {}: {} samples ({:.1}%)", mode, count, *count as f64 / 30.0);
+        println!(
+            "  {}: {} samples ({:.1}%)",
+            mode,
+            count,
+            *count as f64 / 30.0
+        );
     }
     println!("  Mode transitions: {}", mode_transitions);
 
     // Should have reasonable stability (not constantly transitioning)
     // Allow up to 20% of samples to be transitions (600 out of 3000)
-    assert!(mode_transitions < 600,
-            "Too many mode transitions ({}) - controller may be unstable", mode_transitions);
+    assert!(
+        mode_transitions < 600,
+        "Too many mode transitions ({}) - controller may be unstable",
+        mode_transitions
+    );
 }

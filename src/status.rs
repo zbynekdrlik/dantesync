@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Sync status shared via IPC between service and tray app
 ///
@@ -11,7 +11,6 @@ pub struct SyncStatus {
     // ========================================================================
     // Core PTP Status (existing fields)
     // ========================================================================
-
     /// Current phase offset from Dante master (nanoseconds)
     /// Note: Absolute value is meaningless for Dante (device uptime, not UTC)
     pub offset_ns: i64,
@@ -31,7 +30,6 @@ pub struct SyncStatus {
     // ========================================================================
     // Extended Status (new fields for tray app)
     // ========================================================================
-
     /// True when frequency is locked (rate stable < 5us/s)
     /// Used for icon badge color (green = locked)
     pub is_locked: bool,

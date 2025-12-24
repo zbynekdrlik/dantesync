@@ -19,8 +19,8 @@ pub struct ServoConfig {
 pub struct FilterConfig {
     pub sample_window_size: usize,
     pub min_delta_ns: i64,
-    pub calibration_samples: usize,  // Number of samples for timestamp calibration (0 = disabled)
-    pub warmup_secs: f64,            // Warmup period in seconds (0.0 = disabled, for tests)
+    pub calibration_samples: usize, // Number of samples for timestamp calibration (0 = disabled)
+    pub warmup_secs: f64,           // Warmup period in seconds (0.0 = disabled, for tests)
 }
 
 impl Default for SystemConfig {
@@ -40,9 +40,9 @@ impl Default for SystemConfig {
 
         // Platform-specific values
         #[cfg(windows)]
-        let (calibration, min_delta) = (3, 0_i64);  // Windows: quick calibration (3 samples ≈ 3s), accept all samples
+        let (calibration, min_delta) = (3, 0_i64); // Windows: quick calibration (3 samples ≈ 3s), accept all samples
         #[cfg(not(windows))]
-        let (calibration, min_delta) = (0, 1_000_000_i64);  // Linux: no calibration, 1ms rate limit
+        let (calibration, min_delta) = (0, 1_000_000_i64); // Linux: no calibration, 1ms rate limit
 
         SystemConfig {
             servo: ServoConfig {
@@ -97,7 +97,7 @@ mod tests {
         // Platform-specific values
         #[cfg(windows)]
         {
-            assert_eq!(config.filters.calibration_samples, 3);  // Quick calibration
+            assert_eq!(config.filters.calibration_samples, 3); // Quick calibration
             assert_eq!(config.filters.min_delta_ns, 0);
         }
         #[cfg(not(windows))]
@@ -122,8 +122,14 @@ mod tests {
         // Verify values match
         assert!((restored.servo.kp - config.servo.kp).abs() < f64::EPSILON);
         assert!((restored.servo.ki - config.servo.ki).abs() < f64::EPSILON);
-        assert_eq!(restored.filters.sample_window_size, config.filters.sample_window_size);
-        assert_eq!(restored.filters.calibration_samples, config.filters.calibration_samples);
+        assert_eq!(
+            restored.filters.sample_window_size,
+            config.filters.sample_window_size
+        );
+        assert_eq!(
+            restored.filters.calibration_samples,
+            config.filters.calibration_samples
+        );
     }
 
     #[test]
@@ -158,6 +164,9 @@ mod tests {
         let cloned = config.clone();
 
         assert!((cloned.servo.kp - config.servo.kp).abs() < f64::EPSILON);
-        assert_eq!(cloned.filters.sample_window_size, config.filters.sample_window_size);
+        assert_eq!(
+            cloned.filters.sample_window_size,
+            config.filters.sample_window_size
+        );
     }
 }

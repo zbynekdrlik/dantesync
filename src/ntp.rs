@@ -47,7 +47,7 @@ mod tests {
     #[test]
     fn test_offset_to_duration_positive() {
         // Simulate positive offset (local clock behind, needs step forward)
-        let offset_secs: f64 = 1.5;  // +1.5 seconds
+        let offset_secs: f64 = 1.5; // +1.5 seconds
 
         let sign = if offset_secs < 0.0 { -1 } else { 1 };
         let abs_secs = offset_secs.abs();
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn test_offset_to_duration_negative() {
         // Simulate negative offset (local clock ahead, needs step backward)
-        let offset_secs: f64 = -2.25;  // -2.25 seconds
+        let offset_secs: f64 = -2.25; // -2.25 seconds
 
         let sign = if offset_secs < 0.0 { -1 } else { 1 };
         let abs_secs = offset_secs.abs();
@@ -87,7 +87,7 @@ mod tests {
         let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
         let duration = Duration::new(secs, nanos);
 
-        assert_eq!(sign, 1);  // 0 is considered positive
+        assert_eq!(sign, 1); // 0 is considered positive
         assert_eq!(duration.as_secs(), 0);
         assert_eq!(duration.subsec_nanos(), 0);
     }
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn test_offset_small_values() {
         // Test sub-second offset (common case)
-        let offset_secs: f64 = 0.002;  // 2ms
+        let offset_secs: f64 = 0.002; // 2ms
 
         let abs_secs = offset_secs.abs();
         let secs = abs_secs.trunc() as u64;
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn test_offset_microsecond_precision() {
         // Test microsecond precision
-        let offset_secs: f64 = 0.000500;  // 500us
+        let offset_secs: f64 = 0.000500; // 500us
 
         let abs_secs = offset_secs.abs();
         let secs = abs_secs.trunc() as u64;

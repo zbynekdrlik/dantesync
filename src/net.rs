@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use socket2::{Socket, Domain, Type, Protocol};
+use anyhow::{anyhow, Result};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 
 #[cfg(unix)]
@@ -19,9 +19,9 @@ pub fn get_default_interface() -> Result<(String, Ipv4Addr)> {
 
         // Skip wireless interfaces if possible
         let name_lower = iface.name.to_lowercase();
-        let is_wireless = name_lower.contains("wireless") ||
-                          name_lower.contains("wi-fi") ||
-                          name_lower.contains("wlan");
+        let is_wireless = name_lower.contains("wireless")
+            || name_lower.contains("wi-fi")
+            || name_lower.contains("wlan");
 
         // Verify we can actually bind to this IP
         if is_ip_bindable(ip) {
@@ -58,15 +58,15 @@ fn is_ip_bindable(ip: Ipv4Addr) -> bool {
 pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpSocket> {
     // Standard UDP socket creation for TX (Transmission) or legacy RX
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    
+
     socket.set_reuse_address(true)?;
-    
+
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     socket.bind(&addr.into())?;
 
     let multi_addr: Ipv4Addr = "224.0.1.129".parse()?;
     socket.join_multicast_v4(&multi_addr, &interface_ip)?;
-    
+
     socket.set_multicast_loop_v4(false)?;
     socket.set_nonblocking(true)?;
 
@@ -84,27 +84,33 @@ pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpS
 }
 
 #[cfg(unix)]
-pub fn recv_with_timestamp(sock: &UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, std::time::SystemTime)>> {
-    use std::os::fd::AsRawFd;
-    use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned, SockaddrStorage};
+pub fn recv_with_timestamp(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> Result<Option<(usize, std::time::SystemTime)>> {
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrStorage};
     use nix::sys::time::TimeSpec;
+    use std::os::fd::AsRawFd;
     use std::time::{Duration, SystemTime};
 
     let fd = sock.as_raw_fd();
     let mut iov = [std::io::IoSliceMut::new(buf)];
     let mut cmsg_buf = nix::cmsg_space!(TimeSpec);
-    
+
     match recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty()) {
         Ok(msg) => {
-            let timestamp = msg.cmsgs().find_map(|cmsg| {
-                if let ControlMessageOwned::ScmTimestampns(ts) = cmsg {
-                    let duration = Duration::new(ts.tv_sec() as u64, ts.tv_nsec() as u32);
-                    Some(SystemTime::UNIX_EPOCH + duration)
-                } else {
-                    None
-                }
-            }).unwrap_or_else(SystemTime::now);
-            
+            let timestamp = msg
+                .cmsgs()
+                .find_map(|cmsg| {
+                    if let ControlMessageOwned::ScmTimestampns(ts) = cmsg {
+                        let duration = Duration::new(ts.tv_sec() as u64, ts.tv_nsec() as u32);
+                        Some(SystemTime::UNIX_EPOCH + duration)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(SystemTime::now);
+
             Ok(Some((msg.bytes, timestamp)))
         }
         Err(nix::errno::Errno::EAGAIN) => Ok(None),
@@ -113,7 +119,10 @@ pub fn recv_with_timestamp(sock: &UdpSocket, buf: &mut [u8]) -> Result<Option<(u
 }
 
 #[cfg(not(unix))]
-pub fn recv_with_timestamp(sock: &UdpSocket, buf: &mut [u8]) -> Result<Option<(usize, std::time::SystemTime)>> {
+pub fn recv_with_timestamp(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+) -> Result<Option<(usize, std::time::SystemTime)>> {
     match sock.recv_from(buf) {
         Ok((size, _)) => Ok(Some((size, std::time::SystemTime::now()))),
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),

@@ -7,18 +7,21 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
-    use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, MenuEvent}, Icon};
-    use winit::event_loop::{ControlFlow, EventLoopBuilder};
-    use winit::event::Event;
-    use tokio::net::windows::named_pipe::ClientOptions;
-    use tokio::io::AsyncReadExt;
     use serde::Deserialize;
-    use std::time::Duration;
     use std::cell::RefCell;
-    use winrt_notification::{Toast, Sound};
-    use windows::Win32::Foundation::{HANDLE, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-    use windows::Win32::System::Threading::CreateMutexW;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use tray_icon::{
+        menu::{Menu, MenuEvent, MenuItem},
+        Icon, TrayIconBuilder,
+    };
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use winit::event::Event;
+    use winit::event_loop::{ControlFlow, EventLoopBuilder};
+    use winrt_notification::{Sound, Toast};
 
     // ========================================================================
     // SINGLE INSTANCE CHECK - Prevent multiple tray apps
@@ -136,7 +139,7 @@ mod app {
             for x in 0..width {
                 let dx = x as f32 - cx + 0.5;
                 let dy = y as f32 - cy + 0.5;
-                let dist = (dx*dx + dy*dy).sqrt();
+                let dist = (dx * dx + dy * dy).sqrt();
 
                 if dist <= inner_radius {
                     // Main fill - solid color
@@ -192,7 +195,9 @@ mod app {
             }
         };
 
-        let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build().unwrap();
+        let event_loop = EventLoopBuilder::<AppEvent>::with_user_event()
+            .build()
+            .unwrap();
         let proxy = event_loop.create_proxy();
 
         // ====================================================================
@@ -216,29 +221,34 @@ mod app {
         let menu = Menu::new();
         menu.append(&status_i).unwrap();
         menu.append(&mode_i).unwrap();
-        menu.append(&tray_icon::menu::PredefinedMenuItem::separator()).unwrap();
+        menu.append(&tray_icon::menu::PredefinedMenuItem::separator())
+            .unwrap();
         menu.append(&restart_i).unwrap();
         menu.append(&stop_i).unwrap();
-        menu.append(&tray_icon::menu::PredefinedMenuItem::separator()).unwrap();
+        menu.append(&tray_icon::menu::PredefinedMenuItem::separator())
+            .unwrap();
         menu.append(&log_i).unwrap();
         menu.append(&live_log_i).unwrap();
         menu.append(&config_i).unwrap();
-        menu.append(&tray_icon::menu::PredefinedMenuItem::separator()).unwrap();
+        menu.append(&tray_icon::menu::PredefinedMenuItem::separator())
+            .unwrap();
         menu.append(&quit_i).unwrap();
 
         // Colors (Flat UI / Bootstrap-style)
-        let red_icon = generate_icon(220, 53, 69);    // Danger Red - Offline
-        let green_icon = generate_icon(40, 167, 69);  // Success Green - Locked
+        let red_icon = generate_icon(220, 53, 69); // Danger Red - Offline
+        let green_icon = generate_icon(40, 167, 69); // Success Green - Locked
         let yellow_icon = generate_icon(255, 193, 7); // Warning Yellow - Acquiring
-        let cyan_icon = generate_icon(0, 188, 212);   // Cyan - NANO mode (ultra-precise)
+        let cyan_icon = generate_icon(0, 188, 212); // Cyan - NANO mode (ultra-precise)
 
         // Wrap in RefCell so we can explicitly drop it on exit to clean up tray icon
-        let tray_icon = RefCell::new(Some(TrayIconBuilder::new()
-            .with_menu(Box::new(menu.clone()))
-            .with_tooltip("Dante Time Sync - Connecting...")
-            .with_icon(yellow_icon.clone())
-            .build()
-            .unwrap()));
+        let tray_icon = RefCell::new(Some(
+            TrayIconBuilder::new()
+                .with_menu(Box::new(menu.clone()))
+                .with_tooltip("Dante Time Sync - Connecting...")
+                .with_icon(yellow_icon.clone())
+                .build()
+                .unwrap(),
+        ));
 
         // Spawn poller thread... (kept same)
         std::thread::spawn(move || {
@@ -246,7 +256,7 @@ mod app {
                 .enable_all()
                 .build()
                 .unwrap();
-            
+
             rt.block_on(async move {
                 loop {
                     // Server pipe is outbound-only (Server -> Client).
@@ -254,16 +264,20 @@ mod app {
                     match ClientOptions::new()
                         .write(false)
                         .read(true)
-                        .open(r"\\.\pipe\dantetimesync") 
+                        .open(r"\\.\pipe\dantetimesync")
                     {
                         Ok(mut client) => {
                             loop {
                                 let mut len_buf = [0u8; 4];
-                                if client.read_exact(&mut len_buf).await.is_err() { break; }
+                                if client.read_exact(&mut len_buf).await.is_err() {
+                                    break;
+                                }
                                 let len = u32::from_le_bytes(len_buf) as usize;
                                 let mut buf = vec![0u8; len];
-                                if client.read_exact(&mut buf).await.is_err() { break; }
-                                
+                                if client.read_exact(&mut buf).await.is_err() {
+                                    break;
+                                }
+
                                 if let Ok(status) = serde_json::from_slice::<SyncStatus>(&buf) {
                                     let _ = proxy.send_event(AppEvent::Update(status));
                                 }

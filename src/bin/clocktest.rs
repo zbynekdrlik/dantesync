@@ -3,13 +3,13 @@
 
 #[cfg(windows)]
 fn main() {
-    use std::time::Duration;
     use std::thread;
-    use windows::Win32::System::SystemInformation::{
-        GetSystemTimeAdjustmentPrecise, SetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime,
-    };
-    use windows::Win32::System::Performance::{QueryPerformanceFrequency, QueryPerformanceCounter};
+    use std::time::Duration;
     use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    use windows::Win32::System::SystemInformation::{
+        GetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime, SetSystemTimeAdjustmentPrecise,
+    };
 
     println!("=== Windows Clock Adjustment Test ===\n");
 
@@ -25,7 +25,8 @@ fn main() {
     let mut inc = 0u64;
     let mut disabled = BOOL(0);
     unsafe {
-        GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled).expect("Failed to get adjustment");
+        GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled)
+            .expect("Failed to get adjustment");
     }
     println!("Nominal Increment: {}", inc);
     println!("Current Adjustment: {}", adj);
@@ -34,7 +35,10 @@ fn main() {
 
     // Test function
     let test_ppm = |ppm: f64, duration_secs: u64| {
-        println!("--- Testing {:+.0} PPM for {} seconds ---", ppm, duration_secs);
+        println!(
+            "--- Testing {:+.0} PPM for {} seconds ---",
+            ppm, duration_secs
+        );
 
         // Calculate new adjustment
         let delta = (ppm * perf_freq as f64 / 1_000_000.0).round() as i64;
@@ -86,13 +90,23 @@ fn main() {
         let diff_ns = system_ns - wall_ns;
         let observed_ppm = (diff_ns / wall_ns) * 1_000_000.0;
 
-        println!("Wall time (QPC):    {:.6} seconds", wall_ns / 1_000_000_000.0);
-        println!("System time (FT):   {:.6} seconds", system_ns / 1_000_000_000.0);
+        println!(
+            "Wall time (QPC):    {:.6} seconds",
+            wall_ns / 1_000_000_000.0
+        );
+        println!(
+            "System time (FT):   {:.6} seconds",
+            system_ns / 1_000_000_000.0
+        );
         println!("Difference:         {:.3} ms", diff_ns / 1_000_000.0);
         println!("Requested PPM:      {:+.1}", ppm);
         println!("Observed PPM:       {:+.1}", observed_ppm);
 
-        let effectiveness = if ppm.abs() > 0.1 { observed_ppm / ppm } else { 0.0 };
+        let effectiveness = if ppm.abs() > 0.1 {
+            observed_ppm / ppm
+        } else {
+            0.0
+        };
         println!("Effectiveness:      {:.1}%", effectiveness * 100.0);
         println!();
 
@@ -105,36 +119,57 @@ fn main() {
     println!(">>> Baseline drift: {:+.1} PPM", baseline);
 
     // Reset to nominal
-    unsafe { SetSystemTimeAdjustmentPrecise(inc, false).ok(); }
+    unsafe {
+        SetSystemTimeAdjustmentPrecise(inc, false).ok();
+    }
     thread::sleep(Duration::from_millis(500));
 
     // Test 2: Positive PPM
     println!("\n========== TEST 2: +500 PPM ==========");
     let pos = test_ppm(500.0, 5);
     let pos_corrected = pos - baseline;
-    println!(">>> Observed change from baseline: {:+.1} PPM (expected +500)", pos_corrected);
+    println!(
+        ">>> Observed change from baseline: {:+.1} PPM (expected +500)",
+        pos_corrected
+    );
 
     // Reset to nominal
-    unsafe { SetSystemTimeAdjustmentPrecise(inc, false).ok(); }
+    unsafe {
+        SetSystemTimeAdjustmentPrecise(inc, false).ok();
+    }
     thread::sleep(Duration::from_millis(500));
 
     // Test 3: Negative PPM
     println!("\n========== TEST 3: -500 PPM ==========");
     let neg = test_ppm(-500.0, 5);
     let neg_corrected = neg - baseline;
-    println!(">>> Observed change from baseline: {:+.1} PPM (expected -500)", neg_corrected);
+    println!(
+        ">>> Observed change from baseline: {:+.1} PPM (expected -500)",
+        neg_corrected
+    );
 
     // Reset to nominal
-    unsafe { SetSystemTimeAdjustmentPrecise(inc, false).ok(); }
+    unsafe {
+        SetSystemTimeAdjustmentPrecise(inc, false).ok();
+    }
 
     // Summary
     println!("\n========== SUMMARY ==========");
     println!("Baseline drift:         {:+.1} PPM", baseline);
-    println!("+500 PPM test:          {:+.1} PPM observed ({:+.1} from baseline)", pos, pos_corrected);
-    println!("-500 PPM test:          {:+.1} PPM observed ({:+.1} from baseline)", neg, neg_corrected);
+    println!(
+        "+500 PPM test:          {:+.1} PPM observed ({:+.1} from baseline)",
+        pos, pos_corrected
+    );
+    println!(
+        "-500 PPM test:          {:+.1} PPM observed ({:+.1} from baseline)",
+        neg, neg_corrected
+    );
 
     let avg_effectiveness = ((pos_corrected / 500.0).abs() + (neg_corrected / -500.0).abs()) / 2.0;
-    println!("\nAverage effectiveness:  {:.1}%", avg_effectiveness * 100.0);
+    println!(
+        "\nAverage effectiveness:  {:.1}%",
+        avg_effectiveness * 100.0
+    );
 
     if avg_effectiveness > 0.8 {
         println!("\n✓ FREQUENCY ADJUSTMENT IS WORKING!");

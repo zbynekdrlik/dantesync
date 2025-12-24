@@ -7,11 +7,11 @@
 //! Key: We use TimestampType::HostHighPrec which maps to PCAP_TSTAMP_HOST_HIPREC
 //! and uses KeQuerySystemTimePrecise() internally - NOT the default UNSYNCED mode.
 
-use anyhow::{Result, anyhow};
-use pcap::{Capture, Active, Device, TimestampType};
-use std::net::{UdpSocket, Ipv4Addr};
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
-use log::{info, warn, debug};
+use anyhow::{anyhow, Result};
+use log::{debug, info, warn};
+use pcap::{Active, Capture, Device, TimestampType};
+use std::net::{Ipv4Addr, UdpSocket};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PTP_EVENT_PORT: u16 = 319;
 const PTP_GENERAL_PORT: u16 = 320;
@@ -19,7 +19,7 @@ const PTP_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
 
 /// Create a socket and join PTP multicast group (for IGMP membership)
 fn join_multicast(port: u16, iface_ip: Ipv4Addr) -> Result<UdpSocket> {
-    use socket2::{Socket, Domain, Type, Protocol};
+    use socket2::{Domain, Protocol, Socket, Type};
     use std::net::SocketAddrV4;
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -46,34 +46,48 @@ pub struct NpcapPtpNetwork {
 
 impl NpcapPtpNetwork {
     pub fn new(interface_name: &str) -> Result<Self> {
-        info!("Initializing Npcap capture on interface: {}", interface_name);
+        info!(
+            "Initializing Npcap capture on interface: {}",
+            interface_name
+        );
 
         // Find the device by name or description
         let devices = Device::list()?;
-        let device = devices.iter()
+        let device = devices
+            .iter()
             .find(|d| {
-                d.name.contains(interface_name) ||
-                d.desc.as_ref().map(|desc| desc.contains(interface_name)).unwrap_or(false)
+                d.name.contains(interface_name)
+                    || d.desc
+                        .as_ref()
+                        .map(|desc| desc.contains(interface_name))
+                        .unwrap_or(false)
             })
             .or_else(|| {
                 // Try matching by IP address in description
                 devices.iter().find(|d| {
-                    d.addresses.iter().any(|addr| {
-                        format!("{:?}", addr.addr).contains(interface_name)
-                    })
+                    d.addresses
+                        .iter()
+                        .any(|addr| format!("{:?}", addr.addr).contains(interface_name))
                 })
             })
             .ok_or_else(|| {
-                let available: Vec<String> = devices.iter()
+                let available: Vec<String> = devices
+                    .iter()
                     .map(|d| format!("{} ({:?})", d.name, d.desc))
                     .collect();
-                anyhow!("Interface '{}' not found. Available: {:?}", interface_name, available)
+                anyhow!(
+                    "Interface '{}' not found. Available: {:?}",
+                    interface_name,
+                    available
+                )
             })?;
 
         info!("Found device: {} ({:?})", device.name, device.desc);
 
         // Extract interface IP for multicast join
-        let iface_ip = device.addresses.iter()
+        let iface_ip = device
+            .addresses
+            .iter()
             .find_map(|a| {
                 if let std::net::IpAddr::V4(ip) = a.addr {
                     if !ip.is_loopback() {
@@ -96,10 +110,10 @@ impl NpcapPtpNetwork {
         info!("[TS] Requesting HostHighPrec timestamps (KeQuerySystemTimePrecise)");
 
         let mut capture = Capture::from_device(device.clone())?
-            .promisc(false)        // Don't use promiscuous - rely on IGMP multicast join
-            .immediate_mode(true)  // Critical: disable buffering for lowest latency
-            .snaplen(256)          // PTP packets are small
-            .timeout(1)            // 1ms timeout for responsiveness
+            .promisc(false) // Don't use promiscuous - rely on IGMP multicast join
+            .immediate_mode(true) // Critical: disable buffering for lowest latency
+            .snaplen(256) // PTP packets are small
+            .timeout(1) // 1ms timeout for responsiveness
             .tstamp_type(TimestampType::HostHighPrec)
             .open()?;
 
@@ -133,7 +147,6 @@ impl NpcapPtpNetwork {
     }
 }
 
-
 impl crate::traits::PtpNetwork for NpcapPtpNetwork {
     fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
         match self.capture.next_packet() {
@@ -147,9 +160,12 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                     // Npcap provides high-precision timestamps synced with system time
                     let ts = Self::pcap_ts_to_systemtime(
                         header.ts.tv_sec as i64,
-                        header.ts.tv_usec as i64
+                        header.ts.tv_usec as i64,
                     );
-                    debug!("[TS] Npcap HostHighPrec: {}.{:06}", header.ts.tv_sec, header.ts.tv_usec);
+                    debug!(
+                        "[TS] Npcap HostHighPrec: {}.{:06}",
+                        header.ts.tv_sec, header.ts.tv_usec
+                    );
                     ts
                 } else {
                     // Fallback to SystemTime::now() if HostHighPrec not available
@@ -214,7 +230,8 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
 /// Get list of available Npcap devices
 pub fn list_npcap_devices() -> Result<Vec<String>> {
     let devices = Device::list()?;
-    Ok(devices.iter()
+    Ok(devices
+        .iter()
         .map(|d| format!("{}: {:?}", d.name, d.desc))
         .collect())
 }

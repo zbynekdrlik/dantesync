@@ -1,6 +1,6 @@
 use super::SystemClock;
-use anyhow::{Result, anyhow};
-use libc::{self, timex, adjtimex, ADJ_FREQUENCY, timeval, settimeofday};
+use anyhow::{anyhow, Result};
+use libc::{self, adjtimex, settimeofday, timeval, timex, ADJ_FREQUENCY};
 use std::mem;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ impl LinuxClock {
     pub fn new() -> Result<Self> {
         let mut tx: timex = unsafe { mem::zeroed() };
         tx.modes = 0; // Query mode
-        
+
         let ret = unsafe { adjtimex(&mut tx) };
         if ret < 0 {
             return Err(anyhow!("adjtimex failed (are you root?)"));
@@ -28,16 +28,16 @@ impl SystemClock for LinuxClock {
     fn adjust_frequency(&mut self, factor: f64) -> Result<()> {
         let ppm = (factor - 1.0) * 1_000_000.0;
         let freq_val = (ppm * 65536.0) as i64;
-        
+
         let mut tx: timex = unsafe { mem::zeroed() };
         tx.modes = ADJ_FREQUENCY;
         tx.freq = freq_val;
 
         let ret = unsafe { adjtimex(&mut tx) };
         if ret < 0 {
-             return Err(anyhow!("adjtimex failed to set frequency"));
+            return Err(anyhow!("adjtimex failed to set frequency"));
         }
-        
+
         Ok(())
     }
 
@@ -68,7 +68,10 @@ impl SystemClock for LinuxClock {
 
         let ret = unsafe { settimeofday(&tv, std::ptr::null()) };
         if ret < 0 {
-            return Err(anyhow!("settimeofday failed: errno={}", std::io::Error::last_os_error()));
+            return Err(anyhow!(
+                "settimeofday failed: errno={}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -105,13 +108,19 @@ mod tests {
         // +100ppm: factor = 1.0001 → ppm = 100 → freq_val ≈ 6553600
         // Allow ±1 for floating point rounding
         let freq_100ppm = factor_to_freq_val(1.0001);
-        assert!((freq_100ppm - 6553600).abs() <= 1,
-                "Expected ~6553600, got {}", freq_100ppm);
+        assert!(
+            (freq_100ppm - 6553600).abs() <= 1,
+            "Expected ~6553600, got {}",
+            freq_100ppm
+        );
 
         // -100ppm: factor = 0.9999 → ppm = -100 → freq_val ≈ -6553600
         let freq_neg100ppm = factor_to_freq_val(0.9999);
-        assert!((freq_neg100ppm + 6553600).abs() <= 1,
-                "Expected ~-6553600, got {}", freq_neg100ppm);
+        assert!(
+            (freq_neg100ppm + 6553600).abs() <= 1,
+            "Expected ~-6553600, got {}",
+            freq_neg100ppm
+        );
 
         // Test exact integer PPM values using direct calculation
         // +1ppm exactly: ppm * 65536 = 65536

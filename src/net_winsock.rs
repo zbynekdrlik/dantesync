@@ -9,27 +9,23 @@
 //! - WSARecvMsg to receive packets with control messages
 //! - SO_TIMESTAMP control message contains QPC timestamp
 
-use anyhow::{Result, anyhow};
-use log::{info, warn, debug};
-use std::net::Ipv4Addr;
-use std::time::SystemTime;
+use anyhow::{anyhow, Result};
+use log::{debug, info, warn};
 use std::mem;
+use std::net::Ipv4Addr;
 use std::ptr;
+use std::time::SystemTime;
 
-use windows::Win32::Networking::WinSock::{
-    AF_INET, SOCK_DGRAM, IPPROTO_UDP, IPPROTO_IP,
-    SOCKET, SOCKADDR_IN, IN_ADDR, WSADATA,
-    WSAStartup, WSACleanup, WSAGetLastError, WSAIoctl,
-    socket, bind, closesocket, setsockopt, ioctlsocket, FIONBIO,
-    IP_ADD_MEMBERSHIP, IP_MULTICAST_LOOP,
-    SOL_SOCKET, SO_REUSEADDR, SO_TIMESTAMP,
-    SOCKET_ERROR, INVALID_SOCKET,
-    WSAMSG, WSABUF, SEND_RECV_FLAGS,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, recv,
-};
-use windows::Win32::System::IO::OVERLAPPED;
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::GUID;
+use windows::Win32::Networking::WinSock::{
+    bind, closesocket, ioctlsocket, recv, setsockopt, socket, WSACleanup, WSAGetLastError,
+    WSAIoctl, WSAStartup, AF_INET, FIONBIO, INVALID_SOCKET, IN_ADDR, IPPROTO_IP, IPPROTO_UDP,
+    IP_ADD_MEMBERSHIP, IP_MULTICAST_LOOP, SEND_RECV_FLAGS, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, SO_TIMESTAMP, WSABUF,
+    WSADATA, WSAMSG,
+};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::IO::OVERLAPPED;
 
 const PTP_EVENT_PORT: u16 = 319;
 const PTP_GENERAL_PORT: u16 = 320;
@@ -46,9 +42,9 @@ const WSAID_WSARECVMSG: GUID = GUID::from_u128(0xf689d7c8_6f1f_436b_8a53_e54fe35
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct CmsgHdr {
-    cmsg_len: usize,   // Length including header
-    cmsg_level: i32,   // Protocol level
-    cmsg_type: i32,    // Protocol-specific type
+    cmsg_len: usize, // Length including header
+    cmsg_level: i32, // Protocol level
+    cmsg_type: i32,  // Protocol-specific type
 }
 
 /// IP multicast membership request
@@ -72,7 +68,7 @@ type WsaRecvMsgFn = unsafe extern "system" fn(
     *mut WSAMSG,
     *mut u32,
     *mut OVERLAPPED,
-    *mut std::ffi::c_void,  // LPWSAOVERLAPPED_COMPLETION_ROUTINE
+    *mut std::ffi::c_void, // LPWSAOVERLAPPED_COMPLETION_ROUTINE
 ) -> i32;
 
 /// PTP network using Winsock with SO_TIMESTAMP for precise timestamps
@@ -123,7 +119,10 @@ impl WinsockPtpNetwork {
             warn!("SO_TIMESTAMP not available - falling back to application timestamps");
         }
 
-        info!("Winsock PTP network initialized on {} (ports 319, 320)", interface_ip);
+        info!(
+            "Winsock PTP network initialized on {} (ports 319, 320)",
+            interface_ip
+        );
 
         Ok(WinsockPtpNetwork {
             socket_319,
@@ -144,8 +143,13 @@ impl WinsockPtpNetwork {
 
             // Enable address reuse
             let reuse: i32 = 1;
-            if setsockopt(sock, SOL_SOCKET as i32, SO_REUSEADDR as i32,
-                         Some(&reuse.to_ne_bytes())) == SOCKET_ERROR {
+            if setsockopt(
+                sock,
+                SOL_SOCKET as i32,
+                SO_REUSEADDR as i32,
+                Some(&reuse.to_ne_bytes()),
+            ) == SOCKET_ERROR
+            {
                 warn!("Failed to set SO_REUSEADDR: {}", WSAGetLastError().0);
             }
 
@@ -153,14 +157,24 @@ impl WinsockPtpNetwork {
             let addr = SOCKADDR_IN {
                 sin_family: AF_INET,
                 sin_port: port.to_be(),
-                sin_addr: IN_ADDR { S_un: std::mem::zeroed() },
+                sin_addr: IN_ADDR {
+                    S_un: std::mem::zeroed(),
+                },
                 sin_zero: [0; 8],
             };
 
-            if bind(sock, &addr as *const SOCKADDR_IN as *const _,
-                   mem::size_of::<SOCKADDR_IN>() as i32) == SOCKET_ERROR {
+            if bind(
+                sock,
+                &addr as *const SOCKADDR_IN as *const _,
+                mem::size_of::<SOCKADDR_IN>() as i32,
+            ) == SOCKET_ERROR
+            {
                 closesocket(sock);
-                return Err(anyhow!("Failed to bind port {}: {}", port, WSAGetLastError().0));
+                return Err(anyhow!(
+                    "Failed to bind port {}: {}",
+                    port,
+                    WSAGetLastError().0
+                ));
             }
 
             // Join PTP multicast group
@@ -169,19 +183,28 @@ impl WinsockPtpNetwork {
                 imr_interface: u32::from_ne_bytes(interface_ip.octets()),
             };
 
-            if setsockopt(sock, IPPROTO_IP.0 as i32, IP_ADD_MEMBERSHIP as i32,
-                         Some(std::slice::from_raw_parts(
-                             &mreq as *const IpMreq as *const u8,
-                             mem::size_of::<IpMreq>()
-                         ))) == SOCKET_ERROR {
+            if setsockopt(
+                sock,
+                IPPROTO_IP.0 as i32,
+                IP_ADD_MEMBERSHIP as i32,
+                Some(std::slice::from_raw_parts(
+                    &mreq as *const IpMreq as *const u8,
+                    mem::size_of::<IpMreq>(),
+                )),
+            ) == SOCKET_ERROR
+            {
                 closesocket(sock);
                 return Err(anyhow!("Failed to join multicast: {}", WSAGetLastError().0));
             }
 
             // Disable multicast loopback
             let loopback: u8 = 0;
-            setsockopt(sock, IPPROTO_IP.0 as i32, IP_MULTICAST_LOOP as i32,
-                      Some(&[loopback]));
+            setsockopt(
+                sock,
+                IPPROTO_IP.0 as i32,
+                IP_MULTICAST_LOOP as i32,
+                Some(&[loopback]),
+            );
 
             // Set socket to non-blocking mode
             let mut mode: u32 = 1;
@@ -233,8 +256,10 @@ impl WinsockPtpNetwork {
 
             let mut bytes_returned: u32 = 0;
 
-            info!("[TS-Init] Attempting SIO_TIMESTAMPING (ioctl=0x{:08X}, flags=0x{:X})",
-                  SIO_TIMESTAMPING, TIMESTAMPING_FLAG_RX);
+            info!(
+                "[TS-Init] Attempting SIO_TIMESTAMPING (ioctl=0x{:08X}, flags=0x{:X})",
+                SIO_TIMESTAMPING, TIMESTAMPING_FLAG_RX
+            );
 
             let result = WSAIoctl(
                 sock,
@@ -270,7 +295,10 @@ impl WinsockPtpNetwork {
     }
 
     /// Receive packet with timestamp using WSARecvMsg
-    fn recv_with_timestamp(&mut self, sock: SOCKET) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    fn recv_with_timestamp(
+        &mut self,
+        sock: SOCKET,
+    ) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
         const BUFFER_SIZE: usize = 512;
         const CONTROL_SIZE: usize = 128; // Increased for control messages
 
@@ -299,7 +327,13 @@ impl WinsockPtpNetwork {
 
             // Use WSARecvMsg if available, otherwise fall back
             let result = if let Some(recv_fn) = self.recv_msg_fn {
-                recv_fn(sock, &mut msg, &mut bytes_received, ptr::null_mut(), ptr::null_mut())
+                recv_fn(
+                    sock,
+                    &mut msg,
+                    &mut bytes_received,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
             } else {
                 debug!("[Recv] WSARecvMsg not available, using fallback");
                 return self.recv_fallback(sock);
@@ -307,7 +341,8 @@ impl WinsockPtpNetwork {
 
             if result == SOCKET_ERROR {
                 let err = WSAGetLastError().0;
-                if err == 10035 { // WSAEWOULDBLOCK
+                if err == 10035 {
+                    // WSAEWOULDBLOCK
                     return Ok(None);
                 }
                 return Err(anyhow!("WSARecvMsg failed: {}", err));
@@ -319,7 +354,10 @@ impl WinsockPtpNetwork {
 
             // Log receive details
             let control_len = msg.Control.len as usize;
-            debug!("[Recv] Got {} bytes, control_len={}", bytes_received, control_len);
+            debug!(
+                "[Recv] Got {} bytes, control_len={}",
+                bytes_received, control_len
+            );
 
             // Extract timestamp from control message
             let timestamp = self.extract_timestamp(&control, control_len);
@@ -342,26 +380,28 @@ impl WinsockPtpNetwork {
         let mut offset = 0;
         let mut msg_count = 0;
         while offset + mem::size_of::<CmsgHdr>() <= control_len {
-            let cmsg: &CmsgHdr = unsafe {
-                &*(control.as_ptr().add(offset) as *const CmsgHdr)
-            };
+            let cmsg: &CmsgHdr = unsafe { &*(control.as_ptr().add(offset) as *const CmsgHdr) };
 
             if cmsg.cmsg_len == 0 {
-                debug!("[TS] Control message {} has zero length, stopping", msg_count);
+                debug!(
+                    "[TS] Control message {} has zero length, stopping",
+                    msg_count
+                );
                 break;
             }
 
-            debug!("[TS] Control msg {}: level={} type={} len={}",
-                   msg_count, cmsg.cmsg_level, cmsg.cmsg_type, cmsg.cmsg_len);
+            debug!(
+                "[TS] Control msg {}: level={} type={} len={}",
+                msg_count, cmsg.cmsg_level, cmsg.cmsg_type, cmsg.cmsg_len
+            );
 
             // Check for SO_TIMESTAMP (level=SOL_SOCKET, type=SO_TIMESTAMP)
             if cmsg.cmsg_level == SOL_SOCKET as i32 && cmsg.cmsg_type == SO_TIMESTAMP as i32 {
                 // Data follows the header
                 let data_offset = offset + mem::size_of::<CmsgHdr>();
                 if data_offset + 8 <= control_len {
-                    let qpc_timestamp: u64 = unsafe {
-                        *(control.as_ptr().add(data_offset) as *const u64)
-                    };
+                    let qpc_timestamp: u64 =
+                        unsafe { *(control.as_ptr().add(data_offset) as *const u64) };
 
                     // Get current QPC for comparison
                     let current_qpc = unsafe {
@@ -373,8 +413,10 @@ impl WinsockPtpNetwork {
                     let latency_qpc = current_qpc.saturating_sub(qpc_timestamp);
                     let latency_us = (latency_qpc as f64 / self.qpc_frequency as f64) * 1_000_000.0;
 
-                    info!("[TS] SO_TIMESTAMP found! QPC={} current={} latency={:.1}us",
-                          qpc_timestamp, current_qpc, latency_us);
+                    info!(
+                        "[TS] SO_TIMESTAMP found! QPC={} current={} latency={:.1}us",
+                        qpc_timestamp, current_qpc, latency_us
+                    );
 
                     // Convert QPC to SystemTime
                     return self.qpc_to_systemtime(qpc_timestamp);
@@ -388,7 +430,10 @@ impl WinsockPtpNetwork {
         }
 
         // No timestamp found, fall back
-        warn!("[TS] No SO_TIMESTAMP in {} control messages, using SystemTime::now()", msg_count);
+        warn!(
+            "[TS] No SO_TIMESTAMP in {} control messages, using SystemTime::now()",
+            msg_count
+        );
         SystemTime::now()
     }
 
@@ -422,7 +467,8 @@ impl WinsockPtpNetwork {
 
             if result == SOCKET_ERROR {
                 let err = WSAGetLastError().0;
-                if err == 10035 { // WSAEWOULDBLOCK
+                if err == 10035 {
+                    // WSAEWOULDBLOCK
                     return Ok(None);
                 }
                 return Err(anyhow!("recv failed: {}", err));

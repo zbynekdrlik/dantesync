@@ -21,7 +21,10 @@ fn main() {
     let _ = sock_general.join_multicast_v4(&mcast, &any);
 
     println!("Listening on ports 319/320...\n");
-    println!("{:>6} {:>20} {:>20} {:>12} {:>12}", "Seq", "T1 (ns mod 1s)", "T2 (ns mod 1s)", "Offset (us)", "Raw (us)");
+    println!(
+        "{:>6} {:>20} {:>20} {:>12} {:>12}",
+        "Seq", "T1 (ns mod 1s)", "T2 (ns mod 1s)", "Offset (us)", "Raw (us)"
+    );
     println!("{}", "-".repeat(80));
 
     // Store pending syncs: seq_id -> (T2_ns, raw_T2)
@@ -36,9 +39,11 @@ fn main() {
             let t2 = SystemTime::now();
             let t2_ns = t2.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
 
-            if size >= 36 && (buf[0] & 0x0F) == 1 {  // PTPv1
+            if size >= 36 && (buf[0] & 0x0F) == 1 {
+                // PTPv1
                 let msg_type = buf[32] & 0x0F;
-                if msg_type == 0 {  // Sync
+                if msg_type == 0 {
+                    // Sync
                     let seq_id = u16::from_be_bytes([buf[30], buf[31]]);
                     pending.insert(seq_id, (t2_ns, t2_ns));
                 }
@@ -47,15 +52,19 @@ fn main() {
 
         // Check general socket (FollowUp messages)
         if let Ok((size, _)) = sock_general.recv_from(&mut buf) {
-            if size >= 52 && (buf[0] & 0x0F) == 1 {  // PTPv1
+            if size >= 52 && (buf[0] & 0x0F) == 1 {
+                // PTPv1
                 let msg_type = buf[32] & 0x0F;
-                if msg_type == 2 {  // FollowUp
+                if msg_type == 2 {
+                    // FollowUp
                     let assoc_seq = u16::from_be_bytes([buf[42], buf[43]]);
 
                     if let Some((t2_ns, _)) = pending.remove(&assoc_seq) {
                         // Parse T1 from FollowUp (offset 44-51 in body, which starts at 36)
-                        let t1_secs = u32::from_be_bytes([buf[44], buf[45], buf[46], buf[47]]) as i64;
-                        let t1_nanos = u32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]) as i64;
+                        let t1_secs =
+                            u32::from_be_bytes([buf[44], buf[45], buf[46], buf[47]]) as i64;
+                        let t1_nanos =
+                            u32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]) as i64;
                         let t1_ns = t1_secs * 1_000_000_000 + t1_nanos;
 
                         // Calculate phase offset (within 1 second)
@@ -64,14 +73,20 @@ fn main() {
 
                         let mut raw_offset = t2_mod - t1_mod;
                         // Normalize to ±0.5s
-                        if raw_offset > 500_000_000 { raw_offset -= 1_000_000_000; }
-                        if raw_offset < -500_000_000 { raw_offset += 1_000_000_000; }
+                        if raw_offset > 500_000_000 {
+                            raw_offset -= 1_000_000_000;
+                        }
+                        if raw_offset < -500_000_000 {
+                            raw_offset += 1_000_000_000;
+                        }
 
                         let offset_us = raw_offset as f64 / 1000.0;
                         offsets.push(offset_us);
 
-                        println!("{:>6} {:>20} {:>20} {:>+12.1} {:>+12.1}",
-                                 assoc_seq, t1_mod, t2_mod, offset_us, offset_us);
+                        println!(
+                            "{:>6} {:>20} {:>20} {:>+12.1} {:>+12.1}",
+                            assoc_seq, t1_mod, t2_mod, offset_us, offset_us
+                        );
 
                         count += 1;
                     }
@@ -86,13 +101,12 @@ fn main() {
     if offsets.len() > 5 {
         offsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let min = offsets[0];
-        let max = offsets[offsets.len()-1];
-        let median = offsets[offsets.len()/2];
+        let max = offsets[offsets.len() - 1];
+        let median = offsets[offsets.len() / 2];
         let mean: f64 = offsets.iter().sum::<f64>() / offsets.len() as f64;
 
-        let variance: f64 = offsets.iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>() / offsets.len() as f64;
+        let variance: f64 =
+            offsets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / offsets.len() as f64;
         let std_dev = variance.sqrt();
 
         println!("\n{}", "=".repeat(80));
