@@ -1,15 +1,14 @@
 #!/bin/bash
 set -e
 
-# Installer version - the binary version is extracted dynamically from the installed binary
-INSTALLER_VERSION="1.0.0"
+echo ">>> Dante Time Sync Installer <<<"
 
+# Version is extracted from the installed binary
 if [ "$1" == "--version" ]; then
-    echo "Dante Time Sync Installer v$INSTALLER_VERSION"
+    VERSION=$(/usr/local/bin/dantetimesync --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "not installed")
+    echo "Dante Time Sync v$VERSION"
     exit 0
 fi
-
-echo ">>> Dante Time Sync Installer v$INSTALLER_VERSION <<<"
 
 if [ "$EUID" -ne 0 ]; then
   echo "Error: Please run as root (sudo ./install.sh)"
