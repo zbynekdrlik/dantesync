@@ -178,126 +178,131 @@ function Install-NpcapWithAutomation {
         # Remove old result file
         Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
 
-        # Write the installation script (avoid nested here-strings by using line-by-line construction)
-        $scriptLines = @(
-            '$ErrorActionPreference = ''Continue'''
-            'try {'
-            '    Add-Type -AssemblyName UIAutomationClient'
-            '    Add-Type -AssemblyName UIAutomationTypes'
-            ''
-            '    $mouseCode = @"'
-            '        using System;'
-            '        using System.Runtime.InteropServices;'
-            '        public class NpcapMouseHelper {'
-            '            [DllImport("user32.dll")]'
-            '            public static extern bool SetCursorPos(int X, int Y);'
-            '            [DllImport("user32.dll")]'
-            '            public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, int dwExtraInfo);'
-            '            public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;'
-            '            public const uint MOUSEEVENTF_LEFTUP = 0x0004;'
-            '            public static void Click(int x, int y) {'
-            '                SetCursorPos(x, y);'
-            '                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);'
-            '                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);'
-            '            }'
-            '        }'
-            '"@'
-            '    Add-Type -TypeDefinition $mouseCode -ErrorAction SilentlyContinue'
-            ''
-            '    function Find-NpcapWindow {'
-            '        param([int]$TimeoutSeconds = 30)'
-            '        $rootElement = [System.Windows.Automation.AutomationElement]::RootElement'
-            '        $condition = New-Object System.Windows.Automation.PropertyCondition('
-            '            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,'
-            '            [System.Windows.Automation.ControlType]::Window)'
-            '        $elapsed = 0'
-            '        while ($elapsed -lt $TimeoutSeconds) {'
-            '            $windows = $rootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)'
-            '            foreach ($win in $windows) {'
-            '                $name = $win.Current.Name'
-            '                if ($name -and $name -like ''*Npcap*Setup*'') { return $win }'
-            '            }'
-            '            Start-Sleep -Milliseconds 500'
-            '            $elapsed += 0.5'
-            '        }'
-            '        return $null'
-            '    }'
-            ''
-            '    function Click-NpcapButton {'
-            '        param([System.Windows.Automation.AutomationElement]$Window, [string]$ButtonName)'
-            '        $titleBarIds = @(''Minimize'', ''Maximize'', ''Close'', ''SmallDecrement'', ''SmallIncrement'', ''LargeDecrement'', ''LargeIncrement'')'
-            '        $btnCondition = New-Object System.Windows.Automation.PropertyCondition('
-            '            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,'
-            '            [System.Windows.Automation.ControlType]::Button)'
-            '        $buttons = $Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCondition)'
-            '        foreach ($btn in $buttons) {'
-            '            $name = $btn.Current.Name'
-            '            $autoId = $btn.Current.AutomationId'
-            '            if ($titleBarIds -contains $autoId) { continue }'
-            '            if ($name -eq $ButtonName -or ($name -like "*$ButtonName*" -and $name -notlike ''*Cancel*'' -and $name -notlike ''*Back*'')) {'
-            '                try {'
-            '                    $rect = $btn.Current.BoundingRectangle'
-            '                    $x = [int]($rect.X + $rect.Width / 2)'
-            '                    $y = [int]($rect.Y + $rect.Height / 2)'
-            '                    [NpcapMouseHelper]::Click($x, $y)'
-            '                    Start-Sleep -Milliseconds 500'
-            '                    return $true'
-            '                } catch { }'
-            '            }'
-            '        }'
-            '        return $false'
-            '    }'
-            ''
-            '    # Kill existing installers'
-            '    Get-Process | Where-Object { $_.Name -like ''*npcap*'' } | Stop-Process -Force -ErrorAction SilentlyContinue'
-            '    Start-Sleep -Seconds 1'
-            ''
-            "    `$process = Start-Process -FilePath '$InstallerPath' -ArgumentList '/winpcap_mode=yes /loopback_support=no /dot11_support=no /vlan_support=no /admin_only=no /disable_restore_point=yes' -PassThru"
-            '    Start-Sleep -Seconds 2'
-            ''
-            '    # Click I Agree'
-            '    $window = Find-NpcapWindow -TimeoutSeconds 30'
-            '    if ($window) {'
-            '        Start-Sleep -Milliseconds 500'
-            '        Click-NpcapButton -Window $window -ButtonName ''I Agree'' | Out-Null'
-            '    }'
-            ''
-            '    # Click Install'
-            '    Start-Sleep -Seconds 1'
-            '    $window = Find-NpcapWindow -TimeoutSeconds 10'
-            '    if ($window) { Click-NpcapButton -Window $window -ButtonName ''Install'' | Out-Null }'
-            ''
-            '    # Wait for driver installation'
-            '    Start-Sleep -Seconds 20'
-            ''
-            '    # Click through remaining screens'
-            '    $maxWait = 90'
-            '    $waited = 0'
-            '    while ($waited -lt $maxWait) {'
-            '        $window = Find-NpcapWindow -TimeoutSeconds 3'
-            '        if (-not $window) { break }'
-            '        $clicked = Click-NpcapButton -Window $window -ButtonName ''Next'''
-            '        if (-not $clicked) { $clicked = Click-NpcapButton -Window $window -ButtonName ''Finish'' }'
-            '        if (-not $clicked) { $clicked = Click-NpcapButton -Window $window -ButtonName ''Close'' }'
-            '        if ($clicked) { Start-Sleep -Seconds 1 } else { Start-Sleep -Seconds 2; $waited += 2 }'
-            '    }'
-            ''
-            '    if (-not $process.HasExited) { $process.WaitForExit(10000) }'
-            '    Start-Sleep -Seconds 2'
-            ''
-            '    # Write result'
-            '    $packetDll = Test-Path ''C:\Windows\System32\Packet.dll'''
-            '    $npcapService = Get-Service -Name ''npcap'' -ErrorAction SilentlyContinue'
-            '    if ($packetDll -or $npcapService) {'
-            "        'SUCCESS' | Out-File '$resultFile'"
-            '    } else {'
-            "        'FAILED' | Out-File '$resultFile'"
-            '    }'
-            '} catch {'
-            "    `$_.Exception.Message | Out-File '$resultFile'"
-            '}'
-        )
-        $scriptLines | Out-File -FilePath $tempScript -Encoding UTF8
+        # Write the installation script - use Set-Content to write the script as a single string
+        # This avoids encoding issues with line-by-line array output
+        $csharpCode = @'
+using System;
+using System.Runtime.InteropServices;
+public class NpcapMouseHelper {
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, int dwExtraInfo);
+    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+    public static void Click(int x, int y) {
+        SetCursorPos(x, y);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+    }
+}
+'@
+        # Escape the C# code for embedding in the script
+        $csharpCodeEscaped = $csharpCode -replace "'", "''"
+
+        $scriptContent = @"
+`$ErrorActionPreference = 'Continue'
+try {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+
+    `$mouseCode = '$csharpCodeEscaped'
+    Add-Type -TypeDefinition `$mouseCode -ErrorAction SilentlyContinue
+
+    function Find-NpcapWindow {
+        param([int]`$TimeoutSeconds = 30)
+        `$rootElement = [System.Windows.Automation.AutomationElement]::RootElement
+        `$condition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Window)
+        `$elapsed = 0
+        while (`$elapsed -lt `$TimeoutSeconds) {
+            `$windows = `$rootElement.FindAll([System.Windows.Automation.TreeScope]::Children, `$condition)
+            foreach (`$win in `$windows) {
+                `$name = `$win.Current.Name
+                if (`$name -and `$name -like '*Npcap*Setup*') { return `$win }
+            }
+            Start-Sleep -Milliseconds 500
+            `$elapsed += 0.5
+        }
+        return `$null
+    }
+
+    function Click-NpcapButton {
+        param([System.Windows.Automation.AutomationElement]`$Window, [string]`$ButtonName)
+        `$titleBarIds = @('Minimize', 'Maximize', 'Close', 'SmallDecrement', 'SmallIncrement', 'LargeDecrement', 'LargeIncrement')
+        `$btnCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button)
+        `$buttons = `$Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, `$btnCondition)
+        foreach (`$btn in `$buttons) {
+            `$name = `$btn.Current.Name
+            `$autoId = `$btn.Current.AutomationId
+            if (`$titleBarIds -contains `$autoId) { continue }
+            if (`$name -eq `$ButtonName -or (`$name -like "*`$ButtonName*" -and `$name -notlike '*Cancel*' -and `$name -notlike '*Back*')) {
+                try {
+                    `$rect = `$btn.Current.BoundingRectangle
+                    `$x = [int](`$rect.X + `$rect.Width / 2)
+                    `$y = [int](`$rect.Y + `$rect.Height / 2)
+                    [NpcapMouseHelper]::Click(`$x, `$y)
+                    Start-Sleep -Milliseconds 500
+                    return `$true
+                } catch { }
+            }
+        }
+        return `$false
+    }
+
+    # Kill existing installers
+    Get-Process | Where-Object { `$_.Name -like '*npcap*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+
+    `$process = Start-Process -FilePath '$InstallerPath' -ArgumentList '/winpcap_mode=yes /loopback_support=no /dot11_support=no /vlan_support=no /admin_only=no /disable_restore_point=yes' -PassThru
+    Start-Sleep -Seconds 2
+
+    # Click I Agree
+    `$window = Find-NpcapWindow -TimeoutSeconds 30
+    if (`$window) {
+        Start-Sleep -Milliseconds 500
+        Click-NpcapButton -Window `$window -ButtonName 'I Agree' | Out-Null
+    }
+
+    # Click Install
+    Start-Sleep -Seconds 1
+    `$window = Find-NpcapWindow -TimeoutSeconds 10
+    if (`$window) { Click-NpcapButton -Window `$window -ButtonName 'Install' | Out-Null }
+
+    # Wait for driver installation
+    Start-Sleep -Seconds 20
+
+    # Click through remaining screens
+    `$maxWait = 90
+    `$waited = 0
+    while (`$waited -lt `$maxWait) {
+        `$window = Find-NpcapWindow -TimeoutSeconds 3
+        if (-not `$window) { break }
+        `$clicked = Click-NpcapButton -Window `$window -ButtonName 'Next'
+        if (-not `$clicked) { `$clicked = Click-NpcapButton -Window `$window -ButtonName 'Finish' }
+        if (-not `$clicked) { `$clicked = Click-NpcapButton -Window `$window -ButtonName 'Close' }
+        if (`$clicked) { Start-Sleep -Seconds 1 } else { Start-Sleep -Seconds 2; `$waited += 2 }
+    }
+
+    if (-not `$process.HasExited) { `$process.WaitForExit(10000) }
+    Start-Sleep -Seconds 2
+
+    # Write result
+    `$packetDll = Test-Path 'C:\Windows\System32\Packet.dll'
+    `$npcapService = Get-Service -Name 'npcap' -ErrorAction SilentlyContinue
+    if (`$packetDll -or `$npcapService) {
+        'SUCCESS' | Out-File '$resultFile'
+    } else {
+        'FAILED' | Out-File '$resultFile'
+    }
+} catch {
+    `$_.Exception.Message | Out-File '$resultFile'
+}
+"@
+        Set-Content -Path $tempScript -Value $scriptContent -Encoding UTF8
 
         # Get interactive user
         $loggedInUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
