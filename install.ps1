@@ -246,15 +246,28 @@ try {
     Write-Warning "Failed to register in Add/Remove Programs: $_"
 }
 
-# Copy uninstall script to install directory
-$UninstallScriptSource = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "uninstall.ps1"
-$UninstallScriptDest = "$InstallDir\uninstall.ps1"
-if (Test-Path $UninstallScriptSource) {
+# Copy uninstall script to install directory (only works when run from file, not irm | iex)
+$ScriptPath = $MyInvocation.MyCommand.Path
+if ($ScriptPath) {
+    $UninstallScriptSource = Join-Path (Split-Path -Parent $ScriptPath) "uninstall.ps1"
+    $UninstallScriptDest = "$InstallDir\uninstall.ps1"
+    if (Test-Path $UninstallScriptSource) {
+        try {
+            Copy-Item -Path $UninstallScriptSource -Destination $UninstallScriptDest -Force
+            Write-Host "  - Uninstall script copied to $InstallDir" -ForegroundColor Gray
+        } catch {
+            Write-Warning "Failed to copy uninstall script: $_"
+        }
+    }
+} else {
+    # Running via irm | iex - download uninstall script from GitHub
+    $UninstallScriptDest = "$InstallDir\uninstall.ps1"
     try {
-        Copy-Item -Path $UninstallScriptSource -Destination $UninstallScriptDest -Force
-        Write-Host "  - Uninstall script copied to $InstallDir" -ForegroundColor Gray
+        $UninstallUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/master/uninstall.ps1"
+        Invoke-WebRequest -Uri $UninstallUrl -OutFile $UninstallScriptDest
+        Write-Host "  - Uninstall script downloaded to $InstallDir" -ForegroundColor Gray
     } catch {
-        Write-Warning "Failed to copy uninstall script: $_"
+        Write-Warning "Failed to download uninstall script: $_"
     }
 }
 
