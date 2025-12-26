@@ -350,7 +350,7 @@ function Install-NpcapWithAutomation {
         Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
         Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
 
-        if ($result -eq "SUCCESS") {
+        if ($result -and $result.Trim() -eq "SUCCESS") {
             Write-Host "  Npcap installed successfully!" -ForegroundColor Green
             return $true
         } else {
