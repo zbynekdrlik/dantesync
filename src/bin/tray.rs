@@ -307,6 +307,8 @@ mod app {
             was_locked: false,
             was_nano: false,
             was_online: false,
+            was_ptp_offline: false,
+            was_ntp_failed: false,
             first_update: true,
         });
 
