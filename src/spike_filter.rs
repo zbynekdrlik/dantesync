@@ -118,16 +118,16 @@ impl SpikeFilter {
             // k=3: catches 99% of Gaussian outliers
             // We use higher values because we want to be conservative
             // and only reject clear spikes, not normal variation
-            k_acq: 4.0,   // Permissive: allow fast convergence
-            k_prod: 5.0,  // Balanced: moderate protection
-            k_lock: 6.0,  // Strict: protect locked state
-            k_nano: 8.0,  // Very strict: ultra-stable mode
+            k_acq: 4.0,  // Permissive: allow fast convergence
+            k_prod: 5.0, // Balanced: moderate protection
+            k_lock: 6.0, // Strict: protect locked state
+            k_nano: 8.0, // Very strict: ultra-stable mode
 
-            min_mad: 0.5,  // Minimum MAD floor (µs/s)
-            warmup_samples: 5,  // Need at least 5 samples
+            min_mad: 0.5,      // Minimum MAD floor (µs/s)
+            warmup_samples: 5, // Need at least 5 samples
 
             consecutive_spikes: 0,
-            max_consecutive_spikes: 5,  // Accept after 5 consecutive "spikes"
+            max_consecutive_spikes: 5, // Accept after 5 consecutive "spikes"
 
             total_samples: 0,
             rejected_spikes: 0,
@@ -301,7 +301,11 @@ mod tests {
         // During warmup (first 5 samples), all values should pass through
         for i in 0..5 {
             let result = filter.filter(i as f64 * 10.0, FilterMode::Lock);
-            assert!(!result.is_spike, "Sample {} should not be marked as spike during warmup", i);
+            assert!(
+                !result.is_spike,
+                "Sample {} should not be marked as spike during warmup",
+                i
+            );
             assert!((result.value - (i as f64 * 10.0)).abs() < 0.01);
         }
     }
@@ -336,7 +340,11 @@ mod tests {
         let result = filter.filter(100.0, FilterMode::Lock);
         assert!(result.is_spike, "100 µs/s spike should be detected");
         // Should be replaced with median (close to 0)
-        assert!(result.value.abs() < 5.0, "Spike should be replaced with median, got {}", result.value);
+        assert!(
+            result.value.abs() < 5.0,
+            "Spike should be replaced with median, got {}",
+            result.value
+        );
     }
 
     #[test]
@@ -376,9 +384,12 @@ mod tests {
 
         // ACQ should be more permissive (lower threshold)
         // NANO should be stricter (higher threshold relative to data)
-        assert!(result_acq.threshold < result_nano.threshold,
+        assert!(
+            result_acq.threshold < result_nano.threshold,
             "ACQ threshold {} should be < NANO threshold {}",
-            result_acq.threshold, result_nano.threshold);
+            result_acq.threshold,
+            result_nano.threshold
+        );
     }
 
     #[test]
@@ -417,8 +428,16 @@ mod tests {
         let (_, mad2, threshold2) = filter.last_stats();
 
         // Noisy system should have higher MAD and threshold
-        assert!(mad1 > mad2, "Noisy system MAD {} should be > quiet system MAD {}", mad1, mad2);
-        assert!(threshold1 > threshold2, "Noisy system threshold should be higher");
+        assert!(
+            mad1 > mad2,
+            "Noisy system MAD {} should be > quiet system MAD {}",
+            mad1,
+            mad2
+        );
+        assert!(
+            threshold1 > threshold2,
+            "Noisy system threshold should be higher"
+        );
     }
 
     #[test]
@@ -435,12 +454,17 @@ mod tests {
         // MAD should be at minimum floor
         assert!(mad >= 0.0, "MAD should be non-negative");
         // Threshold should still be meaningful
-        assert!(threshold >= filter.k_lock * filter.min_mad,
-            "Threshold should respect min_mad floor");
+        assert!(
+            threshold >= filter.k_lock * filter.min_mad,
+            "Threshold should respect min_mad floor"
+        );
 
         // A small deviation (2 µs/s) should NOT be marked as spike
         let result = filter.filter(2.0, FilterMode::Lock);
-        assert!(!result.is_spike, "2 µs/s should not be spike on stable system with min_mad floor");
+        assert!(
+            !result.is_spike,
+            "2 µs/s should not be spike on stable system with min_mad floor"
+        );
     }
 
     // ========================================================================
@@ -462,12 +486,19 @@ mod tests {
             let result = filter.filter(50.0, FilterMode::Lock);
             if !result.is_spike && (result.value - 50.0).abs() < 1.0 {
                 accepted = true;
-                assert!(i >= 4, "Should take at least 5 consecutive before accepting, accepted at {}", i);
+                assert!(
+                    i >= 4,
+                    "Should take at least 5 consecutive before accepting, accepted at {}",
+                    i
+                );
                 break;
             }
         }
 
-        assert!(accepted, "Consecutive spikes at same level should eventually be accepted");
+        assert!(
+            accepted,
+            "Consecutive spikes at same level should eventually be accepted"
+        );
     }
 
     #[test]
@@ -491,7 +522,10 @@ mod tests {
         let r2 = filter.filter(100.0, FilterMode::Lock);
 
         // Should still be rejected (counter was reset)
-        assert!(r1.is_spike && r2.is_spike, "Spikes after reset should still be rejected");
+        assert!(
+            r1.is_spike && r2.is_spike,
+            "Spikes after reset should still be rejected"
+        );
     }
 
     // ========================================================================
@@ -518,7 +552,7 @@ mod tests {
         let (total, rejected, ratio) = filter.stats();
         assert_eq!(total, 16);
         assert_eq!(rejected, 1);
-        assert!((ratio - (1.0/16.0*100.0)).abs() < 0.1);
+        assert!((ratio - (1.0 / 16.0 * 100.0)).abs() < 0.1);
     }
 
     #[test]
@@ -567,7 +601,11 @@ mod tests {
             let result = filter.filter(val, FilterMode::Lock);
 
             // Gradual changes should never be spikes
-            assert!(!result.is_spike, "Gradual change at sample {} should not be spike", i);
+            assert!(
+                !result.is_spike,
+                "Gradual change at sample {} should not be spike",
+                i
+            );
         }
     }
 
@@ -577,8 +615,8 @@ mod tests {
 
         // Simulate realistic pattern from mbc.lan logs
         let samples = [
-            -0.4, 0.2, -0.2, 0.5, 1.0, 2.5, -0.7, -0.1, 3.6, -0.7,
-            -1.2, -2.0, -3.9, 2.5, 1.8, 0.8, 0.4, 0.3, 4.4, 11.7,  // 11.7 is borderline
+            -0.4, 0.2, -0.2, 0.5, 1.0, 2.5, -0.7, -0.1, 3.6, -0.7, -1.2, -2.0, -3.9, 2.5, 1.8, 0.8,
+            0.4, 0.3, 4.4, 11.7, // 11.7 is borderline
             -1.4, 2.3, -5.5, -4.1, -3.2, 2.0, 1.4, -2.3, -2.8, 1.5,
         ];
 
@@ -588,13 +626,21 @@ mod tests {
             if result.is_spike {
                 spike_count += 1;
                 // The only real spikes should be large outliers
-                assert!(val.abs() > 10.0,
-                    "Sample {} ({}) marked as spike but < 10", i, val);
+                assert!(
+                    val.abs() > 10.0,
+                    "Sample {} ({}) marked as spike but < 10",
+                    i,
+                    val
+                );
             }
         }
 
         // Should have very few spikes (maybe 1-2 for the 11.7)
-        assert!(spike_count <= 2, "Too many normal samples marked as spikes: {}", spike_count);
+        assert!(
+            spike_count <= 2,
+            "Too many normal samples marked as spikes: {}",
+            spike_count
+        );
     }
 
     #[test]
@@ -602,8 +648,10 @@ mod tests {
         let mut filter = SpikeFilter::new();
 
         // Build up normal baseline from log data
-        let baseline = [-0.4, 0.2, -0.2, 0.5, 1.0, 2.5, -0.7, -0.1, 3.6, -0.7,
-                        -1.2, -2.0, -3.9, 2.5, 1.8, 0.8, 0.4, -1.7, -1.5, 0.3];
+        let baseline = [
+            -0.4, 0.2, -0.2, 0.5, 1.0, 2.5, -0.7, -0.1, 3.6, -0.7, -1.2, -2.0, -3.9, 2.5, 1.8, 0.8,
+            0.4, -1.7, -1.5, 0.3,
+        ];
 
         for &val in &baseline {
             filter.filter(val, FilterMode::Lock);
@@ -612,7 +660,11 @@ mod tests {
         // The massive +149 µs/s spike from logs MUST be rejected
         let result = filter.filter(149.1, FilterMode::Lock);
         assert!(result.is_spike, "+149 µs/s must be detected as spike");
-        assert!(result.value.abs() < 10.0, "Spike should be replaced with median, got {}", result.value);
+        assert!(
+            result.value.abs() < 10.0,
+            "Spike should be replaced with median, got {}",
+            result.value
+        );
     }
 
     #[test]

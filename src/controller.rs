@@ -905,7 +905,10 @@ where
         if filter_result.is_spike {
             info!(
                 "[Spike] REJECTED {:+.1}us/s (dev={:.1}, thresh={:.1}, median={:.1})",
-                raw_rate_ppm, filter_result.deviation, filter_result.threshold, filter_result.median
+                raw_rate_ppm,
+                filter_result.deviation,
+                filter_result.threshold,
+                filter_result.median
             );
         }
 
