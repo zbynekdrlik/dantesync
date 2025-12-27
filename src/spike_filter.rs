@@ -274,6 +274,174 @@ impl SpikeFilter {
 }
 
 // ============================================================================
+// JITTER ESTIMATOR - Adaptive EMA Smoothing for Noisy Systems
+// ============================================================================
+
+/// Jitter estimator for adaptive EMA smoothing
+///
+/// Measures the standard deviation of drift rate samples to detect
+/// high-jitter systems (like those with Realtek NICs) and adjust
+/// the EMA smoothing factor accordingly.
+///
+/// ## Design Principles
+/// 1. **Conservative activation**: Only reduces α when jitter clearly high
+/// 2. **Gradual adjustment**: Linear interpolation, no sudden jumps
+/// 3. **Reversible**: α increases back when jitter decreases
+/// 4. **No interference with spike filter**: Measures variance, not outliers
+#[derive(Debug)]
+pub struct JitterEstimator {
+    /// Rolling window of rate samples for jitter estimation
+    rate_history: VecDeque<f64>,
+
+    /// Window size for jitter calculation
+    window_size: usize,
+
+    /// Minimum samples before jitter estimation is valid
+    min_samples: usize,
+
+    /// Jitter threshold below which no smoothing adjustment (µs/s)
+    jitter_low: f64,
+
+    /// Jitter threshold above which maximum smoothing applied (µs/s)
+    jitter_high: f64,
+
+    /// Normal EMA alpha (used when jitter is low)
+    alpha_normal: f64,
+
+    /// Smoothed EMA alpha (used when jitter is high)
+    alpha_smooth: f64,
+
+    /// Last computed jitter (stddev)
+    last_jitter: f64,
+
+    /// Last computed adaptive alpha
+    last_alpha: f64,
+}
+
+impl JitterEstimator {
+    /// Create a new jitter estimator with default parameters
+    pub fn new() -> Self {
+        Self {
+            rate_history: VecDeque::with_capacity(30),
+            window_size: 30,      // 30 samples (~30 seconds)
+            min_samples: 15,      // Need at least 15 for valid estimate
+            jitter_low: 2.0,      // Below this: α = 0.3 (normal)
+            jitter_high: 8.0,     // Above this: α = 0.1 (heavily smoothed)
+            alpha_normal: 0.3,    // Standard EMA alpha
+            alpha_smooth: 0.1,    // Smoothed EMA alpha for noisy systems
+            last_jitter: 0.0,
+            last_alpha: 0.3,      // Default to normal alpha
+        }
+    }
+
+    /// Create with custom parameters (for testing)
+    #[cfg(test)]
+    pub fn with_params(
+        window_size: usize,
+        min_samples: usize,
+        jitter_low: f64,
+        jitter_high: f64,
+    ) -> Self {
+        Self {
+            rate_history: VecDeque::with_capacity(window_size),
+            window_size,
+            min_samples,
+            jitter_low,
+            jitter_high,
+            alpha_normal: 0.3,
+            alpha_smooth: 0.1,
+            last_jitter: 0.0,
+            last_alpha: 0.3,
+        }
+    }
+
+    /// Add a rate sample and compute adaptive alpha
+    ///
+    /// Returns the EMA alpha to use for this sample:
+    /// - 0.3 for low-jitter systems (normal responsiveness)
+    /// - 0.1-0.3 for medium-jitter systems (interpolated)
+    /// - 0.1 for high-jitter systems (heavy smoothing)
+    pub fn add_sample(&mut self, rate: f64) -> f64 {
+        // Add to history
+        self.rate_history.push_back(rate);
+        if self.rate_history.len() > self.window_size {
+            self.rate_history.pop_front();
+        }
+
+        // Not enough samples yet - use normal alpha
+        if self.rate_history.len() < self.min_samples {
+            self.last_alpha = self.alpha_normal;
+            return self.alpha_normal;
+        }
+
+        // Calculate jitter (standard deviation)
+        let jitter = self.calculate_stddev();
+        self.last_jitter = jitter;
+
+        // Compute adaptive alpha based on jitter level
+        let alpha = self.compute_alpha(jitter);
+        self.last_alpha = alpha;
+
+        alpha
+    }
+
+    /// Calculate standard deviation of rate samples
+    fn calculate_stddev(&self) -> f64 {
+        if self.rate_history.is_empty() {
+            return 0.0;
+        }
+
+        let n = self.rate_history.len() as f64;
+        let mean: f64 = self.rate_history.iter().sum::<f64>() / n;
+        let variance: f64 = self.rate_history.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        variance.sqrt()
+    }
+
+    /// Compute adaptive alpha based on jitter level
+    fn compute_alpha(&self, jitter: f64) -> f64 {
+        if jitter <= self.jitter_low {
+            // Low jitter: use normal alpha (full responsiveness)
+            self.alpha_normal
+        } else if jitter >= self.jitter_high {
+            // High jitter: use smooth alpha (heavy smoothing)
+            self.alpha_smooth
+        } else {
+            // Medium jitter: linear interpolation
+            let t = (jitter - self.jitter_low) / (self.jitter_high - self.jitter_low);
+            self.alpha_normal - t * (self.alpha_normal - self.alpha_smooth)
+        }
+    }
+
+    /// Get last computed jitter (stddev)
+    pub fn last_jitter(&self) -> f64 {
+        self.last_jitter
+    }
+
+    /// Get last computed adaptive alpha
+    pub fn last_alpha(&self) -> f64 {
+        self.last_alpha
+    }
+
+    /// Clear history (call after NTP step or major event)
+    pub fn clear(&mut self) {
+        self.rate_history.clear();
+        self.last_jitter = 0.0;
+        self.last_alpha = self.alpha_normal;
+    }
+
+    /// Get current sample count
+    pub fn sample_count(&self) -> usize {
+        self.rate_history.len()
+    }
+}
+
+impl Default for JitterEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -675,5 +843,284 @@ mod tests {
         // Minimum window size is 5
         let filter_small = SpikeFilter::with_window_size(3);
         assert_eq!(filter_small.window_size, 5);
+    }
+
+    // ========================================================================
+    // JITTER ESTIMATOR TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_jitter_estimator_defaults() {
+        let estimator = JitterEstimator::new();
+        assert_eq!(estimator.window_size, 30);
+        assert_eq!(estimator.min_samples, 15);
+        assert!((estimator.jitter_low - 2.0).abs() < 0.01);
+        assert!((estimator.jitter_high - 8.0).abs() < 0.01);
+        assert!((estimator.alpha_normal - 0.3).abs() < 0.01);
+        assert!((estimator.alpha_smooth - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_jitter_warmup_uses_normal_alpha() {
+        let mut estimator = JitterEstimator::with_params(20, 10, 2.0, 8.0);
+
+        // During warmup (< 10 samples), should return normal alpha
+        for i in 0..9 {
+            let alpha = estimator.add_sample(i as f64 * 5.0);
+            assert!(
+                (alpha - 0.3).abs() < 0.01,
+                "During warmup (sample {}), alpha should be 0.3, got {}",
+                i,
+                alpha
+            );
+        }
+    }
+
+    #[test]
+    fn test_jitter_low_noise_system() {
+        // Simulate strih.lan: stddev ~0.8 µs/s
+        let mut estimator = JitterEstimator::with_params(20, 10, 2.0, 8.0);
+
+        // Add samples with low variance (around 0, stddev ~0.8)
+        let low_jitter_samples = [
+            -0.7, 0.3, -0.5, 0.8, -0.2, 0.6, -0.8, 0.4, -0.3, 0.5, -0.6, 0.2, -0.4, 0.7, -0.1, 0.3,
+            -0.5, 0.4, -0.6, 0.5,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &low_jitter_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // Low jitter system should keep normal alpha (0.3)
+        assert!(
+            (last_alpha - 0.3).abs() < 0.01,
+            "Low jitter system should have alpha=0.3, got {}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
+        assert!(
+            estimator.last_jitter() < 2.0,
+            "Jitter should be < 2.0, got {}",
+            estimator.last_jitter()
+        );
+    }
+
+    #[test]
+    fn test_jitter_high_noise_system() {
+        // Simulate stream.lan: stddev ~10 µs/s
+        let mut estimator = JitterEstimator::with_params(20, 10, 2.0, 8.0);
+
+        // Add samples with high variance (oscillating ±15)
+        let high_jitter_samples = [
+            15.0, -12.0, 18.0, -14.0, 16.0, -10.0, 14.0, -16.0, 12.0, -15.0, 17.0, -11.0, 13.0,
+            -17.0, 15.0, -13.0, 16.0, -14.0, 14.0, -12.0,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &high_jitter_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // High jitter system should get smoothed alpha (0.1)
+        assert!(
+            (last_alpha - 0.1).abs() < 0.02,
+            "High jitter system should have alpha≈0.1, got {}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
+        assert!(
+            estimator.last_jitter() > 8.0,
+            "Jitter should be > 8.0, got {}",
+            estimator.last_jitter()
+        );
+    }
+
+    #[test]
+    fn test_jitter_medium_noise_interpolation() {
+        // Medium jitter: stddev ~5 µs/s -> alpha should be interpolated
+        let mut estimator = JitterEstimator::with_params(20, 10, 2.0, 8.0);
+
+        // Add samples with medium variance (oscillating ±7)
+        let medium_jitter_samples = [
+            7.0, -5.0, 6.0, -6.0, 5.0, -7.0, 6.0, -5.0, 7.0, -6.0, 5.0, -7.0, 6.0, -5.0, 7.0, -6.0,
+            5.0, -7.0, 6.0, -5.0,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &medium_jitter_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // Medium jitter: alpha should be between 0.1 and 0.3
+        assert!(
+            last_alpha > 0.1 && last_alpha < 0.3,
+            "Medium jitter should interpolate alpha, got {}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
+    }
+
+    #[test]
+    fn test_jitter_recovery_from_high_to_low() {
+        let mut estimator = JitterEstimator::with_params(20, 10, 2.0, 8.0);
+
+        // First, add high jitter samples
+        for i in 0..15 {
+            let val = if i % 2 == 0 { 15.0 } else { -15.0 };
+            estimator.add_sample(val);
+        }
+        assert!(
+            estimator.last_alpha() < 0.15,
+            "Should have low alpha after high jitter"
+        );
+
+        // Now add low jitter samples - alpha should recover
+        for _ in 0..20 {
+            estimator.add_sample(0.5);
+        }
+
+        assert!(
+            (estimator.last_alpha() - 0.3).abs() < 0.05,
+            "Alpha should recover to ~0.3 after low jitter, got {}",
+            estimator.last_alpha()
+        );
+    }
+
+    #[test]
+    fn test_jitter_clear_resets_state() {
+        let mut estimator = JitterEstimator::new();
+
+        // Add some samples
+        for i in 0..20 {
+            estimator.add_sample(i as f64);
+        }
+        assert!(estimator.sample_count() > 0);
+
+        // Clear should reset
+        estimator.clear();
+        assert_eq!(estimator.sample_count(), 0);
+        assert!((estimator.last_alpha() - 0.3).abs() < 0.01);
+        assert!((estimator.last_jitter() - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_jitter_drift_step_not_confused_with_jitter() {
+        // A real frequency step (drift changes from +2 to +10) should NOT
+        // trigger high jitter because variance of sustained drift is low
+        let mut estimator = JitterEstimator::with_params(20, 10, 2.0, 8.0);
+
+        // Sustained positive drift with slight variation
+        let drift_step_samples = [
+            2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0,
+            10.5, 10.0, 9.5,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &drift_step_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // Sustained drift has moderate stddev but consistent direction
+        // This should NOT trigger heavy smoothing
+        assert!(
+            last_alpha > 0.15,
+            "Drift step should not trigger heavy smoothing, got alpha={}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
+    }
+
+    #[test]
+    fn test_jitter_boundary_values() {
+        let mut estimator = JitterEstimator::with_params(10, 5, 2.0, 8.0);
+
+        // Test exactly at jitter_low boundary
+        // Samples with stddev = 2.0: [-2, 2, -2, 2, -2, 2, -2, 2, -2, 2]
+        for i in 0..10 {
+            let val = if i % 2 == 0 { -2.0 } else { 2.0 };
+            estimator.add_sample(val);
+        }
+        // stddev of [-2,2,-2,2,...] = 2.0
+        assert!(
+            (estimator.last_alpha() - 0.3).abs() < 0.05,
+            "At jitter_low boundary, alpha should be ~0.3, got {}",
+            estimator.last_alpha()
+        );
+    }
+
+    #[test]
+    fn test_jitter_strih_lan_simulation() {
+        // Real data pattern from strih.lan LOCK mode: drift ±0.5-1.5 µs/s
+        let mut estimator = JitterEstimator::new();
+
+        let strih_samples = [
+            -0.7, -0.3, 0.2, -0.5, 1.2, -0.8, 0.3, -1.0, -0.3, -1.0, -0.7, -0.6, 0.5, -0.6, 0.8,
+            -0.2, -0.8, -0.7, 0.6, -0.8, 0.3, -1.0, -0.3, -0.6, -0.4, -0.7, -0.4, 0.4, -0.3, 0.2,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &strih_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // strih.lan should keep normal alpha
+        assert!(
+            (last_alpha - 0.3).abs() < 0.01,
+            "strih.lan pattern should have alpha=0.3, got {}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
+    }
+
+    #[test]
+    fn test_jitter_stream_lan_simulation() {
+        // Real data pattern from stream.lan: drift ±10-20 µs/s oscillation
+        let mut estimator = JitterEstimator::new();
+
+        let stream_samples = [
+            4.2, -2.3, -18.1, 18.0, -7.5, -16.3, -1.8, 10.8, -0.2, 1.5, -0.5, 25.4, -9.6, -18.4,
+            -3.7, 12.3, -13.3, 1.5, -2.1, 5.8, -9.2, 8.5, -10.5, 19.6, 4.2, 6.1, -17.9, 24.5,
+            -24.2, -18.5,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &stream_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // stream.lan should get heavy smoothing
+        assert!(
+            last_alpha < 0.15,
+            "stream.lan pattern should have alpha<0.15, got {}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
+    }
+
+    #[test]
+    fn test_jitter_mbc_lan_simulation() {
+        // mbc.lan: moderate jitter with occasional spikes (spikes filtered by spike filter)
+        // After spike filter, drift should be moderate (~3-8 µs/s)
+        let mut estimator = JitterEstimator::new();
+
+        let mbc_samples = [
+            -1.6, 3.0, 1.3, -2.2, 7.4, -2.5, -4.5, 2.0, -1.7, 3.8, -3.2, 5.5, -0.8, 2.3, -4.1,
+            -1.4, 3.2, -0.5, 2.1, -3.5, 2.5, 0.5, -2.4, 3.7, 0.8, 1.7, 3.9, -4.3, -0.1, 2.5,
+        ];
+
+        let mut last_alpha = 0.3;
+        for &sample in &mbc_samples {
+            last_alpha = estimator.add_sample(sample);
+        }
+
+        // mbc.lan after spike filtering should have moderate jitter
+        // Alpha should be between 0.2 and 0.3
+        assert!(
+            last_alpha >= 0.2,
+            "mbc.lan should have alpha>=0.2, got {}. Jitter={}",
+            last_alpha,
+            estimator.last_jitter()
+        );
     }
 }

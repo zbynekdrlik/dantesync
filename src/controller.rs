@@ -12,7 +12,7 @@
 use crate::clock::SystemClock;
 use crate::config::SystemConfig;
 use crate::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header, PtpV1SyncMessageBody};
-use crate::spike_filter::{FilterMode, SpikeFilter};
+use crate::spike_filter::{FilterMode, JitterEstimator, SpikeFilter};
 use crate::status::SyncStatus;
 use crate::traits::{NtpSource, PtpNetwork};
 use anyhow::Result;
@@ -214,6 +214,16 @@ where
     // ==========================================================================
     /// Spike filter for rejecting timestamp noise spikes
     spike_filter: SpikeFilter,
+
+    // ==========================================================================
+    // ADAPTIVE JITTER SMOOTHING
+    // ==========================================================================
+    // Measures jitter (stddev of drift rate) and adjusts EMA smoothing factor.
+    // Low-jitter systems (strih.lan): α=0.3 for responsive tracking
+    // High-jitter systems (stream.lan): α=0.1 for heavy smoothing
+    // ==========================================================================
+    /// Jitter estimator for adaptive EMA alpha
+    jitter_estimator: JitterEstimator,
 }
 
 struct PendingSync {
@@ -315,6 +325,8 @@ where
             ntp_failed: false,
             // Adaptive spike detection
             spike_filter: SpikeFilter::new(),
+            // Adaptive jitter smoothing
+            jitter_estimator: JitterEstimator::new(),
         }
     }
 
@@ -457,6 +469,8 @@ where
                         self.last_offset_time = None;
                         // Clear spike filter to prevent false positives from step transient
                         self.spike_filter.clear();
+                        // Clear jitter estimator to restart jitter measurement after step
+                        self.jitter_estimator.clear();
                         info!("[NTP] Stepped {:+}us", step_us);
                     }
                 }
@@ -922,10 +936,26 @@ where
         }
 
         // Smooth rate with exponential moving average (on FILTERED rate)
-        const RATE_SMOOTH_ALPHA: f64 = 0.3; // Higher = more responsive
-        self.smoothed_rate_ppm = self.smoothed_rate_ppm * (1.0 - RATE_SMOOTH_ALPHA)
-            + filtered_rate_ppm * RATE_SMOOTH_ALPHA;
+        // Use adaptive alpha from jitter estimator:
+        // - Low-jitter systems (strih.lan): α=0.3 for responsive tracking
+        // - High-jitter systems (stream.lan): α=0.1 for heavy smoothing
+        let adaptive_alpha = self.jitter_estimator.add_sample(filtered_rate_ppm);
+        self.smoothed_rate_ppm = self.smoothed_rate_ppm * (1.0 - adaptive_alpha)
+            + filtered_rate_ppm * adaptive_alpha;
         let rate_ppm = self.smoothed_rate_ppm;
+
+        // Log jitter statistics periodically (every 50 samples when adjusted)
+        if self.jitter_estimator.sample_count() > 0
+            && self.jitter_estimator.sample_count() % 50 == 0
+            && (adaptive_alpha - 0.3).abs() > 0.01
+        {
+            info!(
+                "[Jitter] stddev={:.2}µs/s α={:.2} (samples={})",
+                self.jitter_estimator.last_jitter(),
+                adaptive_alpha,
+                self.jitter_estimator.sample_count()
+            );
+        }
 
         // THREE-PHASE CONTROL: ACQ → PROD → NANO based on rate stability
         let abs_rate = rate_ppm.abs();
@@ -1140,6 +1170,8 @@ where
         self.smoothed_rate_ppm = 0.0;
         // Clear spike filter history
         self.spike_filter.clear();
+        // Clear jitter estimator history
+        self.jitter_estimator.clear();
 
         // Reset NTP tracking
         self.ntp_offset_samples.clear();
