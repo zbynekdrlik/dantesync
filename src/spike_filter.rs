@@ -323,14 +323,14 @@ impl JitterEstimator {
     pub fn new() -> Self {
         Self {
             rate_history: VecDeque::with_capacity(30),
-            window_size: 30,      // 30 samples (~30 seconds)
-            min_samples: 15,      // Need at least 15 for valid estimate
-            jitter_low: 2.0,      // Below this: α = 0.3 (normal)
-            jitter_high: 8.0,     // Above this: α = 0.1 (heavily smoothed)
-            alpha_normal: 0.3,    // Standard EMA alpha
-            alpha_smooth: 0.1,    // Smoothed EMA alpha for noisy systems
+            window_size: 30,   // 30 samples (~30 seconds)
+            min_samples: 15,   // Need at least 15 for valid estimate
+            jitter_low: 2.0,   // Below this: α = 0.3 (normal)
+            jitter_high: 8.0,  // Above this: α = 0.1 (heavily smoothed)
+            alpha_normal: 0.3, // Standard EMA alpha
+            alpha_smooth: 0.1, // Smoothed EMA alpha for noisy systems
             last_jitter: 0.0,
-            last_alpha: 0.3,      // Default to normal alpha
+            last_alpha: 0.3, // Default to normal alpha
         }
     }
 
@@ -393,7 +393,12 @@ impl JitterEstimator {
 
         let n = self.rate_history.len() as f64;
         let mean: f64 = self.rate_history.iter().sum::<f64>() / n;
-        let variance: f64 = self.rate_history.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let variance: f64 = self
+            .rate_history
+            .iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>()
+            / n;
         variance.sqrt()
     }
 

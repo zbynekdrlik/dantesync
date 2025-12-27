@@ -940,8 +940,8 @@ where
         // - Low-jitter systems (strih.lan): α=0.3 for responsive tracking
         // - High-jitter systems (stream.lan): α=0.1 for heavy smoothing
         let adaptive_alpha = self.jitter_estimator.add_sample(filtered_rate_ppm);
-        self.smoothed_rate_ppm = self.smoothed_rate_ppm * (1.0 - adaptive_alpha)
-            + filtered_rate_ppm * adaptive_alpha;
+        self.smoothed_rate_ppm =
+            self.smoothed_rate_ppm * (1.0 - adaptive_alpha) + filtered_rate_ppm * adaptive_alpha;
         let rate_ppm = self.smoothed_rate_ppm;
 
         // Log jitter statistics periodically (every 50 samples when adjusted)
