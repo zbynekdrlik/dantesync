@@ -1158,7 +1158,6 @@ where
             // NTP offset is updated separately via check_ntp_utc_tracking()
         }
     }
-
 }
 
 // ============================================================================
