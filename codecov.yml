@@ -2,18 +2,26 @@ coverage:
   status:
     project:
       default:
-        # Fail if coverage drops below current level
-        target: auto
-        # Fail if coverage decreases by more than 2%
-        threshold: 2%
+        # Minimum absolute coverage floor - never go below this
+        target: 60%
+        # Fail if coverage decreases by more than 1% (strict regression prevention)
+        threshold: 1%
     patch:
       default:
-        # New code should have at least 70% coverage
-        # Lower than 100% to account for platform-specific code that can't be tested in CI
-        target: 70%
+        # New code must have at least 80% coverage
+        # Strict to prevent untested code from entering codebase
+        target: 80%
+  # Require CI to pass coverage checks
+  require_ci_to_pass: true
 
 comment:
   # Show coverage diff in PR comments
   layout: "reach,diff,flags,files"
   behavior: default
   require_changes: true
+
+# Strict settings to fight regressions
+codecov:
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true

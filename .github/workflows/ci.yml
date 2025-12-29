@@ -136,8 +136,32 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run security audit
-        run: cargo audit
-        continue-on-error: true  # Don't fail CI on advisories, just report
+        run: |
+          # Strict audit: fail on new advisories, but ignore known ones we've reviewed:
+          # - RUSTSEC-2025-0134: rustls-pemfile unmaintained (transitive via reqwest, no direct impact)
+          # - RUSTSEC-2024-0429: glib unsound VariantStrIter (transitive via tray-icon, we don't use this API)
+          # - RUSTSEC-2022-0008: windows 0.24.0 delegate Send (transitive via winrt-notification, we don't use delegates)
+          # GTK ecosystem advisories (all transitive via tray-icon, Linux tray support - we don't use affected APIs):
+          # - RUSTSEC-2024-0413: atk unmaintained
+          # - RUSTSEC-2024-0416: atk-sys unmaintained
+          # - RUSTSEC-2024-0412: gdk unmaintained
+          # - RUSTSEC-2024-0418: gdk-sys unmaintained
+          # - RUSTSEC-2024-0415: gtk unmaintained
+          # - RUSTSEC-2024-0420: gtk-sys unmaintained
+          # - RUSTSEC-2024-0419: gtk3-macros unmaintained
+          # - RUSTSEC-2024-0370: proc-macro-error unmaintained (transitive via gtk3-macros)
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2024-0429 \
+            --ignore RUSTSEC-2022-0008 \
+            --ignore RUSTSEC-2024-0413 \
+            --ignore RUSTSEC-2024-0416 \
+            --ignore RUSTSEC-2024-0412 \
+            --ignore RUSTSEC-2024-0418 \
+            --ignore RUSTSEC-2024-0415 \
+            --ignore RUSTSEC-2024-0420 \
+            --ignore RUSTSEC-2024-0419 \
+            --ignore RUSTSEC-2024-0370
 
   # ============================================================================
   # Build Check (ensures code compiles on all targets)
