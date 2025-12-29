@@ -88,8 +88,14 @@ pub struct PtpTimestamp {
 }
 
 impl PtpTimestamp {
+    /// Convert timestamp to nanoseconds.
+    /// Uses saturating arithmetic to prevent overflow from malformed packets.
+    /// Note: Dante PTP uses device uptime (not Unix epoch), so seconds values
+    /// are typically small, but we handle edge cases defensively.
     pub fn to_nanos(&self) -> i64 {
-        self.seconds as i64 * 1_000_000_000 + self.nanoseconds as i64
+        (self.seconds as i64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(self.nanoseconds as i64)
     }
 }
 

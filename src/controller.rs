@@ -423,7 +423,12 @@ where
         // Query NTP and record offset
         match self.ntp.get_offset() {
             Ok((offset, sign)) => {
-                let offset_us = (offset.as_nanos() as i64 / 1000) * sign as i64;
+                // Use as_micros() directly to avoid overflow from as_nanos() -> i64
+                let offset_us = if sign > 0 {
+                    offset.as_micros() as i64
+                } else {
+                    -(offset.as_micros() as i64)
+                };
 
                 // NTP success - reset failure tracking
                 if self.ntp_failed {
@@ -467,6 +472,9 @@ where
                         // Reset drift tracking to avoid false spike from step
                         self.last_offset_us = None;
                         self.last_offset_time = None;
+                        // Reset prev timestamps so min_delta filter works correctly after grace period
+                        self.prev_t1_ns = 0;
+                        self.prev_t2_ns = 0;
                         // Clear spike filter to prevent false positives from step transient
                         self.spike_filter.clear();
                         // NOTE: jitter_estimator is NOT cleared on NTP step because
@@ -597,6 +605,20 @@ where
             _ => {}
         }
 
+        // Limit pending_syncs size to prevent memory exhaustion from malformed packets
+        const MAX_PENDING_SYNCS: usize = 200;
+        if self.pending_syncs.len() >= MAX_PENDING_SYNCS {
+            // Clean up stale entries first
+            let now = SystemTime::now();
+            self.pending_syncs.retain(|_, v| {
+                now.duration_since(v.rx_time_sys).unwrap_or(Duration::ZERO) < Duration::from_secs(5)
+            });
+            // If still at capacity after cleanup, skip this sync
+            if self.pending_syncs.len() >= MAX_PENDING_SYNCS {
+                return;
+            }
+        }
+
         self.pending_syncs.insert(
             header.sequence_id,
             PendingSync {
@@ -664,9 +686,6 @@ where
         if !self.process_warmup() {
             return;
         }
-
-        // Establish baseline
-        self.update_baseline(t1_ns, phase_offset_ns);
 
         // Log delta sanity check
         self.log_delta_sanity(t1_ns, t2_ns);
@@ -736,10 +755,6 @@ where
         } else {
             false
         }
-    }
-
-    fn update_baseline(&mut self, _t1_ns: i64, _phase_offset_ns: i64) {
-        // First sample logging removed - not useful in production
     }
 
     fn log_delta_sanity(&self, t1_ns: i64, t2_ns: i64) {
@@ -1142,47 +1157,6 @@ where
             };
             // NTP offset is updated separately via check_ntp_utc_tracking()
         }
-    }
-
-    /// Full filter reset - currently unused but kept for edge cases
-    /// (major NTP step correction, config reload, etc.)
-    #[allow(dead_code)]
-    fn reset_filter(&mut self) {
-        self.valid_count = 0;
-        self.clock_settled = false;
-        self.prev_t1_ns = 0;
-        self.prev_t2_ns = 0;
-        self.sample_window.clear();
-        self.warmup_start = Instant::now();
-        self.warmup_complete = false;
-
-        // Reset self-tuning servo state
-        self.drift_baseline_ppm = 0.0;
-        self.is_locked = false;
-        self.lock_stable_count = 0;
-        self.in_production_mode = false;
-        self.in_nano_mode = false;
-        self.nano_sustain_count = 0;
-        self.nano_exit_count = 0;
-        self.applied_freq_ppm = 0.0;
-        self.last_offset_us = None;
-        self.last_offset_time = None;
-        self.smoothed_rate_ppm = 0.0;
-        // Clear spike filter history
-        self.spike_filter.clear();
-        // Clear jitter estimator history
-        self.jitter_estimator.clear();
-
-        // Reset NTP tracking
-        self.ntp_offset_samples.clear();
-        self.last_ntp_check = Instant::now();
-        self.last_ntp_step = None;
-
-        if let Err(e) = self.network.reset() {
-            warn!("Network reset failed: {}", e);
-        }
-
-        self.update_shared_status();
     }
 }
 
