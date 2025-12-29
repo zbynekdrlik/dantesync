@@ -6,12 +6,20 @@ pub struct SystemConfig {
     pub filters: FilterConfig,
 }
 
-/// Servo configuration (reserved for future use - controller uses adaptive gains)
+/// Servo configuration - LEGACY FIELDS (not used by controller)
+///
+/// The controller uses hardcoded adaptive gains that auto-tune based on
+/// oscillation detection. These fields exist only for config file backwards
+/// compatibility and are not read by the sync algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServoConfig {
+    /// Legacy: not used (controller uses adaptive P gain)
     pub kp: f64,
+    /// Legacy: not used (controller uses adaptive I gain)
     pub ki: f64,
+    /// Legacy: not used (controller uses DRIFT_MAX_PPM constant)
     pub max_freq_adj_ppm: f64,
+    /// Legacy: not used (no integral term in current servo)
     pub max_integral_ppm: f64,
 }
 
