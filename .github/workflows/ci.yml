@@ -280,3 +280,42 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage/cobertura.xml
           fail_ci_if_error: true
+
+  # ============================================================================
+  # Auto-Release (creates tag after successful CI on master)
+  # ============================================================================
+  auto-release:
+    name: Auto Release
+    runs-on: ubuntu-latest
+    needs: [version-check, lint, test, security, build, coverage]
+    # Only run on push to master, not on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version and create tag
+        run: |
+          # Extract version from Cargo.toml
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG="v$VERSION"
+          echo "Version: $VERSION"
+          echo "Tag: $TAG"
+
+          # Check if tag already exists (should not, version-check validates this)
+          if git tag -l "$TAG" | grep -q .; then
+            echo "Tag $TAG already exists, skipping release"
+            exit 0
+          fi
+
+          # Configure git for tagging
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create and push tag (this triggers the release workflow)
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "✓ Created and pushed tag $TAG"
