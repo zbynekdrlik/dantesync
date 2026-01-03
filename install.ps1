@@ -541,7 +541,37 @@ $TrayPath = "$InstallDir\dantesync-tray.exe"
 # 4. Stop & Remove Existing Service/Processes (CRITICAL: Do this BEFORE download)
 Write-Host "Stopping services and processes..."
 
-# Stop Service
+# Clean up OLD DanteTimeSync installation (renamed to DanteSync in v1.8.0)
+$OldServiceName = "dantetimesync"
+$OldService = Get-Service -Name $OldServiceName -ErrorAction SilentlyContinue
+if ($OldService) {
+    Write-Host "Removing old '$OldServiceName' service..."
+    Stop-Service -Name $OldServiceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    sc.exe delete $OldServiceName | Out-Null
+}
+Stop-Process -Name "dantetimesync" -Force -ErrorAction SilentlyContinue
+Stop-Process -Name "dantetray" -Force -ErrorAction SilentlyContinue
+
+# Remove old DanteTimeSync directories
+if (Test-Path "C:\Program Files\DanteTimeSync") {
+    Write-Host "Removing old DanteTimeSync directory..."
+    Remove-Item "C:\Program Files\DanteTimeSync" -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path "C:\ProgramData\DanteTimeSync") {
+    Remove-Item "C:\ProgramData\DanteTimeSync" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Remove old registry entries
+Remove-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\DanteTimeSync" -Force -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "DanteTray" -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "DanteTimeSyncTray" -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DanteTray" -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DanteTimeSyncTray" -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "DanteTimeSyncTray" -Confirm:$false -ErrorAction SilentlyContinue
+Remove-Item "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\DanteTimeSync.lnk" -Force -ErrorAction SilentlyContinue
+
+# Stop current Service
 $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($Service) {
     Write-Host "Stopping existing service '$ServiceName'..."
