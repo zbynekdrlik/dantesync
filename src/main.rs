@@ -129,14 +129,21 @@ fn load_config() -> Config {
     cfg
 }
 
+/// Resolve the NTP server address: CLI arg takes priority, then config file value.
+fn resolve_ntp_server(cli_ntp: &Option<String>, config: &Config) -> String {
+    cli_ntp
+        .clone()
+        .unwrap_or_else(|| config.ntp_server.clone())
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
     interface: Option<String>,
 
-    #[arg(long, default_value = "10.77.8.2")]
-    ntp_server: String,
+    #[arg(long)]
+    ntp_server: Option<String>,
 
     #[arg(long, default_value_t = false)]
     skip_ntp: bool,
@@ -503,15 +510,19 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
         }
     };
 
+    let ntp_server = args
+        .ntp_server
+        .as_deref()
+        .expect("ntp_server must be resolved before run_sync_loop");
     let ntp_source = RealNtpSource {
-        client: ntp::NtpClient::new(&args.ntp_server),
+        client: ntp::NtpClient::new(ntp_server),
     };
 
     let mut controller =
         PtpController::new(sys_clock, network, ntp_source, status_shared, system_config);
 
     if !args.skip_ntp {
-        info!("Using NTP Server: {}", args.ntp_server);
+        info!("Using NTP Server: {}", ntp_server);
     }
     controller.run_ntp_sync(args.skip_ntp);
 
@@ -626,8 +637,9 @@ fn my_service_main(_arguments: Vec<OsString>) {
         process_id: None,
     });
 
-    // Use global args via simple parse if needed, but here we just need default or what logic needs
-    let args = Args::parse();
+    // Parse CLI args and resolve NTP server from config file
+    let mut args = Args::parse();
+    args.ntp_server = Some(resolve_ntp_server(&args.ntp_server, &config));
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -672,10 +684,8 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     let config = load_config();
 
-    // Use config if arg is default
-    if args.ntp_server == "10.77.8.2" {
-        args.ntp_server = config.ntp_server.clone();
-    }
+    // Resolve NTP server: CLI arg > config file > default
+    args.ntp_server = Some(resolve_ntp_server(&args.ntp_server, &config));
 
     #[cfg(windows)]
     if args.service {
@@ -744,4 +754,70 @@ fn main() -> Result<()> {
     })?;
 
     run_sync_loop(args, running, config.system)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_ntp(server: &str) -> Config {
+        Config {
+            ntp_server: server.to_string(),
+            system: SystemConfig::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_ntp_server_cli_arg_takes_priority_over_config() {
+        let cli = Some("192.168.1.100".to_string());
+        let config = config_with_ntp("10.0.0.1");
+        assert_eq!(resolve_ntp_server(&cli, &config), "192.168.1.100");
+    }
+
+    #[test]
+    fn resolve_ntp_server_falls_back_to_config_when_cli_is_none() {
+        let cli = None;
+        let config = config_with_ntp("10.0.0.1");
+        assert_eq!(resolve_ntp_server(&cli, &config), "10.0.0.1");
+    }
+
+    #[test]
+    fn resolve_ntp_server_falls_back_to_default_config_when_both_use_default() {
+        let cli = None;
+        let config = Config::default();
+        assert_eq!(resolve_ntp_server(&cli, &config), "10.77.8.2");
+    }
+
+    #[test]
+    fn resolve_ntp_server_explicit_default_ip_on_cli_is_not_overridden() {
+        // If user explicitly passes --ntp-server 10.77.8.2, it should NOT be overridden
+        let cli = Some("10.77.8.2".to_string());
+        let config = config_with_ntp("192.168.1.50");
+        assert_eq!(resolve_ntp_server(&cli, &config), "10.77.8.2");
+    }
+
+    #[test]
+    fn config_default_has_expected_ntp_server() {
+        let config = Config::default();
+        assert_eq!(config.ntp_server, "10.77.8.2");
+    }
+
+    #[test]
+    fn config_deserializes_with_custom_ntp_server() {
+        let json = r#"{"ntp_server": "172.16.0.5"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ntp_server, "172.16.0.5");
+    }
+
+    #[test]
+    fn config_deserializes_with_missing_system_uses_defaults() {
+        let json = r#"{"ntp_server": "172.16.0.5"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let default_system = SystemConfig::default();
+        // system config should use defaults when omitted
+        assert_eq!(
+            format!("{:?}", config.system),
+            format!("{:?}", default_system)
+        );
+    }
 }

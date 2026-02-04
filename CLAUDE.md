@@ -46,6 +46,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   5. Never weaken CI checks. If a check fails, fix the code, don't disable the check
   6. When adding features, always add corresponding tests to maintain coverage
 
+## Branch Policy
+
+- **Two branches only:** `master` (production) and `dev` (development). No other long-lived branches.
+- **Feature work:** Create short-lived branches off `dev`, open PR to merge back into `dev`, then PR from `dev` to `master` for release.
+- **No direct pushes to master:** All changes to `master` must go through a PR merge. Branch protection enforces this for all users including admins.
+- **Clean up after merge:** Delete feature branches after PR merge.
+
 ## Build Commands
 
 ```bash
@@ -67,6 +74,7 @@ RUST_LOG=debug cargo run
 ## Hardware Constraints (CRITICAL)
 
 **This project implements SOFTWARE-ONLY PTP frequency synchronization:**
+
 - NONE of the target computers have NICs with hardware timestamping support
 - Standard consumer/enterprise Ethernet NICs (Intel, Realtek) are used
 - DO NOT waste time on approaches requiring hardware timestamping (SIO_TIMESTAMPING, PTP hardware clocks, etc.)
@@ -102,10 +110,12 @@ DanteSync is a high-precision PTP (Precision Time Protocol) synchronization tool
 - NTP is used for **UTC phase alignment** (setting the correct absolute time)
 
 **Dual-Source Architecture:**
+
 1. **PTP (Dante)** → `adjust_frequency()` - controls clock tick rate
 2. **NTP (UTC)** → `step_clock()` - periodically corrects absolute time
 
 These operations are INDEPENDENT:
+
 - `step_clock()` sets absolute time value (does NOT affect frequency)
 - `adjust_frequency()` sets tick rate (does NOT affect absolute time)
 
@@ -131,10 +141,12 @@ These operations are INDEPENDENT:
 ### Configuration
 
 Config file locations:
+
 - Linux: `/etc/dantesync/config.json`
 - Windows: `C:\ProgramData\DanteSync\config.json`
 
 Key tunable parameters (in `config.rs`):
+
 - Servo gains: `kp`, `ki` (reference only - controller uses adaptive gains)
 - Filter settings: `sample_window_size`, `min_delta_ns`, `calibration_samples`, `warmup_secs`
 
