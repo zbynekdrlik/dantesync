@@ -102,7 +102,9 @@ const DEFAULT_MIN_T1_DELTA_NS: i64 = 100_000_000; // 100ms default (Dante sends 
 // Periodic NTP UTC alignment (steps clock without changing frequency)
 const NTP_CHECK_INTERVAL_SECS: u64 = 30; // Check NTP every 30 seconds
 const NTP_SAMPLE_COUNT: usize = 5; // Samples needed for reliable median
-const NTP_STEP_THRESHOLD_US: i64 = 500; // Step if offset > 500µs (tighter UTC alignment)
+const NTP_STEP_THRESHOLD_BASE_US: i64 = 500; // Base threshold for low-jitter systems
+const NTP_STEP_THRESHOLD_MAX_US: i64 = 10_000; // Maximum threshold (10ms) for high-jitter systems
+const NTP_ADAPTIVE_MULTIPLIER: f64 = 5.0; // Step if offset > base + 5*MAD (covers 99%+ of jitter)
 
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
@@ -449,11 +451,21 @@ where
                     status.ntp_failed = false;
                 }
 
-                // Log current offset
-                info!("[NTP] offset:{:+}us", offset_us);
+                // Calculate adaptive threshold based on offset variance
+                let adaptive_threshold = self.calculate_ntp_adaptive_threshold();
 
-                // Step clock if offset exceeds threshold
-                if offset_us.abs() > NTP_STEP_THRESHOLD_US {
+                // Log current offset with threshold info
+                if adaptive_threshold > NTP_STEP_THRESHOLD_BASE_US {
+                    info!(
+                        "[NTP] offset:{:+}us (threshold:{}us, adaptive)",
+                        offset_us, adaptive_threshold
+                    );
+                } else {
+                    info!("[NTP] offset:{:+}us", offset_us);
+                }
+
+                // Step clock if offset exceeds adaptive threshold
+                if offset_us.abs() > adaptive_threshold {
                     let step_us = offset_us;
 
                     // Apply the step (sets time, does NOT change frequency)
@@ -515,6 +527,47 @@ where
             "[NTP-UTC] Tracking {}",
             if enabled { "enabled" } else { "disabled" }
         );
+    }
+
+    /// Disable periodic NTP UTC tracking (convenience method for NTP server mode).
+    ///
+    /// When DanteSync runs in NTP server mode, periodic NTP queries must be disabled
+    /// because this machine IS the time source. The PTP-disciplined clock advances
+    /// time naturally, and this machine serves that time to others via NTP.
+    pub fn disable_ntp_tracking(&mut self) {
+        self.set_ntp_tracking(false);
+        info!("[NTP-Server] Periodic NTP queries disabled (this machine is the time source)");
+    }
+
+    /// Calculate adaptive NTP step threshold based on measured offset variance.
+    ///
+    /// Uses MAD (median absolute deviation) of recent NTP offsets to determine
+    /// the noise floor. High-jitter systems automatically get a higher threshold
+    /// to avoid unnecessary stepping that creates oscillation.
+    ///
+    /// Returns: threshold in microseconds, clamped between base and max.
+    fn calculate_ntp_adaptive_threshold(&self) -> i64 {
+        // Need at least 3 samples to calculate meaningful statistics
+        if self.ntp_offset_samples.len() < 3 {
+            return NTP_STEP_THRESHOLD_BASE_US;
+        }
+
+        // Calculate median of offsets
+        let mut sorted: Vec<i64> = self.ntp_offset_samples.iter().copied().collect();
+        sorted.sort();
+        let median = sorted[sorted.len() / 2];
+
+        // Calculate MAD (median absolute deviation)
+        let mut deviations: Vec<i64> = sorted.iter().map(|&x| (x - median).abs()).collect();
+        deviations.sort();
+        let mad = deviations[deviations.len() / 2];
+
+        // Adaptive threshold = base + multiplier * MAD
+        // This accounts for measurement noise while still detecting real drift
+        let adaptive = NTP_STEP_THRESHOLD_BASE_US + (NTP_ADAPTIVE_MULTIPLIER * mad as f64) as i64;
+
+        // Clamp to reasonable range
+        adaptive.clamp(NTP_STEP_THRESHOLD_BASE_US, NTP_STEP_THRESHOLD_MAX_US)
     }
 
     pub fn log_status(&self) {
@@ -1795,8 +1848,70 @@ mod tests {
         // Verify timeout and threshold constants
         assert_eq!(PTP_TIMEOUT_SECS, 10, "PTP timeout should be 10 seconds");
         assert_eq!(
-            NTP_STEP_THRESHOLD_US, 500,
-            "NTP step threshold should be 500µs"
+            NTP_STEP_THRESHOLD_BASE_US, 500,
+            "NTP step base threshold should be 500µs"
+        );
+        assert_eq!(
+            NTP_STEP_THRESHOLD_MAX_US, 10_000,
+            "NTP step max threshold should be 10ms"
+        );
+        assert_eq!(
+            NTP_ADAPTIVE_MULTIPLIER, 5.0,
+            "NTP adaptive multiplier should be 5.0"
+        );
+    }
+
+    #[test]
+    fn test_ntp_adaptive_threshold_with_few_samples() {
+        let (controller, _) = create_nano_test_controller();
+        // With fewer than 3 samples, should return base threshold
+        assert_eq!(
+            controller.calculate_ntp_adaptive_threshold(),
+            NTP_STEP_THRESHOLD_BASE_US
+        );
+    }
+
+    #[test]
+    fn test_ntp_adaptive_threshold_low_jitter() {
+        let (mut controller, _) = create_nano_test_controller();
+        // Simulate low-jitter system: offsets around 200us with small variance
+        controller.ntp_offset_samples.push_back(195);
+        controller.ntp_offset_samples.push_back(200);
+        controller.ntp_offset_samples.push_back(205);
+        controller.ntp_offset_samples.push_back(198);
+        controller.ntp_offset_samples.push_back(202);
+
+        let threshold = controller.calculate_ntp_adaptive_threshold();
+        // MAD should be ~4us, so threshold = 500 + 3*4 = 512
+        // Should be close to base threshold for low-jitter
+        assert!(
+            threshold < 600,
+            "Low-jitter threshold {} should be close to base",
+            threshold
+        );
+    }
+
+    #[test]
+    fn test_ntp_adaptive_threshold_high_jitter() {
+        let (mut controller, _) = create_nano_test_controller();
+        // Simulate high-jitter system: offsets varying widely
+        controller.ntp_offset_samples.push_back(-500);
+        controller.ntp_offset_samples.push_back(700);
+        controller.ntp_offset_samples.push_back(100);
+        controller.ntp_offset_samples.push_back(-300);
+        controller.ntp_offset_samples.push_back(900);
+
+        let threshold = controller.calculate_ntp_adaptive_threshold();
+        // MAD should be large, so threshold should be significantly higher
+        assert!(
+            threshold > 1000,
+            "High-jitter threshold {} should be well above base",
+            threshold
+        );
+        assert!(
+            threshold <= NTP_STEP_THRESHOLD_MAX_US,
+            "Threshold {} should not exceed max",
+            threshold
         );
     }
 

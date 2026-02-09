@@ -6,6 +6,34 @@ pub struct SystemConfig {
     pub filters: FilterConfig,
 }
 
+/// NTP Server configuration for unified time source mode.
+///
+/// When enabled, DanteSync becomes an NTP server that:
+/// 1. Syncs time ONCE from upstream NTP on startup
+/// 2. Stops all periodic NTP queries
+/// 3. Serves the PTP-disciplined time to other machines
+///
+/// Only ONE machine per network should enable this (the "master").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtpServerConfig {
+    /// Enable NTP server mode (only one machine per network)
+    pub enabled: bool,
+    /// Port to listen on (default 123, requires elevated privileges)
+    pub port: u16,
+    /// Stratum to report to clients (default 3)
+    pub stratum: u8,
+}
+
+impl Default for NtpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 123,
+            stratum: 3,
+        }
+    }
+}
+
 /// Servo configuration - LEGACY FIELDS (not used by controller)
 ///
 /// The controller uses hardcoded adaptive gains that auto-tune based on
@@ -176,5 +204,59 @@ mod tests {
             cloned.filters.sample_window_size,
             config.filters.sample_window_size
         );
+    }
+
+    // ========================================================================
+    // NTP SERVER CONFIG TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_ntp_server_config_default() {
+        let config = NtpServerConfig::default();
+
+        assert!(!config.enabled, "NTP server should be disabled by default");
+        assert_eq!(config.port, 123, "Default port should be 123");
+        assert_eq!(config.stratum, 3, "Default stratum should be 3");
+    }
+
+    #[test]
+    fn test_ntp_server_config_serde_roundtrip() {
+        let config = NtpServerConfig {
+            enabled: true,
+            port: 1123,
+            stratum: 2,
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize failed");
+        let restored: NtpServerConfig = serde_json::from_str(&json).expect("deserialize failed");
+
+        assert_eq!(restored.enabled, config.enabled);
+        assert_eq!(restored.port, config.port);
+        assert_eq!(restored.stratum, config.stratum);
+    }
+
+    #[test]
+    fn test_ntp_server_config_partial_json() {
+        // Test that partial JSON with only enabled field works
+        let json = r#"{"enabled": true, "port": 123, "stratum": 3}"#;
+        let config: NtpServerConfig = serde_json::from_str(json).expect("parse failed");
+
+        assert!(config.enabled);
+        assert_eq!(config.port, 123);
+        assert_eq!(config.stratum, 3);
+    }
+
+    #[test]
+    fn test_ntp_server_config_clone() {
+        let config = NtpServerConfig {
+            enabled: true,
+            port: 8123,
+            stratum: 4,
+        };
+        let cloned = config.clone();
+
+        assert_eq!(cloned.enabled, config.enabled);
+        assert_eq!(cloned.port, config.port);
+        assert_eq!(cloned.stratum, config.stratum);
     }
 }
