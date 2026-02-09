@@ -78,9 +78,9 @@ use windows_service::{
 use dantesync::net_pcap;
 #[cfg(unix)]
 use dantesync::ptp;
-use dantesync::{clock, config, controller, net, ntp, status, traits};
+use dantesync::{clock, config, controller, net, ntp, ntp_server, status, traits};
 
-use config::SystemConfig;
+use config::{NtpServerConfig, SystemConfig};
 use controller::PtpController;
 use serde::{Deserialize, Serialize};
 use status::SyncStatus;
@@ -94,6 +94,11 @@ use traits::PtpNetwork;
 struct Config {
     ntp_server: String,
 
+    /// NTP server mode configuration (optional - disabled by default)
+    /// When enabled, this machine becomes an NTP server for the network
+    #[serde(default)]
+    ntp_server_mode: NtpServerConfig,
+
     /// Advanced system tuning (optional - uses auto-optimized defaults if omitted)
     #[serde(default)]
     system: SystemConfig,
@@ -103,6 +108,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             ntp_server: "10.77.8.2".to_string(),
+            ntp_server_mode: NtpServerConfig::default(),
             system: SystemConfig::default(),
         }
     }
@@ -425,7 +431,12 @@ fn start_ipc_server(_status: Arc<RwLock<SyncStatus>>) {
 }
 
 // --- Sync Loop ---
-fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConfig) -> Result<()> {
+fn run_sync_loop(
+    args: Args,
+    running: Arc<AtomicBool>,
+    system_config: SystemConfig,
+    ntp_server_config: NtpServerConfig,
+) -> Result<()> {
     // Notify systemd (Linux) that we are starting
     #[cfg(unix)]
     {
@@ -523,6 +534,39 @@ fn run_sync_loop(args: Args, running: Arc<AtomicBool>, system_config: SystemConf
         info!("Using NTP Server: {}", ntp_server);
     }
     controller.run_ntp_sync(args.skip_ntp);
+
+    // Start NTP server if enabled (this machine becomes the time source)
+    if ntp_server_config.enabled {
+        info!(
+            "[NTP-Server] Starting NTP server mode (port {}, stratum {})",
+            ntp_server_config.port, ntp_server_config.stratum
+        );
+
+        // Create NTP server
+        match ntp_server::NtpServer::new(ntp_server_config.port, ntp_server_config.stratum) {
+            Ok(ntp_srv) => {
+                // Disable periodic NTP queries - this machine IS the time source now
+                controller.disable_ntp_tracking();
+
+                // Start NTP server in background thread
+                let server_running = running.clone();
+                thread::spawn(move || {
+                    if let Err(e) = ntp_srv.run(server_running) {
+                        error!("[NTP-Server] Server error: {}", e);
+                    }
+                });
+
+                info!("[NTP-Server] Active - other machines can sync from this host");
+            }
+            Err(e) => {
+                error!(
+                    "[NTP-Server] Failed to start: {} (continuing with PTP-only mode)",
+                    e
+                );
+                // Continue without NTP server - PTP sync still works
+            }
+        }
+    }
 
     info!("Starting PTP Loop...");
 
@@ -644,7 +688,7 @@ fn my_service_main(_arguments: Vec<OsString>) {
 
     // Spawn the sync loop in a thread
     let handle = thread::spawn(move || {
-        if let Err(e) = run_sync_loop(args, r, config.system) {
+        if let Err(e) = run_sync_loop(args, r, config.system, config.ntp_server_mode) {
             error!("Service loop failed: {}", e);
         }
     });
@@ -751,7 +795,7 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    run_sync_loop(args, running, config.system)
+    run_sync_loop(args, running, config.system, config.ntp_server_mode)
 }
 
 #[cfg(test)]
@@ -761,6 +805,7 @@ mod tests {
     fn config_with_ntp(server: &str) -> Config {
         Config {
             ntp_server: server.to_string(),
+            ntp_server_mode: NtpServerConfig::default(),
             system: SystemConfig::default(),
         }
     }
@@ -817,5 +862,59 @@ mod tests {
             format!("{:?}", config.system),
             format!("{:?}", default_system)
         );
+    }
+
+    // ========================================================================
+    // NTP SERVER MODE TESTS
+    // ========================================================================
+
+    #[test]
+    fn config_default_has_ntp_server_mode_disabled() {
+        let config = Config::default();
+        assert!(!config.ntp_server_mode.enabled);
+        assert_eq!(config.ntp_server_mode.port, 123);
+        assert_eq!(config.ntp_server_mode.stratum, 3);
+    }
+
+    #[test]
+    fn config_deserializes_with_ntp_server_mode_enabled() {
+        let json = r#"{
+            "ntp_server": "10.77.8.2",
+            "ntp_server_mode": {
+                "enabled": true,
+                "port": 123,
+                "stratum": 3
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.ntp_server_mode.enabled);
+        assert_eq!(config.ntp_server_mode.port, 123);
+        assert_eq!(config.ntp_server_mode.stratum, 3);
+    }
+
+    #[test]
+    fn config_deserializes_with_custom_ntp_server_mode_port() {
+        let json = r#"{
+            "ntp_server": "10.77.8.2",
+            "ntp_server_mode": {
+                "enabled": true,
+                "port": 1123,
+                "stratum": 2
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.ntp_server_mode.enabled);
+        assert_eq!(config.ntp_server_mode.port, 1123);
+        assert_eq!(config.ntp_server_mode.stratum, 2);
+    }
+
+    #[test]
+    fn config_deserializes_without_ntp_server_mode_uses_defaults() {
+        let json = r#"{"ntp_server": "10.77.8.2"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        // ntp_server_mode should use defaults when omitted
+        assert!(!config.ntp_server_mode.enabled);
+        assert_eq!(config.ntp_server_mode.port, 123);
+        assert_eq!(config.ntp_server_mode.stratum, 3);
     }
 }
