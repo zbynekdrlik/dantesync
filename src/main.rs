@@ -121,12 +121,45 @@ fn load_config() -> Config {
     let path = "/etc/dantesync/config.json";
 
     if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(cfg) = serde_json::from_str::<Config>(&content) {
-            return cfg;
+        // Try to parse as JSON Value first to check for missing fields
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let mut needs_migration = false;
+
+            // Migrate: add _ntp_server_examples if missing
+            if json.get("_ntp_server_examples").is_none() {
+                json["_ntp_server_examples"] = serde_json::Value::String(
+                    "sk.pool.ntp.org, europe.pool.ntp.org, time.google.com, time.cloudflare.com"
+                        .to_string(),
+                );
+                needs_migration = true;
+            }
+
+            // Migrate: add ntp_server_mode if missing
+            if json.get("ntp_server_mode").is_none() {
+                json["ntp_server_mode"] = serde_json::json!({
+                    "enabled": false,
+                    "port": 123,
+                    "stratum": 3
+                });
+                needs_migration = true;
+            }
+
+            // Write back migrated config
+            if needs_migration {
+                if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                    let _ = std::fs::write(path, pretty);
+                    log::info!("Config migrated: added ntp_server_mode and NTP examples");
+                }
+            }
+
+            // Parse the (possibly migrated) config
+            if let Ok(cfg) = serde_json::from_value::<Config>(json) {
+                return cfg;
+            }
         }
     }
 
-    // Create config with ntp_server and ntp_server_mode visible (system defaults auto-apply)
+    // Create new config with all sections visible
     let cfg = Config::default();
     let simple_config = r#"{
   "_ntp_server_examples": "sk.pool.ntp.org, europe.pool.ntp.org, time.google.com, time.cloudflare.com",
