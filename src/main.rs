@@ -126,10 +126,16 @@ fn load_config() -> Config {
         }
     }
 
-    // Create simple config with only ntp_server (system defaults auto-apply)
+    // Create config with ntp_server and ntp_server_mode visible (system defaults auto-apply)
     let cfg = Config::default();
     let simple_config = r#"{
-  "ntp_server": "10.77.8.2"
+  "_ntp_server_examples": "sk.pool.ntp.org, europe.pool.ntp.org, time.google.com, time.cloudflare.com",
+  "ntp_server": "10.77.8.2",
+  "ntp_server_mode": {
+    "enabled": false,
+    "port": 123,
+    "stratum": 3
+  }
 }"#;
     let _ = std::fs::write(path, simple_config);
     cfg
