@@ -343,9 +343,23 @@ struct SingleInstanceGuard {
     _file: File,
 }
 
+#[cfg(unix)]
+impl std::fmt::Debug for SingleInstanceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleInstanceGuard").finish()
+    }
+}
+
 #[cfg(windows)]
 struct SingleInstanceGuard {
     _handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for SingleInstanceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleInstanceGuard").finish()
+    }
 }
 
 #[cfg(windows)]
