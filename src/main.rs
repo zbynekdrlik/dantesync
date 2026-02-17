@@ -22,9 +22,9 @@ use std::os::unix::io::AsRawFd;
 use std::time::SystemTime;
 
 #[cfg(windows)]
-use windows::Win32::Media::timeBeginPeriod;
-#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+#[cfg(windows)]
+use windows::Win32::Media::timeBeginPeriod;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
@@ -377,9 +377,7 @@ fn acquire_singleton_lock() -> Result<SingleInstanceGuard> {
     {
         use anyhow::anyhow;
 
-        let mutex_name: Vec<u16> = "Global\\DanteSyncDaemonMutex\0"
-            .encode_utf16()
-            .collect();
+        let mutex_name: Vec<u16> = "Global\\DanteSyncDaemonMutex\0".encode_utf16().collect();
 
         unsafe {
             match CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) {
