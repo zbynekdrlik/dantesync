@@ -22,10 +22,12 @@ use std::os::unix::io::AsRawFd;
 use std::time::SystemTime;
 
 #[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+#[cfg(windows)]
 use windows::Win32::Media::timeBeginPeriod;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+    CreateMutexW, GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
 };
 
 #[cfg(windows)]
@@ -332,7 +334,30 @@ fn enable_realtime_priority() {
     }
 }
 
-fn acquire_singleton_lock() -> Result<File> {
+// --- Single Instance Lock ---
+// On Windows, we use a named mutex (like the tray app does)
+// On Linux, we use flock on a lock file
+
+#[cfg(unix)]
+struct SingleInstanceGuard {
+    _file: File,
+}
+
+#[cfg(windows)]
+struct SingleInstanceGuard {
+    _handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self._handle);
+        }
+    }
+}
+
+fn acquire_singleton_lock() -> Result<SingleInstanceGuard> {
     #[cfg(unix)]
     {
         let lock_path = "/var/run/dantesync.lock";
@@ -340,7 +365,7 @@ fn acquire_singleton_lock() -> Result<File> {
             .map_err(|e| anyhow!("Failed to create lock file {}: {}", lock_path, e))?;
 
         match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-            Ok(_) => Ok(file),
+            Ok(_) => Ok(SingleInstanceGuard { _file: file }),
             Err(nix::errno::Errno::EAGAIN) => Err(anyhow!(
                 "Another instance of dantesync is already running! (Lockfile: {})",
                 lock_path
@@ -348,14 +373,29 @@ fn acquire_singleton_lock() -> Result<File> {
             Err(e) => Err(e.into()),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // On Windows, file locking prevents deletion but not necessarily running if logic differs.
-        // But File::create opens/truncates.
-        // We want shared read, exclusive write?
-        // Simple create is fine for now if we hold the handle.
-        let file = File::create("dantesync.lock")?;
-        Ok(file)
+        use anyhow::anyhow;
+
+        let mutex_name: Vec<u16> = "Global\\DanteSyncDaemonMutex\0".encode_utf16().collect();
+
+        unsafe {
+            match CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) {
+                Ok(handle) => {
+                    // Check if mutex already existed (another instance is running)
+                    if let Err(e) = GetLastError() {
+                        if e.code() == ERROR_ALREADY_EXISTS.to_hresult() {
+                            let _ = CloseHandle(handle);
+                            return Err(anyhow!(
+                                "Another instance of dantesync is already running!"
+                            ));
+                        }
+                    }
+                    Ok(SingleInstanceGuard { _handle: handle })
+                }
+                Err(e) => Err(anyhow!("Failed to create singleton mutex: {:?}", e)),
+            }
+        }
     }
 }
 
@@ -955,5 +995,34 @@ mod tests {
         assert!(!config.ntp_server_mode.enabled);
         assert_eq!(config.ntp_server_mode.port, 123);
         assert_eq!(config.ntp_server_mode.stratum, 3);
+    }
+
+    // ========================================================================
+    // SINGLE INSTANCE LOCK TESTS
+    // ========================================================================
+
+    #[cfg(windows)]
+    #[test]
+    fn singleton_lock_prevents_duplicate_instances() {
+        // First lock should succeed
+        let lock1 = acquire_singleton_lock();
+        assert!(lock1.is_ok(), "First lock acquisition should succeed");
+
+        // Second lock should fail (another instance already running)
+        let lock2 = acquire_singleton_lock();
+        assert!(lock2.is_err(), "Second lock acquisition should fail");
+
+        // Verify the error message mentions "already running"
+        let err_msg = lock2.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already running"),
+            "Error should mention 'already running', got: {}",
+            err_msg
+        );
+
+        // After dropping lock1, a new lock should succeed
+        drop(lock1);
+        let lock3 = acquire_singleton_lock();
+        assert!(lock3.is_ok(), "Lock after release should succeed");
     }
 }
