@@ -80,7 +80,7 @@ use windows_service::{
 use dantesync::net_pcap;
 #[cfg(unix)]
 use dantesync::ptp;
-use dantesync::{clock, config, controller, net, ntp, ntp_server, status, traits};
+use dantesync::{clock, config, controller, net, ntp, ntp_server, status, time_server, traits};
 
 use config::{NtpServerConfig, SystemConfig};
 use controller::PtpController;
@@ -549,6 +549,18 @@ fn run_sync_loop(
     // Start IPC Server immediately (so Tray App can connect even if network is down)
     start_ipc_server(status_shared.clone());
 
+    // Start UDP Time Query Server for network time verification
+    let time_server = match time_server::TimeServer::new() {
+        Ok(ts) => Some(ts),
+        Err(e) => {
+            warn!(
+                "Failed to start Time Query Server on port {}: {} (continuing without it)",
+                time_server::TIME_SERVER_PORT, e
+            );
+            None
+        }
+    };
+
     stop_conflicting_services();
     enable_realtime_priority();
 
@@ -709,6 +721,11 @@ fn run_sync_loop(
 
         if let Err(e) = controller.process_loop_iteration() {
             warn!("Error in loop: {}", e);
+        }
+
+        // Handle UDP time query requests (for network time verification)
+        if let Some(ref ts) = time_server {
+            ts.handle_requests(&controller.get_status_shared());
         }
 
         // Platform-specific polling intervals:
