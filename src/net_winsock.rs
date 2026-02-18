@@ -18,11 +18,11 @@ use std::time::SystemTime;
 
 use windows::core::GUID;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, ioctlsocket, recv, recvfrom, setsockopt, socket, WSACleanup,
-    WSAGetLastError, WSAIoctl, WSAStartup, AF_INET, FIONBIO, INVALID_SOCKET, IN_ADDR, IPPROTO_IP,
-    IPPROTO_UDP, IP_ADD_MEMBERSHIP, IP_MULTICAST_LOOP, SEND_RECV_FLAGS,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET,
-    SO_REUSEADDR, SO_TIMESTAMP, WSABUF, WSADATA, WSAMSG,
+    bind, closesocket, ioctlsocket, recvfrom, setsockopt, socket, WSACleanup, WSAGetLastError,
+    WSAIoctl, WSAStartup, AF_INET, FIONBIO, INVALID_SOCKET, IN_ADDR, IPPROTO_IP, IPPROTO_UDP,
+    IP_ADD_MEMBERSHIP, IP_MULTICAST_LOOP, SEND_RECV_FLAGS, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, SO_TIMESTAMP, WSABUF,
+    WSADATA, WSAMSG,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::IO::OVERLAPPED;
@@ -485,7 +485,7 @@ impl WinsockPtpNetwork {
             let result = recvfrom(
                 sock,
                 &mut buffer,
-                SEND_RECV_FLAGS(0),
+                0, // flags as i32
                 Some(&mut sockaddr as *mut SOCKADDR_IN as *mut _),
                 Some(&mut sockaddr_len),
             );

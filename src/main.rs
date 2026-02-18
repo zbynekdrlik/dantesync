@@ -217,7 +217,9 @@ struct RealPtpNetwork {
 
 #[cfg(unix)]
 impl PtpNetwork for RealPtpNetwork {
-    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<std::net::Ipv4Addr>)>> {
+    fn recv_packet(
+        &mut self,
+    ) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<std::net::Ipv4Addr>)>> {
         let mut buf = [0u8; 2048];
 
         // Check Event Socket first
