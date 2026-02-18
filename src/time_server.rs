@@ -24,7 +24,10 @@
 //! - `[41]`    Is locked: 0/1
 //! - `[42-47]` Grandmaster UUID (6 bytes)
 //! - `[48-55]` Monotonic frequency (ticks per second, u64)
-//! - `[56-63]` Reserved (zeros)
+//! - `[56-59]` NTP offset (microseconds, signed i32)
+//! - `[60-61]` Accumulated phase drift since last NTP step (microseconds, signed i16)
+//! - `[62]`    Flags: bit 0 = ntp_failed, bit 1 = settled
+//! - `[63]`    Reserved (zero)
 
 use crate::status::SyncStatus;
 use anyhow::Result;
@@ -180,7 +183,26 @@ fn build_response(request_id: u32, status: &SyncStatus) -> [u8; RESPONSE_SIZE] {
     let mono_freq = get_monotonic_frequency();
     resp[48..56].copy_from_slice(&mono_freq.to_be_bytes());
 
-    // [56-63] Reserved (already zero)
+    // [56-59] NTP offset (microseconds, i32)
+    let ntp_offset = status.ntp_offset_us as i32;
+    resp[56..60].copy_from_slice(&ntp_offset.to_be_bytes());
+
+    // [60-61] Accumulated phase drift (microseconds, i16) — clamped to i16 range
+    let phase_clamped = status.accumulated_phase_us.round() as i64;
+    let phase_i16 = phase_clamped.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+    resp[60..62].copy_from_slice(&phase_i16.to_be_bytes());
+
+    // [62] Flags byte: bit 0 = ntp_failed, bit 1 = settled
+    let mut flags: u8 = 0;
+    if status.ntp_failed {
+        flags |= 0x01;
+    }
+    if status.settled {
+        flags |= 0x02;
+    }
+    resp[62] = flags;
+
+    // [63] Reserved (already zero)
 
     resp
 }
@@ -404,5 +426,73 @@ mod tests {
     #[test]
     fn test_time_server_port_constant() {
         assert_eq!(TIME_SERVER_PORT, 31900);
+    }
+
+    #[test]
+    fn test_build_response_ntp_fields() {
+        let mut status = SyncStatus::default();
+        status.ntp_offset_us = 1234;
+        status.accumulated_phase_us = -567.8;
+        status.ntp_failed = false;
+        status.settled = true;
+
+        let response = build_response(0, &status);
+
+        // [56-59] NTP offset (i32)
+        let ntp_off = i32::from_be_bytes([response[56], response[57], response[58], response[59]]);
+        assert_eq!(ntp_off, 1234);
+
+        // [60-61] Accumulated phase (i16, rounded)
+        let phase = i16::from_be_bytes([response[60], response[61]]);
+        assert_eq!(phase, -568); // -567.8 rounds to -568
+
+        // [62] Flags: bit 0 = ntp_failed (0), bit 1 = settled (1) = 0b10 = 2
+        assert_eq!(response[62], 0x02);
+
+        // [63] Reserved
+        assert_eq!(response[63], 0);
+    }
+
+    #[test]
+    fn test_build_response_ntp_failed_flag() {
+        let mut status = SyncStatus::default();
+        status.ntp_failed = true;
+        status.settled = false;
+
+        let response = build_response(0, &status);
+        // bit 0 = ntp_failed (1), bit 1 = settled (0) = 0b01 = 1
+        assert_eq!(response[62], 0x01);
+    }
+
+    #[test]
+    fn test_build_response_both_flags() {
+        let mut status = SyncStatus::default();
+        status.ntp_failed = true;
+        status.settled = true;
+
+        let response = build_response(0, &status);
+        // bit 0 = ntp_failed (1), bit 1 = settled (1) = 0b11 = 3
+        assert_eq!(response[62], 0x03);
+    }
+
+    #[test]
+    fn test_build_response_ntp_offset_negative() {
+        let mut status = SyncStatus::default();
+        status.ntp_offset_us = -42000;
+
+        let response = build_response(0, &status);
+        let ntp_off = i32::from_be_bytes([response[56], response[57], response[58], response[59]]);
+        assert_eq!(ntp_off, -42000);
+    }
+
+    #[test]
+    fn test_build_response_phase_clamp() {
+        let mut status = SyncStatus::default();
+        // Exceeds i16 range — should be clamped to i16::MAX
+        status.accumulated_phase_us = 50000.0;
+
+        let response = build_response(0, &status);
+        let phase = i16::from_be_bytes([response[60], response[61]]);
+        assert_eq!(phase, i16::MAX); // 32767
     }
 }
