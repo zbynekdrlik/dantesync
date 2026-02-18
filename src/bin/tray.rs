@@ -92,6 +92,8 @@ mod app {
         pub mode: String,
         #[serde(default)]
         pub ntp_failed: bool,
+        #[serde(default)]
+        pub accumulated_phase_us: f64,
     }
 
     // ========================================================================
@@ -561,9 +563,16 @@ mod app {
                             // Drift rate display (rate of change, not absolute offset)
                             let drift_str = format!("{:+.1}us/s", status.smoothed_rate_ppm);
 
+                            // Include accumulated phase error in tooltip when significant (>10µs)
+                            let phase_str = if status.accumulated_phase_us.abs() > 10.0 {
+                                format!("\nAccum. Phase: {:+.0}us", status.accumulated_phase_us)
+                            } else {
+                                String::new()
+                            };
+
                             let tooltip = format!(
-                                "DanteSync v{}\nMode: {} | Drift: {}\nFreq Adj: {:+.1}ppm\nNTP Offset: {:+}us",
-                                version, mode_str, drift_str, status.drift_ppm, status.ntp_offset_us
+                                "DanteSync v{}\nMode: {} | Drift: {}\nFreq Adj: {:+.1}ppm\nNTP Offset: {:+}us{}",
+                                version, mode_str, drift_str, status.drift_ppm, status.ntp_offset_us, phase_str
                             );
 
                             let status_text = format!("{} | Drift: {}", mode_str, drift_str);
