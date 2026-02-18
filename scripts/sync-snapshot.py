@@ -206,12 +206,22 @@ def drift_to_samples_per_sec(drift_us_per_sec: float, sample_rate: int) -> float
 
 
 def audio_quality_rating(r: TimeResponse, sample_rate: int) -> str:
-    """Rate sync quality in audio-meaningful terms."""
+    """Rate sync quality in audio-meaningful terms.
+
+    Trusts the servo mode over instantaneous drift because of hysteresis:
+    NANO mode requires 15 sustained samples < 0.5 us/s to ENTER, and
+    5 consecutive samples > 1.0 us/s to EXIT. A host in NANO with drift
+    0.5-1.0 us/s is in the hysteresis band and still sample-locked.
+    """
     if r.error:
         return "OFFLINE"
     drift = abs(r.drift_rate_ppm)
     if not r.is_locked:
         return "DRIFTING"
+    # NANO mode = servo proved sustained sub-0.5 us/s precision.
+    # Trust it even if instantaneous drift is in the hysteresis band (0.5-1.0 us/s).
+    if r.mode == "NANO":
+        return "SAMPLE-LOCKED"
     if drift < DRIFT_NANO_US:
         return "SAMPLE-LOCKED"
     if drift < DRIFT_LOCK_US:
