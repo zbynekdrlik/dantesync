@@ -77,6 +77,9 @@ mod app {
         pub drift_ppm: f64,
         #[serde(rename = "gm_uuid")]
         pub _gm_uuid: Option<[u8; 6]>,
+        /// IP address of the PTP grandmaster device
+        #[serde(default)]
+        pub gm_source_ip: Option<std::net::Ipv4Addr>,
         pub settled: bool,
         #[serde(rename = "updated_ts")]
         pub _updated_ts: u64,
@@ -298,6 +301,7 @@ mod app {
 
         let status_i = MenuItem::new("Status: Connecting...", false, None);
         let mode_i = MenuItem::new("Mode: --", false, None);
+        let gm_ip_i = MenuItem::new("PTP Master: --", false, None);
 
         // Service control
         let restart_i = MenuItem::new("Restart Service", true, None);
@@ -316,6 +320,7 @@ mod app {
         let menu = Menu::new();
         menu.append(&status_i).unwrap();
         menu.append(&mode_i).unwrap();
+        menu.append(&gm_ip_i).unwrap();
         menu.append(&tray_icon::menu::PredefinedMenuItem::separator())
             .unwrap();
         menu.append(&restart_i).unwrap();
@@ -570,13 +575,25 @@ mod app {
                                 String::new()
                             };
 
+                            // Show PTP grandmaster IP if available
+                            let gm_str = match &status.gm_source_ip {
+                                Some(ip) => format!("\nPTP Master: {}", ip),
+                                None => String::new(),
+                            };
+
                             let tooltip = format!(
-                                "DanteSync v{}\nMode: {} | Drift: {}\nFreq Adj: {:+.1}ppm\nNTP Offset: {:+}us{}",
-                                version, mode_str, drift_str, status.drift_ppm, status.ntp_offset_us, phase_str
+                                "DanteSync v{}\nMode: {} | Drift: {}\nFreq Adj: {:+.1}ppm\nNTP Offset: {:+}us{}{}",
+                                version, mode_str, drift_str, status.drift_ppm, status.ntp_offset_us, phase_str, gm_str
                             );
 
                             let status_text = format!("{} | Drift: {}", mode_str, drift_str);
                             let mode_text = format!("Mode: {} | Adj: {:+.1}ppm", mode_str, status.drift_ppm);
+
+                            // Format grandmaster IP for menu
+                            let gm_ip_text = match &status.gm_source_ip {
+                                Some(ip) => format!("PTP Master: {}", ip),
+                                None => "PTP Master: --".to_string(),
+                            };
 
                             if let Some(ref ti) = *tray_icon.borrow() {
                                 let _ = ti.set_icon(Some(icon));
@@ -584,6 +601,7 @@ mod app {
                             }
                             status_i.set_text(status_text);
                             mode_i.set_text(mode_text);
+                            gm_ip_i.set_text(gm_ip_text);
                             // Service is running - show Stop option
                             start_stop_i.set_text("Stop Service".to_string());
                             restart_i.set_enabled(true);
@@ -612,6 +630,7 @@ mod app {
                             }
                             status_i.set_text("Service Offline".to_string());
                             mode_i.set_text("--".to_string());
+                            gm_ip_i.set_text("PTP Master: --".to_string());
                             // Service is stopped - show Start option
                             start_stop_i.set_text("Start Service".to_string());
                             restart_i.set_enabled(false);

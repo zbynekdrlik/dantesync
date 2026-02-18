@@ -79,7 +79,9 @@ struct StatefulNetwork {
 }
 
 impl PtpNetwork for StatefulNetwork {
-    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    fn recv_packet(
+        &mut self,
+    ) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<std::net::Ipv4Addr>)>> {
         let mut phys = self.physics.engine.borrow_mut();
 
         if let Some((seq, t1)) = self.pending_followup {
@@ -100,7 +102,7 @@ impl PtpNetwork for StatefulNetwork {
             BigEndian::write_u32(&mut buf[44..48], s);
             BigEndian::write_u32(&mut buf[48..52], n);
 
-            return Ok(Some((buf, 60, t2_sys)));
+            return Ok(Some((buf, 60, t2_sys, None)));
         }
 
         // Advance time (packet interval 125ms)
@@ -130,7 +132,7 @@ impl PtpNetwork for StatefulNetwork {
 
         self.pending_followup = Some((self.seq, t1_ns));
 
-        Ok(Some((buf, 60, t2_sys)))
+        Ok(Some((buf, 60, t2_sys, None)))
     }
 
     fn reset(&mut self) -> Result<()> {

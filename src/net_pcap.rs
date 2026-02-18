@@ -148,7 +148,7 @@ impl NpcapPtpNetwork {
 }
 
 impl crate::traits::PtpNetwork for NpcapPtpNetwork {
-    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
         match self.capture.next_packet() {
             Ok(packet) => {
                 let data = packet.data;
@@ -196,6 +196,10 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                     return Ok(None);
                 }
 
+                // Extract source IP from IP header (Ethernet 14 bytes + IP src at offset 12)
+                // Source IP is at bytes 26-29 of the Ethernet frame
+                let source_ip = Ipv4Addr::new(data[26], data[27], data[28], data[29]);
+
                 // Extract UDP payload
                 let payload = &data[ETH_IP_UDP_HEADER..];
                 let payload_len = payload.len();
@@ -204,8 +208,11 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                     let mut result = vec![0u8; payload_len];
                     result.copy_from_slice(payload);
 
-                    debug!("[Npcap] PTP payload {} bytes", payload_len);
-                    Ok(Some((result, payload_len, ts)))
+                    debug!(
+                        "[Npcap] PTP payload {} bytes from {}",
+                        payload_len, source_ip
+                    );
+                    Ok(Some((result, payload_len, ts, Some(source_ip))))
                 } else {
                     Ok(None)
                 }

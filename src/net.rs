@@ -87,7 +87,7 @@ pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpS
 pub fn recv_with_timestamp(
     sock: &UdpSocket,
     buf: &mut [u8],
-) -> Result<Option<(usize, std::time::SystemTime)>> {
+) -> Result<Option<(usize, std::time::SystemTime, Option<Ipv4Addr>)>> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrStorage};
     use nix::sys::time::TimeSpec;
     use std::os::fd::AsRawFd;
@@ -111,7 +111,20 @@ pub fn recv_with_timestamp(
                 })
                 .unwrap_or_else(SystemTime::now);
 
-            Ok(Some((msg.bytes, timestamp)))
+            // Extract source IP from the address field
+            let source_ip = msg.address.and_then(|addr| {
+                addr.as_sockaddr_in().map(|sin| {
+                    let ip = sin.ip();
+                    Ipv4Addr::new(
+                        ((ip >> 24) & 0xFF) as u8,
+                        ((ip >> 16) & 0xFF) as u8,
+                        ((ip >> 8) & 0xFF) as u8,
+                        (ip & 0xFF) as u8,
+                    )
+                })
+            });
+
+            Ok(Some((msg.bytes, timestamp, source_ip)))
         }
         Err(nix::errno::Errno::EAGAIN) => Ok(None),
         Err(e) => Err(e.into()),
@@ -122,9 +135,15 @@ pub fn recv_with_timestamp(
 pub fn recv_with_timestamp(
     sock: &UdpSocket,
     buf: &mut [u8],
-) -> Result<Option<(usize, std::time::SystemTime)>> {
+) -> Result<Option<(usize, std::time::SystemTime, Option<Ipv4Addr>)>> {
     match sock.recv_from(buf) {
-        Ok((size, _)) => Ok(Some((size, std::time::SystemTime::now()))),
+        Ok((size, addr)) => {
+            let source_ip = match addr {
+                std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                _ => None,
+            };
+            Ok(Some((size, std::time::SystemTime::now(), source_ip)))
+        }
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e.into()),
     }

@@ -18,11 +18,11 @@ use std::time::SystemTime;
 
 use windows::core::GUID;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, ioctlsocket, recv, setsockopt, socket, WSACleanup, WSAGetLastError,
-    WSAIoctl, WSAStartup, AF_INET, FIONBIO, INVALID_SOCKET, IN_ADDR, IPPROTO_IP, IPPROTO_UDP,
-    IP_ADD_MEMBERSHIP, IP_MULTICAST_LOOP, SEND_RECV_FLAGS, SIO_GET_EXTENSION_FUNCTION_POINTER,
-    SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, SO_TIMESTAMP, WSABUF,
-    WSADATA, WSAMSG,
+    bind, closesocket, ioctlsocket, recv, recvfrom, setsockopt, socket, WSACleanup,
+    WSAGetLastError, WSAIoctl, WSAStartup, AF_INET, FIONBIO, INVALID_SOCKET, IN_ADDR, IPPROTO_IP,
+    IPPROTO_UDP, IP_ADD_MEMBERSHIP, IP_MULTICAST_LOOP, SEND_RECV_FLAGS,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET,
+    SO_REUSEADDR, SO_TIMESTAMP, WSABUF, WSADATA, WSAMSG,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::IO::OVERLAPPED;
@@ -298,12 +298,13 @@ impl WinsockPtpNetwork {
     fn recv_with_timestamp(
         &mut self,
         sock: SOCKET,
-    ) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    ) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
         const BUFFER_SIZE: usize = 512;
         const CONTROL_SIZE: usize = 128; // Increased for control messages
 
         let mut data = vec![0u8; BUFFER_SIZE];
         let mut control = vec![0u8; CONTROL_SIZE];
+        let mut sockaddr: SOCKADDR_IN = unsafe { mem::zeroed() };
 
         unsafe {
             let mut data_buf = WSABUF {
@@ -312,8 +313,8 @@ impl WinsockPtpNetwork {
             };
 
             let mut msg = WSAMSG {
-                name: ptr::null_mut(),
-                namelen: 0,
+                name: &mut sockaddr as *mut SOCKADDR_IN as *mut _,
+                namelen: mem::size_of::<SOCKADDR_IN>() as i32,
                 lpBuffers: &mut data_buf,
                 dwBufferCount: 1,
                 Control: WSABUF {
@@ -352,18 +353,31 @@ impl WinsockPtpNetwork {
                 return Ok(None);
             }
 
+            // Extract source IP from sockaddr
+            let source_ip = if sockaddr.sin_family == AF_INET {
+                let ip_bytes = sockaddr.sin_addr.S_un.S_addr.to_ne_bytes();
+                Some(Ipv4Addr::new(
+                    ip_bytes[0],
+                    ip_bytes[1],
+                    ip_bytes[2],
+                    ip_bytes[3],
+                ))
+            } else {
+                None
+            };
+
             // Log receive details
             let control_len = msg.Control.len as usize;
             debug!(
-                "[Recv] Got {} bytes, control_len={}",
-                bytes_received, control_len
+                "[Recv] Got {} bytes from {:?}, control_len={}",
+                bytes_received, source_ip, control_len
             );
 
             // Extract timestamp from control message
             let timestamp = self.extract_timestamp(&control, control_len);
 
             data.truncate(bytes_received as usize);
-            Ok(Some((data, bytes_received as usize, timestamp)))
+            Ok(Some((data, bytes_received as usize, timestamp, source_ip)))
         }
     }
 
@@ -459,11 +473,22 @@ impl WinsockPtpNetwork {
     }
 
     /// Fallback receive without timestamp
-    fn recv_fallback(&self, sock: SOCKET) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    fn recv_fallback(
+        &self,
+        sock: SOCKET,
+    ) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
         let mut buffer = vec![0u8; 512];
+        let mut sockaddr: SOCKADDR_IN = unsafe { mem::zeroed() };
+        let mut sockaddr_len: i32 = mem::size_of::<SOCKADDR_IN>() as i32;
 
         unsafe {
-            let result = recv(sock, &mut buffer, SEND_RECV_FLAGS(0));
+            let result = recvfrom(
+                sock,
+                &mut buffer,
+                SEND_RECV_FLAGS(0),
+                Some(&mut sockaddr as *mut SOCKADDR_IN as *mut _),
+                Some(&mut sockaddr_len),
+            );
 
             if result == SOCKET_ERROR {
                 let err = WSAGetLastError().0;
@@ -471,16 +496,29 @@ impl WinsockPtpNetwork {
                     // WSAEWOULDBLOCK
                     return Ok(None);
                 }
-                return Err(anyhow!("recv failed: {}", err));
+                return Err(anyhow!("recvfrom failed: {}", err));
             }
 
             if result == 0 {
                 return Ok(None);
             }
 
+            // Extract source IP
+            let source_ip = if sockaddr.sin_family == AF_INET {
+                let ip_bytes = sockaddr.sin_addr.S_un.S_addr.to_ne_bytes();
+                Some(Ipv4Addr::new(
+                    ip_bytes[0],
+                    ip_bytes[1],
+                    ip_bytes[2],
+                    ip_bytes[3],
+                ))
+            } else {
+                None
+            };
+
             let timestamp = SystemTime::now();
             buffer.truncate(result as usize);
-            Ok(Some((buffer, result as usize, timestamp)))
+            Ok(Some((buffer, result as usize, timestamp, source_ip)))
         }
     }
 }
@@ -497,7 +535,7 @@ impl Drop for WinsockPtpNetwork {
 }
 
 impl crate::traits::PtpNetwork for WinsockPtpNetwork {
-    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
         // Try event port first (319), then general port (320)
         if let Some(packet) = self.recv_with_timestamp(self.socket_319)? {
             return Ok(Some(packet));
