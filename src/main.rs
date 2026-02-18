@@ -555,7 +555,8 @@ fn run_sync_loop(
         Err(e) => {
             warn!(
                 "Failed to start Time Query Server on port {}: {} (continuing without it)",
-                time_server::TIME_SERVER_PORT, e
+                time_server::TIME_SERVER_PORT,
+                e
             );
             None
         }
