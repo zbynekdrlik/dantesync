@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 /// Sync status shared via IPC between service and tray app
 ///
@@ -20,6 +21,10 @@ pub struct SyncStatus {
 
     /// Grandmaster clock UUID (from PTP Sync messages)
     pub gm_uuid: Option<[u8; 6]>,
+
+    /// IP address of the device sending PTP Sync messages
+    /// This is the actual network address of the PTP grandmaster/boundary clock
+    pub gm_source_ip: Option<Ipv4Addr>,
 
     /// True once sync is established (receiving valid packets)
     pub settled: bool,
@@ -62,6 +67,7 @@ impl Default for SyncStatus {
             offset_ns: 0,
             drift_ppm: 0.0,
             gm_uuid: None,
+            gm_source_ip: None,
             settled: false,
             updated_ts: 0,
 

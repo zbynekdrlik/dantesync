@@ -217,13 +217,15 @@ struct RealPtpNetwork {
 
 #[cfg(unix)]
 impl PtpNetwork for RealPtpNetwork {
-    fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime)>> {
+    fn recv_packet(
+        &mut self,
+    ) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<std::net::Ipv4Addr>)>> {
         let mut buf = [0u8; 2048];
 
         // Check Event Socket first
         match net::recv_with_timestamp(&self.sock_event, &mut buf) {
-            Ok(Some((size, ts))) => {
-                return Ok(Some((buf[..size].to_vec(), size, ts)));
+            Ok(Some((size, ts, source_ip))) => {
+                return Ok(Some((buf[..size].to_vec(), size, ts, source_ip)));
             }
             Ok(None) => {} // Continue to check general
             Err(e) => return Err(e),
@@ -231,8 +233,8 @@ impl PtpNetwork for RealPtpNetwork {
 
         // Check General Socket
         match net::recv_with_timestamp(&self.sock_general, &mut buf) {
-            Ok(Some((size, ts))) => {
-                return Ok(Some((buf[..size].to_vec(), size, ts)));
+            Ok(Some((size, ts, source_ip))) => {
+                return Ok(Some((buf[..size].to_vec(), size, ts, source_ip)));
             }
             Ok(None) => {} // No data on either socket
             Err(e) => return Err(e),

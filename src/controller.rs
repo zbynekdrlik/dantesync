@@ -136,6 +136,8 @@ where
     current_gm_uuid: Option<[u8; 6]>,
     /// The source UUID of the device sending Sync messages (may differ from grandmaster_clock_uuid)
     current_sync_source: Option<[u8; 6]>,
+    /// IP address of the device sending PTP Sync messages (for display in tray app)
+    current_sync_source_ip: Option<std::net::Ipv4Addr>,
 
     // Sample filtering
     sample_window: Vec<i64>,
@@ -289,6 +291,7 @@ where
             prev_t2_ns: 0,
             current_gm_uuid: None,
             current_sync_source: None,
+            current_sync_source_ip: None,
             sample_window: Vec::with_capacity(window_size),
             last_phase_offset_ns: 0,
             last_adj_ppm: 0.0,
@@ -610,7 +613,7 @@ where
         // Check PTP status first (handles timeout detection for NTP-only fallback)
         self.check_ptp_status();
 
-        let (buf, size, t2) = match self.network.recv_packet()? {
+        let (buf, size, t2, source_ip) = match self.network.recv_packet()? {
             Some(res) => res,
             None => {
                 // No packet, but still run NTP tracking if PTP is offline
@@ -621,8 +624,11 @@ where
             }
         };
 
-        // Packet received - update last_ptp_packet timestamp
+        // Packet received - update last_ptp_packet timestamp and source IP
         self.last_ptp_packet = Instant::now();
+        if source_ip.is_some() {
+            self.current_sync_source_ip = source_ip;
+        }
 
         if size < PtpV1Header::SIZE {
             return Ok(());
@@ -1236,6 +1242,7 @@ where
             status.offset_ns = self.last_phase_offset_ns;
             status.drift_ppm = self.last_adj_ppm;
             status.gm_uuid = self.current_gm_uuid;
+            status.gm_source_ip = self.current_sync_source_ip;
             status.settled = self.clock_settled;
             status.updated_ts = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1350,12 +1357,12 @@ mod tests {
             mock_net
                 .expect_recv_packet()
                 .times(1)
-                .returning(move || Ok(Some((sync_pkt.clone(), 60, t2))));
+                .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, None))));
 
             mock_net
                 .expect_recv_packet()
                 .times(1)
-                .returning(move || Ok(Some((follow_pkt.clone(), 60, t2))));
+                .returning(move || Ok(Some((follow_pkt.clone(), 60, t2, None))));
         }
 
         mock_net.expect_recv_packet().returning(|| Ok(None));
