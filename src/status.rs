@@ -48,6 +48,11 @@ pub struct SyncStatus {
 
     /// True when NTP sync has failed (can't reach server)
     pub ntp_failed: bool,
+
+    /// Accumulated phase error since last NTP step (microseconds)
+    /// Tracks estimated UTC drift between NTP corrections
+    /// Reset to 0 after each NTP step
+    pub accumulated_phase_us: f64,
 }
 
 impl Default for SyncStatus {
@@ -66,6 +71,7 @@ impl Default for SyncStatus {
             ntp_offset_us: 0,
             mode: "ACQ".to_string(),
             ntp_failed: false,
+            accumulated_phase_us: 0.0,
         }
     }
 }

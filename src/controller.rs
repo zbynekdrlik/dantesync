@@ -199,6 +199,10 @@ where
     ntp_tracking_enabled: bool,
     last_ntp_step: Option<Instant>, // Grace period after NTP stepping
 
+    // Accumulated phase error tracking (estimated drift between NTP steps)
+    accumulated_phase_error_us: f64,
+    last_phase_accumulation_time: Option<Instant>,
+
     // PTP offline detection
     last_ptp_packet: Instant,
     ptp_offline: bool,
@@ -318,6 +322,9 @@ where
             ntp_offset_samples: VecDeque::with_capacity(NTP_SAMPLE_COUNT + 2),
             ntp_tracking_enabled: true, // Always enabled - NTP is the UTC time source
             last_ntp_step: None,
+            // Accumulated phase error tracking
+            accumulated_phase_error_us: 0.0,
+            last_phase_accumulation_time: None,
             // PTP offline detection
             last_ptp_packet: now,
             ptp_offline: false,
@@ -415,8 +422,11 @@ where
             return;
         }
 
-        // Check if enough time has passed since last NTP query
-        if self.last_ntp_check.elapsed() < Duration::from_secs(NTP_CHECK_INTERVAL_SECS) {
+        // Adaptive NTP interval based on accumulated phase error:
+        // - Higher error = check more frequently for tighter UTC alignment
+        // - Low error = use default interval to reduce NTP overhead
+        let ntp_interval_secs = self.calculate_adaptive_ntp_interval();
+        if self.last_ntp_check.elapsed() < Duration::from_secs(ntp_interval_secs) {
             return;
         }
 
@@ -491,6 +501,9 @@ where
                         self.spike_filter.clear();
                         // NOTE: jitter_estimator is NOT cleared on NTP step because
                         // jitter is a hardware property that persists across steps
+                        // Reset accumulated phase error - we just aligned to UTC
+                        self.accumulated_phase_error_us = 0.0;
+                        self.last_phase_accumulation_time = None;
                         info!("[NTP] Stepped {:+}us", step_us);
                     }
                 }
@@ -568,6 +581,24 @@ where
 
         // Clamp to reasonable range
         adaptive.clamp(NTP_STEP_THRESHOLD_BASE_US, NTP_STEP_THRESHOLD_MAX_US)
+    }
+
+    /// Calculate adaptive NTP check interval based on accumulated phase error.
+    ///
+    /// Higher accumulated error = more frequent checks for tighter UTC alignment.
+    /// Lower accumulated error = less frequent checks to reduce NTP overhead.
+    ///
+    /// Returns: interval in seconds (10, 15, or 30 based on accumulated error)
+    fn calculate_adaptive_ntp_interval(&self) -> u64 {
+        let abs_error = self.accumulated_phase_error_us.abs();
+
+        if abs_error > 50.0 {
+            10 // Tighter: check every 10s when drifting significantly
+        } else if abs_error > 20.0 {
+            15 // Moderate: check every 15s
+        } else {
+            NTP_CHECK_INTERVAL_SECS // Normal: default 30s interval
+        }
     }
 
     pub fn log_status(&self) {
@@ -1025,6 +1056,21 @@ where
             );
         }
 
+        // =======================================================================
+        // ACCUMULATED PHASE ERROR TRACKING
+        // =======================================================================
+        // Track estimated phase drift between NTP steps for monitoring.
+        // Uses smoothed rate (µs/s) integrated over time to estimate
+        // how much UTC alignment has drifted since last NTP step.
+        // =======================================================================
+        let now_phase = Instant::now();
+        if let Some(last_time) = self.last_phase_accumulation_time {
+            let dt = now_phase.duration_since(last_time).as_secs_f64();
+            // rate_ppm is in µs/s, so rate_ppm * dt gives µs of accumulated error
+            self.accumulated_phase_error_us += rate_ppm * dt;
+        }
+        self.last_phase_accumulation_time = Some(now_phase);
+
         // THREE-PHASE CONTROL: ACQ → PROD → NANO based on rate stability
         let abs_rate = rate_ppm.abs();
 
@@ -1208,6 +1254,8 @@ where
             } else {
                 "ACQ".to_string()
             };
+            // Accumulated phase error since last NTP step
+            status.accumulated_phase_us = self.accumulated_phase_error_us;
             // NTP offset is updated separately via check_ntp_utc_tracking()
         }
     }
