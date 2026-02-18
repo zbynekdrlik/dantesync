@@ -7,6 +7,7 @@ pub mod ntp_server;
 pub mod ptp;
 pub mod spike_filter;
 pub mod status;
+pub mod time_server;
 pub mod traits;
 
 #[cfg(windows)]
