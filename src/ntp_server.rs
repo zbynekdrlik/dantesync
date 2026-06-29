@@ -272,6 +272,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_idle_recv_blocks_for_read_timeout_not_busy_loop() {
+        // #340: the NTP-server listen socket must be BLOCKING with a read timeout — NOT non-blocking.
+        // set_nonblocking(true) and set_read_timeout(..) are mutually exclusive: non-blocking wins,
+        // so recv_from returns WouldBlock INSTANTLY and the run() loop's WouldBlock arm `continue`s
+        // with no sleep -> one thread busy-spins a full CPU core (observed on strih, the NTP master,
+        // ~99% of one core continuously). With a blocking socket + 100ms read timeout, an idle
+        // recv_from blocks in the kernel until the timeout, so the loop wakes ~10x/sec (graceful
+        // shutdown still <=100ms) and consumes ~0% idle. This test pins that: an idle recv_from with
+        // no inbound packet must take ~the read timeout, not return immediately.
+        let server = NtpServer::new(0, 3).expect("bind ephemeral NTP server for the test");
+        let mut buf = [0u8; NTP_PACKET_SIZE];
+        let t0 = std::time::Instant::now();
+        let _ = server.socket.recv_from(&mut buf); // nothing inbound -> blocks until the read timeout
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(90),
+            "idle recv_from returned in {:?} (<90ms) — the listen socket is non-blocking, so the \
+             NTP-server loop busy-spins a core (#340). It must be blocking with a ~100ms read timeout.",
+            elapsed
+        );
+    }
+
+    #[test]
     fn test_system_time_to_ntp_epoch() {
         // Unix epoch (1970-01-01 00:00:00) should be NTP epoch + 70 years
         let unix_epoch = UNIX_EPOCH;
