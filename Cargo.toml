@@ -55,7 +55,7 @@ tray-icon = "0.14"
 winit = "0.29"
 winrt-notification = "0.5"  # Windows toast notifications
 pcap = "2.2"  # Npcap for Windows packet capture with precise timestamps
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }  # HTTP client for version check
+reqwest = { version = "0.11", features = ["json", "native-tls"], default-features = false }  # HTTP client for version check (native-tls = Windows schannel, drops the rustls-webpki stack — #340 security audit RUSTSEC-2026-0098/0099/0104)
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
