@@ -76,10 +76,12 @@ impl NtpServer {
             )
         })?;
 
-        // Set non-blocking for graceful shutdown
-        socket.set_nonblocking(true)?;
-
-        // Set read timeout for polling
+        // #340: BLOCKING socket with a read timeout — NOT non-blocking. These two settings are
+        // MUTUALLY EXCLUSIVE: with set_nonblocking(true), recv_from returns WouldBlock instantly and
+        // the read timeout is ignored, so run()'s loop busy-spins a full CPU core (observed on strih,
+        // the NTP master, ~99% of one core continuously). The 100ms read timeout alone gives graceful
+        // shutdown (the loop re-checks `running` every <=100ms) AND ~0% idle CPU (recv_from sleeps in
+        // the kernel between packets). Do NOT re-add set_nonblocking.
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
 
         info!(
