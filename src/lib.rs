@@ -1,6 +1,7 @@
 pub mod clock;
 pub mod config;
 pub mod controller;
+pub mod http_status;
 pub mod net;
 pub mod ntp;
 pub mod ntp_server;

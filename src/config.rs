@@ -17,19 +17,72 @@ pub struct SystemConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpServerConfig {
     /// Enable NTP server mode (only one machine per network)
+    #[serde(default = "default_ntp_server_mode_enabled")]
     pub enabled: bool,
     /// Port to listen on (default 123, requires elevated privileges)
+    #[serde(default = "default_ntp_server_mode_port")]
     pub port: u16,
     /// Stratum to report to clients (default 3)
+    #[serde(default = "default_ntp_server_mode_stratum")]
     pub stratum: u8,
+}
+
+fn default_ntp_server_mode_enabled() -> bool {
+    false
+}
+
+fn default_ntp_server_mode_port() -> u16 {
+    123
+}
+
+fn default_ntp_server_mode_stratum() -> u8 {
+    3
 }
 
 impl Default for NtpServerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            port: 123,
-            stratum: 3,
+            enabled: default_ntp_server_mode_enabled(),
+            port: default_ntp_server_mode_port(),
+            stratum: default_ntp_server_mode_stratum(),
+        }
+    }
+}
+
+/// HTTP status endpoint configuration.
+///
+/// Serves the SAME `SyncStatus` JSON the named pipe already emits (minus the pipe's
+/// 4-byte length prefix), over a plain HTTP GET, bound to the LAN interface
+/// (0.0.0.0). This lets automation/CI on a DIFFERENT machine read PTP/NTP lock
+/// status without a human or an SMB/named-pipe bridge (dantesync#47).
+///
+/// Unlike `NtpServerConfig` (opt-in — only ONE machine per network should become
+/// the NTP master), this is enabled by DEFAULT: it is read-only, LAN-bound, and the
+/// whole point of the feature is unattended reads working out of the box on every
+/// box in the fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpStatusConfig {
+    /// Enable the HTTP status endpoint (default: true — safe, read-only, LAN-only).
+    #[serde(default = "default_http_status_enabled")]
+    pub enabled: bool,
+    /// Port to listen on (default 8898 — matches camera-box's existing expectation).
+    #[serde(default = "default_http_status_port")]
+    pub port: u16,
+}
+
+fn default_http_status_enabled() -> bool {
+    true
+}
+
+fn default_http_status_port() -> u16 {
+    8898
+}
+
+impl Default for HttpStatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_http_status_enabled(),
+            port: default_http_status_port(),
         }
     }
 }
@@ -258,5 +311,109 @@ mod tests {
         assert_eq!(cloned.enabled, config.enabled);
         assert_eq!(cloned.port, config.port);
         assert_eq!(cloned.stratum, config.stratum);
+    }
+
+    // ========================================================================
+    // HTTP STATUS CONFIG TESTS (#47)
+    // ========================================================================
+
+    #[test]
+    fn test_http_status_config_default_enabled_and_port() {
+        let config = HttpStatusConfig::default();
+
+        // Enabled by default (unlike NtpServerConfig) — read-only, LAN-bound,
+        // unattended reads are the entire point of the feature.
+        assert!(
+            config.enabled,
+            "HTTP status endpoint should be enabled by default"
+        );
+        assert_eq!(config.port, 8898, "Default port should be 8898");
+    }
+
+    #[test]
+    fn test_http_status_config_serde_roundtrip() {
+        let config = HttpStatusConfig {
+            enabled: false,
+            port: 9000,
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize failed");
+        let restored: HttpStatusConfig = serde_json::from_str(&json).expect("deserialize failed");
+
+        assert_eq!(restored.enabled, config.enabled);
+        assert_eq!(restored.port, config.port);
+    }
+
+    #[test]
+    fn test_http_status_config_clone() {
+        let config = HttpStatusConfig {
+            enabled: true,
+            port: 8898,
+        };
+        let cloned = config.clone();
+
+        assert_eq!(cloned.enabled, config.enabled);
+        assert_eq!(cloned.port, config.port);
+    }
+
+    // ========================================================================
+    // #47 REVIEW FINDING — partial config objects must not fail the whole parse
+    // ========================================================================
+    //
+    // A previous version of HttpStatusConfig (and the pre-existing NtpServerConfig)
+    // had NO per-field #[serde(default)] — only the outer Config.http_status /
+    // Config.ntp_server_mode fields were `#[serde(default)]`, which only fires when
+    // the KEY IS ENTIRELY ABSENT. A config.json with `"http_status": {"enabled":
+    // false}` (missing "port") failed to deserialize the WHOLE Config, and
+    // load_config()'s fallback then silently overwrote the user's real config file
+    // with fresh defaults — losing their actual ntp_server address and any other
+    // customization, with no error logged. Confirmed via the pre-fix struct: it
+    // returned `Err("missing field \"port\"")` for exactly this input.
+
+    #[test]
+    fn test_http_status_config_partial_object_missing_port_still_parses() {
+        let json = r#"{"enabled": false}"#;
+        let config: HttpStatusConfig =
+            serde_json::from_str(json).expect("partial http_status object must still parse");
+        assert!(!config.enabled);
+        assert_eq!(
+            config.port, 8898,
+            "missing port must fall back to the default"
+        );
+    }
+
+    #[test]
+    fn test_http_status_config_partial_object_missing_enabled_still_parses() {
+        let json = r#"{"port": 9999}"#;
+        let config: HttpStatusConfig =
+            serde_json::from_str(json).expect("partial http_status object must still parse");
+        assert!(
+            config.enabled,
+            "missing enabled must fall back to the default (true)"
+        );
+        assert_eq!(config.port, 9999);
+    }
+
+    #[test]
+    fn test_http_status_config_empty_object_uses_all_defaults() {
+        let json = r#"{}"#;
+        let config: HttpStatusConfig =
+            serde_json::from_str(json).expect("empty http_status object must still parse");
+        assert!(config.enabled);
+        assert_eq!(config.port, 8898);
+    }
+
+    #[test]
+    fn test_ntp_server_config_partial_object_missing_port_still_parses() {
+        // Same class of bug, pre-existing in NtpServerConfig before this fix.
+        let json = r#"{"enabled": true, "stratum": 2}"#;
+        let config: NtpServerConfig =
+            serde_json::from_str(json).expect("partial ntp_server_mode object must still parse");
+        assert!(config.enabled);
+        assert_eq!(
+            config.port, 123,
+            "missing port must fall back to the default"
+        );
+        assert_eq!(config.stratum, 2);
     }
 }
