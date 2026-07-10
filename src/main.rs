@@ -176,8 +176,24 @@ fn load_config() -> Config {
             }
 
             // Parse the (possibly migrated) config
-            if let Ok(cfg) = serde_json::from_value::<Config>(json) {
-                return cfg;
+            match serde_json::from_value::<Config>(json) {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    // #47 review: this used to fail SILENTLY for any field missing
+                    // its own #[serde(default)] (e.g. a hand-edited http_status/
+                    // ntp_server_mode object present but incomplete), then fall
+                    // through below and overwrite the file with fresh defaults —
+                    // losing the user's real ntp_server address and any other
+                    // customization with zero signal. Per-field defaults now cover
+                    // the known partial-object shapes (see config.rs), but log
+                    // loudly on ANY remaining parse failure so a genuinely corrupt
+                    // config.json never gets silently replaced without a trace.
+                    log::error!(
+                        "Failed to parse {} as Config: {} — falling back to a fresh default config (the existing file will be overwritten)",
+                        path,
+                        e
+                    );
+                }
             }
         }
     }
@@ -1136,6 +1152,28 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.http_status.enabled);
         assert_eq!(config.http_status.port, 8898);
+    }
+
+    #[test]
+    fn config_deserializes_with_partial_http_status_object() {
+        // #47 review finding: a hand-edited/partial config.json with "http_status"
+        // PRESENT but missing "port" must still parse the WHOLE Config — before the
+        // fix, HttpStatusConfig had no per-field #[serde(default)], so this exact
+        // shape made serde_json::from_value::<Config> fail, and load_config()'s
+        // fallback then silently overwrote the file with fresh defaults (losing
+        // ntp_server and any other customization). See config.rs's own
+        // test_http_status_config_partial_object_* for the leaf-struct-level proof.
+        let json = r#"{
+            "ntp_server": "10.77.8.2",
+            "http_status": {
+                "enabled": false
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json)
+            .expect("a partial http_status object must not fail the whole Config parse");
+        assert_eq!(config.ntp_server, "10.77.8.2");
+        assert!(!config.http_status.enabled);
+        assert_eq!(config.http_status.port, 8898, "missing port must default");
     }
 
     // ========================================================================

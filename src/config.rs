@@ -14,6 +14,9 @@ pub struct SystemConfig {
 /// 3. Serves the PTP-disciplined time to other machines
 ///
 /// Only ONE machine per network should enable this (the "master").
+// TODO(#47 review): none of these fields have per-field #[serde(default)] yet — the
+// RED state. A config.json with e.g. "ntp_server_mode": {"enabled": true} (missing
+// "port"/"stratum") fails the WHOLE Config parse. See the GREEN commit that follows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpServerConfig {
     /// Enable NTP server mode (only one machine per network)
@@ -329,5 +332,66 @@ mod tests {
 
         assert_eq!(cloned.enabled, config.enabled);
         assert_eq!(cloned.port, config.port);
+    }
+
+    // ========================================================================
+    // #47 REVIEW FINDING — partial config objects must not fail the whole parse
+    // ========================================================================
+    //
+    // A previous version of HttpStatusConfig (and the pre-existing NtpServerConfig)
+    // had NO per-field #[serde(default)] — only the outer Config.http_status /
+    // Config.ntp_server_mode fields were `#[serde(default)]`, which only fires when
+    // the KEY IS ENTIRELY ABSENT. A config.json with `"http_status": {"enabled":
+    // false}` (missing "port") failed to deserialize the WHOLE Config, and
+    // load_config()'s fallback then silently overwrote the user's real config file
+    // with fresh defaults — losing their actual ntp_server address and any other
+    // customization, with no error logged. Confirmed via the pre-fix struct: it
+    // returned `Err("missing field \"port\"")` for exactly this input.
+
+    #[test]
+    fn test_http_status_config_partial_object_missing_port_still_parses() {
+        let json = r#"{"enabled": false}"#;
+        let config: HttpStatusConfig =
+            serde_json::from_str(json).expect("partial http_status object must still parse");
+        assert!(!config.enabled);
+        assert_eq!(
+            config.port, 8898,
+            "missing port must fall back to the default"
+        );
+    }
+
+    #[test]
+    fn test_http_status_config_partial_object_missing_enabled_still_parses() {
+        let json = r#"{"port": 9999}"#;
+        let config: HttpStatusConfig =
+            serde_json::from_str(json).expect("partial http_status object must still parse");
+        assert!(
+            config.enabled,
+            "missing enabled must fall back to the default (true)"
+        );
+        assert_eq!(config.port, 9999);
+    }
+
+    #[test]
+    fn test_http_status_config_empty_object_uses_all_defaults() {
+        let json = r#"{}"#;
+        let config: HttpStatusConfig =
+            serde_json::from_str(json).expect("empty http_status object must still parse");
+        assert!(config.enabled);
+        assert_eq!(config.port, 8898);
+    }
+
+    #[test]
+    fn test_ntp_server_config_partial_object_missing_port_still_parses() {
+        // Same class of bug, pre-existing in NtpServerConfig before this fix.
+        let json = r#"{"enabled": true, "stratum": 2}"#;
+        let config: NtpServerConfig =
+            serde_json::from_str(json).expect("partial ntp_server_mode object must still parse");
+        assert!(config.enabled);
+        assert_eq!(
+            config.port, 123,
+            "missing port must fall back to the default"
+        );
+        assert_eq!(config.stratum, 2);
     }
 }

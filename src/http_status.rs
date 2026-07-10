@@ -14,9 +14,16 @@ use crate::status::SyncStatus;
 use log::{error, info, warn};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
+
+/// Hard cap on concurrent in-flight connections. This is a read-only monitoring
+/// endpoint on a trusted LAN, not a public service — the cap exists purely to bound
+/// worst-case thread/memory usage if something opens many connections at once (a
+/// port scanner, a misbehaving client), not to defend against a serious adversary.
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 
 /// Start the HTTP status server in a background thread, bound to `0.0.0.0:port` so
 /// it's reachable from OTHER machines on the LAN (not just localhost) — that's the
@@ -45,6 +52,10 @@ pub fn start_http_status_server(status: Arc<RwLock<SyncStatus>>, port: u16) {
 /// code goes through `start_http_status_server` (binds `0.0.0.0:port`); tests bind an
 /// ephemeral `127.0.0.1:0` listener directly so they need no fixed port and no LAN
 /// exposure.
+///
+/// TODO(#47 review): MAX_CONCURRENT_CONNECTIONS is not yet enforced here — this is
+/// the RED state, one unbounded thread per accepted connection. See the GREEN
+/// commit that follows for the connection cap + non-panicking spawn.
 fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -193,5 +204,55 @@ mod tests {
         // No assertion beyond "did not panic" — a bind failure is logged and the
         // function returns normally.
         drop(blocker);
+    }
+
+    /// #47 review finding: `spawn_accept_loop` used to spawn ONE unbounded OS thread
+    /// per accepted connection with no cap. Under a connection flood (port scanner,
+    /// misbehaving client), that risks exhausting the process's thread limit — and
+    /// since the un-capped code used a bare `thread::spawn` (which PANICS if the OS
+    /// can't create a thread), the panic would unwind and kill the single accept-loop
+    /// thread, permanently disabling the endpoint for the rest of the process's life.
+    ///
+    /// RED: proves the cap actually rejects a connection beyond
+    /// `MAX_CONCURRENT_CONNECTIONS` (closes it immediately, no response written)
+    /// rather than queuing/serving it — this fails against the un-capped code because
+    /// every connection gets served.
+    #[test]
+    fn test_connection_cap_rejects_connections_beyond_the_limit() {
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        spawn_accept_loop(listener, status);
+
+        // Hold MAX_CONCURRENT_CONNECTIONS connections open. Each server-side handler
+        // thread blocks on its 2s read timeout (we never write anything), so the
+        // in-flight count stays elevated for the duration of this test.
+        let mut held: Vec<TcpStream> = Vec::new();
+        for i in 0..MAX_CONCURRENT_CONNECTIONS {
+            let conn = TcpStream::connect(("127.0.0.1", port))
+                .unwrap_or_else(|e| panic!("connect #{} under the cap failed: {}", i, e));
+            held.push(conn);
+        }
+        // Give the single accept-loop thread time to actually accept() each of the
+        // above (TCP connect() completes via the kernel backlog before accept() does)
+        // and bump the in-flight counter for all of them.
+        thread::sleep(Duration::from_millis(300));
+
+        // One more, over the cap, must be rejected: the accept loop closes it
+        // immediately without ever spawning a handler or writing a response.
+        let mut over_cap = TcpStream::connect(("127.0.0.1", port)).expect("connect over the cap");
+        over_cap
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .expect("set read timeout");
+        let mut buf = [0u8; 16];
+        match over_cap.read(&mut buf) {
+            Ok(0) => {} // closed cleanly with no bytes — rejected, exactly as expected
+            other => panic!(
+                "expected the over-cap connection to be closed with no response, got {:?}",
+                other
+            ),
+        }
+
+        drop(held);
     }
 }
