@@ -170,6 +170,23 @@ jobs:
           # - RUSTSEC-2024-0420: gtk-sys unmaintained
           # - RUSTSEC-2024-0419: gtk3-macros unmaintained
           # - RUSTSEC-2024-0370: proc-macro-error unmaintained (transitive via gtk3-macros)
+          # winit's Wayland/CSD backend advisories (#47 CI investigation, 2026-07-10) — chain is
+          # winit -> sctk-adwaita -> smithay-client-toolkit/wayland-scanner -> quick-xml, and
+          # winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser -> ttf-parser. `winit` itself is
+          # a [target.'cfg(windows)'.dependencies] entry (dantesync-tray only); its Linux/Wayland
+          # client-side-decoration backend is NEVER compiled into ANY shipped artifact — Windows
+          # builds use winit's Win32 backend, and Linux CI only builds `--bin dantesync` (no
+          # tray-icon/winit at all). cargo-audit still flags them because Cargo.lock resolves the
+          # full cross-platform graph regardless of what actually compiles for a given target. No
+          # semver-compatible fix available yet (`cargo update -p quick-xml`/`-p ttf-parser`:
+          # 0 packages updated — wayland-scanner 0.31.10 is already latest and still pins
+          # quick-xml <0.41). Re-check when wayland-scanner/winit bump their pin.
+          # - RUSTSEC-2026-0194: quick-xml quadratic runtime on duplicate attrs (build-time-only
+          #   parse of static, crate-bundled Wayland protocol XML — no runtime/untrusted input)
+          # - RUSTSEC-2026-0195: quick-xml unbounded namespace-decl allocation (same build-time-only
+          #   parse path as RUSTSEC-2026-0194)
+          # - RUSTSEC-2026-0192: ttf-parser unmaintained (Wayland CSD title-bar glyph rendering,
+          #   never compiled into a shipped binary — see chain above)
           cargo audit --deny warnings \
             --ignore RUSTSEC-2025-0134 \
             --ignore RUSTSEC-2024-0429 \
@@ -181,7 +198,10 @@ jobs:
             --ignore RUSTSEC-2024-0415 \
             --ignore RUSTSEC-2024-0420 \
             --ignore RUSTSEC-2024-0419 \
-            --ignore RUSTSEC-2024-0370
+            --ignore RUSTSEC-2024-0370 \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0192
 
   # ============================================================================
   # Build Check (ensures code compiles on all targets)
