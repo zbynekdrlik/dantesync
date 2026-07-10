@@ -14,25 +14,37 @@ pub struct SystemConfig {
 /// 3. Serves the PTP-disciplined time to other machines
 ///
 /// Only ONE machine per network should enable this (the "master").
-// TODO(#47 review): none of these fields have per-field #[serde(default)] yet — the
-// RED state. A config.json with e.g. "ntp_server_mode": {"enabled": true} (missing
-// "port"/"stratum") fails the WHOLE Config parse. See the GREEN commit that follows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpServerConfig {
     /// Enable NTP server mode (only one machine per network)
+    #[serde(default = "default_ntp_server_mode_enabled")]
     pub enabled: bool,
     /// Port to listen on (default 123, requires elevated privileges)
+    #[serde(default = "default_ntp_server_mode_port")]
     pub port: u16,
     /// Stratum to report to clients (default 3)
+    #[serde(default = "default_ntp_server_mode_stratum")]
     pub stratum: u8,
+}
+
+fn default_ntp_server_mode_enabled() -> bool {
+    false
+}
+
+fn default_ntp_server_mode_port() -> u16 {
+    123
+}
+
+fn default_ntp_server_mode_stratum() -> u8 {
+    3
 }
 
 impl Default for NtpServerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            port: 123,
-            stratum: 3,
+            enabled: default_ntp_server_mode_enabled(),
+            port: default_ntp_server_mode_port(),
+            stratum: default_ntp_server_mode_stratum(),
         }
     }
 }
@@ -51,16 +63,26 @@ impl Default for NtpServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpStatusConfig {
     /// Enable the HTTP status endpoint (default: true — safe, read-only, LAN-only).
+    #[serde(default = "default_http_status_enabled")]
     pub enabled: bool,
     /// Port to listen on (default 8898 — matches camera-box's existing expectation).
+    #[serde(default = "default_http_status_port")]
     pub port: u16,
+}
+
+fn default_http_status_enabled() -> bool {
+    true
+}
+
+fn default_http_status_port() -> u16 {
+    8898
 }
 
 impl Default for HttpStatusConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            port: 8898,
+            enabled: default_http_status_enabled(),
+            port: default_http_status_port(),
         }
     }
 }

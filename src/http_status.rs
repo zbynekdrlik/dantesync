@@ -53,16 +53,51 @@ pub fn start_http_status_server(status: Arc<RwLock<SyncStatus>>, port: u16) {
 /// ephemeral `127.0.0.1:0` listener directly so they need no fixed port and no LAN
 /// exposure.
 ///
-/// TODO(#47 review): MAX_CONCURRENT_CONNECTIONS is not yet enforced here — this is
-/// the RED state, one unbounded thread per accepted connection. See the GREEN
-/// commit that follows for the connection cap + non-panicking spawn.
+/// Two hardenings on top of the naive "one thread per connection" (#47 review):
+/// - **Connection cap** (`MAX_CONCURRENT_CONNECTIONS`): a connection accepted while
+///   already at the cap is closed immediately, never spawned — bounds worst-case
+///   thread/memory usage under a connection flood (port scanner, misbehaving
+///   client) instead of growing unboundedly.
+/// - **Non-panicking spawn**: bare `thread::spawn` PANICS if the OS can't create a
+///   thread. That panic would unwind the SINGLE accept-loop thread it runs in,
+///   permanently disabling the endpoint for the rest of the process's life. Using
+///   `thread::Builder::spawn` (which returns `Result`) lets a spawn failure just log
+///   and drop that one connection — the accept loop itself keeps running.
 fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
+    let in_flight = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(conn) => {
+                    // fetch_add returns the count BEFORE this connection — if it was
+                    // already at the cap, this connection would push it over.
+                    if in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNECTIONS {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        warn!(
+                            "[HTTP-Status] At the {}-connection cap — dropping a new connection",
+                            MAX_CONCURRENT_CONNECTIONS
+                        );
+                        continue; // `conn` drops here, closing the socket
+                    }
+
                     let status = status.clone();
-                    thread::spawn(move || handle_connection(conn, &status));
+                    let counter = in_flight.clone();
+                    let spawned = thread::Builder::new()
+                        .name("http-status-conn".into())
+                        .spawn(move || {
+                            handle_connection(conn, &status);
+                            counter.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    if let Err(e) = spawned {
+                        // The thread never started, so it will never decrement the
+                        // counter itself — do it here, or the cap would ratchet down
+                        // permanently on every failed spawn.
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        warn!(
+                            "[HTTP-Status] Failed to spawn connection handler thread: {} — dropping connection",
+                            e
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("[HTTP-Status] Accept error: {}", e);
