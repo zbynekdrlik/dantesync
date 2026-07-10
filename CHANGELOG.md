@@ -5,6 +5,15 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.18] - 2026-07-10
+
+### Added
+- HTTP status endpoint (`GET http://<host>:8898/status`), bound to the LAN interface, serving
+  the same status JSON the named pipe (`\\.\pipe\dantesync`) already emits — lets CI/automation
+  read PTP/NTP lock status over the network without a human or an SMB/pipe bridge (#47). Enabled
+  by default; configurable via `http_status.enabled` / `http_status.port` in `config.json`. The
+  named pipe is unchanged.
+
 ## [1.8.0] - 2025-12-28
 
 ### Changed
