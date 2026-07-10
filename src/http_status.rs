@@ -48,12 +48,31 @@ pub fn start_http_status_server(status: Arc<RwLock<SyncStatus>>, port: u16) {
     }
 }
 
+/// RAII guard releasing one in-flight-connection slot when dropped — INCLUDING
+/// during a panic unwind (this crate does not set `panic = "abort"`, so `Drop`
+/// still runs while unwinding). Without this, a plain `counter.fetch_sub(...)`
+/// placed as the last statement after `handle_connection(...)` would be skipped if
+/// `handle_connection` ever panicked (no panic path exists there today, but nothing
+/// stops one being introduced later, e.g. a `.unwrap()` added during maintenance) —
+/// permanently leaking that slot and, after enough panics, wedging the connection
+/// cap shut forever. Constructing the guard BEFORE calling `handle_connection`
+/// closes that gap.
+struct InFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Testable seam: given an already-bound listener, spawn the accept loop. Production
 /// code goes through `start_http_status_server` (binds `0.0.0.0:port`); tests bind an
 /// ephemeral `127.0.0.1:0` listener directly so they need no fixed port and no LAN
 /// exposure.
 ///
-/// Two hardenings on top of the naive "one thread per connection" (#47 review):
+/// Hardenings on top of the naive "one thread per connection" (#47 review):
 /// - **Connection cap** (`MAX_CONCURRENT_CONNECTIONS`): a connection accepted while
 ///   already at the cap is closed immediately, never spawned — bounds worst-case
 ///   thread/memory usage under a connection flood (port scanner, misbehaving
@@ -63,6 +82,8 @@ pub fn start_http_status_server(status: Arc<RwLock<SyncStatus>>, port: u16) {
 ///   permanently disabling the endpoint for the rest of the process's life. Using
 ///   `thread::Builder::spawn` (which returns `Result`) lets a spawn failure just log
 ///   and drop that one connection — the accept loop itself keeps running.
+/// - **Panic-safe slot release** (`InFlightGuard`): the in-flight slot releases via
+///   `Drop`, so a future panic inside `handle_connection` can't leak it.
 fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
     let in_flight = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
@@ -85,13 +106,15 @@ fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
                     let spawned = thread::Builder::new()
                         .name("http-status-conn".into())
                         .spawn(move || {
+                            // Constructed BEFORE handle_connection so its Drop
+                            // releases the slot even if handle_connection panics.
+                            let _guard = InFlightGuard { counter };
                             handle_connection(conn, &status);
-                            counter.fetch_sub(1, Ordering::SeqCst);
                         });
                     if let Err(e) = spawned {
-                        // The thread never started, so it will never decrement the
-                        // counter itself — do it here, or the cap would ratchet down
-                        // permanently on every failed spawn.
+                        // The thread never started, so no InFlightGuard was ever
+                        // constructed to release the slot — do it here, or the cap
+                        // would ratchet down permanently on every failed spawn.
                         in_flight.fetch_sub(1, Ordering::SeqCst);
                         warn!(
                             "[HTTP-Status] Failed to spawn connection handler thread: {} — dropping connection",
@@ -157,6 +180,30 @@ fn write_response(stream: &mut TcpStream, code: u16, body: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deep-review finding (post-#48-review hardening): `InFlightGuard` exists
+    /// specifically so a panic inside `handle_connection` can't permanently leak a
+    /// connection-cap slot. Prove the mechanism directly — construct the guard,
+    /// panic while it's alive, and confirm the counter still released.
+    #[test]
+    fn test_in_flight_guard_releases_slot_even_on_panic() {
+        let counter = Arc::new(AtomicUsize::new(1)); // simulate one in-flight slot
+        let counter_for_closure = counter.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = InFlightGuard {
+                counter: counter_for_closure,
+            };
+            panic!("simulated handler panic while a connection slot is held");
+        }));
+
+        assert!(result.is_err(), "the panic should have propagated");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "InFlightGuard must release its slot even when the guarded code panics"
+        );
+    }
 
     fn locked_status() -> Arc<RwLock<SyncStatus>> {
         let status = SyncStatus {
