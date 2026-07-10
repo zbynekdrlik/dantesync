@@ -60,6 +60,16 @@ pub struct SyncStatus {
     pub accumulated_phase_us: f64,
 }
 
+impl SyncStatus {
+    /// Serialize this status to the SAME JSON bytes used by every consumer of the
+    /// status — the named pipe (Windows tray IPC, length-prefixed) and the HTTP
+    /// status endpoint (dantesync#47, plain body). One implementation, shared by
+    /// both transports, so they can never silently drift apart.
+    pub fn to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(self)
+    }
+}
+
 impl Default for SyncStatus {
     fn default() -> Self {
         SyncStatus {
@@ -110,5 +120,21 @@ mod tests {
         assert_eq!(restored.mode, "LOCK");
         assert!((restored.smoothed_rate_ppm - 2.5).abs() < f64::EPSILON);
         assert_eq!(restored.ntp_offset_us, 150);
+    }
+
+    #[test]
+    fn test_to_json_bytes_matches_serde_json_to_vec() {
+        // #47: the HTTP status endpoint and the named pipe must serve byte-identical
+        // JSON. `to_json_bytes()` is the ONE shared implementation both call — pin
+        // that it really is just serde_json::to_vec, so a future edit can't quietly
+        // fork the two transports' serialization.
+        let mut status = SyncStatus::default();
+        status.mode = "LOCK".to_string();
+        status.offset_ns = 4242;
+
+        let via_helper = status.to_json_bytes().expect("to_json_bytes failed");
+        let via_direct = serde_json::to_vec(&status).expect("serde_json::to_vec failed");
+
+        assert_eq!(via_helper, via_direct);
     }
 }

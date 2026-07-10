@@ -34,6 +34,34 @@ impl Default for NtpServerConfig {
     }
 }
 
+/// HTTP status endpoint configuration.
+///
+/// Serves the SAME `SyncStatus` JSON the named pipe already emits (minus the pipe's
+/// 4-byte length prefix), over a plain HTTP GET, bound to the LAN interface
+/// (0.0.0.0). This lets automation/CI on a DIFFERENT machine read PTP/NTP lock
+/// status without a human or an SMB/named-pipe bridge (dantesync#47).
+///
+/// Unlike `NtpServerConfig` (opt-in — only ONE machine per network should become
+/// the NTP master), this is enabled by DEFAULT: it is read-only, LAN-bound, and the
+/// whole point of the feature is unattended reads working out of the box on every
+/// box in the fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpStatusConfig {
+    /// Enable the HTTP status endpoint (default: true — safe, read-only, LAN-only).
+    pub enabled: bool,
+    /// Port to listen on (default 8898 — matches camera-box's existing expectation).
+    pub port: u16,
+}
+
+impl Default for HttpStatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 8898,
+        }
+    }
+}
+
 /// Servo configuration - LEGACY FIELDS (not used by controller)
 ///
 /// The controller uses hardcoded adaptive gains that auto-tune based on
@@ -258,5 +286,48 @@ mod tests {
         assert_eq!(cloned.enabled, config.enabled);
         assert_eq!(cloned.port, config.port);
         assert_eq!(cloned.stratum, config.stratum);
+    }
+
+    // ========================================================================
+    // HTTP STATUS CONFIG TESTS (#47)
+    // ========================================================================
+
+    #[test]
+    fn test_http_status_config_default_enabled_and_port() {
+        let config = HttpStatusConfig::default();
+
+        // Enabled by default (unlike NtpServerConfig) — read-only, LAN-bound,
+        // unattended reads are the entire point of the feature.
+        assert!(
+            config.enabled,
+            "HTTP status endpoint should be enabled by default"
+        );
+        assert_eq!(config.port, 8898, "Default port should be 8898");
+    }
+
+    #[test]
+    fn test_http_status_config_serde_roundtrip() {
+        let config = HttpStatusConfig {
+            enabled: false,
+            port: 9000,
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize failed");
+        let restored: HttpStatusConfig = serde_json::from_str(&json).expect("deserialize failed");
+
+        assert_eq!(restored.enabled, config.enabled);
+        assert_eq!(restored.port, config.port);
+    }
+
+    #[test]
+    fn test_http_status_config_clone() {
+        let config = HttpStatusConfig {
+            enabled: true,
+            port: 8898,
+        };
+        let cloned = config.clone();
+
+        assert_eq!(cloned.enabled, config.enabled);
+        assert_eq!(cloned.port, config.port);
     }
 }

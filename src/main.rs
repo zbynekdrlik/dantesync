@@ -509,7 +509,10 @@ fn start_ipc_server(status: Arc<RwLock<SyncStatus>>) {
                             continue;
                         }
                     };
-                    if let Ok(bytes) = serde_json::to_vec(&s) {
+                    // #47: shared serialization — the HTTP status endpoint (src/http_status.rs)
+                    // calls the SAME SyncStatus::to_json_bytes(), so the pipe and the HTTP body
+                    // can never silently drift apart into two different JSON shapes.
+                    if let Ok(bytes) = s.to_json_bytes() {
                         let len = (bytes.len() as u32).to_le_bytes();
                         let _ = server.write_all(&len).await;
                         let _ = server.write_all(&bytes).await;
