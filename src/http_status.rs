@@ -65,16 +65,30 @@ fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
 /// don't bother parsing the request line/headers beyond draining them — read
 /// (and discard) whatever the client sent, with a short read timeout so a client
 /// that never sends anything can't wedge this thread forever, then always respond
-/// with the current status JSON.
+/// with the current status JSON — the SAME bytes the named pipe sends
+/// (`SyncStatus::to_json_bytes`), so the two transports can never drift apart.
 fn handle_connection(mut stream: TcpStream, status: &Arc<RwLock<SyncStatus>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 1024];
     let _ = stream.read(&mut buf);
 
-    // TODO(#47): wire up the real status JSON — see the GREEN commit that follows
-    // this one. This stub proves the RED test fails for the right reason (body
-    // mismatch), not because the endpoint is unreachable.
-    write_response(&mut stream, 200, b"{}");
+    let body = match status.read() {
+        Ok(guard) => match guard.to_json_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("[HTTP-Status] Failed to serialize status: {}", e);
+                write_response(&mut stream, 500, b"{}");
+                return;
+            }
+        },
+        Err(e) => {
+            error!("[HTTP-Status] Status lock poisoned: {}", e);
+            write_response(&mut stream, 500, b"{}");
+            return;
+        }
+    };
+
+    write_response(&mut stream, 200, &body);
 }
 
 fn write_response(stream: &mut TcpStream, code: u16, body: &[u8]) {
@@ -99,11 +113,13 @@ mod tests {
     use super::*;
 
     fn locked_status() -> Arc<RwLock<SyncStatus>> {
-        let mut status = SyncStatus::default();
-        status.is_locked = true;
-        status.mode = "LOCK".to_string();
-        status.offset_ns = 1234;
-        status.ntp_offset_us = -150;
+        let status = SyncStatus {
+            is_locked: true,
+            mode: "LOCK".to_string(),
+            offset_ns: 1234,
+            ntp_offset_us: -150,
+            ..Default::default()
+        };
         Arc::new(RwLock::new(status))
     }
 

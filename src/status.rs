@@ -128,9 +128,11 @@ mod tests {
         // JSON. `to_json_bytes()` is the ONE shared implementation both call — pin
         // that it really is just serde_json::to_vec, so a future edit can't quietly
         // fork the two transports' serialization.
-        let mut status = SyncStatus::default();
-        status.mode = "LOCK".to_string();
-        status.offset_ns = 4242;
+        let status = SyncStatus {
+            mode: "LOCK".to_string(),
+            offset_ns: 4242,
+            ..Default::default()
+        };
 
         let via_helper = status.to_json_bytes().expect("to_json_bytes failed");
         let via_direct = serde_json::to_vec(&status).expect("serde_json::to_vec failed");

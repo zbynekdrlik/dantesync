@@ -80,9 +80,11 @@ use windows_service::{
 use dantesync::net_pcap;
 #[cfg(unix)]
 use dantesync::ptp;
-use dantesync::{clock, config, controller, net, ntp, ntp_server, status, time_server, traits};
+use dantesync::{
+    clock, config, controller, http_status, net, ntp, ntp_server, status, time_server, traits,
+};
 
-use config::{NtpServerConfig, SystemConfig};
+use config::{HttpStatusConfig, NtpServerConfig, SystemConfig};
 use controller::PtpController;
 use serde::{Deserialize, Serialize};
 use status::SyncStatus;
@@ -101,6 +103,12 @@ struct Config {
     #[serde(default)]
     ntp_server_mode: NtpServerConfig,
 
+    /// HTTP status endpoint configuration (optional - enabled by default, port 8898).
+    /// Lets LAN automation (e.g. camera-box CI) read PTP/NTP status without the
+    /// Windows-only named pipe (#47).
+    #[serde(default)]
+    http_status: HttpStatusConfig,
+
     /// Advanced system tuning (optional - uses auto-optimized defaults if omitted)
     #[serde(default)]
     system: SystemConfig,
@@ -111,6 +119,7 @@ impl Default for Config {
         Self {
             ntp_server: "10.77.8.2".to_string(),
             ntp_server_mode: NtpServerConfig::default(),
+            http_status: HttpStatusConfig::default(),
             system: SystemConfig::default(),
         }
     }
@@ -146,11 +155,23 @@ fn load_config() -> Config {
                 needs_migration = true;
             }
 
+            // Migrate: add http_status if missing (#47 — existing installs get the
+            // endpoint enabled by default on next start, same as a fresh config)
+            if json.get("http_status").is_none() {
+                json["http_status"] = serde_json::json!({
+                    "enabled": true,
+                    "port": 8898
+                });
+                needs_migration = true;
+            }
+
             // Write back migrated config
             if needs_migration {
                 if let Ok(pretty) = serde_json::to_string_pretty(&json) {
                     let _ = std::fs::write(path, pretty);
-                    log::info!("Config migrated: added ntp_server_mode and NTP examples");
+                    log::info!(
+                        "Config migrated: added ntp_server_mode / http_status / NTP examples (as needed)"
+                    );
                 }
             }
 
@@ -170,6 +191,10 @@ fn load_config() -> Config {
     "enabled": false,
     "port": 123,
     "stratum": 3
+  },
+  "http_status": {
+    "enabled": true,
+    "port": 8898
   }
 }"#;
     let _ = std::fs::write(path, simple_config);
@@ -534,6 +559,7 @@ fn run_sync_loop(
     running: Arc<AtomicBool>,
     system_config: SystemConfig,
     ntp_server_config: NtpServerConfig,
+    http_status_config: HttpStatusConfig,
 ) -> Result<()> {
     // Notify systemd (Linux) that we are starting
     #[cfg(unix)]
@@ -551,6 +577,18 @@ fn run_sync_loop(
 
     // Start IPC Server immediately (so Tray App can connect even if network is down)
     start_ipc_server(status_shared.clone());
+
+    // Start HTTP status endpoint (#47) — LAN automation reads the same status JSON
+    // the named pipe serves, without a human or an SMB/pipe bridge in the loop.
+    if http_status_config.enabled {
+        info!(
+            "[HTTP-Status] Enabled — starting on port {}",
+            http_status_config.port
+        );
+        http_status::start_http_status_server(status_shared.clone(), http_status_config.port);
+    } else {
+        info!("[HTTP-Status] Disabled by config");
+    }
 
     // Start UDP Time Query Server for network time verification
     let time_server = match time_server::TimeServer::new() {
@@ -804,7 +842,13 @@ fn my_service_main(_arguments: Vec<OsString>) {
 
     // Spawn the sync loop in a thread
     let handle = thread::spawn(move || {
-        if let Err(e) = run_sync_loop(args, r, config.system, config.ntp_server_mode) {
+        if let Err(e) = run_sync_loop(
+            args,
+            r,
+            config.system,
+            config.ntp_server_mode,
+            config.http_status,
+        ) {
             error!("Service loop failed: {}", e);
         }
     });
@@ -911,7 +955,13 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    run_sync_loop(args, running, config.system, config.ntp_server_mode)
+    run_sync_loop(
+        args,
+        running,
+        config.system,
+        config.ntp_server_mode,
+        config.http_status,
+    )
 }
 
 #[cfg(test)]
@@ -922,6 +972,7 @@ mod tests {
         Config {
             ntp_server: server.to_string(),
             ntp_server_mode: NtpServerConfig::default(),
+            http_status: HttpStatusConfig::default(),
             system: SystemConfig::default(),
         }
     }
@@ -1032,6 +1083,59 @@ mod tests {
         assert!(!config.ntp_server_mode.enabled);
         assert_eq!(config.ntp_server_mode.port, 123);
         assert_eq!(config.ntp_server_mode.stratum, 3);
+    }
+
+    // ========================================================================
+    // HTTP STATUS ENDPOINT CONFIG TESTS (#47)
+    // ========================================================================
+
+    #[test]
+    fn config_default_has_http_status_enabled_on_port_8898() {
+        let config = Config::default();
+        assert!(
+            config.http_status.enabled,
+            "HTTP status endpoint should be enabled by default (unattended reads is the point)"
+        );
+        assert_eq!(config.http_status.port, 8898);
+    }
+
+    #[test]
+    fn config_deserializes_with_http_status_disabled() {
+        let json = r#"{
+            "ntp_server": "10.77.8.2",
+            "http_status": {
+                "enabled": false,
+                "port": 8898
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.http_status.enabled);
+        assert_eq!(config.http_status.port, 8898);
+    }
+
+    #[test]
+    fn config_deserializes_with_custom_http_status_port() {
+        let json = r#"{
+            "ntp_server": "10.77.8.2",
+            "http_status": {
+                "enabled": true,
+                "port": 9898
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.http_status.enabled);
+        assert_eq!(config.http_status.port, 9898);
+    }
+
+    #[test]
+    fn config_deserializes_without_http_status_uses_defaults() {
+        // An OLDER config.json predating #47 has no "http_status" key at all —
+        // #[serde(default)] must fill in the enabled-by-default value, not fail
+        // to parse or silently disable the endpoint.
+        let json = r#"{"ntp_server": "10.77.8.2"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.http_status.enabled);
+        assert_eq!(config.http_status.port, 8898);
     }
 
     // ========================================================================
