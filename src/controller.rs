@@ -33,6 +33,18 @@ fn format_mac(uuid: &[u8; 6]) -> String {
     )
 }
 
+/// #679 — decides whether the throttled "[PTP] ... Drift: ... Adj: ...ppm"
+/// summary line should be emitted this sample, given a running per-sample
+/// counter (incremented once per call to `apply_self_tuning_servo`, starting
+/// at 0) and the configured interval (`DRIFT_LOG_SUMMARY_INTERVAL_SAMPLES`).
+/// Logs immediately on the very first sample (count == 0, for fast startup
+/// visibility), then every `interval`-th sample thereafter. `interval == 0`
+/// is a defensive guard against a future misconfiguration — it never logs
+/// (fails closed toward LESS log volume) rather than panicking on `% 0`.
+fn should_log_drift_summary(sample_count: u64, interval: u64) -> bool {
+    interval != 0 && sample_count % interval == 0
+}
+
 // ============================================================================
 // CONSTANTS - Organized by functional area
 // ============================================================================
@@ -89,6 +101,19 @@ const NANO_EXIT_RATE_US: f64 = 1.0; // Exit NANO if drift > 1.0 µs/s
 const NANO_SUSTAIN_COUNT: usize = 15; // 15 samples (~15s) to enter NANO
 const NANO_EXIT_COUNT: usize = 5; // 5 consecutive samples above threshold to exit (hysteresis)
 const NANO_DEADBAND_US: f64 = 0.1; // Ignore drift < 0.1 µs/s (noise floor)
+
+// ==========================================================================
+// #679 — PER-SAMPLE DRIFT LOG THROTTLE
+// ==========================================================================
+// The routine "[PTP] <status>  Drift:...  Adj:...ppm" line used to fire on
+// EVERY settled sample (~once/sec) — confirmed live to be ~65% of the
+// camera-box fleet's fixed 50MB /var/log tmpfs volume, filling it in ~4-5
+// days and crashing cam2's camera-box.service (2026-07-11). It now emits
+// only every Nth sample (~30s at the typical 1 sample/sec cadence); the
+// LOCKED/UNLOCKED/NANO mode-transition lines above are unaffected — they
+// already only log on a real state change, not per sample.
+// ==========================================================================
+const DRIFT_LOG_SUMMARY_INTERVAL_SAMPLES: u64 = 30;
 
 // Max drift baseline limit
 const DRIFT_MAX_PPM: f64 = 500.0;
@@ -232,6 +257,11 @@ where
     // ==========================================================================
     /// Jitter estimator for adaptive EMA alpha
     jitter_estimator: JitterEstimator,
+
+    /// #679 — running per-sample counter gating the throttled drift summary
+    /// log line (`should_log_drift_summary`). Increments once per call to
+    /// `apply_self_tuning_servo`.
+    drift_log_sample_count: u64,
 }
 
 struct PendingSync {
@@ -339,6 +369,8 @@ where
             spike_filter: SpikeFilter::new(),
             // Adaptive jitter smoothing
             jitter_estimator: JitterEstimator::new(),
+            // #679 — throttled drift summary log counter
+            drift_log_sample_count: 0,
         }
     }
 
@@ -1211,18 +1243,29 @@ where
         };
 
         // User-friendly log: drift rate (stability) and frequency adjustment
-        // NANO mode shows nanoseconds for sub-µs precision visibility
-        if self.in_nano_mode {
-            let drift_ns = rate_ppm * 1000.0; // Convert µs/s to ns/s
-            info!(
-                "[PTP] {:4}  Drift:{:+7.0}ns/s  Adj:{:+6.2}ppm",
-                status, drift_ns, total_correction
-            );
-        } else {
-            info!(
-                "[PTP] {:4}  Drift:{:+6.1}us/s  Adj:{:+6.1}ppm",
-                status, rate_ppm, total_correction
-            );
+        // NANO mode shows nanoseconds for sub-µs precision visibility.
+        // #679 — throttled to once every DRIFT_LOG_SUMMARY_INTERVAL_SAMPLES
+        // samples (was every sample / ~once/sec, the fleet's dominant
+        // /var/log volume driver). LOCKED/UNLOCKED/NANO transitions above
+        // still log immediately and are unaffected by this throttle.
+        let log_drift_summary = should_log_drift_summary(
+            self.drift_log_sample_count,
+            DRIFT_LOG_SUMMARY_INTERVAL_SAMPLES,
+        );
+        self.drift_log_sample_count = self.drift_log_sample_count.wrapping_add(1);
+        if log_drift_summary {
+            if self.in_nano_mode {
+                let drift_ns = rate_ppm * 1000.0; // Convert µs/s to ns/s
+                info!(
+                    "[PTP] {:4}  Drift:{:+7.0}ns/s  Adj:{:+6.2}ppm",
+                    status, drift_ns, total_correction
+                );
+            } else {
+                info!(
+                    "[PTP] {:4}  Drift:{:+6.1}us/s  Adj:{:+6.1}ppm",
+                    status, rate_ppm, total_correction
+                );
+            }
         }
 
         if let Err(e) = self.clock.adjust_frequency(factor) {
