@@ -1279,6 +1279,38 @@ mod tests {
     use crate::traits::{MockNtpSource, MockPtpNetwork};
     use mockall::predicate::*;
 
+    // #679 — the per-sample "[PTP] Drift:... Adj:...ppm" line used to fire on
+    // EVERY sample (~once/sec), which was ~65% of the fleet's fixed 50MB
+    // /var/log tmpfs volume and crashed cam2's camera-box.service after
+    // ~4-5 days of uptime. `should_log_drift_summary` throttles it to once
+    // every `interval` samples (plus immediately on the very first sample).
+    #[test]
+    fn drift_summary_logs_on_first_sample() {
+        assert!(should_log_drift_summary(0, 30));
+    }
+
+    #[test]
+    fn drift_summary_stays_quiet_between_intervals() {
+        assert!(!should_log_drift_summary(1, 30));
+        assert!(!should_log_drift_summary(15, 30));
+        assert!(!should_log_drift_summary(29, 30));
+    }
+
+    #[test]
+    fn drift_summary_logs_again_every_interval_thereafter() {
+        assert!(should_log_drift_summary(30, 30));
+        assert!(should_log_drift_summary(60, 30));
+        assert!(should_log_drift_summary(90, 30));
+    }
+
+    #[test]
+    fn drift_summary_zero_interval_never_logs() {
+        // Defensive: a misconfigured interval=0 must never panic (modulo-by-zero)
+        // and must never log (fail closed toward LESS volume, not a crash).
+        assert!(!should_log_drift_summary(0, 0));
+        assert!(!should_log_drift_summary(500, 0));
+    }
+
     #[test]
     fn test_ntp_sync_trigger() {
         let _ = env_logger::builder().is_test(true).try_init();
