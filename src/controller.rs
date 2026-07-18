@@ -615,8 +615,47 @@ where
     /// step-reverse pairs (+2831us→-2825us) while a GENUINE offset still steps one interval
     /// later (the next sample agrees).
     fn ntp_step_gate(&mut self, offset_us: i64, adaptive_threshold: i64) -> bool {
-        // OLD behavior (pre-#50 gate): trust every single over-threshold measurement.
-        offset_us.abs() > adaptive_threshold
+        if offset_us.abs() <= adaptive_threshold {
+            if self.ntp_pending_step.take().is_some() {
+                info!("[NTP] step candidate cleared (offset back under threshold)");
+            }
+            return false;
+        }
+        match self.ntp_pending_step {
+            Some((cand, n)) => {
+                let same_sign = (cand > 0) == (offset_us > 0);
+                let tol = NTP_STEP_AGREEMENT_TOL_US.max(cand.abs() / 2);
+                if same_sign && (offset_us - cand).abs() <= tol {
+                    let n = n + 1;
+                    if n >= NTP_STEP_AGREEMENT_N {
+                        self.ntp_pending_step = None;
+                        return true;
+                    }
+                    self.ntp_pending_step = Some((cand, n));
+                    info!(
+                        "[NTP] step candidate {:+}us agreed by {:+}us ({}/{}) — awaiting agreement",
+                        cand, offset_us, n, NTP_STEP_AGREEMENT_N
+                    );
+                } else {
+                    info!(
+                        "[NTP] step candidate {:+}us CONTRADICTED by {:+}us — replaced (outlier suspected)",
+                        cand, offset_us
+                    );
+                    self.ntp_pending_step = Some((offset_us, 1));
+                }
+                false
+            }
+            None => {
+                info!(
+                    "[NTP] step candidate {:+}us (threshold:{}us) — awaiting {} agreeing sample(s)",
+                    offset_us,
+                    adaptive_threshold,
+                    NTP_STEP_AGREEMENT_N - 1
+                );
+                self.ntp_pending_step = Some((offset_us, 1));
+                false
+            }
+        }
     }
 
     fn calculate_ntp_adaptive_threshold(&self) -> i64 {
