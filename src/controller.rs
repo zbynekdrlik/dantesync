@@ -130,6 +130,8 @@ const NTP_SAMPLE_COUNT: usize = 5; // Samples needed for reliable median
 const NTP_STEP_THRESHOLD_BASE_US: i64 = 500; // Base threshold for low-jitter systems
 const NTP_STEP_THRESHOLD_MAX_US: i64 = 10_000; // Maximum threshold (10ms) for high-jitter systems
 const NTP_ADAPTIVE_MULTIPLIER: f64 = 5.0; // Step if offset > base + 5*MAD (covers 99%+ of jitter)
+const NTP_STEP_AGREEMENT_N: usize = 2; // Consecutive AGREEING over-threshold measurements required to step
+const NTP_STEP_AGREEMENT_TOL_US: i64 = NTP_STEP_THRESHOLD_BASE_US; // Same-sign magnitude tolerance floor
 
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
@@ -224,7 +226,13 @@ where
     last_ntp_check: Instant,
     ntp_offset_samples: VecDeque<i64>, // in microseconds
     ntp_tracking_enabled: bool,
-    last_ntp_step: Option<Instant>, // Grace period after NTP stepping
+    // #50 step-agreement gate: a single over-threshold NTP measurement is NEVER trusted (a
+    // queue-delay-biased round trip on a loaded LAN produces a false offset, the servo steps,
+    // the next sample shows the negated bias and it steps right back — the live-event
+    // "+2831us then -2825us" pair). A step now requires NTP_STEP_AGREEMENT_N consecutive
+    // over-threshold samples that AGREE (same sign, similar magnitude).
+    ntp_pending_step: Option<(i64, usize)>, // (first candidate offset_us, agreeing sample count)
+    last_ntp_step: Option<Instant>,         // Grace period after NTP stepping
 
     // Accumulated phase error tracking (estimated drift between NTP steps)
     accumulated_phase_error_us: f64,
@@ -354,6 +362,7 @@ where
             last_ntp_check: now,
             ntp_offset_samples: VecDeque::with_capacity(NTP_SAMPLE_COUNT + 2),
             ntp_tracking_enabled: true, // Always enabled - NTP is the UTC time source
+            ntp_pending_step: None,
             last_ntp_step: None,
             // Accumulated phase error tracking
             accumulated_phase_error_us: 0.0,
@@ -509,8 +518,9 @@ where
                     info!("[NTP] offset:{:+}us", offset_us);
                 }
 
-                // Step clock if offset exceeds adaptive threshold
-                if offset_us.abs() > adaptive_threshold {
+                // Step clock if offset exceeds adaptive threshold — but NEVER on a single
+                // measurement: the agreement gate (#50) requires consecutive agreeing samples.
+                if self.ntp_step_gate(offset_us, adaptive_threshold) {
                     let step_us = offset_us;
 
                     // Apply the step (sets time, does NOT change frequency)
@@ -522,6 +532,7 @@ where
                     } else {
                         // Clear NTP samples after step to start fresh measurement
                         self.ntp_offset_samples.clear();
+                        self.ntp_pending_step = None;
                         // Clear PTP sample window to discard post-step transient samples
                         self.sample_window.clear();
                         // Set grace period to skip PTP samples for 2s after step
@@ -594,6 +605,20 @@ where
     /// to avoid unnecessary stepping that creates oscillation.
     ///
     /// Returns: threshold in microseconds, clamped between base and max.
+    /// #50 NTP step-agreement gate — pure decision, unit-tested directly.
+    ///
+    /// Returns true when the clock SHOULD step for `offset_us`. An over-threshold offset
+    /// becomes a CANDIDATE first; only when NTP_STEP_AGREEMENT_N consecutive over-threshold
+    /// samples AGREE (same sign, magnitudes within max(NTP_STEP_AGREEMENT_TOL_US, |first|/2))
+    /// does the step fire. A disagreeing over-threshold sample REPLACES the candidate (it is
+    /// itself suspect); an under-threshold sample clears it. Kills the loaded-LAN outlier
+    /// step-reverse pairs (+2831us→-2825us) while a GENUINE offset still steps one interval
+    /// later (the next sample agrees).
+    fn ntp_step_gate(&mut self, offset_us: i64, adaptive_threshold: i64) -> bool {
+        // OLD behavior (pre-#50 gate): trust every single over-threshold measurement.
+        offset_us.abs() > adaptive_threshold
+    }
+
     fn calculate_ntp_adaptive_threshold(&self) -> i64 {
         // Need at least 3 samples to calculate meaningful statistics
         if self.ntp_offset_samples.len() < 3 {
@@ -1989,6 +2014,80 @@ mod tests {
             NTP_ADAPTIVE_MULTIPLIER, 5.0,
             "NTP adaptive multiplier should be 5.0"
         );
+    }
+
+    // ==== #50 NTP step-agreement gate (pure decision) ====
+
+    #[test]
+    fn ntp_gate_single_outlier_never_steps() {
+        let (mut c, _) = create_nano_test_controller();
+        assert!(
+            !c.ntp_step_gate(2831, 1000),
+            "first over-threshold sample is only a candidate"
+        );
+        assert!(c.ntp_pending_step.is_some());
+    }
+
+    #[test]
+    fn ntp_gate_two_agreeing_samples_step() {
+        let (mut c, _) = create_nano_test_controller();
+        assert!(!c.ntp_step_gate(2000, 1000));
+        assert!(
+            c.ntp_step_gate(2100, 1000),
+            "second agreeing sample fires the step"
+        );
+        assert!(
+            c.ntp_pending_step.is_none(),
+            "pending cleared by the fired step"
+        );
+    }
+
+    #[test]
+    fn ntp_gate_reversal_pair_steps_zero_times() {
+        // The live-event signature (dantesync#50): +2831us then -2825us — a queue-biased
+        // outlier and its negation. The old servo stepped TWICE (there and back); the gate
+        // must step NEVER.
+        let (mut c, _) = create_nano_test_controller();
+        assert!(!c.ntp_step_gate(2831, 1120));
+        assert!(
+            !c.ntp_step_gate(-2825, 1120),
+            "opposite sign contradicts — no step"
+        );
+        assert!(
+            !c.ntp_step_gate(11, 1120),
+            "normal sample clears the replaced candidate"
+        );
+        assert!(c.ntp_pending_step.is_none());
+    }
+
+    #[test]
+    fn ntp_gate_same_sign_but_wild_magnitude_does_not_agree() {
+        let (mut c, _) = create_nano_test_controller();
+        assert!(!c.ntp_step_gate(2000, 1000));
+        assert!(!c.ntp_step_gate(5000, 1000));
+        assert!(c.ntp_step_gate(5200, 1000));
+    }
+
+    #[test]
+    fn ntp_gate_under_threshold_clears_candidate() {
+        let (mut c, _) = create_nano_test_controller();
+        assert!(!c.ntp_step_gate(2000, 1000));
+        assert!(!c.ntp_step_gate(100, 1000), "under threshold — clears");
+        assert!(c.ntp_pending_step.is_none());
+        assert!(
+            !c.ntp_step_gate(2050, 1000),
+            "must start a FRESH candidate after clear"
+        );
+        assert!(c.ntp_step_gate(2100, 1000));
+    }
+
+    #[test]
+    fn ntp_gate_genuine_offset_steps_on_second_interval() {
+        // A REAL clock offset persists across samples — the gate delays the step by exactly
+        // one NTP interval, never blocks it.
+        let (mut c, _) = create_nano_test_controller();
+        assert!(!c.ntp_step_gate(-3000, 800));
+        assert!(c.ntp_step_gate(-2900, 800));
     }
 
     #[test]
