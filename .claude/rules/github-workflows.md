@@ -31,13 +31,30 @@ unrelated findings (this repo does: two shellcheck quoting nits elsewhere in `ci
 PRE-change version too (`git show <base-sha>:.github/workflows/X.yml > /tmp/orig.yml`) and diff the
 finding sets — only NEW findings are yours to fix.
 
+**Same "diff against base" discipline applies to `cargo clippy`/`cargo check` output, not just
+actionlint** — but those need a full crate build, so a single-file `git show > /tmp/orig.yml`
+doesn't work. Use a throwaway `git worktree add -q /tmp/<name> <base-sha>` instead (keeps the
+current checkout untouched, no stash needed), run the same clippy/check command there, compare
+counts (`grep -c "^error:"` for clippy), then `git worktree remove /tmp/<name> --force`. This is
+what caught, on the local `x86_64-pc-windows-gnu` proxy target, that #58's new FFI code added zero
+NEW clippy findings — the pre-existing `field_reassign_with_default` (time_server.rs) and
+`useless_vec` (net_pcap.rs's own older test) hits were identical on both sides (23 == 23).
+
 ## A YAML/logic fix is not proof the job actually WORKS — the runtime environment can still surprise you
 
 actionlint (and `python3 -c "import yaml; yaml.safe_load(...)"` for pure syntax) only prove the
-workflow is well-formed; they cannot predict runtime behavior inside a job (#56: a `cargo test`
-step that is syntactically fine crashed with `STATUS_DLL_NOT_FOUND` on `windows-latest` in one job
-but not an apparently-identical one — traced to a stale `actions/cache`-restored `target/` in the
-failing job, not a workflow syntax problem). When adding a NEW execution step to an existing job,
-prefer the narrowest command that proves what you actually need (e.g. `cargo test --no-run` proves
-compile+link without ever executing the binary) over the broadest one, if the narrower one is
-still sufficient for the goal — it sidesteps whole categories of runtime-environment risk.
+workflow is well-formed; they cannot predict runtime behavior inside a job. Case in point: a
+`cargo test` step that is syntactically fine crashed with `STATUS_DLL_NOT_FOUND` on
+`windows-latest` (#56 first saw it in `ci.yml`'s job only and guessed it was that job's stale
+`actions/cache`-restored `target/`; #58 later proved the REAL cause was `wpcap.dll` missing from
+every `windows-latest` runner's Npcap install — the same crash then hit `release.yml` too, in a
+job with no cache at all, disproving the #56 guess). **The lesson: when a runtime crash's cause
+isn't obvious, verify it against a DIFFERENT job/workflow with a different environment before
+attributing it to that job's specific setup (cache, matrix leg, etc.) — a shared dependency
+(here, a missing system DLL) can look job-specific until it reproduces somewhere without that
+job's quirk.** When adding a NEW execution step to an existing job, prefer the narrowest command
+that proves what you actually need (e.g. `cargo test --no-run` proves compile+link without ever
+executing the binary) over the broadest one, IF the narrower one is still sufficient for the goal
+— but don't let it hide an execution-time bug you actually need caught (#58: delay-loading the
+missing DLL let the Windows leg go back to real `cargo test --verbose` instead of settling for
+`--no-run` forever).

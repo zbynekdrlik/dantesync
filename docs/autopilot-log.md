@@ -145,3 +145,46 @@ canary evidence before continuing.
   --verbose` 157+16+11 passed / 0 failed (one-off full run per Tier-0 bypass), `cargo check
   --target x86_64-pc-windows-gnu --tests --lib` clean (RED→GREEN proof above).
 - Not merged per this session's explicit constraint — PR opened, driven to green CI, stopped there.
+
+## #58: Windows tests execute nowhere -- delay-load wpcap.dll (2026-07-28)
+
+- Root cause + approach posted BEFORE code: gh issue comment
+  https://github.com/zbynekdrlik/dantesync/issues/58#issuecomment-5101073379 (predates commit
+  f1650e3, the first code commit).
+- Version bump: f1650e3 `chore: bump version to 1.8.24` — 1.8.23 already exists as a bare,
+  release-less tag on the remote; CI's own version-check job blocks reusing it.
+- fix(#58) commit 9a70741: build.rs delay-loads `wpcap.dll` on cfg(windows)
+  (`-C link-arg=/DELAYLOAD:wpcap.dll` + `delayimp.lib`); ci.yml Windows leg flipped from
+  `cargo test --no-run` back to a real `cargo test --verbose`. This alone let the process START on
+  a runtime-less windows-latest runner (proven: CI run 30337735289 got PAST process-start, further
+  than the original bug) but then crashed at the first REAL pcap:: call
+  (`test_ntp_client_new` -> `NtpClient::new()` -> `PcapNtpTransport::new()` -> `find_device()` ->
+  `Device::list()`), exit 0xc06d007e — a second, deeper bug this fix's own CI run surfaced live.
+- fix(#58) commit be3d8b1 (RED already captured by 9a70741's own CI run, no separately manufactured
+  RED commit needed): added `wpcap_runtime_available()` to `src/net_pcap.rs` (probes via
+  statically-linked kernel32 LoadLibraryW/FreeLibrary, never delay-loaded) called at the top of
+  `find_device()` — the shared choke point for `NpcapPtpNetwork::new`/`PcapNtpTransport::new` —
+  returning a graceful Err before the first real pcap:: call. 4 new regression tests added in
+  net_pcap.rs (`test_wpcap_runtime_available_never_panics`,
+  `test_find_device_gracefully_errors_without_npcap_runtime`,
+  `test_pcap_ntp_transport_new_gracefully_errors_without_npcap_runtime`,
+  `test_npcap_ptp_network_new_gracefully_errors_without_npcap_runtime`) — all `ok` on CI run
+  30338325119, alongside `test_ntp_client_new` (the original crash trigger) now passing too:
+  `test result: ok. 185 passed; 0 failed`.
+- docs(#58) commit 0704bcf: self-review caught that build.rs's own comment + the
+  windows-only-code.md playbook update (both written in 9a70741, before the second bug was
+  discovered) still claimed "verified no existing #[test] makes a real pcap:: call" — disproven by
+  be3d8b1. Corrected both to describe the actual two-part fix. No functional change. Final green
+  CI run: 30338828677.
+- Local verification each cycle: `cargo fmt --all --check`, `cargo check`, `cargo test --no-run`
+  (default features, Linux); `cargo check`/`cargo clippy --target x86_64-pc-windows-gnu --tests
+  --lib` (proxy for the windows-msvc target CI actually builds — not a substitute, but caught the
+  FFI declarations compile before pushing) — zero NEW findings vs the pre-change baseline in both
+  cases (diffed explicitly).
+- Option 1 (install the Npcap runtime on the CI runner) rejected with evidence: the free Npcap
+  installer has no silent-install switch at all; even rust-pcap/pcap's own official CI needs a
+  paid Npcap OEM subscription (`NPCAP_OEM_USERNAME`/`PASSWORD` secrets) for exactly this — not
+  viable here without a purchase.
+- PR #59: https://github.com/zbynekdrlik/dantesync/pull/59 — green, `mergeable: MERGEABLE`,
+  `mergeStateStatus: CLEAN`, all 7 required checks pass. NOT merged per this session's explicit
+  instruction — supervisor merges, releases fresh tag v1.8.24, canaries to the fleet.
