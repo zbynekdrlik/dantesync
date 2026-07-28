@@ -672,6 +672,74 @@ mod tests {
         );
     }
 
+    /// Adversarial-review fix (#53 continuation): the FOUR tests above never
+    /// actually exercise the /23 vs /24 distinction the implementation
+    /// claims to make -- in every one of them, the winning candidate ALSO
+    /// shares its first three octets with the server (a naive "compare
+    /// octet 1-2-3" /24 implementation would coincidentally pass all four).
+    /// This fixture forces the real subnet-mask math: the server
+    /// (10.77.6.5) is inside the Dante candidate's /23 span
+    /// (10.77.6.0-10.77.7.255, from IP 10.77.7.204/23) but in a DIFFERENT
+    /// /24 than that candidate's own IP (10.77.6.x vs 10.77.7.x) -- a naive
+    /// octet-1-2-3-equality implementation returns None here (matches
+    /// neither candidate), while the real netmask-AND implementation must
+    /// select the Dante candidate (index 0).
+    #[test]
+    fn select_ntp_pcap_device_selects_across_a_24_boundary_within_the_23_span() {
+        let server_ip: Ipv4Addr = "10.77.6.5".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.6.0-10.77.7.255
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.8.0-10.77.9.255
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(0),
+            "10.77.6.5 is inside the Dante candidate's /23 span (10.77.6.0-10.77.7.255) even \
+             though it's in a DIFFERENT /24 (10.77.6.x) than the candidate's own IP (10.77.7.x) \
+             -- a /24-only implementation would wrongly return None here"
+        );
+    }
+
+    /// Same class as above, mirrored onto the LAN candidate: the server
+    /// (10.77.8.50) is inside the LAN candidate's /23 span
+    /// (10.77.8.0-10.77.9.255, from IP 10.77.9.204/23) but in a DIFFERENT
+    /// /24 (10.77.8.x vs the candidate's own 10.77.9.x). A naive /24
+    /// implementation returns None here too; the real implementation must
+    /// select the LAN candidate (index 1).
+    #[test]
+    fn select_ntp_pcap_device_selects_across_a_24_boundary_within_the_23_span_other_candidate() {
+        let server_ip: Ipv4Addr = "10.77.8.50".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.6.0-10.77.7.255
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.8.0-10.77.9.255
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(1),
+            "10.77.8.50 is inside the LAN candidate's /23 span (10.77.8.0-10.77.9.255) even \
+             though it's in a DIFFERENT /24 (10.77.8.x) than the candidate's own IP (10.77.9.x) \
+             -- a /24-only implementation would wrongly return None here"
+        );
+    }
+
     /// #53 RED: the aggregate must be `true` only when EVERY sample in the
     /// burst used the pcap transport. The placeholder only checks the FIRST
     /// flag, so a burst that starts pcap=true but degrades partway through
