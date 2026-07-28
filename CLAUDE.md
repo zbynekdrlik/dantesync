@@ -75,6 +75,26 @@ RUST_LOG=debug cargo run
 
 - Windows-only (`#[cfg(windows)]`) code — what CI actually verifies + a free local compile-check
   without the Npcap SDK → `.claude/rules/windows-only-code.md` (auto-loads on its `paths:`)
+- Editing `.github/workflows/*.yml` — local `actionlint` validation, and why a workflow being
+  syntactically valid doesn't prove a new step actually works at runtime → `.claude/rules/github-workflows.md`
+  (auto-loads on its `paths:`)
+
+## GOTCHA — `gh pr edit --body-file`/`--body` fails with a GraphQL "Projects (classic)" error
+
+`gh pr edit <N> --body-file <file>` on this repo fails with `GraphQL: Projects (classic) is being
+deprecated... (repository.pullRequest.projectCards)` and exit code 1 — `gh`'s GraphQL mutation for
+editing a PR fetches a legacy `projectCards` field even when you never touch project cards, and
+this repo/org still has that field wired up. **The body is silently NOT updated** when this
+happens — always re-read the body afterward to confirm, since the CLI's own error output alone
+doesn't make the silent no-op obvious. The direct REST PATCH sidesteps the broken GraphQL response
+and works every time:
+
+```bash
+gh api repos/zbynekdrlik/dantesync/pulls/<N> -X PATCH -F body=@/path/to/new-body.md
+```
+
+Same for `gh issue view <N>` (also fails the same way — use
+`gh api repos/zbynekdrlik/dantesync/issues/<N> --jq '{title,body,state}'` instead).
 
 ## Hardware Constraints (CRITICAL)
 
