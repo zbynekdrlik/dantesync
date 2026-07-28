@@ -276,6 +276,45 @@ pub fn burst_used_pcap_throughout(via_pcap_flags: &[bool]) -> bool {
 }
 
 // ============================================================================
+// #53 continuation (adversarial-review fix) — reject stale/mis-paired
+// captured NTP replies by Origin Timestamp correlation
+// ============================================================================
+// `PcapNtpTransport::measure_once` (net_pcap.rs) used to accept the FIRST
+// captured packet from `server_ip` parsing as a mode-4 reply as t4, with NO
+// check that it actually answers the request THIS call just sent. Two real
+// sources of a stale/foreign reply landing in the same 500ms capture window:
+// (1) a reply left over in the capture queue from a PRIOR `measure_once`
+// call (mitigated by draining the queue before sending, in net_pcap.rs), and
+// (2) the userspace `rsntp` fallback path sending its own independent
+// request to the same `server_ip:123` — which the open BPF filter
+// (`udp and host <server> and port 123`) also matches — so its reply can be
+// captured and mistaken for ours even with the queue freshly drained.
+// `parse_reply` already decodes the reply's Origin Timestamp (the server's
+// verbatim echo of OUR request's Transmit Timestamp field) but nothing ever
+// checked it against the request we actually just sent. Fix: compare the
+// reply's `origin_ts_us` to the `request_transmit_ts_us` embedded when we
+// built the request; a REAL reply to THIS request matches within the ~1us
+// NTP-fixed-point encode/decode rounding already proven exact by
+// `unix_micros_ntp_roundtrip_is_within_one_microsecond_for_arbitrary_values`
+// above — anything else is a different exchange (a check runs every
+// 10-30s, so a stale reply differs by many orders of magnitude more than
+// 1us) and must be rejected, not paired.
+// ============================================================================
+
+/// Whether a captured reply's echoed Origin Timestamp matches the request we
+/// actually just sent — the correlation check that used to be missing
+/// entirely from `PcapNtpTransport::measure_once`. A tolerance of 1us covers
+/// the NTP 32-bit fixed-point encode/decode rounding (see the round-trip
+/// tests above); a genuinely stale/foreign reply (a different measurement
+/// interval, or the rsntp fallback's own independent exchange to the same
+/// server) differs by milliseconds-to-seconds, far outside this tolerance.
+///
+/// #53 GREEN: a real bounded-difference check.
+pub fn reply_origin_matches_request(_origin_ts_us: i64, _request_transmit_ts_us: i64) -> bool {
+    true // RED placeholder -- accepts everything, exactly the bug being fixed
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -655,5 +694,46 @@ mod tests {
     #[test]
     fn burst_used_pcap_throughout_false_for_empty_slice() {
         assert!(!burst_used_pcap_throughout(&[]));
+    }
+
+    // ---- #53 continuation (adversarial-review fix): reply-origin correlation ----
+
+    /// #53 RED: an exact echo of the request's transmit timestamp must match.
+    #[test]
+    fn reply_origin_matches_request_exact_match_is_true() {
+        assert!(reply_origin_matches_request(1_000_000, 1_000_000));
+    }
+
+    /// #53 RED: a 1us difference is within the NTP fixed-point encode/decode
+    /// rounding tolerance and must still match.
+    #[test]
+    fn reply_origin_matches_request_within_one_microsecond_rounding_is_true() {
+        assert!(reply_origin_matches_request(1_000_001, 1_000_000));
+        assert!(reply_origin_matches_request(999_999, 1_000_000));
+    }
+
+    /// #53 RED: a 2us difference is already outside the encode/decode
+    /// rounding tolerance and must be rejected.
+    #[test]
+    fn reply_origin_matches_request_two_microseconds_off_is_false() {
+        assert!(!reply_origin_matches_request(1_000_002, 1_000_000));
+    }
+
+    /// #53 RED: this is the actual defect fixture — a reply whose origin
+    /// timestamp is from a MUCH earlier request (e.g. the previous
+    /// `measure_once` call's request, one 10-30s check-interval ago, or the
+    /// rsntp fallback's own independent exchange to the same server) must be
+    /// rejected as a stale/foreign reply, never paired with the current
+    /// request. The naive "accept whatever comes from server_ip" behavior
+    /// this replaces would have paired them.
+    #[test]
+    fn reply_origin_matches_request_rejects_a_reply_from_a_stale_prior_interval() {
+        let request_transmit_ts_us = 50_000_000_000i64; // "now" for this call
+        let stale_origin_ts_us = request_transmit_ts_us - 15_000_000; // 15s earlier
+        assert!(
+            !reply_origin_matches_request(stale_origin_ts_us, request_transmit_ts_us),
+            "a reply echoing a 15s-old origin timestamp must never be accepted as this \
+             request's reply"
+        );
     }
 }
