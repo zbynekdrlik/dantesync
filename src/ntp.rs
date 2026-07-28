@@ -105,11 +105,12 @@ pub struct FilteredOffset {
 /// scheduling stall on either end — the standard NTP "minimum delay" selection
 /// technique. Returns fewer than `n` if `samples` is shorter.
 pub fn select_lowest_rtt(samples: &[RawSample], n: usize) -> Vec<RawSample> {
-    // TODO(#53 RED): naive no-op placeholder — does NOT actually select by RTT
-    // yet, it just truncates in whatever order the burst arrived. This is
-    // exactly today's bug generalized to a slice: whatever came first/last
-    // reaches the output unfiltered. GREEN replaces this with a real sort.
-    samples.iter().copied().take(n).collect()
+    // #53 GREEN: a real RTT-ascending sort, then keep the lowest n. `sort_by_key`
+    // is stable, so equal-RTT samples keep their original relative order.
+    let mut sorted: Vec<RawSample> = samples.to_vec();
+    sorted.sort_by_key(|s| s.rtt_us);
+    sorted.truncate(n);
+    sorted
 }
 
 /// Median + spread over a slice of ALREADY-SELECTED ("accepted") offsets (pure).
@@ -118,14 +119,19 @@ pub fn summarize_offsets(offsets_us: &[i64]) -> Option<FilteredOffset> {
     if offsets_us.is_empty() {
         return None;
     }
-    // TODO(#53 RED): naive placeholder — "median" is just the last raw sample
-    // (today's actual bug: `status.ntp_offset_us = offset_us` publishes the
-    // last measurement verbatim) and spread is hardcoded to 0, which is the
-    // exact "smoothing a bad node into looking good" failure this ticket bans.
-    // GREEN replaces this with a real median + a real max-min spread.
+    // #53 GREEN: a real median (sorted[len/2] — same "upper of two" convention
+    // as controller.rs's calculate_ntp_adaptive_threshold, for consistency) and
+    // a real max-min spread across the SAME sorted slice. The spread is what
+    // keeps this honest: a wide spread survives the filtering and is reported
+    // as-is, never collapsed toward 0 just because a single median exists.
+    let mut sorted: Vec<i64> = offsets_us.to_vec();
+    sorted.sort();
+    let median = sorted[sorted.len() / 2];
+    let spread = (sorted[sorted.len() - 1] - sorted[0]).unsigned_abs();
+
     Some(FilteredOffset {
-        offset_us: *offsets_us.last().expect("checked non-empty above"),
-        spread_us: 0,
+        offset_us: median,
+        spread_us: spread,
         sample_count: offsets_us.len(),
     })
 }
