@@ -516,6 +516,7 @@ where
                     status.ntp_failed = false;
                     status.ntp_spread_us = measurement.spread_us;
                     status.ntp_sample_count = measurement.sample_count;
+                    status.pcap_ntp_active = measurement.pcap_active;
                 }
 
                 // Calculate adaptive threshold based on offset variance
@@ -570,6 +571,16 @@ where
             Err(e) => {
                 // Track consecutive failures
                 self.ntp_consecutive_failures += 1;
+
+                // Adversarial-review fix (#53 continuation): a failed burst
+                // produced NO measurement at all, so `pcap_ntp_active` must
+                // never keep reporting whatever it was set to by the last
+                // SUCCESSFUL burst -- otherwise a consumer reading this field
+                // alone during an outage is told the kernel-timestamped
+                // transport is still active when nothing ran this check.
+                if let Ok(mut status) = self.status_shared.write() {
+                    status.pcap_ntp_active = false;
+                }
 
                 if self.ntp_consecutive_failures >= NTP_FAILURE_THRESHOLD && !self.ntp_failed {
                     self.ntp_failed = true;
@@ -1444,6 +1455,7 @@ mod tests {
                 sign: 1,
                 spread_us: 0,
                 sample_count: 1,
+                pcap_active: false,
             })
         });
 
@@ -1465,10 +1477,11 @@ mod tests {
     }
 
     /// #53: `check_ntp_utc_tracking` must propagate the burst-filter quality
-    /// fields (`spread_us`/`sample_count`) from the `NtpMeasurement` into
-    /// `SyncStatus`, not just the offset — otherwise a consumer (e.g.
-    /// camera-box's gate) has no way to tell a well-measured node from a
-    /// badly-measured one.
+    /// fields (`spread_us`/`sample_count`/`pcap_active`, dantesync#53
+    /// continuation) from the `NtpMeasurement` into `SyncStatus`, not just
+    /// the offset — otherwise a consumer (e.g. camera-box's gate) has no way
+    /// to tell a well-measured node from a badly-measured one, or whether
+    /// the kernel-timestamped transport is actually in use.
     #[test]
     fn test_check_ntp_utc_tracking_propagates_quality_fields_to_status() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -1482,6 +1495,7 @@ mod tests {
                 sign: 1,
                 spread_us: 41610,
                 sample_count: 3,
+                pcap_active: true,
             })
         });
 
@@ -1510,6 +1524,67 @@ mod tests {
             "spread must reach status, not just the offset"
         );
         assert_eq!(s.ntp_sample_count, 3);
+        assert!(
+            s.pcap_ntp_active,
+            "pcap_active must reach status, not just the offset/spread/count"
+        );
+    }
+
+    /// Adversarial-review fix (#53 continuation): `pcap_ntp_active` must NOT
+    /// go stale on a burst failure. Root cause: the success branch of
+    /// `check_ntp_utc_tracking` writes `status.pcap_ntp_active =
+    /// measurement.pcap_active`, but the failure (`Err`) branch only ever
+    /// touched `ntp_failed` -- leaving a stuck `true` from the last good
+    /// burst even once NTP starts failing every check. A consumer reading
+    /// `pcap_ntp_active` alone during an outage would be lied to.
+    #[test]
+    fn test_check_ntp_utc_tracking_clears_pcap_ntp_active_on_burst_failure() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+
+        // First check: a real successful pcap-backed burst.
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(100),
+                sign: 1,
+                spread_us: 0,
+                sample_count: 3,
+                pcap_active: true,
+            })
+        });
+        // Second check: the burst fails outright (e.g. Npcap transport lost
+        // reachability, or the rsntp fallback also failed).
+        mock_ntp
+            .expect_get_offset()
+            .times(1)
+            .returning(|| Err(anyhow::anyhow!("NTP burst: no server response")));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut controller = PtpController::new(
+            mock_clock,
+            mock_net,
+            mock_ntp,
+            status.clone(),
+            SystemConfig::default(),
+        );
+        controller.ptp_offline = true;
+
+        controller.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        controller.check_ntp_utc_tracking();
+        assert!(
+            status.read().unwrap().pcap_ntp_active,
+            "sanity check: the first (successful, pcap_active=true) burst must have set it"
+        );
+
+        controller.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        controller.check_ntp_utc_tracking();
+        assert!(
+            !status.read().unwrap().pcap_ntp_active,
+            "pcap_ntp_active must be cleared to false on a failed burst, not left stuck at the \
+             last successful value"
+        );
     }
 
     #[test]

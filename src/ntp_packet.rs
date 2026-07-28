@@ -204,6 +204,129 @@ pub fn parse_udp_frame(data: &[u8]) -> Option<(Ipv4Addr, u16, &[u8])> {
 }
 
 // ============================================================================
+// #53 continuation — select the pcap NTP device by NTP-server reachability
+// ============================================================================
+// v1.8.24 confirmed live on a dual-homed host (stream box: Dante 10.77.7.204/23,
+// LAN 10.77.9.204/23) that `PcapNtpTransport` inheriting the PTP capture
+// interface can never work when PTP and NTP live on different subnets — the
+// NTP server is genuinely unreachable from the PTP-selected device
+// (WSAENETUNREACH / os error 10051), so the transport silently degrades to
+// userspace rsntp for every sample, forever. The fix: pick the pcap device by
+// which interface's subnet actually CONTAINS the (resolved) NTP server
+// address — the same decision `Find-NetRoute` makes, made automatically and
+// testably. Pure, zero-pcap-dependency, so it is unit-tested on Linux CI
+// exactly like the wire-format math above.
+// ============================================================================
+
+/// One Npcap-visible network interface candidate for NTP-transport device
+/// selection: a device's name plus ONE of its IPv4 address/netmask pairs,
+/// pulled out of the platform-specific `pcap::Device` into a plain value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateInterface {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub netmask: Option<Ipv4Addr>,
+}
+
+/// Whether `target` falls inside the subnet defined by `ip`/`netmask`
+/// (standard IP containment: masking both addresses must produce the same
+/// network prefix).
+fn same_subnet(ip: Ipv4Addr, netmask: Ipv4Addr, target: Ipv4Addr) -> bool {
+    (u32::from(ip) & u32::from(netmask)) == (u32::from(target) & u32::from(netmask))
+}
+
+/// Select which `candidates` entry can actually reach `server_ip` — never by
+/// name, only by whether the candidate's OWN subnet contains the server
+/// address. On more than one match, the MOST SPECIFIC (longest-prefix /
+/// smallest) subnet wins, mirroring standard IP routing "longest prefix
+/// match" — a stable sort keeps the first-listed candidate on an exact tie.
+/// Returns `None` when no candidate's subnet contains `server_ip`.
+///
+/// #53 GREEN: real subnet-containment selection instead of a name-based or
+/// arrival-order guess.
+///
+/// Adversarial-review fix (#53 continuation): a candidate whose netmask is
+/// the degenerate `0.0.0.0` (a junk/APIPA/misconfigured adapter -- pcap's
+/// enumeration can genuinely report this) is EXCLUDED here, not just
+/// deprioritized. `same_subnet(ip, 0.0.0.0, target)` masks both addresses to
+/// 0 and is trivially true for every `target`, so without this guard such a
+/// candidate would vacuously "reach" any server and could win when no real
+/// candidate matches -- silently defeating the caller's
+/// "no reachable interface" diagnostic.
+pub fn select_ntp_pcap_device(
+    server_ip: Ipv4Addr,
+    candidates: &[CandidateInterface],
+) -> Option<usize> {
+    let mut matches: Vec<(usize, u32)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let netmask = c.netmask?;
+            if netmask == Ipv4Addr::UNSPECIFIED {
+                return None;
+            }
+            if same_subnet(c.ip, netmask, server_ip) {
+                Some((i, u32::from(netmask).count_ones()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Stable sort descending by prefix length -- an exact tie keeps the
+    // original (first-listed) relative order.
+    matches.sort_by_key(|&(_, prefix_len)| std::cmp::Reverse(prefix_len));
+    matches.first().map(|&(i, _)| i)
+}
+
+/// Whether the kernel-timestamped Npcap NTP transport was used for EVERY
+/// sample in a burst — `false` the instant even one sample fell back to
+/// userspace rsntp, and `false` for an empty burst.
+///
+/// #53 GREEN: a real "every flag true, and non-empty" check.
+pub fn burst_used_pcap_throughout(via_pcap_flags: &[bool]) -> bool {
+    !via_pcap_flags.is_empty() && via_pcap_flags.iter().all(|&v| v)
+}
+
+// ============================================================================
+// #53 continuation (adversarial-review fix) — reject stale/mis-paired
+// captured NTP replies by Origin Timestamp correlation
+// ============================================================================
+// `PcapNtpTransport::measure_once` (net_pcap.rs) used to accept the FIRST
+// captured packet from `server_ip` parsing as a mode-4 reply as t4, with NO
+// check that it actually answers the request THIS call just sent. Two real
+// sources of a stale/foreign reply landing in the same 500ms capture window:
+// (1) a reply left over in the capture queue from a PRIOR `measure_once`
+// call (mitigated by draining the queue before sending, in net_pcap.rs), and
+// (2) the userspace `rsntp` fallback path sending its own independent
+// request to the same `server_ip:123` — which the open BPF filter
+// (`udp and host <server> and port 123`) also matches — so its reply can be
+// captured and mistaken for ours even with the queue freshly drained.
+// `parse_reply` already decodes the reply's Origin Timestamp (the server's
+// verbatim echo of OUR request's Transmit Timestamp field) but nothing ever
+// checked it against the request we actually just sent. Fix: compare the
+// reply's `origin_ts_us` to the `request_transmit_ts_us` embedded when we
+// built the request; a REAL reply to THIS request matches within the ~1us
+// NTP-fixed-point encode/decode rounding already proven exact by
+// `unix_micros_ntp_roundtrip_is_within_one_microsecond_for_arbitrary_values`
+// above — anything else is a different exchange (a check runs every
+// 10-30s, so a stale reply differs by many orders of magnitude more than
+// 1us) and must be rejected, not paired.
+// ============================================================================
+
+/// Whether a captured reply's echoed Origin Timestamp matches the request we
+/// actually just sent — the correlation check that used to be missing
+/// entirely from `PcapNtpTransport::measure_once`. A tolerance of 1us covers
+/// the NTP 32-bit fixed-point encode/decode rounding (see the round-trip
+/// tests above); a genuinely stale/foreign reply (a different measurement
+/// interval, or the rsntp fallback's own independent exchange to the same
+/// server) differs by milliseconds-to-seconds, far outside this tolerance.
+///
+/// #53 GREEN: a real bounded-difference check.
+pub fn reply_origin_matches_request(origin_ts_us: i64, request_transmit_ts_us: i64) -> bool {
+    (origin_ts_us - request_transmit_ts_us).abs() <= 1
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -449,6 +572,301 @@ mod tests {
         assert!(
             parse_udp_frame(&frame).is_none(),
             "a 20-byte frame is too short to contain Ethernet+IP+UDP headers"
+        );
+    }
+
+    // ---- #53 continuation: pcap NTP device selection by reachability ----
+
+    /// #53 RED: reproduces the EXACT live stream-box topology — Dante on
+    /// 10.77.7.204/23 (where the PTP capture binds), LAN on 10.77.9.204/23
+    /// (where the NTP server actually lives). The LAN candidate must be
+    /// selected because ONLY its subnet contains the server address; the
+    /// placeholder just returns the first candidate with a netmask (Dante,
+    /// listed first) regardless of `server_ip`, so this fails against it.
+    #[test]
+    fn select_ntp_pcap_device_picks_the_subnet_that_contains_the_server() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23
+            },
+        ];
+
+        let selected = select_ntp_pcap_device(server_ip, &candidates);
+
+        assert_eq!(
+            selected,
+            Some(1),
+            "the LAN device (index 1) is the only one whose /23 subnet contains \
+             10.77.9.202 -- Dante's 10.77.6.0-10.77.7.255 does not overlap LAN's \
+             10.77.8.0-10.77.9.255"
+        );
+    }
+
+    /// #53 RED: when NO candidate's subnet contains the server address, the
+    /// selector must return `None` rather than guessing a device.
+    #[test]
+    fn select_ntp_pcap_device_returns_none_when_no_candidate_can_reach_server() {
+        let server_ip: Ipv4Addr = "192.168.1.5".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()),
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()),
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            None,
+            "no candidate's /23 subnet contains 192.168.1.5 -- must be None, not a guess"
+        );
+    }
+
+    /// #53 RED: on overlap (more than one candidate's subnet contains the
+    /// server), the MOST SPECIFIC (longest-prefix / smallest) subnet must
+    /// win -- mirrors standard IP routing "longest prefix match". The
+    /// placeholder ignores this entirely (just picks the first with a
+    /// netmask), so this fails when the broader (/16) candidate is listed
+    /// first.
+    #[test]
+    fn select_ntp_pcap_device_prefers_longest_prefix_on_overlap() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "broad /16".to_string(),
+                ip: "10.77.0.1".parse().unwrap(),
+                netmask: Some("255.255.0.0".parse().unwrap()), // /16, also contains the server
+            },
+            CandidateInterface {
+                name: "specific /23".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23, more specific
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(1),
+            "both subnets contain the server, but the /23 (index 1) is more specific \
+             than the /16 (index 0) and must win"
+        );
+    }
+
+    /// #53 RED: a candidate with no netmask (e.g. an interface pcap couldn't
+    /// fully enumerate) can never be selected, even if its bare address
+    /// happens to share the server's first octets.
+    #[test]
+    fn select_ntp_pcap_device_skips_candidates_without_netmask() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [CandidateInterface {
+            name: "no netmask".to_string(),
+            ip: "10.77.9.1".parse().unwrap(),
+            netmask: None,
+        }];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            None,
+            "a candidate with no netmask must never be selected"
+        );
+    }
+
+    /// Adversarial-review fix (#53 continuation): the FOUR tests above never
+    /// actually exercise the /23 vs /24 distinction the implementation
+    /// claims to make -- in every one of them, the winning candidate ALSO
+    /// shares its first three octets with the server (a naive "compare
+    /// octet 1-2-3" /24 implementation would coincidentally pass all four).
+    /// This fixture forces the real subnet-mask math: the server
+    /// (10.77.6.5) is inside the Dante candidate's /23 span
+    /// (10.77.6.0-10.77.7.255, from IP 10.77.7.204/23) but in a DIFFERENT
+    /// /24 than that candidate's own IP (10.77.6.x vs 10.77.7.x) -- a naive
+    /// octet-1-2-3-equality implementation returns None here (matches
+    /// neither candidate), while the real netmask-AND implementation must
+    /// select the Dante candidate (index 0).
+    #[test]
+    fn select_ntp_pcap_device_selects_across_a_24_boundary_within_the_23_span() {
+        let server_ip: Ipv4Addr = "10.77.6.5".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.6.0-10.77.7.255
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.8.0-10.77.9.255
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(0),
+            "10.77.6.5 is inside the Dante candidate's /23 span (10.77.6.0-10.77.7.255) even \
+             though it's in a DIFFERENT /24 (10.77.6.x) than the candidate's own IP (10.77.7.x) \
+             -- a /24-only implementation would wrongly return None here"
+        );
+    }
+
+    /// Same class as above, mirrored onto the LAN candidate: the server
+    /// (10.77.8.50) is inside the LAN candidate's /23 span
+    /// (10.77.8.0-10.77.9.255, from IP 10.77.9.204/23) but in a DIFFERENT
+    /// /24 (10.77.8.x vs the candidate's own 10.77.9.x). A naive /24
+    /// implementation returns None here too; the real implementation must
+    /// select the LAN candidate (index 1).
+    #[test]
+    fn select_ntp_pcap_device_selects_across_a_24_boundary_within_the_23_span_other_candidate() {
+        let server_ip: Ipv4Addr = "10.77.8.50".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.6.0-10.77.7.255
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23: 10.77.8.0-10.77.9.255
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(1),
+            "10.77.8.50 is inside the LAN candidate's /23 span (10.77.8.0-10.77.9.255) even \
+             though it's in a DIFFERENT /24 (10.77.8.x) than the candidate's own IP (10.77.9.x) \
+             -- a /24-only implementation would wrongly return None here"
+        );
+    }
+
+    /// Adversarial-review fix (#53 continuation): a candidate with a
+    /// DEGENERATE `0.0.0.0` netmask (a junk/APIPA/misconfigured adapter --
+    /// pcap's netmask enumeration can genuinely report this) must never be
+    /// selectable, no matter what server address is asked for. Root cause:
+    /// `same_subnet(ip, 0.0.0.0, target)` masks both addresses to 0, so it is
+    /// trivially true for EVERY target -- a 0.0.0.0-netmask candidate
+    /// silently "reaches" any server, defeating the specific
+    /// "No Npcap-capturable interface can reach ..." diagnostic that should
+    /// fire when nothing real can reach it.
+    #[test]
+    fn select_ntp_pcap_device_never_selects_a_zero_netmask_candidate() {
+        let server_ip: Ipv4Addr = "203.0.113.7".parse().unwrap(); // TEST-NET-3, reachable by nothing real here
+        let candidates = [CandidateInterface {
+            name: "junk adapter".to_string(),
+            ip: "169.254.1.5".parse().unwrap(), // APIPA-style address
+            netmask: Some("0.0.0.0".parse().unwrap()),
+        }];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            None,
+            "a 0.0.0.0-netmask candidate must never be selected -- it vacuously matches every \
+             server address and would defeat the no-reachable-interface diagnostic"
+        );
+    }
+
+    /// Same defect, but with a REAL candidate present too: the 0.0.0.0-mask
+    /// junk candidate must never win even when listed FIRST and a genuinely
+    /// reachable candidate is also present.
+    #[test]
+    fn select_ntp_pcap_device_prefers_a_real_match_over_a_zero_netmask_candidate() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "junk adapter".to_string(),
+                ip: "169.254.1.5".parse().unwrap(),
+                netmask: Some("0.0.0.0".parse().unwrap()),
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()),
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(1),
+            "the real LAN candidate (index 1) must win -- the 0.0.0.0-netmask junk candidate \
+             (index 0) must never be selected even when listed first"
+        );
+    }
+
+    /// #53 RED: the aggregate must be `true` only when EVERY sample in the
+    /// burst used the pcap transport. The placeholder only checks the FIRST
+    /// flag, so a burst that starts pcap=true but degrades partway through
+    /// (a transient per-sample fallback) would be wrongly reported active.
+    #[test]
+    fn burst_used_pcap_throughout_true_only_when_all_true() {
+        assert!(burst_used_pcap_throughout(&[true, true, true]));
+        assert!(
+            !burst_used_pcap_throughout(&[true, true, false]),
+            "one fallback sample must flip the whole burst to NOT active"
+        );
+        assert!(
+            !burst_used_pcap_throughout(&[false, true, true]),
+            "a leading fallback sample must also flip it -- not just a trailing one"
+        );
+    }
+
+    /// #53 RED: an empty burst (every sample failed outright) must never be
+    /// reported as "pcap active" — no samples is not "active".
+    #[test]
+    fn burst_used_pcap_throughout_false_for_empty_slice() {
+        assert!(!burst_used_pcap_throughout(&[]));
+    }
+
+    // ---- #53 continuation (adversarial-review fix): reply-origin correlation ----
+
+    /// #53 RED: an exact echo of the request's transmit timestamp must match.
+    #[test]
+    fn reply_origin_matches_request_exact_match_is_true() {
+        assert!(reply_origin_matches_request(1_000_000, 1_000_000));
+    }
+
+    /// #53 RED: a 1us difference is within the NTP fixed-point encode/decode
+    /// rounding tolerance and must still match.
+    #[test]
+    fn reply_origin_matches_request_within_one_microsecond_rounding_is_true() {
+        assert!(reply_origin_matches_request(1_000_001, 1_000_000));
+        assert!(reply_origin_matches_request(999_999, 1_000_000));
+    }
+
+    /// #53 RED: a 2us difference is already outside the encode/decode
+    /// rounding tolerance and must be rejected.
+    #[test]
+    fn reply_origin_matches_request_two_microseconds_off_is_false() {
+        assert!(!reply_origin_matches_request(1_000_002, 1_000_000));
+    }
+
+    /// #53 RED: this is the actual defect fixture — a reply whose origin
+    /// timestamp is from a MUCH earlier request (e.g. the previous
+    /// `measure_once` call's request, one 10-30s check-interval ago, or the
+    /// rsntp fallback's own independent exchange to the same server) must be
+    /// rejected as a stale/foreign reply, never paired with the current
+    /// request. The naive "accept whatever comes from server_ip" behavior
+    /// this replaces would have paired them.
+    #[test]
+    fn reply_origin_matches_request_rejects_a_reply_from_a_stale_prior_interval() {
+        let request_transmit_ts_us = 50_000_000_000i64; // "now" for this call
+        let stale_origin_ts_us = request_transmit_ts_us - 15_000_000; // 15s earlier
+        assert!(
+            !reply_origin_matches_request(stale_origin_ts_us, request_transmit_ts_us),
+            "a reply echoing a 15s-old origin timestamp must never be accepted as this \
+             request's reply"
         );
     }
 }

@@ -72,6 +72,18 @@ pub struct SyncStatus {
     /// also a reason to trust the value less).
     #[serde(default)]
     pub ntp_sample_count: usize,
+
+    /// dantesync#53 continuation: whether the kernel-timestamped Npcap NTP
+    /// transport was used for EVERY sample of the last burst (Windows only —
+    /// always `false` on platforms with no such transport). `false` here
+    /// means every sample fell back to userspace `rsntp`, which is exactly
+    /// the silent-degradation failure mode confirmed live on the stream box
+    /// (the transport failed at construction — dual-homed host, NTP server
+    /// unreachable from the PTP capture NIC — and nothing after the startup
+    /// log line ever showed it again). Monitoring/gates should treat a
+    /// persistent `false` on a Windows node as worth investigating.
+    #[serde(default)]
+    pub pcap_ntp_active: bool,
 }
 
 impl SyncStatus {
@@ -104,6 +116,7 @@ impl Default for SyncStatus {
             accumulated_phase_us: 0.0,
             ntp_spread_us: 0,
             ntp_sample_count: 0,
+            pcap_ntp_active: false,
         }
     }
 }
@@ -163,6 +176,32 @@ mod tests {
             serde_json::from_str(old_json).expect("old JSON (pre-#53) must still deserialize");
         assert_eq!(restored_old.ntp_spread_us, 0);
         assert_eq!(restored_old.ntp_sample_count, 0);
+    }
+
+    /// dantesync#53 continuation: `pcap_ntp_active` round-trips like any
+    /// other field, AND an old JSON blob missing it entirely (pre-this-fix)
+    /// still deserializes cleanly, defaulting to `false` — the honest
+    /// default (no evidence the pcap transport was ever active).
+    #[test]
+    fn test_sync_status_pcap_ntp_active_roundtrips_and_defaults_false_on_missing() {
+        let status = SyncStatus {
+            pcap_ntp_active: true,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize failed");
+        let restored: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert!(restored.pcap_ntp_active);
+
+        let old_json = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":false,"updated_ts":0,"is_locked":false,"smoothed_rate_ppm":0.0,
+            "ntp_offset_us":0,"mode":"ACQ","ntp_failed":false,"accumulated_phase_us":0.0}"#;
+        let restored_old: SyncStatus = serde_json::from_str(old_json)
+            .expect("old JSON (pre-pcap_ntp_active) must still deserialize");
+        assert!(
+            !restored_old.pcap_ntp_active,
+            "missing field must default to false, not silently claim the pcap path is active"
+        );
     }
 
     #[test]
