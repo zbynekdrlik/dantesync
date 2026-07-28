@@ -397,9 +397,14 @@ where
         }
 
         match self.ntp.get_offset() {
-            Ok((offset, sign)) => {
+            Ok(measurement) => {
+                let offset = measurement.offset;
+                let sign = measurement.sign;
                 let sign_str = if sign > 0 { "+" } else { "-" };
-                info!("NTP Sync: Offset {}{:?}", sign_str, offset);
+                info!(
+                    "NTP Sync: Offset {}{:?} (spread:{}us samples:{})",
+                    sign_str, offset, measurement.spread_us, measurement.sample_count
+                );
 
                 if offset.as_millis() > 50 {
                     info!("Stepping clock (NTP)...");
@@ -478,7 +483,9 @@ where
 
         // Query NTP and record offset
         match self.ntp.get_offset() {
-            Ok((offset, sign)) => {
+            Ok(measurement) => {
+                let offset = measurement.offset;
+                let sign = measurement.sign;
                 // Use as_micros() directly to avoid overflow from as_nanos() -> i64
                 let offset_us = if sign > 0 {
                     offset.as_micros() as i64
@@ -493,16 +500,22 @@ where
                 self.ntp_consecutive_failures = 0;
                 self.ntp_failed = false;
 
-                // Add sample to buffer
+                // Add sample to buffer. #53: `offset_us` is now the burst-filtered
+                // (RTT-selected + median'd) value from NtpClient::get_offset(), not a
+                // single raw round trip — the MAD threshold below and the #50
+                // step-agreement gate deliberately keep consuming this same per-check
+                // value unchanged; they just get a cleaner input now.
                 self.ntp_offset_samples.push_back(offset_us);
                 if self.ntp_offset_samples.len() > NTP_SAMPLE_COUNT + 2 {
                     self.ntp_offset_samples.pop_front();
                 }
 
-                // Update shared status with NTP offset for tray app display
+                // Update shared status with NTP offset + quality (#53) for tray/HTTP display
                 if let Ok(mut status) = self.status_shared.write() {
                     status.ntp_offset_us = offset_us;
                     status.ntp_failed = false;
+                    status.ntp_spread_us = measurement.spread_us;
+                    status.ntp_sample_count = measurement.sample_count;
                 }
 
                 // Calculate adaptive threshold based on offset variance
@@ -1425,10 +1438,14 @@ mod tests {
         let mock_net = MockPtpNetwork::new();
         let mut mock_ntp = MockNtpSource::new();
 
-        mock_ntp
-            .expect_get_offset()
-            .times(1)
-            .returning(|| Ok((Duration::from_millis(100), 1)));
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_millis(100),
+                sign: 1,
+                spread_us: 0,
+                sample_count: 1,
+            })
+        });
 
         mock_clock
             .expect_step_clock()
@@ -1445,6 +1462,54 @@ mod tests {
             SystemConfig::default(),
         );
         controller.run_ntp_sync(false);
+    }
+
+    /// #53: `check_ntp_utc_tracking` must propagate the burst-filter quality
+    /// fields (`spread_us`/`sample_count`) from the `NtpMeasurement` into
+    /// `SyncStatus`, not just the offset — otherwise a consumer (e.g.
+    /// camera-box's gate) has no way to tell a well-measured node from a
+    /// badly-measured one.
+    #[test]
+    fn test_check_ntp_utc_tracking_propagates_quality_fields_to_status() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(100),
+                sign: 1,
+                spread_us: 41610,
+                sample_count: 3,
+            })
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut controller = PtpController::new(
+            mock_clock,
+            mock_net,
+            mock_ntp,
+            status.clone(),
+            SystemConfig::default(),
+        );
+
+        // Force the check to run now (bypass the 10-30s adaptive interval gate)
+        // and make it eligible (PTP offline is the simplest path — the OTHER
+        // eligibility path, is_locked && ntp_tracking_enabled, needs a fuller
+        // PTP-locked setup this test doesn't need).
+        controller.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        controller.ptp_offline = true;
+
+        controller.check_ntp_utc_tracking();
+
+        let s = status.read().unwrap();
+        assert_eq!(s.ntp_offset_us, 100);
+        assert_eq!(
+            s.ntp_spread_us, 41610,
+            "spread must reach status, not just the offset"
+        );
+        assert_eq!(s.ntp_sample_count, 3);
     }
 
     #[test]
