@@ -111,7 +111,7 @@ canary evidence before continuing.
   lines 412/416/420/424/432); mechanical reference fix, no behavior change. RED reproduced locally
   via `cargo check --target x86_64-pc-windows-gnu --tests --lib` (exact same 5 `E0599` errors as the
   release log, no Npcap SDK/MSVC needed); GREEN after the fix (same command, clean).
-- CI hardening: `008345a`, revised in `<pending>` after the PR's own CI caught a real problem with
+- CI hardening: `008345a`, revised in `50d96dc` after the PR's own CI caught a real problem with
   the first attempt —
   1. `ci.yml`'s `build` job's Windows leg now runs `cargo test --no-run --verbose` (right after the
      existing Npcap SDK install, before the release build step) — closing the exact PR-gate blind
