@@ -40,6 +40,16 @@ Clients (sync to strih.lan via NTP):
 - `1-5ms`: DRIFT - May need investigation
 - `> 5ms`: ERROR - Sync problem detected
 
+**NTP measurement quality (dantesync#53):** `ntp_offset_us` (status JSON / tray) is now a
+burst-filtered, RTT-selected MEDIAN (5 raw samples/check, lowest-3-RTT accepted), not a single raw
+round trip — a single loaded-Windows-box round trip used to scatter ±20ms even while PTP reported
+locked. Two new fields expose whether to TRUST that median: `ntp_spread_us` (max-min across the
+accepted samples — large even when the offset itself looks reasonable means the node's NTP
+measurement is still noisy) and `ntp_sample_count` (how many samples backed it — lower than 3 means
+a partial burst failure). **Never read `ntp_offset_us` alone as "this node is fine" — check
+`ntp_spread_us` too.** A wide spread on an otherwise-locked node points at userspace scheduling
+jitter on THAT box (CPU load, thread starvation), not a network/PTP problem.
+
 **Sync Modes:**
 
 - `ACQ` - Acquiring lock (fast convergence)
