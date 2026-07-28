@@ -548,9 +548,18 @@ impl PcapNtpTransport {
     }
 }
 
-/// Get list of available Npcap devices
+/// Get list of available Npcap devices.
+///
+/// Adversarial-review fix (#53 continuation): this used to call
+/// `Device::list()` directly, bypassing `list_devices_guarded()` -- making
+/// that function's own doc comment ("the SINGLE choke point ... so neither
+/// path can bypass the guard") false. Zero live callers today, so there was
+/// no real #58 crash exposure yet, but a future caller (e.g. a `--list-devices`
+/// CLI flag) would have hit the exact unguarded delay-load crash #58 fixed
+/// for every other pcap:: entry point. Routed through the guard instead of
+/// just correcting the comment.
 pub fn list_npcap_devices() -> Result<Vec<String>> {
-    let devices = Device::list()?;
+    let devices = list_devices_guarded()?;
     Ok(devices
         .iter()
         .map(|d| format!("{}: {:?}", d.name, d.desc))
@@ -770,6 +779,30 @@ mod tests {
             result.is_err(),
             "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
              same #58 guard as find_device()"
+        );
+    }
+
+    /// Adversarial-review regression: `list_npcap_devices()` used to call
+    /// `Device::list()` directly, bypassing `list_devices_guarded()` -- so on
+    /// a runtime-less machine it would have crashed the process exactly like
+    /// the pre-#58 `find_device()` used to, instead of returning a graceful
+    /// `Err`. Now routed through the same guard as every other pcap:: entry
+    /// point.
+    #[test]
+    fn test_list_npcap_devices_gracefully_errors_without_npcap_runtime() {
+        if wpcap_runtime_available() {
+            eprintln!(
+                "skipping test_list_npcap_devices_gracefully_errors_without_npcap_runtime: \
+                 Npcap runtime IS installed on this machine"
+            );
+            return;
+        }
+        let result = list_npcap_devices();
+        assert!(
+            result.is_err(),
+            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
+             list_npcap_devices() must go through the same #58 guard as every other pcap:: entry \
+             point"
         );
     }
 }
