@@ -17,9 +17,21 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# #56: releases are ALL-OR-NOTHING. Each platform builds+tests and uploads its
+# assets as a workflow ARTIFACT (never touching the actual GitHub Release).
+# The `publish` job below has `needs: build`, which GitHub Actions only runs
+# once EVERY matrix instance of `build` has succeeded -- so if either platform
+# fails, `publish` is skipped entirely and NO GitHub Release/asset is ever
+# created. The tag itself (pushed by ci.yml's auto-release job, which is what
+# actually triggers this workflow) is left as a bare git ref in that case --
+# invisible to install.sh/install.ps1, which both resolve the version via the
+# `/releases/latest` API, never by walking tags. Before this fix, each
+# platform published directly and independently, so a Windows-only failure
+# still left a real, publicly-resolvable "latest" release with a missing
+# Windows asset (v1.8.22, run 30333447928).
 jobs:
   build:
-    name: Build Release Asset
+    name: Build Release Asset (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -107,24 +119,58 @@ jobs:
           sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
           sha256sum ${{ matrix.tray_asset_name }} > ${{ matrix.tray_asset_name }}.sha256
 
-      - name: Upload Release Asset (Linux)
+      # #56: upload as a workflow ARTIFACT, not a GitHub Release asset -- the
+      # actual Release is created exactly once, by `publish`, only after
+      # BOTH platforms reach this point successfully.
+      - name: Upload Release Artifact (Linux)
         if: runner.os == 'Linux'
-        uses: softprops/action-gh-release@v1
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
+          name: release-assets-linux
+          path: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
-          generate_release_notes: true
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Upload Release Asset (Windows)
+      - name: Upload Release Artifact (Windows)
         if: runner.os == 'Windows'
-        uses: softprops/action-gh-release@v1
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
+          name: release-assets-windows
+          path: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
             ${{ matrix.tray_asset_name }}
             ${{ matrix.tray_asset_name }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # #56: single atomic publish -- only reached once EVERY `build` matrix leg
+  # (Linux AND Windows) has succeeded. GitHub Actions skips a job whose
+  # `needs` target had ANY failing instance, so a Windows (or Linux) failure
+  # here means this job never runs at all: no GitHub Release is created, no
+  # asset is published, and the tag pushed by ci.yml's auto-release job is
+  # left bare -- invisible to `/releases/latest`, which install.sh/install.ps1
+  # actually query.
+  publish:
+    name: Publish Release (all platforms)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-assets-*
+          merge-multiple: true
+
+      - name: List assets to publish
+        run: ls -la release-assets
+
+      - name: Publish GitHub Release (all platforms, one shot)
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: release-assets/*
           generate_release_notes: true

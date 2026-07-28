@@ -205,6 +205,17 @@ jobs:
 
   # ============================================================================
   # Build Check (ensures code compiles on all targets)
+  #
+  # #56: the Windows leg ALSO executes `cargo test` here (not just `cargo
+  # build`) -- previously the only place Windows-only #[cfg(test)] code ever
+  # compiled was release.yml, i.e. AFTER a PR already merged. A Windows-only
+  # test that stopped compiling (dantesync#53/PR #55's
+  # NpcapPtpNetwork::pcap_ts_to_systemtime regression) passed every PR gate
+  # and only broke at release time, publishing a half-complete release
+  # (v1.8.22: Linux asset uploaded, Windows leg failed, no .exe at all).
+  # All Windows-only unit tests (net_pcap.rs/net_winsock.rs/clock/windows.rs)
+  # are pure logic/constant/layout tests with no live-device or hardware
+  # access, so running them here is safe and non-flaky.
   # ============================================================================
   build:
     name: Build Check (${{ matrix.os }})
@@ -253,6 +264,10 @@ jobs:
           Write-Host "Npcap SDK checksum verified: $actualHash"
           Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
           echo "LIB=$PWD\npcap-sdk\Lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run Tests (Windows) [#56 -- closes the PR-time blind spot]
+        if: runner.os == 'Windows'
+        run: cargo test --verbose
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
