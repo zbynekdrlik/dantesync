@@ -127,20 +127,107 @@ pub struct NtpMeasurement {
 
 pub struct NtpClient {
     server: String,
+    // dantesync#53: on Windows, a persistent kernel-timestamped (Npcap)
+    // transport, opened once at construction. `None` means either this
+    // isn't Windows, or Npcap init failed (loudly logged in `new()`) — in
+    // both cases `measure_once()` falls back to the `rsntp` path below.
+    #[cfg(windows)]
+    pcap_transport: std::sync::Mutex<Option<crate::net_pcap::PcapNtpTransport>>,
 }
 
 impl NtpClient {
-    pub fn new(server: &str) -> Self {
-        NtpClient {
-            server: server.to_string(),
+    /// `interface_name` is the same interface name `main.rs` resolves via
+    /// `net::get_default_interface()` before constructing the PTP network —
+    /// it is used ONLY on Windows, to open the kernel-timestamped NTP
+    /// capture (dantesync#53); ignored on other platforms.
+    pub fn new(server: &str, interface_name: &str) -> Self {
+        #[cfg(windows)]
+        {
+            let pcap_transport = match Self::init_pcap_transport(server, interface_name) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    log::warn!(
+                        "[NTP] Npcap kernel-timestamped transport unavailable ({}), falling back \
+                         to userspace rsntp for ALL samples — offset scatter is the KNOWN defect \
+                         this transport exists to fix (dantesync#53)",
+                        e
+                    );
+                    None
+                }
+            };
+            NtpClient {
+                server: server.to_string(),
+                pcap_transport: std::sync::Mutex::new(pcap_transport),
+            }
         }
+        #[cfg(not(windows))]
+        {
+            let _ = interface_name;
+            NtpClient {
+                server: server.to_string(),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn init_pcap_transport(
+        server: &str,
+        interface_name: &str,
+    ) -> Result<crate::net_pcap::PcapNtpTransport> {
+        let server_ip = Self::resolve_ipv4(server)?;
+        crate::net_pcap::PcapNtpTransport::new(interface_name, server_ip)
+    }
+
+    #[cfg(windows)]
+    fn resolve_ipv4(server: &str) -> Result<std::net::Ipv4Addr> {
+        use std::net::ToSocketAddrs;
+        (server, 123u16)
+            .to_socket_addrs()?
+            .find_map(|a| match a {
+                std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("could not resolve '{}' to an IPv4 address", server))
+    }
+
+    /// One measurement, preferring the kernel-timestamped Npcap transport on
+    /// Windows (dantesync#53) and falling back to the userspace `rsntp` path
+    /// — on Linux always, on Windows only when Npcap init failed at
+    /// construction or a single round trip fails transiently (logged either
+    /// way; never a silent fallback).
+    fn measure_once(&self) -> Result<RawSample> {
+        #[cfg(windows)]
+        {
+            let mut guard = self
+                .pcap_transport
+                .lock()
+                .expect("ntp pcap transport mutex poisoned");
+            if let Some(transport) = guard.as_mut() {
+                match transport.measure_once() {
+                    Ok(sample) => return Ok(sample),
+                    Err(e) => {
+                        log::warn!(
+                            "[NTP] Npcap round trip failed ({}), falling back to rsntp for this \
+                             sample",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        self.measure_once_rsntp()
     }
 
     /// One raw blocking SNTP round trip. `rsntp` 4.1.2's `SynchronizationResult`
     /// exposes only the DERIVED `clock_offset()`/`round_trip_delay()` — no raw
     /// t1..t4 accessors (confirmed by reading its source, `result.rs`) — so
     /// those two derived quantities are what get measured/logged per sample.
-    fn measure_once(&self) -> Result<RawSample> {
+    ///
+    /// This is the ORIGINAL measurement path (unchanged since before #53's
+    /// kernel-timestamp work) — still used on every platform when the
+    /// Npcap transport above isn't available, and always on Linux, where
+    /// this path is already precise (5-32us spread observed live).
+    fn measure_once_rsntp(&self) -> Result<RawSample> {
         let client = SntpClient::new();
         let result = client.synchronize(&self.server)?;
 
@@ -217,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_ntp_client_new() {
-        let client = NtpClient::new("pool.ntp.org");
+        let client = NtpClient::new("pool.ntp.org", "eth0");
         assert_eq!(client.server, "pool.ntp.org");
     }
 
