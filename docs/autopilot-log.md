@@ -44,3 +44,52 @@ Terse per-issue log of autonomous work on this repo (commits, RED->GREEN test na
 - Still needed: a live canary read-back from `stream` (10.77.9.204:8898/status) over several
   minutes to prove the ±20ms scatter is actually gone (or that `ntp_spread_us` now honestly
   surfaces it) — this worker never touched a live machine.
+
+## #53 (continued) — kernel-timestamped Npcap NTP transport for Windows
+
+v1.8.21's burst+RTT-select+median filter (above) did NOT fix the scatter — a live canary (posted
+to #53 after v1.8.21 shipped) proved the contamination lives INSIDE a single 5-sample burst (up to
+21094us spread across samples taken back to back on the stream box, vs cam1's 5-32us on the same
+server at the same instant), so no filter across a burst can rescue it. The issue had been
+auto-closed by PR #54's "Fixes #53" title despite the fix being incomplete; reopened with the
+canary evidence before continuing.
+
+- Version bump: `cd7f8c0` (1.8.21 -> 1.8.22)
+- Design comment (root cause + approach + rejected alternative), posted BEFORE any code:
+  https://github.com/zbynekdrlik/dantesync/issues/53#issuecomment-5100359554
+- RED: `ac52dbd` — new `src/ntp_packet.rs` (NTP<->Unix epoch conversion, client request build,
+  server reply parse, RFC 5905 offset/RTT formula, Ethernet+IPv4+UDP frame parsing) — 13 of 15
+  fixture tests fail against naive stubs (return 0 / all-zero buffer / accept-anything).
+- GREEN: `71e6cbb` — real implementations; all 15 pass; `cargo test --lib` 156/156.
+- Wiring: `777c315` — `PcapNtpTransport` (`src/net_pcap.rs`, cfg(windows)): separate Npcap capture
+  (HostHighPrec timestamps) filtered to the NTP server + port 123, correlates captured packets by
+  source IP to get t1 (our own request leaving the NIC) and t4 (server reply arriving) instead of
+  userspace `SystemTime::now()`; t2/t3 parsed from the reply payload. Refactored
+  `NpcapPtpNetwork::new`'s device-lookup/capture-open/timestamp-convert code into shared
+  `find_device`/`device_ipv4`/`open_hiprec_capture`/`pcap_ts_to_systemtime` helpers so PTP and NTP
+  capture paths share one implementation; `recv_packet` now uses the shared
+  `ntp_packet::parse_udp_frame` instead of duplicating frame parsing inline. `NtpClient::measure_once()`
+  gets a platform split: Windows tries the persistent pcap transport first (permanent rsntp
+  fallback + loud warning if Npcap init failed; per-sample rsntp fallback + loud warning on a
+  transient round-trip failure); Linux's `measure_once_rsntp()` is byte-for-byte unchanged.
+  `NtpClient::new()` gained an `interface_name` parameter (the one main.rs already resolves for the
+  PTP network).
+- Test: `e51456e` — `pcap_style_t1_to_t4_measurements_stay_honest_through_the_existing_filter`:
+  synthetic (t1,t2,t3,t4) quadruples (equal RTT, so RTT-selection can't discard any) spanning the
+  issue's own extremes (-18750/+22860us), run through `compute_offset_rtt_us` then the existing
+  `filter_offset` — proves the honesty guarantee survives one layer further back than the
+  already-known-offset pathological test.
+- Docs: `05c3f0f` — updated `.claude/skills/sync-monitoring.md` for the actual fix.
+- Local verification: `cargo test --lib` 157/157, `cargo test --test '*'` 11/11, `cargo fmt --check`
+  clean, `cargo clippy -- -D warnings -A dead_code` (CI's exact Linux invocation) clean. The
+  Windows-only code (`net_pcap.rs` additions, `ntp.rs` cfg(windows) blocks) additionally
+  compile-checked clean (zero new warnings) against `--target x86_64-pc-windows-gnu` and the exact
+  CI Windows build-job invocation (`--bin dantesync --bin dantesync-tray`) — the real MSVC target +
+  Npcap SDK link, and any test EXECUTION on Windows, only happen in CI's own jobs (`build` job
+  compile-checks on every PR; `release.yml` runs `cargo test` on Windows but only on a tag push,
+  i.e. after merge — this worker never touched a live machine per its dispatch constraints).
+- What the live canary must show for this to count as fixed: `ntp_spread_us` on the stream box
+  (10.77.9.204:8898/status) collapsing from the observed 877-21094us into the same order of
+  magnitude as cam1's 5-32us on the same server, over several minutes of samples — not just a
+  lower `ntp_offset_us`, since a single lucky-looking offset with a wide spread is exactly the
+  "smoothed into looking good" failure this ticket exists to prevent.
