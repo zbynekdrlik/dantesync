@@ -35,6 +35,57 @@ fn join_multicast(port: u16, iface_ip: Ipv4Addr) -> Result<UdpSocket> {
     Ok(socket.into())
 }
 
+/// Probe whether the Npcap RUNTIME (`wpcap.dll`) is actually loadable,
+/// WITHOUT ever making a delay-loaded `pcap::` call.
+///
+/// #58: `build.rs` delay-loads `wpcap.dll` (`/DELAYLOAD:wpcap.dll`) so the
+/// process can still START on a machine that has only the Npcap SDK
+/// (link-time `.lib` stubs, e.g. every `windows-latest` CI runner) and not
+/// the runtime -- but delay-load only defers WHEN the DLL is resolved, not
+/// WHETHER a missing DLL is recoverable: MSVC's default delay-load failure
+/// hook raises an unrecoverable structured exception the moment a
+/// delay-loaded symbol is first called and the DLL can't be found (observed
+/// live: `NtpClient::new()` -> `PcapNtpTransport::new()` -> `find_device()`
+/// -> `Device::list()` crashed the whole test binary with `0xc06d007e` on a
+/// runtime-less CI runner, run 30337735289). `LoadLibraryW`/`FreeLibrary`
+/// live in `kernel32.dll`, which every Windows process implicitly and
+/// STATICALLY imports (never delay-loaded) -- probing with them lets us
+/// detect a missing runtime BEFORE the first real pcap:: call, so we return
+/// a normal `Err` (exactly like any other pcap failure -- `NtpClient::new`
+/// already logs and falls back to userspace `rsntp` for this case) instead
+/// of crashing the process. This also hardens a real deployed box: if
+/// Npcap's runtime is ever missing/corrupted there, dantesync now degrades
+/// gracefully instead of crashing outright.
+pub(crate) fn wpcap_runtime_available() -> bool {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
+        fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
+    }
+
+    let wide_name: Vec<u16> = std::ffi::OsStr::new("wpcap.dll")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `wide_name` is a valid NUL-terminated UTF-16 string that
+    // outlives this call; `LoadLibraryW`/`FreeLibrary` are the standard
+    // Win32 module-loading APIs used exactly per their documented contract
+    // (probe-then-release, never retaining the handle).
+    unsafe {
+        let handle = LoadLibraryW(wide_name.as_ptr());
+        if handle.is_null() {
+            false
+        } else {
+            FreeLibrary(handle);
+            true
+        }
+    }
+}
+
 /// Find the Npcap device matching `interface_name` by name, description, or
 /// an IP-address substring in its address list.
 ///
@@ -42,6 +93,16 @@ fn join_multicast(port: u16, iface_ip: Ipv4Addr) -> Result<UdpSocket> {
 /// transport (dantesync#53, `PcapNtpTransport`) so device-matching logic
 /// exists in exactly one place instead of being duplicated per capture path.
 pub(crate) fn find_device(interface_name: &str) -> Result<Device> {
+    // #58: check BEFORE the first delay-loaded pcap:: call (Device::list(),
+    // right below), not after -- see `wpcap_runtime_available()`.
+    if !wpcap_runtime_available() {
+        return Err(anyhow!(
+            "Npcap runtime (wpcap.dll) is not installed/loadable -- only the \
+             Npcap SDK's link-time stubs are present. Install the Npcap \
+             runtime (https://npcap.com) to use Npcap-based capture."
+        ));
+    }
+
     let devices = Device::list()?;
     devices
         .iter()
@@ -510,5 +571,80 @@ mod tests {
         assert!(frame[23] == 17, "Should be UDP");
         let dst_port = ((frame[36] as u16) << 8) | frame[37] as u16;
         assert!(dst_port == 319 || dst_port == 320, "Should be PTP port");
+    }
+
+    /// #58 RED->GREEN: `wpcap_runtime_available()` must never panic/crash --
+    /// it's the guard that replaces a delay-load crash with a plain bool.
+    #[test]
+    fn test_wpcap_runtime_available_never_panics() {
+        let _ = wpcap_runtime_available();
+    }
+
+    /// #58 regression: on a machine with only the Npcap SDK (every
+    /// `windows-latest` CI runner -- confirmed absent by
+    /// `wpcap_runtime_available()` returning `false` there), constructing
+    /// either capture path must return a graceful `Err`, never crash the
+    /// process. Before this fix, `find_device()` called `Device::list()`
+    /// unconditionally, which triggered the delay-loaded `wpcap.dll` symbol
+    /// resolution and aborted the whole test binary with `0xc06d007e`
+    /// (observed live via `NtpClient::new()` in run 30337735289 -- that is
+    /// the RED this test proves GREEN). On a real box where Npcap IS
+    /// installed this test is a no-op (skipped) -- it is specifically about
+    /// the "runtime missing" degradation path, not normal capture behavior.
+    #[test]
+    fn test_find_device_gracefully_errors_without_npcap_runtime() {
+        if wpcap_runtime_available() {
+            eprintln!(
+                "skipping test_find_device_gracefully_errors_without_npcap_runtime: \
+                 Npcap runtime IS installed on this machine"
+            );
+            return;
+        }
+        let result = find_device("eth0");
+        assert!(
+            result.is_err(),
+            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
+             this used to crash the whole process (#58)"
+        );
+    }
+
+    /// #58 regression: same guard, exercised through the public
+    /// `PcapNtpTransport::new()` entry point (the exact call chain that
+    /// crashed via `NtpClient::new()` in ntp.rs's own `test_ntp_client_new`).
+    #[test]
+    fn test_pcap_ntp_transport_new_gracefully_errors_without_npcap_runtime() {
+        if wpcap_runtime_available() {
+            eprintln!(
+                "skipping test_pcap_ntp_transport_new_gracefully_errors_without_npcap_runtime: \
+                 Npcap runtime IS installed on this machine"
+            );
+            return;
+        }
+        let result = PcapNtpTransport::new("eth0", Ipv4Addr::new(127, 0, 0, 1));
+        assert!(
+            result.is_err(),
+            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
+             this used to crash the whole process (#58)"
+        );
+    }
+
+    /// #58 regression: the PTP capture path (`NpcapPtpNetwork::new`) shares
+    /// `find_device()` with `PcapNtpTransport::new` -- same guard, same
+    /// graceful-Err expectation when the runtime is missing.
+    #[test]
+    fn test_npcap_ptp_network_new_gracefully_errors_without_npcap_runtime() {
+        if wpcap_runtime_available() {
+            eprintln!(
+                "skipping test_npcap_ptp_network_new_gracefully_errors_without_npcap_runtime: \
+                 Npcap runtime IS installed on this machine"
+            );
+            return;
+        }
+        let result = NpcapPtpNetwork::new("eth0");
+        assert!(
+            result.is_err(),
+            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
+             this used to crash the whole process (#58)"
+        );
     }
 }
