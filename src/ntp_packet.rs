@@ -204,6 +204,55 @@ pub fn parse_udp_frame(data: &[u8]) -> Option<(Ipv4Addr, u16, &[u8])> {
 }
 
 // ============================================================================
+// #53 continuation — select the pcap NTP device by NTP-server reachability
+// ============================================================================
+// v1.8.24 confirmed live on a dual-homed host (stream box: Dante 10.77.7.204/23,
+// LAN 10.77.9.204/23) that `PcapNtpTransport` inheriting the PTP capture
+// interface can never work when PTP and NTP live on different subnets — the
+// NTP server is genuinely unreachable from the PTP-selected device
+// (WSAENETUNREACH / os error 10051), so the transport silently degrades to
+// userspace rsntp for every sample, forever. The fix: pick the pcap device by
+// which interface's subnet actually CONTAINS the (resolved) NTP server
+// address — the same decision `Find-NetRoute` makes, made automatically and
+// testably. Pure, zero-pcap-dependency, so it is unit-tested on Linux CI
+// exactly like the wire-format math above.
+// ============================================================================
+
+/// One Npcap-visible network interface candidate for NTP-transport device
+/// selection: a device's name plus ONE of its IPv4 address/netmask pairs,
+/// pulled out of the platform-specific `pcap::Device` into a plain value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateInterface {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub netmask: Option<Ipv4Addr>,
+}
+
+/// Select which `candidates` entry can actually reach `server_ip` — never by
+/// name, only by whether the candidate's OWN subnet contains the server
+/// address. Returns `None` when no candidate's subnet contains `server_ip`.
+///
+/// #53 RED: placeholder just returns the first candidate that HAS a netmask,
+/// ignoring `server_ip` entirely — wrong the moment more than one candidate
+/// carries a netmask (the exact dual-homed shape this ticket is about).
+pub fn select_ntp_pcap_device(
+    server_ip: Ipv4Addr,
+    candidates: &[CandidateInterface],
+) -> Option<usize> {
+    let _ = server_ip;
+    candidates.iter().position(|c| c.netmask.is_some())
+}
+
+/// Whether the kernel-timestamped Npcap NTP transport was used for EVERY
+/// sample in a burst — `false` the instant even one sample fell back to
+/// userspace rsntp, and `false` for an empty burst.
+///
+/// #53 RED: placeholder just checks the first flag, ignoring the rest.
+pub fn burst_used_pcap_throughout(via_pcap_flags: &[bool]) -> bool {
+    via_pcap_flags.first().copied().unwrap_or(false)
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -450,5 +499,138 @@ mod tests {
             parse_udp_frame(&frame).is_none(),
             "a 20-byte frame is too short to contain Ethernet+IP+UDP headers"
         );
+    }
+
+    // ---- #53 continuation: pcap NTP device selection by reachability ----
+
+    /// #53 RED: reproduces the EXACT live stream-box topology — Dante on
+    /// 10.77.7.204/23 (where the PTP capture binds), LAN on 10.77.9.204/23
+    /// (where the NTP server actually lives). The LAN candidate must be
+    /// selected because ONLY its subnet contains the server address; the
+    /// placeholder just returns the first candidate with a netmask (Dante,
+    /// listed first) regardless of `server_ip`, so this fails against it.
+    #[test]
+    fn select_ntp_pcap_device_picks_the_subnet_that_contains_the_server() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23
+            },
+        ];
+
+        let selected = select_ntp_pcap_device(server_ip, &candidates);
+
+        assert_eq!(
+            selected,
+            Some(1),
+            "the LAN device (index 1) is the only one whose /23 subnet contains \
+             10.77.9.202 -- Dante's 10.77.6.0-10.77.7.255 does not overlap LAN's \
+             10.77.8.0-10.77.9.255"
+        );
+    }
+
+    /// #53 RED: when NO candidate's subnet contains the server address, the
+    /// selector must return `None` rather than guessing a device.
+    #[test]
+    fn select_ntp_pcap_device_returns_none_when_no_candidate_can_reach_server() {
+        let server_ip: Ipv4Addr = "192.168.1.5".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "Ethernet 2 (Dante)".to_string(),
+                ip: "10.77.7.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()),
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()),
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            None,
+            "no candidate's /23 subnet contains 192.168.1.5 -- must be None, not a guess"
+        );
+    }
+
+    /// #53 RED: on overlap (more than one candidate's subnet contains the
+    /// server), the MOST SPECIFIC (longest-prefix / smallest) subnet must
+    /// win -- mirrors standard IP routing "longest prefix match". The
+    /// placeholder ignores this entirely (just picks the first with a
+    /// netmask), so this fails when the broader (/16) candidate is listed
+    /// first.
+    #[test]
+    fn select_ntp_pcap_device_prefers_longest_prefix_on_overlap() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "broad /16".to_string(),
+                ip: "10.77.0.1".parse().unwrap(),
+                netmask: Some("255.255.0.0".parse().unwrap()), // /16, also contains the server
+            },
+            CandidateInterface {
+                name: "specific /23".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()), // /23, more specific
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(1),
+            "both subnets contain the server, but the /23 (index 1) is more specific \
+             than the /16 (index 0) and must win"
+        );
+    }
+
+    /// #53 RED: a candidate with no netmask (e.g. an interface pcap couldn't
+    /// fully enumerate) can never be selected, even if its bare address
+    /// happens to share the server's first octets.
+    #[test]
+    fn select_ntp_pcap_device_skips_candidates_without_netmask() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [CandidateInterface {
+            name: "no netmask".to_string(),
+            ip: "10.77.9.1".parse().unwrap(),
+            netmask: None,
+        }];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            None,
+            "a candidate with no netmask must never be selected"
+        );
+    }
+
+    /// #53 RED: the aggregate must be `true` only when EVERY sample in the
+    /// burst used the pcap transport. The placeholder only checks the FIRST
+    /// flag, so a burst that starts pcap=true but degrades partway through
+    /// (a transient per-sample fallback) would be wrongly reported active.
+    #[test]
+    fn burst_used_pcap_throughout_true_only_when_all_true() {
+        assert!(burst_used_pcap_throughout(&[true, true, true]));
+        assert!(
+            !burst_used_pcap_throughout(&[true, true, false]),
+            "one fallback sample must flip the whole burst to NOT active"
+        );
+        assert!(
+            !burst_used_pcap_throughout(&[false, true, true]),
+            "a leading fallback sample must also flip it -- not just a trailing one"
+        );
+    }
+
+    /// #53 RED: an empty burst (every sample failed outright) must never be
+    /// reported as "pcap active" — no samples is not "active".
+    #[test]
+    fn burst_used_pcap_throughout_false_for_empty_slice() {
+        assert!(!burst_used_pcap_throughout(&[]));
     }
 }
