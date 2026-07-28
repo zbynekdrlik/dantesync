@@ -40,15 +40,26 @@ Clients (sync to strih.lan via NTP):
 - `1-5ms`: DRIFT - May need investigation
 - `> 5ms`: ERROR - Sync problem detected
 
-**NTP measurement quality (dantesync#53):** `ntp_offset_us` (status JSON / tray) is now a
+**NTP measurement quality (dantesync#53):** `ntp_offset_us` (status JSON / tray) is a
 burst-filtered, RTT-selected MEDIAN (5 raw samples/check, lowest-3-RTT accepted), not a single raw
-round trip — a single loaded-Windows-box round trip used to scatter ±20ms even while PTP reported
-locked. Two new fields expose whether to TRUST that median: `ntp_spread_us` (max-min across the
+round trip. Two fields expose whether to TRUST that median: `ntp_spread_us` (max-min across the
 accepted samples — large even when the offset itself looks reasonable means the node's NTP
 measurement is still noisy) and `ntp_sample_count` (how many samples backed it — lower than 3 means
 a partial burst failure). **Never read `ntp_offset_us` alone as "this node is fine" — check
-`ntp_spread_us` too.** A wide spread on an otherwise-locked node points at userspace scheduling
-jitter on THAT box (CPU load, thread starvation), not a network/PTP problem.
+`ntp_spread_us` too.**
+
+The burst+RTT-select+median filter ALONE (v1.8.21) did NOT fix a loaded Windows box's ±20ms
+scatter — a live canary proved the contamination lives INSIDE a single 5-sample burst (samples
+taken back to back spread by up to 21ms), so no amount of filtering across a burst can recover a
+clean measurement; only a Linux client, on the same server at the same instant, stayed tight
+(5-32us). The real fix (v1.8.22) is a kernel-timestamped Npcap transport for Windows NTP
+(`PcapNtpTransport` in `src/net_pcap.rs`) — the same `HostHighPrec`/`KeQuerySystemTimePrecise()`
+technique the PTP receive path already used, now applied to both t1 (our own request leaving the
+NIC) and t4 (the server's reply arriving) instead of userspace `SystemTime::now()`. Linux is
+unchanged (`rsntp`, already precise). A wide `ntp_spread_us` on an otherwise-locked Windows node
+now most likely means either the Npcap transport failed to initialize (permanent rsntp fallback,
+logged loudly at startup) or the network/server path itself is genuinely noisy — check the log for
+`[NTP] Npcap kernel-timestamped transport unavailable` before assuming it's a CPU/scheduling issue.
 
 **Sync Modes:**
 
