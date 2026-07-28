@@ -22,17 +22,23 @@ paths:
   genuine type/borrow/API error in `#[cfg(windows)]` **production** code fails a PR here. But
   `cargo build` never activates `#[cfg(test)]` code, so this alone proved nothing about the
   `mod tests` blocks in these same files.
-- **Fixed in #56:** `ci.yml`'s `build` job's Windows leg now ALSO runs `cargo test --verbose`
-  (right after the Npcap SDK install, before the release build step) — the exact same command
-  `release.yml` runs. This is what PR CI was missing: dantesync#53/PR #55 refactored
-  `pcap_ts_to_systemtime` out of `NpcapPtpNetwork` into a free function but left 5 Windows-only test
-  call sites calling the old associated-function path; that compile break passed every PR gate
-  (nothing on a PR ever activated `#[cfg(test)]` on Windows) and only surfaced in `release.yml`
-  **after** the tag was already pushed and the Linux asset already published in parallel (v1.8.22,
-  run 30333447928: Linux asset live, Windows leg failed, no `.exe` at all). All Windows-only unit
-  tests across `net_pcap.rs`/`net_winsock.rs`/`clock/windows.rs` are pure logic/constant/layout
-  tests with zero live-device or hardware access, so running them on every PR is safe and
-  non-flaky — this is not a partial mitigation, the class of bug is now caught at PR time.
+- **Fixed in #56:** `ci.yml`'s `build` job's Windows leg now ALSO runs `cargo test --no-run
+  --verbose` (right after the Npcap SDK install, before the release build step) — this compiles
+  AND links every test binary (lib + every `#[cfg(test)] mod tests`) without executing any of
+  them. This is what PR CI was missing: dantesync#53/PR #55 refactored `pcap_ts_to_systemtime` out
+  of `NpcapPtpNetwork` into a free function but left 5 Windows-only test call sites calling the old
+  associated-function path; that compile break passed every PR gate (nothing on a PR ever activated
+  `#[cfg(test)]` on Windows) and only surfaced in `release.yml` **after** the tag was already
+  pushed and the Linux asset already published in parallel (v1.8.22, run 30333447928: Linux asset
+  live, Windows leg failed, no `.exe` at all). `--no-run` is the deliberate choice, not a bare
+  `cargo test`: a bare `cargo test --verbose` was tried first here and hit a real
+  `STATUS_DLL_NOT_FOUND` crash starting the produced test binary, specific to THIS job (it restores
+  a cached `target/` via `actions/cache`, which `release.yml`'s job never does — `release.yml`'s own
+  `cargo test --verbose` keeps working reliably in its cache-free environment). `--no-run` sidesteps
+  that whole question: linking only needs the Npcap SDK's import library (already installed here),
+  never the runtime DLL, so it is 100% deterministic regardless of what caused the execution crash.
+  This still fully closes the gap for the class of bug that shipped v1.8.22 — a compile/link error
+  in `mod tests` — which is exactly what PR CI was missing.
 - `release.yml` itself is now **all-or-nothing** (#56): both platform legs upload their binaries as
   workflow artifacts instead of publishing directly; a single `publish` job (`needs: build`, which
   only runs once *every* matrix leg succeeds) creates the GitHub Release exactly once with the
@@ -41,10 +47,12 @@ paths:
   *different* class of Windows-only bug slips past the now-hardened PR gate above.
 
 **Consequence:** the historic "no PR-time signal beyond compiles" caveat is closed for
-*compile-time* breaks in `mod tests`. It is still worth pulling interesting *logic* into a plain
+*compile-time and link-time* breaks in `mod tests` — but PR CI still never EXECUTES a Windows-only
+test (only `release.yml` does, after merge); a logic bug inside a Windows-only test body is still
+only caught at release time. It is still worth pulling interesting *logic* into a plain
 (non-`cfg`-gated) module wherever possible (see `src/ntp_packet.rs`, added in #53) so it gets real
-Linux-CI coverage too — the Windows PR job proves Windows-specific glue compiles and its own tests
-pass, but a Linux-side plain-module test is cheaper to run and iterate on locally.
+Linux-CI execution too — the Windows PR job proves Windows-specific glue compiles and links; a
+Linux-side plain-module test is what actually exercises the logic on every PR.
 
 ## Getting a REAL local compile-check without the Npcap SDK
 

@@ -111,11 +111,17 @@ canary evidence before continuing.
   lines 412/416/420/424/432); mechanical reference fix, no behavior change. RED reproduced locally
   via `cargo check --target x86_64-pc-windows-gnu --tests --lib` (exact same 5 `E0599` errors as the
   release log, no Npcap SDK/MSVC needed); GREEN after the fix (same command, clean).
-- CI hardening: `008345a` —
-  1. `ci.yml`'s `build` job's Windows leg now runs `cargo test --verbose` (right after the existing
-     Npcap SDK install, before the release build step) — closing the exact PR-gate blind spot that
-     let this ship. Verified all 27 Windows-only unit tests are pure logic/constant/layout tests
-     with zero live-device/hardware access, so this is safe and non-flaky in CI.
+- CI hardening: `008345a`, revised in `<pending>` after the PR's own CI caught a real problem with
+  the first attempt —
+  1. `ci.yml`'s `build` job's Windows leg now runs `cargo test --no-run --verbose` (right after the
+     existing Npcap SDK install, before the release build step) — closing the exact PR-gate blind
+     spot that let this ship (compiles+links every test binary, catching the E0599-class break).
+     First attempt used a bare `cargo test --verbose` (matching release.yml); that hit a real
+     `STATUS_DLL_NOT_FOUND` crash starting the produced test binary in the PR's own CI run — specific
+     to this job (it restores a cached `target/` via `actions/cache`, which `release.yml`'s job never
+     does). `--no-run` sidesteps the whole question since linking never needs the runtime DLL, and is
+     exactly the minimum the ticket itself named as sufficient ("cargo test --no-run, or
+     equivalent").
   2. `release.yml` reworked to be all-or-nothing: both platform legs upload their binaries as
      workflow artifacts (`actions/upload-artifact@v4`); a new `publish` job (`needs: build`, which
      GitHub Actions only runs once every matrix leg succeeds) downloads all artifacts and calls
