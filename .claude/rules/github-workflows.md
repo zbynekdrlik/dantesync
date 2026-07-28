@@ -31,6 +31,15 @@ unrelated findings (this repo does: two shellcheck quoting nits elsewhere in `ci
 PRE-change version too (`git show <base-sha>:.github/workflows/X.yml > /tmp/orig.yml`) and diff the
 finding sets — only NEW findings are yours to fix.
 
+**Same "diff against base" discipline applies to `cargo clippy`/`cargo check` output, not just
+actionlint** — but those need a full crate build, so a single-file `git show > /tmp/orig.yml`
+doesn't work. Use a throwaway `git worktree add -q /tmp/<name> <base-sha>` instead (keeps the
+current checkout untouched, no stash needed), run the same clippy/check command there, compare
+counts (`grep -c "^error:"` for clippy), then `git worktree remove /tmp/<name> --force`. This is
+what caught, on the local `x86_64-pc-windows-gnu` proxy target, that #58's new FFI code added zero
+NEW clippy findings — the pre-existing `field_reassign_with_default` (time_server.rs) and
+`useless_vec` (net_pcap.rs's own older test) hits were identical on both sides (23 == 23).
+
 ## A YAML/logic fix is not proof the job actually WORKS — the runtime environment can still surprise you
 
 actionlint (and `python3 -c "import yaml; yaml.safe_load(...)"` for pure syntax) only prove the
