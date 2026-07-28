@@ -123,6 +123,14 @@ pub struct NtpMeasurement {
     pub spread_us: u64,
     /// See `FilteredOffset::sample_count`.
     pub sample_count: usize,
+    /// dantesync#53 continuation: whether the kernel-timestamped Npcap
+    /// transport was used for EVERY sample in this burst (never smoothed —
+    /// `false` the instant even one sample fell back to userspace rsntp).
+    /// Surfaces the silent-degradation failure mode confirmed live on the
+    /// stream box: the transport can fail at construction (dual-homed host,
+    /// NTP server unreachable from the PTP capture NIC) and nothing after
+    /// startup ever showed it again.
+    pub pcap_active: bool,
 }
 
 pub struct NtpClient {
@@ -136,14 +144,16 @@ pub struct NtpClient {
 }
 
 impl NtpClient {
-    /// `interface_name` is the same interface name `main.rs` resolves via
-    /// `net::get_default_interface()` before constructing the PTP network —
-    /// it is used ONLY on Windows, to open the kernel-timestamped NTP
-    /// capture (dantesync#53); ignored on other platforms.
-    pub fn new(server: &str, interface_name: &str) -> Self {
+    /// dantesync#53 continuation: no longer takes an `interface_name` — the
+    /// Npcap NTP capture device (Windows only) is now selected by which
+    /// interface can actually REACH `server`, not by inheriting the PTP
+    /// capture interface (which fails outright on a dual-homed host where
+    /// PTP and NTP live on different subnets — confirmed live on the stream
+    /// box). See `net_pcap::find_device_for_ntp_server`.
+    pub fn new(server: &str) -> Self {
         #[cfg(windows)]
         {
-            let pcap_transport = match Self::init_pcap_transport(server, interface_name) {
+            let pcap_transport = match Self::init_pcap_transport(server) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     log::warn!(
@@ -162,7 +172,6 @@ impl NtpClient {
         }
         #[cfg(not(windows))]
         {
-            let _ = interface_name;
             NtpClient {
                 server: server.to_string(),
             }
@@ -170,12 +179,9 @@ impl NtpClient {
     }
 
     #[cfg(windows)]
-    fn init_pcap_transport(
-        server: &str,
-        interface_name: &str,
-    ) -> Result<crate::net_pcap::PcapNtpTransport> {
+    fn init_pcap_transport(server: &str) -> Result<crate::net_pcap::PcapNtpTransport> {
         let server_ip = Self::resolve_ipv4(server)?;
-        crate::net_pcap::PcapNtpTransport::new(interface_name, server_ip)
+        crate::net_pcap::PcapNtpTransport::new(server_ip)
     }
 
     #[cfg(windows)]
@@ -194,8 +200,11 @@ impl NtpClient {
     /// Windows (dantesync#53) and falling back to the userspace `rsntp` path
     /// — on Linux always, on Windows only when Npcap init failed at
     /// construction or a single round trip fails transiently (logged either
-    /// way; never a silent fallback).
-    fn measure_once(&self) -> Result<RawSample> {
+    /// way; never a silent fallback). The `bool` reports whether THIS sample
+    /// was satisfied by the pcap transport (dantesync#53 continuation:
+    /// `pcap_ntp_active` status signal) — always `false` on non-Windows,
+    /// where no such transport exists.
+    fn measure_once(&self) -> (Result<RawSample>, bool) {
         #[cfg(windows)]
         {
             let mut guard = self
@@ -204,7 +213,7 @@ impl NtpClient {
                 .expect("ntp pcap transport mutex poisoned");
             if let Some(transport) = guard.as_mut() {
                 match transport.measure_once() {
-                    Ok(sample) => return Ok(sample),
+                    Ok(sample) => return (Ok(sample), true),
                     Err(e) => {
                         log::warn!(
                             "[NTP] Npcap round trip failed ({}), falling back to rsntp for this \
@@ -215,7 +224,7 @@ impl NtpClient {
                 }
             }
         }
-        self.measure_once_rsntp()
+        (self.measure_once_rsntp(), false)
     }
 
     /// One raw blocking SNTP round trip. `rsntp` 4.1.2's `SynchronizationResult`
@@ -250,10 +259,15 @@ impl NtpClient {
     /// behind (needs to step forward).
     pub fn get_offset(&self) -> Result<NtpMeasurement> {
         let mut raw = Vec::with_capacity(NTP_BURST_SIZE);
+        let mut via_pcap_flags = Vec::with_capacity(NTP_BURST_SIZE);
         let mut last_err = None;
         for _ in 0..NTP_BURST_SIZE {
-            match self.measure_once() {
-                Ok(sample) => raw.push(sample),
+            let (result, via_pcap) = self.measure_once();
+            match result {
+                Ok(sample) => {
+                    raw.push(sample);
+                    via_pcap_flags.push(via_pcap);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
@@ -262,13 +276,20 @@ impl NtpClient {
         let filtered = filter_offset(&raw, NTP_BURST_ACCEPT_N)
             .ok_or_else(|| last_err.unwrap_or_else(|| anyhow!("NTP burst: no server response")))?;
 
+        // dantesync#53 continuation: pure, Linux-testable aggregation --
+        // `true` only when EVERY sample in the burst used the kernel-
+        // timestamped pcap transport (never smoothed away by a partial
+        // fallback).
+        let pcap_active = crate::ntp_packet::burst_used_pcap_throughout(&via_pcap_flags);
+
         log::info!(
-            "[NTP] burst offset:{:+}us spread:{}us samples:{}/{} (discarded {})",
+            "[NTP] burst offset:{:+}us spread:{}us samples:{}/{} (discarded {}) pcap_active:{}",
             filtered.offset_us,
             filtered.spread_us,
             filtered.sample_count,
             NTP_BURST_SIZE,
             discarded,
+            pcap_active,
         );
 
         let sign: i8 = if filtered.offset_us < 0 { -1 } else { 1 };
@@ -279,6 +300,7 @@ impl NtpClient {
             sign,
             spread_us: filtered.spread_us,
             sample_count: filtered.sample_count,
+            pcap_active,
         })
     }
 }
@@ -304,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_ntp_client_new() {
-        let client = NtpClient::new("pool.ntp.org", "eth0");
+        let client = NtpClient::new("pool.ntp.org");
         assert_eq!(client.server, "pool.ntp.org");
     }
 

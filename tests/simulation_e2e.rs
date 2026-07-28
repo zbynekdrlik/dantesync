@@ -156,6 +156,7 @@ impl NtpSource for SimNtp {
             sign,
             spread_us: 0,
             sample_count: 1,
+            pcap_active: false,
         })
     }
 }
@@ -177,6 +178,7 @@ impl NtpSource for DriftingNtp {
             sign,
             spread_us: 0,
             sample_count: 1,
+            pcap_active: false,
         })
     }
 }

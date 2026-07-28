@@ -228,28 +228,51 @@ pub struct CandidateInterface {
     pub netmask: Option<Ipv4Addr>,
 }
 
+/// Whether `target` falls inside the subnet defined by `ip`/`netmask`
+/// (standard IP containment: masking both addresses must produce the same
+/// network prefix).
+fn same_subnet(ip: Ipv4Addr, netmask: Ipv4Addr, target: Ipv4Addr) -> bool {
+    (u32::from(ip) & u32::from(netmask)) == (u32::from(target) & u32::from(netmask))
+}
+
 /// Select which `candidates` entry can actually reach `server_ip` — never by
 /// name, only by whether the candidate's OWN subnet contains the server
-/// address. Returns `None` when no candidate's subnet contains `server_ip`.
+/// address. On more than one match, the MOST SPECIFIC (longest-prefix /
+/// smallest) subnet wins, mirroring standard IP routing "longest prefix
+/// match" — a stable sort keeps the first-listed candidate on an exact tie.
+/// Returns `None` when no candidate's subnet contains `server_ip`.
 ///
-/// #53 RED: placeholder just returns the first candidate that HAS a netmask,
-/// ignoring `server_ip` entirely — wrong the moment more than one candidate
-/// carries a netmask (the exact dual-homed shape this ticket is about).
+/// #53 GREEN: real subnet-containment selection instead of a name-based or
+/// arrival-order guess.
 pub fn select_ntp_pcap_device(
     server_ip: Ipv4Addr,
     candidates: &[CandidateInterface],
 ) -> Option<usize> {
-    let _ = server_ip;
-    candidates.iter().position(|c| c.netmask.is_some())
+    let mut matches: Vec<(usize, u32)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let netmask = c.netmask?;
+            if same_subnet(c.ip, netmask, server_ip) {
+                Some((i, u32::from(netmask).count_ones()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Stable sort descending by prefix length -- an exact tie keeps the
+    // original (first-listed) relative order.
+    matches.sort_by_key(|&(_, prefix_len)| std::cmp::Reverse(prefix_len));
+    matches.first().map(|&(i, _)| i)
 }
 
 /// Whether the kernel-timestamped Npcap NTP transport was used for EVERY
 /// sample in a burst — `false` the instant even one sample fell back to
 /// userspace rsntp, and `false` for an empty burst.
 ///
-/// #53 RED: placeholder just checks the first flag, ignoring the rest.
+/// #53 GREEN: a real "every flag true, and non-empty" check.
 pub fn burst_used_pcap_throughout(via_pcap_flags: &[bool]) -> bool {
-    via_pcap_flags.first().copied().unwrap_or(false)
+    !via_pcap_flags.is_empty() && via_pcap_flags.iter().all(|&v| v)
 }
 
 // ============================================================================

@@ -86,13 +86,12 @@ pub(crate) fn wpcap_runtime_available() -> bool {
     }
 }
 
-/// Find the Npcap device matching `interface_name` by name, description, or
-/// an IP-address substring in its address list.
-///
-/// Shared by the PTP capture path (below) and the NTP kernel-timestamped
-/// transport (dantesync#53, `PcapNtpTransport`) so device-matching logic
-/// exists in exactly one place instead of being duplicated per capture path.
-pub(crate) fn find_device(interface_name: &str) -> Result<Device> {
+/// Guarded device enumeration — the SINGLE choke point before any
+/// `pcap::Device::list()` call (the #58 delay-load crash guard). BOTH
+/// name-based selection (`find_device`, PTP) and NTP-server-reachability
+/// selection (`find_device_for_ntp_server`, dantesync#53 continuation) go
+/// through this, so neither path can bypass the guard.
+fn list_devices_guarded() -> Result<Vec<Device>> {
     // #58: check BEFORE the first delay-loaded pcap:: call (Device::list(),
     // right below), not after -- see `wpcap_runtime_available()`.
     if !wpcap_runtime_available() {
@@ -102,8 +101,18 @@ pub(crate) fn find_device(interface_name: &str) -> Result<Device> {
              runtime (https://npcap.com) to use Npcap-based capture."
         ));
     }
+    Ok(Device::list()?)
+}
 
-    let devices = Device::list()?;
+/// Find the Npcap device matching `interface_name` by name, description, or
+/// an IP-address substring in its address list.
+///
+/// Shared by the PTP capture path (below) — the NTP kernel-timestamped
+/// transport (dantesync#53) uses `find_device_for_ntp_server` instead
+/// (selection by NTP-server reachability, not by inherited PTP interface
+/// name — see that function's doc comment for why).
+pub(crate) fn find_device(interface_name: &str) -> Result<Device> {
+    let devices = list_devices_guarded()?;
     devices
         .iter()
         .find(|d| {
@@ -133,6 +142,58 @@ pub(crate) fn find_device(interface_name: &str) -> Result<Device> {
                 available
             )
         })
+}
+
+/// Select the Npcap device whose IPv4 subnet can actually reach
+/// `server_ip` — NOT the PTP capture interface (dantesync#53 continuation).
+///
+/// Confirmed live on the stream box: `PcapNtpTransport` used to inherit the
+/// PTP capture device (`find_device(interface_name)`), which fails outright
+/// on a dual-homed host where PTP (Dante) and NTP (LAN) live on different
+/// subnets — the NTP server is genuinely unreachable from that device
+/// (WSAENETUNREACH / os error 10051). This instead enumerates EVERY Npcap
+/// device's IPv4 addresses and picks the one whose subnet contains the
+/// (already-resolved) `server_ip`, via the pure, unit-tested
+/// `ntp_packet::select_ntp_pcap_device` — the same decision a manual
+/// `Find-NetRoute` makes, made automatically.
+pub(crate) fn find_device_for_ntp_server(server_ip: Ipv4Addr) -> Result<Device> {
+    let devices = list_devices_guarded()?;
+
+    let mut candidates = Vec::new();
+    let mut candidate_device_idx = Vec::new();
+    for (idx, d) in devices.iter().enumerate() {
+        for a in &d.addresses {
+            if let (std::net::IpAddr::V4(ip), Some(std::net::IpAddr::V4(netmask))) =
+                (a.addr, a.netmask)
+            {
+                if !ip.is_loopback() {
+                    candidates.push(crate::ntp_packet::CandidateInterface {
+                        name: d.name.clone(),
+                        ip,
+                        netmask: Some(netmask),
+                    });
+                    candidate_device_idx.push(idx);
+                }
+            }
+        }
+    }
+
+    match crate::ntp_packet::select_ntp_pcap_device(server_ip, &candidates) {
+        Some(ci) => Ok(devices[candidate_device_idx[ci]].clone()),
+        None => {
+            let considered: Vec<String> = candidates
+                .iter()
+                .map(|c| format!("{} ({})", c.name, c.ip))
+                .collect();
+            Err(anyhow!(
+                "No Npcap-capturable interface can reach NTP server {} -- considered: [{}] \
+                 (dantesync#53: this host may be dual-homed with PTP and NTP on separate \
+                 networks)",
+                server_ip,
+                considered.join(", ")
+            ))
+        }
+    }
 }
 
 /// The device's first non-loopback IPv4 address.
@@ -343,12 +404,14 @@ pub struct PcapNtpTransport {
 }
 
 impl PcapNtpTransport {
-    /// `interface_name` is the same interface name `main.rs` resolves via
-    /// `net::get_default_interface()` before constructing the PTP Npcap
-    /// network. `server_ip` is the already-resolved NTP server address (the
-    /// BPF filter needs a concrete IP, not a hostname).
-    pub fn new(interface_name: &str, server_ip: Ipv4Addr) -> Result<Self> {
-        let device = find_device(interface_name)?;
+    /// `server_ip` is the already-resolved NTP server address (the BPF
+    /// filter needs a concrete IP, not a hostname). The capture device is
+    /// selected by which interface can actually REACH `server_ip`
+    /// (`find_device_for_ntp_server`, dantesync#53 continuation) — NOT by
+    /// inheriting the PTP capture interface, which fails outright on a
+    /// dual-homed host where PTP and NTP live on different subnets.
+    pub fn new(server_ip: Ipv4Addr) -> Result<Self> {
+        let device = find_device_for_ntp_server(server_ip)?;
         let local_ip = device_ipv4(&device)?;
 
         let filter = format!("udp and host {} and port {}", server_ip, NTP_PORT);
@@ -363,7 +426,7 @@ impl PcapNtpTransport {
 
         info!(
             "[NTP][Npcap] kernel-timestamped NTP transport ready: {} ({}) -> {}",
-            interface_name, local_ip, server_ip
+            device.name, local_ip, server_ip
         );
 
         Ok(Self {
@@ -620,7 +683,7 @@ mod tests {
             );
             return;
         }
-        let result = PcapNtpTransport::new("eth0", Ipv4Addr::new(127, 0, 0, 1));
+        let result = PcapNtpTransport::new(Ipv4Addr::new(127, 0, 0, 1));
         assert!(
             result.is_err(),
             "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
@@ -645,6 +708,27 @@ mod tests {
             result.is_err(),
             "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
              this used to crash the whole process (#58)"
+        );
+    }
+
+    /// #53 continuation regression: `find_device_for_ntp_server` -- the NEW
+    /// NTP-server-reachability selection path -- goes through the SAME #58
+    /// guard as `find_device`. On a runtime-less machine it must return a
+    /// graceful `Err`, never crash, exactly like the name-based path above.
+    #[test]
+    fn test_find_device_for_ntp_server_gracefully_errors_without_npcap_runtime() {
+        if wpcap_runtime_available() {
+            eprintln!(
+                "skipping test_find_device_for_ntp_server_gracefully_errors_without_npcap_runtime: \
+                 Npcap runtime IS installed on this machine"
+            );
+            return;
+        }
+        let result = find_device_for_ntp_server(Ipv4Addr::new(10, 77, 9, 202));
+        assert!(
+            result.is_err(),
+            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
+             same #58 guard as find_device()"
         );
     }
 }
