@@ -572,6 +572,16 @@ where
                 // Track consecutive failures
                 self.ntp_consecutive_failures += 1;
 
+                // Adversarial-review fix (#53 continuation): a failed burst
+                // produced NO measurement at all, so `pcap_ntp_active` must
+                // never keep reporting whatever it was set to by the last
+                // SUCCESSFUL burst -- otherwise a consumer reading this field
+                // alone during an outage is told the kernel-timestamped
+                // transport is still active when nothing ran this check.
+                if let Ok(mut status) = self.status_shared.write() {
+                    status.pcap_ntp_active = false;
+                }
+
                 if self.ntp_consecutive_failures >= NTP_FAILURE_THRESHOLD && !self.ntp_failed {
                     self.ntp_failed = true;
                     warn!(
