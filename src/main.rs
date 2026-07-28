@@ -244,7 +244,7 @@ struct RealNtpSource {
 }
 
 impl NtpSource for RealNtpSource {
-    fn get_offset(&self) -> Result<(Duration, i8)> {
+    fn get_offset(&self) -> Result<ntp::NtpMeasurement> {
         self.client.get_offset()
     }
 }

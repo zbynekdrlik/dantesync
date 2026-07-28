@@ -1,10 +1,12 @@
+use crate::ntp::NtpMeasurement;
 use anyhow::Result;
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 #[cfg_attr(test, mockall::automock)]
 pub trait NtpSource {
-    fn get_offset(&self) -> Result<(Duration, i8)>;
+    /// dantesync#53: returns a burst-filtered `NtpMeasurement` (offset/sign
+    /// plus quality fields), not a single raw round trip.
+    fn get_offset(&self) -> Result<NtpMeasurement>;
 }
 
 #[cfg_attr(test, mockall::automock)]

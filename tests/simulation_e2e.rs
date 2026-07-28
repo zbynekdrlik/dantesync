@@ -2,6 +2,7 @@ use anyhow::Result;
 use dantesync::clock::SystemClock;
 use dantesync::config::SystemConfig;
 use dantesync::controller::PtpController;
+use dantesync::ntp::NtpMeasurement;
 use dantesync::status::SyncStatus;
 use dantesync::traits::{NtpSource, PtpNetwork};
 use std::cell::RefCell;
@@ -144,11 +145,18 @@ struct SimNtp {
     physics: Arc<SharedPhysics>,
 }
 impl NtpSource for SimNtp {
-    fn get_offset(&self) -> Result<(Duration, i8)> {
+    fn get_offset(&self) -> Result<NtpMeasurement> {
         let phys = self.physics.engine.borrow();
         let off = phys.offset_ns + phys.step_offset_ns;
         let sign = if off >= 0.0 { 1 } else { -1 };
-        Ok((Duration::from_nanos(off.abs() as u64), sign))
+        // Simulated measurement has no real burst/RTT — report it as a clean,
+        // single-sample-equivalent read (spread 0, sample_count 1).
+        Ok(NtpMeasurement {
+            offset: Duration::from_nanos(off.abs() as u64),
+            sign,
+            spread_us: 0,
+            sample_count: 1,
+        })
     }
 }
 
@@ -159,12 +167,17 @@ struct DriftingNtp {
 }
 
 impl NtpSource for DriftingNtp {
-    fn get_offset(&self) -> Result<(Duration, i8)> {
+    fn get_offset(&self) -> Result<NtpMeasurement> {
         // Simulate NTP offset growing because Dante frequency ≠ NTP reference
         let current = self.offset_us.get();
         self.offset_us.set(current + self.drift_us_per_call);
         let sign = if current >= 0 { 1 } else { -1 };
-        Ok((Duration::from_micros(current.abs() as u64), sign))
+        Ok(NtpMeasurement {
+            offset: Duration::from_micros(current.abs() as u64),
+            sign,
+            spread_us: 0,
+            sample_count: 1,
+        })
     }
 }
 

@@ -58,6 +58,20 @@ pub struct SyncStatus {
     /// Tracks estimated UTC drift between NTP corrections
     /// Reset to 0 after each NTP step
     pub accumulated_phase_us: f64,
+
+    /// dantesync#53: spread (max - min, microseconds) across the accepted
+    /// (lowest-RTT) burst samples that produced `ntp_offset_us`. Large even
+    /// when `ntp_offset_us` looks reasonable ⇒ this node's NTP measurement is
+    /// NOT trustworthy despite the filtered value — never read `ntp_offset_us`
+    /// alone as "this node is fine".
+    #[serde(default)]
+    pub ntp_spread_us: u64,
+
+    /// dantesync#53: how many burst samples fed the published `ntp_offset_us`
+    /// (<= the configured accept count; lower after a partial burst failure —
+    /// also a reason to trust the value less).
+    #[serde(default)]
+    pub ntp_sample_count: usize,
 }
 
 impl SyncStatus {
@@ -88,6 +102,8 @@ impl Default for SyncStatus {
             mode: "ACQ".to_string(),
             ntp_failed: false,
             accumulated_phase_us: 0.0,
+            ntp_spread_us: 0,
+            ntp_sample_count: 0,
         }
     }
 }
@@ -120,6 +136,33 @@ mod tests {
         assert_eq!(restored.mode, "LOCK");
         assert!((restored.smoothed_rate_ppm - 2.5).abs() < f64::EPSILON);
         assert_eq!(restored.ntp_offset_us, 150);
+    }
+
+    /// dantesync#53: the two new quality fields round-trip like any other
+    /// field, and an OLD JSON blob missing them entirely (pre-#53) still
+    /// deserializes cleanly via `#[serde(default)]` — existing consumers
+    /// (e.g. the tray app's own status struct) must not break.
+    #[test]
+    fn test_sync_status_ntp_quality_fields_roundtrip_and_default_on_missing() {
+        let status = SyncStatus {
+            ntp_offset_us: 100,
+            ntp_spread_us: 41610,
+            ntp_sample_count: 3,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize failed");
+        let restored: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(restored.ntp_spread_us, 41610);
+        assert_eq!(restored.ntp_sample_count, 3);
+
+        let old_json = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":false,"updated_ts":0,"is_locked":false,"smoothed_rate_ppm":0.0,
+            "ntp_offset_us":0,"mode":"ACQ","ntp_failed":false,"accumulated_phase_us":0.0}"#;
+        let restored_old: SyncStatus =
+            serde_json::from_str(old_json).expect("old JSON (pre-#53) must still deserialize");
+        assert_eq!(restored_old.ntp_spread_us, 0);
+        assert_eq!(restored_old.ntp_sample_count, 0);
     }
 
     #[test]

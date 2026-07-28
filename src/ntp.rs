@@ -1,38 +1,6 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rsntp::SntpClient;
 use std::time::Duration;
-
-pub struct NtpClient {
-    server: String,
-}
-
-impl NtpClient {
-    pub fn new(server: &str) -> Self {
-        NtpClient {
-            server: server.to_string(),
-        }
-    }
-
-    /// Fetches the current time from the NTP server.
-    /// Returns the offset required to apply to the local system time (Local + Offset = True Time).
-    /// Positive offset means local clock is behind (needs to step forward).
-    pub fn get_offset(&self) -> Result<(Duration, i8)> {
-        let client = SntpClient::new();
-        let result = client.synchronize(&self.server)?;
-
-        let offset = result.clock_offset();
-        let offset_secs = offset.as_secs_f64();
-
-        let sign = if offset_secs < 0.0 { -1 } else { 1 };
-        let abs_secs = offset_secs.abs();
-
-        // Convert abs_secs to Duration
-        let secs = abs_secs.trunc() as u64;
-        let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
-
-        Ok((Duration::new(secs, nanos), sign))
-    }
-}
 
 // ============================================================================
 // #53 — NTP measurement burst-filtering (pure selection/summary functions)
@@ -143,101 +111,115 @@ pub fn filter_offset(samples: &[RawSample], accept_n: usize) -> Option<FilteredO
     summarize_offsets(&offsets)
 }
 
+/// A published NTP measurement: the offset/sign pair `SystemClock::step_clock`
+/// and the #50 step-agreement gate need, PLUS the quality fields (dantesync#53)
+/// that let a consumer tell a well-measured node from a badly-measured one
+/// instead of the filtering silently hiding instability.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NtpMeasurement {
+    pub offset: Duration,
+    pub sign: i8,
+    /// See `FilteredOffset::spread_us`.
+    pub spread_us: u64,
+    /// See `FilteredOffset::sample_count`.
+    pub sample_count: usize,
+}
+
+pub struct NtpClient {
+    server: String,
+}
+
+impl NtpClient {
+    pub fn new(server: &str) -> Self {
+        NtpClient {
+            server: server.to_string(),
+        }
+    }
+
+    /// One raw blocking SNTP round trip. `rsntp` 4.1.2's `SynchronizationResult`
+    /// exposes only the DERIVED `clock_offset()`/`round_trip_delay()` — no raw
+    /// t1..t4 accessors (confirmed by reading its source, `result.rs`) — so
+    /// those two derived quantities are what get measured/logged per sample.
+    fn measure_once(&self) -> Result<RawSample> {
+        let client = SntpClient::new();
+        let result = client.synchronize(&self.server)?;
+
+        let offset_us = (result.clock_offset().as_secs_f64() * 1_000_000.0).round() as i64;
+        let rtt_us = (result.round_trip_delay().as_secs_f64() * 1_000_000.0)
+            .abs()
+            .round() as u64;
+
+        log::debug!("[NTP] raw sample offset:{:+}us rtt:{}us", offset_us, rtt_us);
+
+        Ok(RawSample { offset_us, rtt_us })
+    }
+
+    /// Fetches the current offset from the NTP server as a burst-filtered,
+    /// RTT-selected measurement (dantesync#53) instead of a single unfiltered
+    /// round trip.
+    ///
+    /// Returns the offset required to apply to the local system time
+    /// (Local + Offset = True Time). Positive offset means local clock is
+    /// behind (needs to step forward).
+    pub fn get_offset(&self) -> Result<NtpMeasurement> {
+        let mut raw = Vec::with_capacity(NTP_BURST_SIZE);
+        let mut last_err = None;
+        for _ in 0..NTP_BURST_SIZE {
+            match self.measure_once() {
+                Ok(sample) => raw.push(sample),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        let discarded = raw.len().saturating_sub(NTP_BURST_ACCEPT_N.min(raw.len()));
+        let filtered = filter_offset(&raw, NTP_BURST_ACCEPT_N)
+            .ok_or_else(|| last_err.unwrap_or_else(|| anyhow!("NTP burst: no server response")))?;
+
+        log::info!(
+            "[NTP] burst offset:{:+}us spread:{}us samples:{}/{} (discarded {})",
+            filtered.offset_us,
+            filtered.spread_us,
+            filtered.sample_count,
+            NTP_BURST_SIZE,
+            discarded,
+        );
+
+        let sign: i8 = if filtered.offset_us < 0 { -1 } else { 1 };
+        let offset = Duration::from_micros(filtered.offset_us.unsigned_abs());
+
+        Ok(NtpMeasurement {
+            offset,
+            sign,
+            spread_us: filtered.spread_us,
+            sample_count: filtered.sample_count,
+        })
+    }
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use super::{
+        filter_offset, select_lowest_rtt, summarize_offsets, NtpClient, RawSample,
+        NTP_BURST_ACCEPT_N,
+    };
 
-    /// Test offset to Duration+sign conversion logic
-    /// This mirrors the logic in get_offset() but with controlled inputs
-    #[test]
-    fn test_offset_to_duration_positive() {
-        // Simulate positive offset (local clock behind, needs step forward)
-        let offset_secs: f64 = 1.5; // +1.5 seconds
-
-        let sign = if offset_secs < 0.0 { -1 } else { 1 };
-        let abs_secs = offset_secs.abs();
-        let secs = abs_secs.trunc() as u64;
-        let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
-        let duration = Duration::new(secs, nanos);
-
-        assert_eq!(sign, 1);
-        assert_eq!(duration.as_secs(), 1);
-        assert_eq!(duration.subsec_nanos(), 500_000_000);
-    }
-
-    #[test]
-    fn test_offset_to_duration_negative() {
-        // Simulate negative offset (local clock ahead, needs step backward)
-        let offset_secs: f64 = -2.25; // -2.25 seconds
-
-        let sign = if offset_secs < 0.0 { -1 } else { 1 };
-        let abs_secs = offset_secs.abs();
-        let secs = abs_secs.trunc() as u64;
-        let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
-        let duration = Duration::new(secs, nanos);
-
-        assert_eq!(sign, -1);
-        assert_eq!(duration.as_secs(), 2);
-        assert_eq!(duration.subsec_nanos(), 250_000_000);
-    }
-
-    #[test]
-    fn test_offset_to_duration_zero() {
-        // Simulate zero offset
-        let offset_secs: f64 = 0.0;
-
-        let sign = if offset_secs < 0.0 { -1 } else { 1 };
-        let abs_secs = offset_secs.abs();
-        let secs = abs_secs.trunc() as u64;
-        let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
-        let duration = Duration::new(secs, nanos);
-
-        assert_eq!(sign, 1); // 0 is considered positive
-        assert_eq!(duration.as_secs(), 0);
-        assert_eq!(duration.subsec_nanos(), 0);
-    }
-
-    #[test]
-    fn test_offset_small_values() {
-        // Test sub-second offset (common case)
-        let offset_secs: f64 = 0.002; // 2ms
-
-        let abs_secs = offset_secs.abs();
-        let secs = abs_secs.trunc() as u64;
-        let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
-        let duration = Duration::new(secs, nanos);
-
-        assert_eq!(duration.as_secs(), 0);
-        assert_eq!(duration.subsec_millis(), 2);
-    }
-
-    #[test]
-    fn test_offset_microsecond_precision() {
-        // Test microsecond precision
-        let offset_secs: f64 = 0.000500; // 500us
-
-        let abs_secs = offset_secs.abs();
-        let secs = abs_secs.trunc() as u64;
-        let nanos = (abs_secs.fract() * 1_000_000_000.0) as u32;
-        let duration = Duration::new(secs, nanos);
-
-        assert_eq!(duration.as_secs(), 0);
-        assert_eq!(duration.subsec_micros(), 500);
-    }
+    // Note: the old `test_offset_to_duration_*` tests (dropped here, #53) only
+    // mirrored the sign/Duration-split arithmetic inline — they never called a
+    // real production function, and that arithmetic no longer exists in
+    // `NtpClient::get_offset()` (replaced by the burst+filter pipeline tested
+    // below, which converts the already-filtered `offset_us` i64 directly via
+    // `Duration::from_micros`). Superseded by the fixture tests on the real
+    // pure functions, which is strictly more coverage of real behavior.
 
     #[test]
     fn test_ntp_client_new() {
-        let client = super::NtpClient::new("pool.ntp.org");
+        let client = NtpClient::new("pool.ntp.org");
         assert_eq!(client.server, "pool.ntp.org");
     }
-
-    use super::{
-        filter_offset, select_lowest_rtt, summarize_offsets, RawSample, NTP_BURST_ACCEPT_N,
-    };
 
     /// #53 RED: `select_lowest_rtt` must pick the samples with the SMALLEST
     /// round-trip delay, regardless of what order they arrived in the burst.
