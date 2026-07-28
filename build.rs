@@ -20,15 +20,25 @@
 // the pcap-touching tests.
 //
 // `/DELAYLOAD:wpcap.dll` defers the loader's resolution of the DLL to the
-// FIRST actual call into it. Verified safe: every #[test] reachable from
-// net_pcap.rs (test_pcap_ts_to_systemtime, test_ptp_constants, etc.) is pure
-// arithmetic/logic -- none of them call Device::list()/Capture::from_device()
-// or any other real pcap:: API; those are only reached from
-// NpcapPtpNetwork::new()/PcapNtpTransport::new(), production code paths a
-// test never exercises. So with delay-load, every existing test genuinely
-// runs to completion without ever touching wpcap.dll. A future test that DOES
-// call into pcap on a runtime-less runner will fail loudly at that call --
-// an honest, real missing-capability failure, never a silent no-op.
+// FIRST actual call into it -- necessary but NOT sufficient on its own:
+// net_pcap.rs's OWN #[test]s (test_pcap_ts_to_systemtime, test_ptp_constants,
+// etc.) are pure arithmetic/logic and never call Device::list()/
+// Capture::from_device(), but ntp.rs's pre-existing `test_ntp_client_new`
+// DOES reach Device::list() indirectly (NtpClient::new() ->
+// PcapNtpTransport::new() -> find_device()) -- and MSVC's default delay-load
+// failure hook raises an UNRECOVERABLE structured exception the moment a
+// delay-loaded symbol is first called and the DLL can't be found, so
+// delay-load alone still crashed that test (0xc06d007e, confirmed live).
+// The actual safety net is net_pcap.rs's own `wpcap_runtime_available()`
+// guard (probes via statically-linked kernel32 LoadLibraryW/FreeLibrary,
+// never delay-loaded), called at the top of `find_device()` -- the shared
+// choke point for both capture paths -- BEFORE the first real pcap:: call.
+// That is what turns a missing runtime into a normal `Err` everywhere,
+// including from code this build.rs change alone cannot see into. A future
+// pcap:: call site that bypasses that guard will crash the same way this
+// one did -- route every new pcap:: entry point through find_device() (or
+// call wpcap_runtime_available() directly) rather than relying on
+// delay-load by itself.
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-arg=/DELAYLOAD:wpcap.dll");

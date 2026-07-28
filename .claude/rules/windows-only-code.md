@@ -38,13 +38,27 @@ paths:
   CI, which uses `NPCAP_OEM_USERNAME`/`PASSWORD` secrets for exactly this). So the OS loader refuses
   to even START the test process (`0xc0000135`/`STATUS_DLL_NOT_FOUND`) — this hit `release.yml`
   for real in run 30336428951 (tag v1.8.23), proving the old #56 comment's "cache-specific, release
-  keeps working" theory false. **Fix:** `build.rs` now delay-loads `wpcap.dll` on Windows
+  keeps working" theory false. **Fix, part 1:** `build.rs` now delay-loads `wpcap.dll` on Windows
   (`-C link-arg=/DELAYLOAD:wpcap.dll` + `delayimp.lib`), deferring DLL resolution to the first
-  actual `pcap::` call. Verified no existing `#[test]` makes one (every `net_pcap.rs` test is pure
-  arithmetic/logic; `Device::list()`/`Capture::from_device()` are only reached from production
-  code), so `ci.yml`'s Windows leg is now back to a REAL `cargo test --verbose` — genuinely
-  executing, not just compiling — and `release.yml`'s own `cargo test --verbose` step no longer
-  crashes either.
+  actual `pcap::` call — this alone let the process START, but is NOT sufficient by itself: MSVC's
+  default delay-load failure hook raises an UNRECOVERABLE structured exception the moment a
+  delay-loaded symbol is first called and the DLL can't be found, so `ntp.rs`'s pre-existing
+  `test_ntp_client_new` (which legitimately reaches `Device::list()` via
+  `NtpClient::new() → PcapNtpTransport::new() → find_device()`) still crashed the whole test
+  binary with `0xc06d007e` (run 30337735289 — proof that "grep for which tests touch pcap" is not
+  a substitute for actually running it, since this call chain crosses module boundaries and was
+  missed on first pass). **Fix, part 2:** `net_pcap.rs`'s `find_device()` — the shared choke point
+  for both `NpcapPtpNetwork::new()` and `PcapNtpTransport::new()` — now calls
+  `wpcap_runtime_available()` (probes via statically-linked `kernel32`
+  `LoadLibraryW`/`FreeLibrary`, never delay-loaded, so the probe itself can't crash) BEFORE the
+  first real `pcap::` call, returning a normal `Err` when the runtime is missing instead of letting
+  the delay-load failure hook abort the process. `NtpClient::new()` already treats that `Err`
+  exactly like any other pcap failure (log + fall back to userspace `rsntp`), so this is a genuine
+  graceful degradation, not a new special case. **Together**, `ci.yml`'s Windows leg is now back
+  to a REAL `cargo test --verbose` — genuinely executing, not just compiling — and `release.yml`'s
+  own `cargo test --verbose` step no longer crashes either. **Any NEW `pcap::` call site MUST go
+  through `find_device()` (or call `wpcap_runtime_available()` itself)** — delay-load alone does
+  not make a missing runtime survivable.
 - `release.yml` itself is **all-or-nothing** (#56): both platform legs upload their binaries as
   workflow artifacts instead of publishing directly; a single `publish` job (`needs: build`, which
   only runs once *every* matrix leg succeeds) creates the GitHub Release exactly once with the
