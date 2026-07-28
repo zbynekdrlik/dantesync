@@ -35,6 +35,97 @@ fn join_multicast(port: u16, iface_ip: Ipv4Addr) -> Result<UdpSocket> {
     Ok(socket.into())
 }
 
+/// Find the Npcap device matching `interface_name` by name, description, or
+/// an IP-address substring in its address list.
+///
+/// Shared by the PTP capture path (below) and the NTP kernel-timestamped
+/// transport (dantesync#53, `PcapNtpTransport`) so device-matching logic
+/// exists in exactly one place instead of being duplicated per capture path.
+pub(crate) fn find_device(interface_name: &str) -> Result<Device> {
+    let devices = Device::list()?;
+    devices
+        .iter()
+        .find(|d| {
+            d.name.contains(interface_name)
+                || d.desc
+                    .as_ref()
+                    .map(|desc| desc.contains(interface_name))
+                    .unwrap_or(false)
+        })
+        .or_else(|| {
+            // Try matching by IP address in description
+            devices.iter().find(|d| {
+                d.addresses
+                    .iter()
+                    .any(|addr| format!("{:?}", addr.addr).contains(interface_name))
+            })
+        })
+        .cloned()
+        .ok_or_else(|| {
+            let available: Vec<String> = devices
+                .iter()
+                .map(|d| format!("{} ({:?})", d.name, d.desc))
+                .collect();
+            anyhow!(
+                "Interface '{}' not found. Available: {:?}",
+                interface_name,
+                available
+            )
+        })
+}
+
+/// The device's first non-loopback IPv4 address.
+///
+/// Shared by the PTP capture path (below) and the NTP kernel-timestamped
+/// transport (dantesync#53).
+pub(crate) fn device_ipv4(device: &Device) -> Result<Ipv4Addr> {
+    device
+        .addresses
+        .iter()
+        .find_map(|a| {
+            if let std::net::IpAddr::V4(ip) = a.addr {
+                if !ip.is_loopback() {
+                    return Some(ip);
+                }
+            }
+            None
+        })
+        .ok_or_else(|| anyhow!("No IPv4 address found on device"))
+}
+
+/// Open an Npcap capture with `HostHighPrec` (`KeQuerySystemTimePrecise()`)
+/// timestamps and the given BPF filter applied.
+///
+/// Shared by the PTP capture path (below) and the NTP kernel-timestamped
+/// transport (dantesync#53) — both need the same precise-timestamp capture
+/// setup, differing only in which traffic the filter selects.
+pub(crate) fn open_hiprec_capture(device: &Device, bpf_filter: &str) -> Result<Capture<Active>> {
+    info!("[TS] Requesting HostHighPrec timestamps (KeQuerySystemTimePrecise)");
+
+    let mut capture = Capture::from_device(device.clone())?
+        .promisc(false) // Don't use promiscuous - rely on the traffic actually reaching this NIC
+        .immediate_mode(true) // Critical: disable buffering for lowest latency
+        .snaplen(256) // PTP/NTP packets are both small
+        .timeout(1) // 1ms timeout for responsiveness
+        .tstamp_type(TimestampType::HostHighPrec)
+        .open()?;
+
+    capture.filter(bpf_filter, true)?;
+    info!("[Filter] Applied BPF: {}", bpf_filter);
+    info!("[TS] Using HostHighPrec timestamps (KeQuerySystemTimePrecise)");
+
+    Ok(capture)
+}
+
+/// Convert a pcap capture timestamp (seconds, microseconds) to `SystemTime`.
+///
+/// Shared by the PTP capture path (below) and the NTP kernel-timestamped
+/// transport (dantesync#53).
+pub(crate) fn pcap_ts_to_systemtime(ts_sec: i64, ts_usec: i64) -> SystemTime {
+    let duration = Duration::new(ts_sec as u64, (ts_usec * 1000) as u32);
+    UNIX_EPOCH + duration
+}
+
 /// PTP network using Npcap with HostHighPrec timestamps
 pub struct NpcapPtpNetwork {
     capture: Capture<Active>,
@@ -51,53 +142,11 @@ impl NpcapPtpNetwork {
             interface_name
         );
 
-        // Find the device by name or description
-        let devices = Device::list()?;
-        let device = devices
-            .iter()
-            .find(|d| {
-                d.name.contains(interface_name)
-                    || d.desc
-                        .as_ref()
-                        .map(|desc| desc.contains(interface_name))
-                        .unwrap_or(false)
-            })
-            .or_else(|| {
-                // Try matching by IP address in description
-                devices.iter().find(|d| {
-                    d.addresses
-                        .iter()
-                        .any(|addr| format!("{:?}", addr.addr).contains(interface_name))
-                })
-            })
-            .ok_or_else(|| {
-                let available: Vec<String> = devices
-                    .iter()
-                    .map(|d| format!("{} ({:?})", d.name, d.desc))
-                    .collect();
-                anyhow!(
-                    "Interface '{}' not found. Available: {:?}",
-                    interface_name,
-                    available
-                )
-            })?;
-
+        let device = find_device(interface_name)?;
         info!("Found device: {} ({:?})", device.name, device.desc);
 
         // Extract interface IP for multicast join
-        let iface_ip = device
-            .addresses
-            .iter()
-            .find_map(|a| {
-                if let std::net::IpAddr::V4(ip) = a.addr {
-                    if !ip.is_loopback() {
-                        return Some(ip);
-                    }
-                }
-                None
-            })
-            .ok_or_else(|| anyhow!("No IPv4 address found on device"))?;
-
+        let iface_ip = device_ipv4(&device)?;
         info!("Using interface IP {} for multicast join", iface_ip);
 
         // CRITICAL: Join multicast group via sockets to trigger IGMP
@@ -105,26 +154,12 @@ impl NpcapPtpNetwork {
         let igmp_sock_320 = join_multicast(PTP_GENERAL_PORT, iface_ip)?;
         info!("Joined PTP multicast group 224.0.1.129 on ports 319 and 320");
 
-        // Create capture handle with HostHighPrec timestamps
-        // HostHighPrec uses KeQuerySystemTimePrecise() which is both high-precision AND synced with system time
-        info!("[TS] Requesting HostHighPrec timestamps (KeQuerySystemTimePrecise)");
-
-        let mut capture = Capture::from_device(device.clone())?
-            .promisc(false) // Don't use promiscuous - rely on IGMP multicast join
-            .immediate_mode(true) // Critical: disable buffering for lowest latency
-            .snaplen(256) // PTP packets are small
-            .timeout(1) // 1ms timeout for responsiveness
-            .tstamp_type(TimestampType::HostHighPrec)
-            .open()?;
-
         // Apply BPF filter to only capture PTP multicast - reduces conflict with DVS
         let ptp_filter = "udp and dst host 224.0.1.129 and (dst port 319 or dst port 320)";
-        capture.filter(ptp_filter, true)?;
-        info!("[Filter] Applied BPF: {}", ptp_filter);
+        let capture = open_hiprec_capture(&device, ptp_filter)?;
 
         // Assume HostHighPrec is available on modern Npcap (1.20+)
         let using_hiprec = true;
-        info!("[TS] Using HostHighPrec timestamps (KeQuerySystemTimePrecise)");
 
         if using_hiprec {
             info!("Npcap capture initialized with HIGH PRECISION synchronized timestamps");
@@ -139,12 +174,6 @@ impl NpcapPtpNetwork {
             using_hiprec,
         })
     }
-
-    /// Convert pcap timestamp to SystemTime
-    fn pcap_ts_to_systemtime(ts_sec: i64, ts_usec: i64) -> SystemTime {
-        let duration = Duration::new(ts_sec as u64, (ts_usec * 1000) as u32);
-        UNIX_EPOCH + duration
-    }
 }
 
 impl crate::traits::PtpNetwork for NpcapPtpNetwork {
@@ -158,10 +187,8 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                 let header = packet.header;
                 let ts = if self.using_hiprec {
                     // Npcap provides high-precision timestamps synced with system time
-                    let ts = Self::pcap_ts_to_systemtime(
-                        header.ts.tv_sec as i64,
-                        header.ts.tv_usec as i64,
-                    );
+                    let ts =
+                        pcap_ts_to_systemtime(header.ts.tv_sec as i64, header.ts.tv_usec as i64);
                     debug!(
                         "[TS] Npcap HostHighPrec: {}.{:06}",
                         header.ts.tv_sec, header.ts.tv_usec
@@ -172,36 +199,19 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                     SystemTime::now()
                 };
 
-                // Extract UDP payload from Ethernet frame
-                // Ethernet (14) + IP (20) + UDP (8) = 42 bytes header
-                const ETH_IP_UDP_HEADER: usize = 42;
-
-                if data.len() < ETH_IP_UDP_HEADER {
+                // Extract source IP / dest port / UDP payload from the
+                // Ethernet+IPv4+UDP frame (dantesync#53: shared pure parser,
+                // also used by the NTP kernel-timestamped transport).
+                let Some((source_ip, dst_port, payload)) = crate::ntp_packet::parse_udp_frame(data)
+                else {
                     return Ok(None);
-                }
-
-                // Verify it's an IP packet (EtherType 0x0800)
-                if data[12] != 0x08 || data[13] != 0x00 {
-                    return Ok(None);
-                }
-
-                // Verify UDP protocol (IP header byte 9 = protocol)
-                if data[23] != 17 {
-                    return Ok(None);
-                }
+                };
 
                 // Check destination port for PTP (319 or 320)
-                let dst_port = ((data[36] as u16) << 8) | data[37] as u16;
                 if dst_port != 319 && dst_port != 320 {
                     return Ok(None);
                 }
 
-                // Extract source IP from IP header (Ethernet 14 bytes + IP src at offset 12)
-                // Source IP is at bytes 26-29 of the Ethernet frame
-                let source_ip = Ipv4Addr::new(data[26], data[27], data[28], data[29]);
-
-                // Extract UDP payload
-                let payload = &data[ETH_IP_UDP_HEADER..];
                 let payload_len = payload.len();
 
                 if payload_len > 0 {
@@ -231,6 +241,145 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
     fn reset(&mut self) -> Result<()> {
         // Npcap doesn't need explicit reset
         Ok(())
+    }
+}
+
+// ============================================================================
+// #53 — kernel-timestamped NTP transport (Windows)
+// ============================================================================
+// The Windows NTP client's offset scattered by tens of milliseconds even
+// while this same box's PTP servo (above) reported locked, because
+// `NtpClient::measure_once()` (src/ntp.rs) took t1/t4 as userspace
+// `SystemTime::now()` calls around a blocking socket — exactly the
+// scheduling-jitter problem `NpcapPtpNetwork` above was built to avoid for
+// PTP. `PcapNtpTransport` gives NTP the same treatment: a SEPARATE Npcap
+// capture (own device lookup, own HostHighPrec timestamps, own BPF filter —
+// unicast NTP traffic to one server, nothing to do with the PTP multicast
+// group) sees both our own outgoing request leaving the NIC (t1) and the
+// server's reply arriving (t4), sidestepping userspace scheduling delay on
+// both ends. t2/t3 come from the reply packet's own fields.
+//
+// This glue is intentionally thin: everything it depends on (packet
+// build/parse, the offset/RTT formula, frame parsing) lives in the
+// zero-I/O, fully-unit-tested `ntp_packet` module. This file only opens the
+// capture, sends the request, and correlates captured packets by direction.
+const NTP_PORT: u16 = 123;
+
+/// Upper bound on one pcap-based NTP round trip. NTP checks run every
+/// 10-30s in production (`controller.rs`'s adaptive interval) — this bounds
+/// the cost of a single check so a lost request or reply can never hang the
+/// sync loop (dantesync#53's "bound the cost" requirement).
+const NTP_PCAP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Kernel-timestamped NTP transport for Windows: captures t1 (our own
+/// request leaving the NIC) and t4 (the server's reply arriving) via Npcap
+/// `HostHighPrec` timestamps instead of userspace `SystemTime::now()`.
+pub struct PcapNtpTransport {
+    capture: Capture<Active>,
+    socket: UdpSocket,
+    server_ip: Ipv4Addr,
+    local_ip: Ipv4Addr,
+}
+
+impl PcapNtpTransport {
+    /// `interface_name` is the same interface name `main.rs` resolves via
+    /// `net::get_default_interface()` before constructing the PTP Npcap
+    /// network. `server_ip` is the already-resolved NTP server address (the
+    /// BPF filter needs a concrete IP, not a hostname).
+    pub fn new(interface_name: &str, server_ip: Ipv4Addr) -> Result<Self> {
+        let device = find_device(interface_name)?;
+        let local_ip = device_ipv4(&device)?;
+
+        let filter = format!("udp and host {} and port {}", server_ip, NTP_PORT);
+        let capture = open_hiprec_capture(&device, &filter)?;
+
+        // A plain socket only to SEND the request -- Npcap sees the packet
+        // leave the NIC and gives us the real t1, so this socket's own
+        // send() timing is irrelevant (that userspace timing is exactly the
+        // defect this transport exists to route around).
+        let socket = UdpSocket::bind((local_ip, 0))?;
+        socket.connect((server_ip, NTP_PORT))?;
+
+        info!(
+            "[NTP][Npcap] kernel-timestamped NTP transport ready: {} ({}) -> {}",
+            interface_name, local_ip, server_ip
+        );
+
+        Ok(Self {
+            capture,
+            socket,
+            server_ip,
+            local_ip,
+        })
+    }
+
+    /// One kernel-timestamped NTP round trip: send a request, capture our
+    /// own outgoing packet (t1) and the server's reply (t4), parse t2/t3
+    /// from the reply payload, and compute offset/RTT.
+    pub fn measure_once(&mut self) -> Result<crate::ntp::RawSample> {
+        use crate::ntp_packet::{
+            build_client_request, compute_offset_rtt_us, parse_reply, parse_udp_frame,
+            systemtime_to_unix_micros,
+        };
+
+        let request = build_client_request(systemtime_to_unix_micros(SystemTime::now()));
+        self.socket.send(&request)?;
+
+        let mut t1_us: Option<i64> = None;
+        let mut t4_reply: Option<(i64, crate::ntp_packet::ParsedReply)> = None;
+        let deadline = std::time::Instant::now() + NTP_PCAP_TIMEOUT;
+
+        while t4_reply.is_none() && std::time::Instant::now() < deadline {
+            match self.capture.next_packet() {
+                Ok(packet) => {
+                    let Some((src_ip, _dst_port, payload)) = parse_udp_frame(packet.data) else {
+                        continue;
+                    };
+                    let ts = pcap_ts_to_systemtime(
+                        packet.header.ts.tv_sec as i64,
+                        packet.header.ts.tv_usec as i64,
+                    );
+                    let ts_us = systemtime_to_unix_micros(ts);
+
+                    if src_ip == self.local_ip && t1_us.is_none() {
+                        t1_us = Some(ts_us);
+                        debug!("[NTP][Npcap] t1 (our request) captured at {}us", ts_us);
+                    } else if src_ip == self.server_ip {
+                        match parse_reply(payload) {
+                            Ok(reply) => {
+                                t4_reply = Some((ts_us, reply));
+                                debug!("[NTP][Npcap] t4 (server reply) captured at {}us", ts_us);
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "[NTP][Npcap] ignoring unparseable server-port packet: {}",
+                                    e
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(pcap::Error::TimeoutExpired) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let t1_us = t1_us.ok_or_else(|| {
+            anyhow!(
+                "NTP/Npcap: never observed our own outgoing request within {:?}",
+                NTP_PCAP_TIMEOUT
+            )
+        })?;
+        let (t4_us, reply) = t4_reply
+            .ok_or_else(|| anyhow!("NTP/Npcap: no server reply within {:?}", NTP_PCAP_TIMEOUT))?;
+
+        let (offset_us, rtt_us) =
+            compute_offset_rtt_us(t1_us, reply.receive_ts_us, reply.transmit_ts_us, t4_us);
+
+        Ok(crate::ntp::RawSample {
+            offset_us,
+            rtt_us: rtt_us.max(0) as u64,
+        })
     }
 }
 

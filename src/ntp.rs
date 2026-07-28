@@ -127,20 +127,107 @@ pub struct NtpMeasurement {
 
 pub struct NtpClient {
     server: String,
+    // dantesync#53: on Windows, a persistent kernel-timestamped (Npcap)
+    // transport, opened once at construction. `None` means either this
+    // isn't Windows, or Npcap init failed (loudly logged in `new()`) — in
+    // both cases `measure_once()` falls back to the `rsntp` path below.
+    #[cfg(windows)]
+    pcap_transport: std::sync::Mutex<Option<crate::net_pcap::PcapNtpTransport>>,
 }
 
 impl NtpClient {
-    pub fn new(server: &str) -> Self {
-        NtpClient {
-            server: server.to_string(),
+    /// `interface_name` is the same interface name `main.rs` resolves via
+    /// `net::get_default_interface()` before constructing the PTP network —
+    /// it is used ONLY on Windows, to open the kernel-timestamped NTP
+    /// capture (dantesync#53); ignored on other platforms.
+    pub fn new(server: &str, interface_name: &str) -> Self {
+        #[cfg(windows)]
+        {
+            let pcap_transport = match Self::init_pcap_transport(server, interface_name) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    log::warn!(
+                        "[NTP] Npcap kernel-timestamped transport unavailable ({}), falling back \
+                         to userspace rsntp for ALL samples — offset scatter is the KNOWN defect \
+                         this transport exists to fix (dantesync#53)",
+                        e
+                    );
+                    None
+                }
+            };
+            NtpClient {
+                server: server.to_string(),
+                pcap_transport: std::sync::Mutex::new(pcap_transport),
+            }
         }
+        #[cfg(not(windows))]
+        {
+            let _ = interface_name;
+            NtpClient {
+                server: server.to_string(),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn init_pcap_transport(
+        server: &str,
+        interface_name: &str,
+    ) -> Result<crate::net_pcap::PcapNtpTransport> {
+        let server_ip = Self::resolve_ipv4(server)?;
+        crate::net_pcap::PcapNtpTransport::new(interface_name, server_ip)
+    }
+
+    #[cfg(windows)]
+    fn resolve_ipv4(server: &str) -> Result<std::net::Ipv4Addr> {
+        use std::net::ToSocketAddrs;
+        (server, 123u16)
+            .to_socket_addrs()?
+            .find_map(|a| match a {
+                std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("could not resolve '{}' to an IPv4 address", server))
+    }
+
+    /// One measurement, preferring the kernel-timestamped Npcap transport on
+    /// Windows (dantesync#53) and falling back to the userspace `rsntp` path
+    /// — on Linux always, on Windows only when Npcap init failed at
+    /// construction or a single round trip fails transiently (logged either
+    /// way; never a silent fallback).
+    fn measure_once(&self) -> Result<RawSample> {
+        #[cfg(windows)]
+        {
+            let mut guard = self
+                .pcap_transport
+                .lock()
+                .expect("ntp pcap transport mutex poisoned");
+            if let Some(transport) = guard.as_mut() {
+                match transport.measure_once() {
+                    Ok(sample) => return Ok(sample),
+                    Err(e) => {
+                        log::warn!(
+                            "[NTP] Npcap round trip failed ({}), falling back to rsntp for this \
+                             sample",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        self.measure_once_rsntp()
     }
 
     /// One raw blocking SNTP round trip. `rsntp` 4.1.2's `SynchronizationResult`
     /// exposes only the DERIVED `clock_offset()`/`round_trip_delay()` — no raw
     /// t1..t4 accessors (confirmed by reading its source, `result.rs`) — so
     /// those two derived quantities are what get measured/logged per sample.
-    fn measure_once(&self) -> Result<RawSample> {
+    ///
+    /// This is the ORIGINAL measurement path (unchanged since before #53's
+    /// kernel-timestamp work) — still used on every platform when the
+    /// Npcap transport above isn't available, and always on Linux, where
+    /// this path is already precise (5-32us spread observed live).
+    fn measure_once_rsntp(&self) -> Result<RawSample> {
         let client = SntpClient::new();
         let result = client.synchronize(&self.server)?;
 
@@ -217,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_ntp_client_new() {
-        let client = NtpClient::new("pool.ntp.org");
+        let client = NtpClient::new("pool.ntp.org", "eth0");
         assert_eq!(client.server, "pool.ntp.org");
     }
 
@@ -347,5 +434,69 @@ mod tests {
     #[test]
     fn filter_offset_empty_samples_is_none() {
         assert!(filter_offset(&[], NTP_BURST_ACCEPT_N).is_none());
+    }
+
+    /// #53 GREEN: end-to-end honesty check from RAW t1..t4 timestamps (the
+    /// kernel-timestamped `PcapNtpTransport` transport's own output shape)
+    /// through to the published quality fields.
+    ///
+    /// The earlier pathological-scatter test above starts from
+    /// already-known offsets; this one starts one layer further back — from
+    /// synthetic (t1,t2,t3,t4) quadruples run through the SAME
+    /// `compute_offset_rtt_us` formula `PcapNtpTransport::measure_once()`
+    /// uses — to prove the honesty guarantee survives the new measurement
+    /// path too: even samples that are genuinely computed from 4 real
+    /// timestamps (not just handed a pre-baked offset), all with EQUAL
+    /// round-trip delay (so RTT-selection cannot distinguish or discard any
+    /// of them), still surface the full ~41.6ms scatter from the issue's own
+    /// extremes (-18750us and +22860us) rather than being smoothed into a
+    /// falsely-clean median. Kernel timestamps fix WHERE the noise comes
+    /// from (userspace scheduling jitter); they do not, and must not,
+    /// change whether genuine remaining disagreement gets hidden.
+    #[test]
+    fn pcap_style_t1_to_t4_measurements_stay_honest_through_the_existing_filter() {
+        use crate::ntp_packet::compute_offset_rtt_us;
+
+        // Every quadruple shares t1=0, t4=2000 (rtt=2000us, server dwell=0)
+        // so all 5 samples tie on round-trip delay -- `select_lowest_rtt`'s
+        // stable sort keeps arrival order on a tie, so the first 3 in this
+        // list are exactly the "accepted" subset.
+        let target_offsets_us = [-18750i64, 22860, 2014, 100, 100];
+        let raw: Vec<RawSample> = target_offsets_us
+            .iter()
+            .map(|&offset_us| {
+                let t1 = 0i64;
+                let t4 = 2000i64;
+                // offset = ((t2-t1)+(t3-t4))/2 with t2==t3 (zero server dwell)
+                // solves to t2 = t3 = offset_us + (t4 - t1) / 2.
+                let t2 = offset_us + (t4 - t1) / 2;
+                let t3 = t2;
+                let (offset_us_computed, rtt_us) = compute_offset_rtt_us(t1, t2, t3, t4);
+                assert_eq!(
+                    offset_us_computed, offset_us,
+                    "fixture construction sanity check"
+                );
+                RawSample {
+                    offset_us: offset_us_computed,
+                    rtt_us: rtt_us.max(0) as u64,
+                }
+            })
+            .collect();
+
+        let filtered = filter_offset(&raw, NTP_BURST_ACCEPT_N).expect("non-empty input");
+
+        assert_eq!(
+            filtered.sample_count, NTP_BURST_ACCEPT_N,
+            "3 of 5 tied-RTT samples must be accepted"
+        );
+        assert_eq!(
+            filtered.offset_us, 2014,
+            "median of the accepted [-18750, 22860, 2014] is 2014"
+        );
+        assert_eq!(
+            filtered.spread_us, 41610,
+            "spread must expose the full -18750..+22860 scatter (41610us) computed from raw \
+             t1..t4 timestamps, never hidden by a clean-looking median"
+        );
     }
 }

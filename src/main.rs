@@ -689,7 +689,7 @@ fn run_sync_loop(
         .as_deref()
         .expect("ntp_server must be resolved before run_sync_loop");
     let ntp_source = RealNtpSource {
-        client: ntp::NtpClient::new(ntp_server),
+        client: ntp::NtpClient::new(ntp_server, &iface_name),
     };
 
     let mut controller =

@@ -71,6 +71,11 @@ RUST_LOG=debug cargo run
 
 **Windows cross-compilation** requires Npcap SDK 1.13+ with `LIB` env var set to `npcap-sdk/Lib/x64`.
 
+## Playbook router
+
+- Windows-only (`#[cfg(windows)]`) code — what CI actually verifies + a free local compile-check
+  without the Npcap SDK → `.claude/rules/windows-only-code.md` (auto-loads on its `paths:`)
+
 ## Hardware Constraints (CRITICAL)
 
 **This project implements SOFTWARE-ONLY PTP frequency synchronization:**

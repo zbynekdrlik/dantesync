@@ -4,6 +4,7 @@ pub mod controller;
 pub mod http_status;
 pub mod net;
 pub mod ntp;
+pub mod ntp_packet;
 pub mod ntp_server;
 pub mod ptp;
 pub mod spike_filter;
