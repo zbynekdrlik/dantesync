@@ -440,13 +440,39 @@ impl PcapNtpTransport {
     /// One kernel-timestamped NTP round trip: send a request, capture our
     /// own outgoing packet (t1) and the server's reply (t4), parse t2/t3
     /// from the reply payload, and compute offset/RTT.
+    ///
+    /// Adversarial-review fix (#53 continuation): before sending, DRAIN any
+    /// packets already queued in the capture (a leftover reply from a prior
+    /// `measure_once` call, or the userspace rsntp fallback's own request/
+    /// reply exchange to the same server:123, which the open BPF filter also
+    /// matches). And a captured reply is only accepted as t4 when its echoed
+    /// Origin Timestamp actually matches THIS request's transmit timestamp
+    /// (`reply_origin_matches_request`) -- without both of these, a stale or
+    /// foreign reply could be silently paired with the current request,
+    /// producing a self-consistent but wrong measurement (the exact fat-tail
+    /// bug this fixes: healthy median, occasional multi-ms-wrong sample).
     pub fn measure_once(&mut self) -> Result<crate::ntp::RawSample> {
         use crate::ntp_packet::{
             build_client_request, compute_offset_rtt_us, parse_reply, parse_udp_frame,
-            systemtime_to_unix_micros,
+            reply_origin_matches_request, systemtime_to_unix_micros,
         };
 
-        let request = build_client_request(systemtime_to_unix_micros(SystemTime::now()));
+        // Drain anything already queued before this request exists -- a
+        // stale reply/request sitting in the capture buffer must never be
+        // considered for THIS round trip's t1/t4.
+        const MAX_DRAIN_PACKETS: u32 = 64;
+        for _ in 0..MAX_DRAIN_PACKETS {
+            match self.capture.next_packet() {
+                Ok(_) => {
+                    debug!("[NTP][Npcap] drained a stale queued packet before sending");
+                }
+                Err(pcap::Error::TimeoutExpired) => break,
+                Err(_) => break, // any other capture error: nothing more to drain
+            }
+        }
+
+        let request_transmit_ts_us = systemtime_to_unix_micros(SystemTime::now());
+        let request = build_client_request(request_transmit_ts_us);
         self.socket.send(&request)?;
 
         let mut t1_us: Option<i64> = None;
@@ -471,8 +497,23 @@ impl PcapNtpTransport {
                     } else if src_ip == self.server_ip {
                         match parse_reply(payload) {
                             Ok(reply) => {
-                                t4_reply = Some((ts_us, reply));
-                                debug!("[NTP][Npcap] t4 (server reply) captured at {}us", ts_us);
+                                if reply_origin_matches_request(
+                                    reply.origin_ts_us,
+                                    request_transmit_ts_us,
+                                ) {
+                                    t4_reply = Some((ts_us, reply));
+                                    debug!(
+                                        "[NTP][Npcap] t4 (server reply) captured at {}us",
+                                        ts_us
+                                    );
+                                } else {
+                                    debug!(
+                                        "[NTP][Npcap] ignoring reply with mismatched origin \
+                                         timestamp {}us (our request: {}us) -- stale or foreign \
+                                         reply, not paired",
+                                        reply.origin_ts_us, request_transmit_ts_us
+                                    );
+                                }
                             }
                             Err(e) => {
                                 debug!(

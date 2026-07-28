@@ -310,8 +310,8 @@ pub fn burst_used_pcap_throughout(via_pcap_flags: &[bool]) -> bool {
 /// server) differs by milliseconds-to-seconds, far outside this tolerance.
 ///
 /// #53 GREEN: a real bounded-difference check.
-pub fn reply_origin_matches_request(_origin_ts_us: i64, _request_transmit_ts_us: i64) -> bool {
-    true // RED placeholder -- accepts everything, exactly the bug being fixed
+pub fn reply_origin_matches_request(origin_ts_us: i64, request_transmit_ts_us: i64) -> bool {
+    (origin_ts_us - request_transmit_ts_us).abs() <= 1
 }
 
 // ============================================================================
