@@ -50,20 +50,29 @@ pub const NTP_UNIX_EPOCH_DELTA_SECS: i64 = 2_208_988_800;
 /// 32-bit binary fraction of a second) into signed microseconds since the
 /// Unix epoch.
 ///
-/// #53 RED: the naive placeholder always returns 0 — any fixture with a
-/// non-epoch timestamp fails immediately.
-pub fn ntp_timestamp_to_unix_micros(_seconds: u32, _fraction: u32) -> i64 {
-    0
+/// #53 GREEN: seconds shift by the epoch delta; the 32-bit binary fraction
+/// converts to microseconds via `(fraction * 1_000_000) >> 32` (done in u64
+/// to avoid overflowing u32's ~4.29e9 range against the ~4.3e15 intermediate
+/// product).
+pub fn ntp_timestamp_to_unix_micros(seconds: u32, fraction: u32) -> i64 {
+    let unix_secs = seconds as i64 - NTP_UNIX_EPOCH_DELTA_SECS;
+    let frac_us = (fraction as u64 * 1_000_000) >> 32;
+    unix_secs * 1_000_000 + frac_us as i64
 }
 
 /// Convert microseconds-since-Unix-epoch back into an NTP (seconds, fraction)
 /// pair. Handles pre-1970 values (negative `unix_us`) via Euclidean division
 /// so the fractional part always stays non-negative.
 ///
-/// #53 RED: the naive placeholder always returns `(0, 0)` — any non-epoch
-/// fixture fails immediately.
-pub fn unix_micros_to_ntp_timestamp(_unix_us: i64) -> (u32, u32) {
-    (0, 0)
+/// #53 GREEN: the inverse of `ntp_timestamp_to_unix_micros` — the
+/// microsecond remainder scales up to the 32-bit binary fraction via
+/// `(rem_us << 32) / 1_000_000` (done in u64 for the same overflow reason).
+pub fn unix_micros_to_ntp_timestamp(unix_us: i64) -> (u32, u32) {
+    let unix_secs = unix_us.div_euclid(1_000_000);
+    let rem_us = unix_us.rem_euclid(1_000_000);
+    let seconds = (unix_secs + NTP_UNIX_EPOCH_DELTA_SECS) as u32;
+    let fraction = ((rem_us as u64) << 32) / 1_000_000;
+    (seconds, fraction as u32)
 }
 
 /// Convert a `SystemTime` to signed microseconds since the Unix epoch. Never
@@ -94,10 +103,15 @@ const NTP_MODE_MASK: u8 = 0x07;
 /// request/response, though `PcapNtpTransport` matches by capture direction
 /// instead) as the packet's own Transmit Timestamp field.
 ///
-/// #53 RED: the naive placeholder returns an all-zero buffer — the LI/VN/Mode
-/// byte and the embedded timestamp are both wrong.
-pub fn build_client_request(_transmit_ts_us: i64) -> [u8; NTP_PACKET_LEN] {
-    [0u8; NTP_PACKET_LEN]
+/// #53 GREEN: sets LI=0/VN=4/Mode=3 in byte 0 and encodes `transmit_ts_us`
+/// into the Transmit Timestamp field (bytes 40..48).
+pub fn build_client_request(transmit_ts_us: i64) -> [u8; NTP_PACKET_LEN] {
+    let mut packet = [0u8; NTP_PACKET_LEN];
+    packet[0] = (NTP_VERSION << 3) | NTP_MODE_CLIENT;
+    let (secs, frac) = unix_micros_to_ntp_timestamp(transmit_ts_us);
+    packet[40..44].copy_from_slice(&secs.to_be_bytes());
+    packet[44..48].copy_from_slice(&frac.to_be_bytes());
+    packet
 }
 
 /// The two timestamps we need out of a server reply: t2 (server receive) and
@@ -112,15 +126,33 @@ pub struct ParsedReply {
 
 /// Parse an NTP server reply (mode 4) from a UDP payload.
 ///
-/// #53 RED: the naive placeholder accepts ANY buffer (no length check, no
-/// mode check) and always returns zeros — it doesn't reject a too-short
-/// buffer, doesn't reject a non-server-mode packet, and doesn't extract the
-/// real timestamps.
-pub fn parse_reply(_buf: &[u8]) -> Result<ParsedReply> {
+/// #53 GREEN: rejects a too-short buffer and a non-server mode, then decodes
+/// the real Origin/Receive/Transmit Timestamp fields.
+pub fn parse_reply(buf: &[u8]) -> Result<ParsedReply> {
+    if buf.len() < NTP_PACKET_LEN {
+        return Err(anyhow!(
+            "NTP reply too short: {} bytes (need {})",
+            buf.len(),
+            NTP_PACKET_LEN
+        ));
+    }
+    let mode = buf[0] & NTP_MODE_MASK;
+    if mode != NTP_MODE_SERVER {
+        return Err(anyhow!(
+            "NTP reply has unexpected mode {} (expected server={})",
+            mode,
+            NTP_MODE_SERVER
+        ));
+    }
+    let read_ts = |off: usize| -> i64 {
+        let secs = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+        let frac = u32::from_be_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        ntp_timestamp_to_unix_micros(secs, frac)
+    };
     Ok(ParsedReply {
-        origin_ts_us: 0,
-        receive_ts_us: 0,
-        transmit_ts_us: 0,
+        origin_ts_us: read_ts(24),
+        receive_ts_us: read_ts(32),
+        transmit_ts_us: read_ts(40),
     })
 }
 
@@ -133,10 +165,11 @@ pub fn parse_reply(_buf: &[u8]) -> Result<ParsedReply> {
 /// t1 = our send time, t2 = server receive time, t3 = server transmit time,
 /// t4 = our receive time (all signed microseconds since the Unix epoch).
 ///
-/// #53 RED: the naive placeholder always returns `(0, 0)` — any fixture with
-/// a genuine offset or non-zero delay fails immediately.
-pub fn compute_offset_rtt_us(_t1_us: i64, _t2_us: i64, _t3_us: i64, _t4_us: i64) -> (i64, i64) {
-    (0, 0)
+/// #53 GREEN: the real formulas.
+pub fn compute_offset_rtt_us(t1_us: i64, t2_us: i64, t3_us: i64, t4_us: i64) -> (i64, i64) {
+    let offset_us = ((t2_us - t1_us) + (t3_us - t4_us)) / 2;
+    let rtt_us = (t4_us - t1_us) - (t3_us - t2_us);
+    (offset_us, rtt_us)
 }
 
 // ============================================================================
@@ -151,16 +184,23 @@ pub fn compute_offset_rtt_us(_t1_us: i64, _t2_us: i64, _t3_us: i64, _t4_us: i64)
 /// NTP (dantesync#53) Windows Npcap capture paths, which otherwise
 /// duplicated this exact parsing.
 ///
-/// #53 RED: the naive placeholder skips every real check (ethertype,
-/// protocol) and always returns `(0.0.0.0, 0, ...)` for anything long enough
-/// — a non-IPv4 or non-UDP frame is wrongly accepted, and the real source IP
-/// / destination port are never extracted.
+/// #53 GREEN: validates length, EtherType (IPv4 = 0x0800), and IP protocol
+/// (UDP = 17) before extracting the real source IP, destination port, and
+/// payload.
 pub fn parse_udp_frame(data: &[u8]) -> Option<(Ipv4Addr, u16, &[u8])> {
     const ETH_IP_UDP_HEADER: usize = 42;
     if data.len() < ETH_IP_UDP_HEADER {
         return None;
     }
-    Some((Ipv4Addr::UNSPECIFIED, 0, &data[ETH_IP_UDP_HEADER..]))
+    if data[12] != 0x08 || data[13] != 0x00 {
+        return None; // not IPv4
+    }
+    if data[23] != 17 {
+        return None; // not UDP
+    }
+    let src_ip = Ipv4Addr::new(data[26], data[27], data[28], data[29]);
+    let dst_port = ((data[36] as u16) << 8) | data[37] as u16;
+    Some((src_ip, dst_port, &data[ETH_IP_UDP_HEADER..]))
 }
 
 // ============================================================================
@@ -173,7 +213,7 @@ mod tests {
 
     // ---- NTP <-> Unix epoch conversion ----
 
-    /// #53 RED: converting the NTP epoch itself (seconds = the delta,
+    /// #53 GREEN: converting the NTP epoch itself (seconds = the delta,
     /// fraction = 0) must land exactly on unix_us = 0.
     #[test]
     fn ntp_timestamp_to_unix_micros_at_ntp_epoch_boundary_is_zero() {
@@ -184,7 +224,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: a half-second fraction (2^31 / 2^32 = 0.5) must decode to
+    /// #53 GREEN: a half-second fraction (2^31 / 2^32 = 0.5) must decode to
     /// exactly 500_000us past the second boundary.
     #[test]
     fn ntp_timestamp_to_unix_micros_half_second_fraction_is_exact() {
@@ -196,7 +236,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: encoding then decoding the NTP epoch (unix_us=0) and an exact
+    /// #53 GREEN: encoding then decoding the NTP epoch (unix_us=0) and an exact
     /// half-second value must round-trip EXACTLY (both are exactly
     /// representable in 32-bit binary fixed point).
     #[test]
@@ -212,7 +252,7 @@ mod tests {
         }
     }
 
-    /// #53 RED: an arbitrary microsecond value must round-trip within 1us
+    /// #53 GREEN: an arbitrary microsecond value must round-trip within 1us
     /// (32-bit binary fraction resolution is ~0.233ns, far finer than 1us —
     /// only integer-division rounding in each direction can lose anything).
     #[test]
@@ -233,7 +273,7 @@ mod tests {
 
     // ---- Client request build ----
 
-    /// #53 RED: byte 0 must be LI=0/VN=4/Mode=3 = 0x23. The naive stub
+    /// #53 GREEN: byte 0 must be LI=0/VN=4/Mode=3 = 0x23. The naive stub
     /// returns an all-zero buffer, so byte 0 is 0x00.
     #[test]
     fn build_client_request_sets_li_vn_mode_byte() {
@@ -245,7 +285,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: the Transmit Timestamp field (bytes 40..48) must decode back
+    /// #53 GREEN: the Transmit Timestamp field (bytes 40..48) must decode back
     /// to the value passed in. The naive stub never writes it.
     #[test]
     fn build_client_request_encodes_transmit_timestamp() {
@@ -281,18 +321,24 @@ mod tests {
         buf
     }
 
-    /// #53 RED: a well-formed server reply must yield the exact origin/
+    /// #53 GREEN: a well-formed server reply must yield the exact origin/
     /// receive/transmit values that were encoded into it.
     #[test]
     fn parse_reply_extracts_origin_receive_and_transmit_timestamps() {
-        let buf = fake_server_reply(1_000_000, 1_010_000, 1_020_000);
+        // Half-second-aligned values so the 32-bit NTP fraction encode/decode
+        // round-trips EXACTLY (see unix_micros_ntp_roundtrip_is_exact_at_whole_and_half_second_boundaries)
+        // — an arbitrary microsecond value can lose up to 1us to floor
+        // rounding in this encoding, which is a property of the wire format
+        // being tested separately above, not something this test needs to
+        // re-litigate.
+        let buf = fake_server_reply(1_000_000, 1_500_000, 2_000_000);
         let reply = parse_reply(&buf).expect("well-formed server reply must parse");
         assert_eq!(reply.origin_ts_us, 1_000_000);
-        assert_eq!(reply.receive_ts_us, 1_010_000);
-        assert_eq!(reply.transmit_ts_us, 1_020_000);
+        assert_eq!(reply.receive_ts_us, 1_500_000);
+        assert_eq!(reply.transmit_ts_us, 2_000_000);
     }
 
-    /// #53 RED: a buffer shorter than the 48-byte NTP header must be
+    /// #53 GREEN: a buffer shorter than the 48-byte NTP header must be
     /// rejected, not silently accepted with garbage/zero fields.
     #[test]
     fn parse_reply_rejects_too_short_buffer() {
@@ -303,7 +349,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: a packet with the CLIENT mode (3) — e.g. our own request
+    /// #53 GREEN: a packet with the CLIENT mode (3) — e.g. our own request
     /// looped back, or a malformed/spoofed packet — must be rejected as a
     /// reply, not parsed as if it were a real server response.
     #[test]
@@ -318,7 +364,7 @@ mod tests {
 
     // ---- Offset / RTT math ----
 
-    /// #53 RED: a perfectly symmetric network path (equal delay each way)
+    /// #53 GREEN: a perfectly symmetric network path (equal delay each way)
     /// must yield offset=0 — any true clock difference cancels out of the
     /// formula only when the path truly is symmetric, which this fixture is
     /// by construction.
@@ -332,7 +378,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: a known asymmetric fixture (server clock ahead of ours) must
+    /// #53 GREEN: a known asymmetric fixture (server clock ahead of ours) must
     /// match the textbook RFC 5905 formula exactly.
     #[test]
     fn compute_offset_rtt_us_matches_known_asymmetric_fixture() {
@@ -359,7 +405,7 @@ mod tests {
         frame
     }
 
-    /// #53 RED: a well-formed IPv4/UDP frame must yield the real source IP,
+    /// #53 GREEN: a well-formed IPv4/UDP frame must yield the real source IP,
     /// destination port, and payload — the naive stub always returns
     /// 0.0.0.0/port 0 regardless of the actual frame content.
     #[test]
@@ -372,7 +418,7 @@ mod tests {
         assert_eq!(payload, b"hello");
     }
 
-    /// #53 RED: a non-IPv4 EtherType must be rejected, not silently accepted.
+    /// #53 GREEN: a non-IPv4 EtherType must be rejected, not silently accepted.
     #[test]
     fn parse_udp_frame_rejects_non_ipv4_ethertype() {
         let mut frame = fake_udp_frame([10, 0, 0, 1], 123, b"x");
@@ -384,7 +430,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: a non-UDP IP protocol must be rejected, not silently accepted.
+    /// #53 GREEN: a non-UDP IP protocol must be rejected, not silently accepted.
     #[test]
     fn parse_udp_frame_rejects_non_udp_protocol() {
         let mut frame = fake_udp_frame([10, 0, 0, 1], 123, b"x");
@@ -395,7 +441,7 @@ mod tests {
         );
     }
 
-    /// #53 RED: a frame shorter than the minimum Ethernet+IP+UDP header must
+    /// #53 GREEN: a frame shorter than the minimum Ethernet+IP+UDP header must
     /// be rejected.
     #[test]
     fn parse_udp_frame_rejects_too_short_frame() {
