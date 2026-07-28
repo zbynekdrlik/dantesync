@@ -207,10 +207,21 @@ impl NtpClient {
     fn measure_once(&self) -> (Result<RawSample>, bool) {
         #[cfg(windows)]
         {
+            // Adversarial-review fix (#53 continuation): recover the guard
+            // instead of `.expect()`-panicking the whole process on a
+            // poisoned mutex. This IS a reachable path -- a panic inside the
+            // critical section (e.g. `pcap_ts_to_systemtime` in net_pcap.rs
+            // can overflow `SystemTime` on a bogus capture header) would
+            // otherwise turn every SUBSEQUENT NTP check into a hard panic
+            // too, since a poisoned std Mutex stays poisoned forever. The
+            // recovered guard may hold a transport left mid-operation from
+            // the panicking call, but that is no worse than what this
+            // function already handles every day: `measure_once()` failing
+            // and falling back to rsntp for this one sample.
             let mut guard = self
                 .pcap_transport
                 .lock()
-                .expect("ntp pcap transport mutex poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(transport) = guard.as_mut() {
                 match transport.measure_once() {
                     Ok(sample) => return (Ok(sample), true),
