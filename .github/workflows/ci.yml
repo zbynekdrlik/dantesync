@@ -205,6 +205,28 @@ jobs:
 
   # ============================================================================
   # Build Check (ensures code compiles on all targets)
+  #
+  # #56: the Windows leg ALSO compiles the test binaries here via
+  # `cargo test --no-run` (not just `cargo build`) -- previously the only
+  # place Windows-only #[cfg(test)] code ever compiled was release.yml, i.e.
+  # AFTER a PR already merged. A Windows-only test that stopped compiling
+  # (dantesync#53/PR #55's NpcapPtpNetwork::pcap_ts_to_systemtime regression)
+  # passed every PR gate and only broke at release time, publishing a
+  # half-complete release (v1.8.22: Linux asset uploaded, Windows leg failed,
+  # no .exe at all).
+  #
+  # `--no-run` (not a bare `cargo test`) is deliberate: it compiles+links
+  # every test binary -- which is exactly what catches this class of bug --
+  # without EXECUTING any of them. A bare `cargo test` was tried first and
+  # hit a real `STATUS_DLL_NOT_FOUND` crash starting the produced test
+  # binary in THIS job's environment (this job restores a cached `target/`
+  # via actions/cache, which release.yml's job never does -- release.yml's
+  # own `cargo test --verbose` step keeps working reliably, so the gap is
+  # specific to this job's cache reuse, not Windows test execution in
+  # general). Chasing that down further wasn't needed: the ticket's own
+  # accepted minimum ("cargo test --no-run, or equivalent") is fully
+  # sufficient for a compile-only regression class, and never touches the
+  # runtime-DLL question at all -- see .claude/rules/windows-only-code.md.
   # ============================================================================
   build:
     name: Build Check (${{ matrix.os }})
@@ -253,6 +275,10 @@ jobs:
           Write-Host "Npcap SDK checksum verified: $actualHash"
           Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
           echo "LIB=$PWD\npcap-sdk\Lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Compile Tests (Windows) [#56 -- closes the PR-time blind spot]
+        if: runner.os == 'Windows'
+        run: cargo test --no-run --verbose
 
       - name: Build (Linux)
         if: runner.os == 'Linux'

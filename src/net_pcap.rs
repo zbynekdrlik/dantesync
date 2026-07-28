@@ -409,19 +409,19 @@ mod tests {
     #[test]
     fn test_pcap_ts_to_systemtime() {
         // Unix epoch (1970-01-01 00:00:00)
-        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(0, 0);
+        let ts = pcap_ts_to_systemtime(0, 0);
         assert_eq!(ts, UNIX_EPOCH);
 
         // 1 second after epoch
-        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(1, 0);
+        let ts = pcap_ts_to_systemtime(1, 0);
         assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1));
 
         // 1.5 seconds after epoch (with microseconds)
-        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(1, 500_000);
+        let ts = pcap_ts_to_systemtime(1, 500_000);
         assert_eq!(ts, UNIX_EPOCH + Duration::from_micros(1_500_000));
 
         // Realistic timestamp (2024-01-01 00:00:00 UTC = 1704067200)
-        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(1704067200, 0);
+        let ts = pcap_ts_to_systemtime(1704067200, 0);
         assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1704067200));
     }
 
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn test_pcap_ts_microsecond_precision() {
         // 123.456789 seconds - but pcap only has microsecond precision
-        let ts = NpcapPtpNetwork::pcap_ts_to_systemtime(123, 456_789);
+        let ts = pcap_ts_to_systemtime(123, 456_789);
 
         // Should be 123 seconds + 456789 microseconds = 456789000 nanoseconds
         let expected = UNIX_EPOCH + Duration::new(123, 456_789_000);
