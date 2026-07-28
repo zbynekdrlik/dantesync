@@ -244,6 +244,15 @@ fn same_subnet(ip: Ipv4Addr, netmask: Ipv4Addr, target: Ipv4Addr) -> bool {
 ///
 /// #53 GREEN: real subnet-containment selection instead of a name-based or
 /// arrival-order guess.
+///
+/// Adversarial-review fix (#53 continuation): a candidate whose netmask is
+/// the degenerate `0.0.0.0` (a junk/APIPA/misconfigured adapter -- pcap's
+/// enumeration can genuinely report this) is EXCLUDED here, not just
+/// deprioritized. `same_subnet(ip, 0.0.0.0, target)` masks both addresses to
+/// 0 and is trivially true for every `target`, so without this guard such a
+/// candidate would vacuously "reach" any server and could win when no real
+/// candidate matches -- silently defeating the caller's
+/// "no reachable interface" diagnostic.
 pub fn select_ntp_pcap_device(
     server_ip: Ipv4Addr,
     candidates: &[CandidateInterface],
@@ -253,6 +262,9 @@ pub fn select_ntp_pcap_device(
         .enumerate()
         .filter_map(|(i, c)| {
             let netmask = c.netmask?;
+            if netmask == Ipv4Addr::UNSPECIFIED {
+                return None;
+            }
             if same_subnet(c.ip, netmask, server_ip) {
                 Some((i, u32::from(netmask).count_ones()))
             } else {
@@ -737,6 +749,59 @@ mod tests {
             "10.77.8.50 is inside the LAN candidate's /23 span (10.77.8.0-10.77.9.255) even \
              though it's in a DIFFERENT /24 (10.77.8.x) than the candidate's own IP (10.77.9.x) \
              -- a /24-only implementation would wrongly return None here"
+        );
+    }
+
+    /// Adversarial-review fix (#53 continuation): a candidate with a
+    /// DEGENERATE `0.0.0.0` netmask (a junk/APIPA/misconfigured adapter --
+    /// pcap's netmask enumeration can genuinely report this) must never be
+    /// selectable, no matter what server address is asked for. Root cause:
+    /// `same_subnet(ip, 0.0.0.0, target)` masks both addresses to 0, so it is
+    /// trivially true for EVERY target -- a 0.0.0.0-netmask candidate
+    /// silently "reaches" any server, defeating the specific
+    /// "No Npcap-capturable interface can reach ..." diagnostic that should
+    /// fire when nothing real can reach it.
+    #[test]
+    fn select_ntp_pcap_device_never_selects_a_zero_netmask_candidate() {
+        let server_ip: Ipv4Addr = "203.0.113.7".parse().unwrap(); // TEST-NET-3, reachable by nothing real here
+        let candidates = [CandidateInterface {
+            name: "junk adapter".to_string(),
+            ip: "169.254.1.5".parse().unwrap(), // APIPA-style address
+            netmask: Some("0.0.0.0".parse().unwrap()),
+        }];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            None,
+            "a 0.0.0.0-netmask candidate must never be selected -- it vacuously matches every \
+             server address and would defeat the no-reachable-interface diagnostic"
+        );
+    }
+
+    /// Same defect, but with a REAL candidate present too: the 0.0.0.0-mask
+    /// junk candidate must never win even when listed FIRST and a genuinely
+    /// reachable candidate is also present.
+    #[test]
+    fn select_ntp_pcap_device_prefers_a_real_match_over_a_zero_netmask_candidate() {
+        let server_ip: Ipv4Addr = "10.77.9.202".parse().unwrap();
+        let candidates = [
+            CandidateInterface {
+                name: "junk adapter".to_string(),
+                ip: "169.254.1.5".parse().unwrap(),
+                netmask: Some("0.0.0.0".parse().unwrap()),
+            },
+            CandidateInterface {
+                name: "Ethernet (LAN)".to_string(),
+                ip: "10.77.9.204".parse().unwrap(),
+                netmask: Some("255.255.254.0".parse().unwrap()),
+            },
+        ];
+
+        assert_eq!(
+            select_ntp_pcap_device(server_ip, &candidates),
+            Some(1),
+            "the real LAN candidate (index 1) must win -- the 0.0.0.0-netmask junk candidate \
+             (index 0) must never be selected even when listed first"
         );
     }
 
