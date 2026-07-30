@@ -59,6 +59,27 @@ fn run_bash(script: &str) -> (i32, String, String) {
     )
 }
 
+/// A curated bin/ directory containing ONLY symlinks to the handful of tools purge-target.sh
+/// actually needs (dirname, git, du, cut, rm, sed, cat) — deliberately EXCLUDING `cargo`, even
+/// though this box has a second, older `cargo` in `/usr/bin` (an apt-installed 1.75.0) that a
+/// naive `PATH=/usr/bin:/bin` restriction does NOT exclude. This is the only reliable way to
+/// exercise purge-target.sh's "cargo unavailable -> rm -rf fallback" branch on this box.
+fn minimal_path_without_cargo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for tool in ["dirname", "git", "du", "cut", "rm", "sed", "cat"] {
+        let real = Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}"))
+            .output()
+            .unwrap_or_else(|e| panic!("resolve {tool}: {e}"));
+        let real_path = String::from_utf8_lossy(&real.stdout).trim().to_string();
+        assert!(!real_path.is_empty(), "could not resolve '{tool}' on PATH");
+        std::os::unix::fs::symlink(&real_path, dir.path().join(tool))
+            .unwrap_or_else(|e| panic!("symlink {tool}: {e}"));
+    }
+    dir
+}
+
 fn run_bash_in(dir: &std::path::Path, script: &str) -> (i32, String, String) {
     let out = Command::new("bash")
         .arg("-c")
@@ -235,7 +256,7 @@ impl ScratchRepo {
 fn purge_target_reports_nothing_to_do_when_no_target_dir_exists() {
     let repo = ScratchRepo::new();
     let cmd = format!(
-        "set -uo pipefail; . {} --check",
+        "set -uo pipefail; . {}; purge_target_main --check",
         repo.purge_target_sh().display()
     );
     let (code, stdout, stderr) = run_bash(&cmd);
@@ -252,7 +273,7 @@ fn purge_target_check_reports_size_and_never_purges_even_when_over_budget() {
     let repo = ScratchRepo::new();
     repo.make_target_dir();
     let cmd = format!(
-        "set -uo pipefail; THRESHOLD_MB=1; . {} --check",
+        "set -uo pipefail; THRESHOLD_MB=1; . {}; purge_target_main --check",
         repo.purge_target_sh().display()
     );
     let (code, stdout, stderr) = run_bash(&cmd);
@@ -321,16 +342,20 @@ purge_target_main
 fn purge_target_purges_via_rm_when_cargo_is_unavailable() {
     let repo = ScratchRepo::new();
     repo.make_target_dir();
-    // Restrict PATH to exclude cargo (which lives outside /usr/bin:/bin on this box) so the
+    // A curated PATH with no `cargo` anywhere on it (this box has TWO cargo installs --
+    // ~/.cargo/bin and an older apt-installed one in /usr/bin -- so a naive PATH=/usr/bin:/bin
+    // restriction does NOT exclude cargo; only an explicitly curated bin/ dir does) so the
     // script must take its `rm -rf` fallback branch.
+    let path_dir = minimal_path_without_cargo();
     let cmd = format!(
         r#"set -uo pipefail
-export PATH=/usr/bin:/bin
+export PATH={path}
 THRESHOLD_MB=1
 . {script}
 pgrep() {{ return 1; }}
 purge_target_main --force
 "#,
+        path = path_dir.path().display(),
         script = repo.purge_target_sh().display()
     );
     let (code, stdout, stderr) = run_bash(&cmd);
@@ -485,10 +510,16 @@ fn claude_md_local_build_policy_names_the_release_workflow_and_cheap_checks() {
         "must name .github/workflows/release.yml as the thing that actually builds+publishes"
     );
     assert!(
-        section.contains("dantesync-linux-amd64") && section.contains("dantesync-windows-amd64.exe"),
+        section.contains("dantesync-linux-amd64")
+            && section.contains("dantesync-windows-amd64.exe"),
         "must name the actual published release assets"
     );
-    for cheap_check in ["cargo fmt", "cargo check", "cargo clippy", "cargo test --no-run"] {
+    for cheap_check in [
+        "cargo fmt",
+        "cargo check",
+        "cargo clippy",
+        "cargo test --no-run",
+    ] {
         assert!(
             section.contains(cheap_check),
             "Local Build Policy must list '{cheap_check}' as an allowed cheap check"
