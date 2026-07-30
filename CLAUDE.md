@@ -34,7 +34,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Autonomous Deployment:** Install and verify updates on remote machines (Windows/Linux) listed in `TARGETS.md` using available tools (SSH, etc.)
 - **STRICT CI - Fight Regressions:** CI is configured to be maximally strict to prevent regressions:
   1. **Version bump required**: CI blocks merging if Cargo.toml version matches an existing release tag
-     - ALWAYS bump version before merging any code changes to master
+     - ALWAYS bump version before merging ANY change to master — including docs-only /
+       process-only commits (e.g. an `autopilot-log.md` entry) with zero functional change. The
+       gate checks the version string only; it does not know or care that your diff is "just
+       docs" (#61 confirmed this live: a docs-only follow-up PR still needed its own bump and
+       produced a real tagged release).
      - This prevents shipping different code under the same version number
   2. **Coverage threshold**: Minimum 60% project coverage, max 1% drop allowed, new code requires 80% coverage
   3. **Security audit**: Blocks CI on ANY security advisory (`cargo audit --deny warnings`)
@@ -93,6 +97,9 @@ is running.
 - Editing `.github/workflows/*.yml` — local `actionlint` validation, and why a workflow being
   syntactically valid doesn't prove a new step actually works at runtime → `.claude/rules/github-workflows.md`
   (auto-loads on its `paths:`)
+- Shell-script testing (`scripts/**`) — the source-guard + curated-PATH conventions from #61's
+  purge-target backstop, and a clippy-scope gotcha → `.claude/rules/shell-script-testing.md`
+  (auto-loads on its `paths:`)
 
 ## GOTCHA — `gh pr edit --body-file`/`--body` fails with a GraphQL "Projects (classic)" error
 
@@ -110,6 +117,10 @@ gh api repos/zbynekdrlik/dantesync/pulls/<N> -X PATCH -F body=@/path/to/new-body
 
 Same for `gh issue view <N>` (also fails the same way — use
 `gh api repos/zbynekdrlik/dantesync/issues/<N> --jq '{title,body,state}'` instead).
+
+**`gh issue comment <N> -F <file>` (POSTING a new comment) is unaffected** — confirmed working
+live (#61) with no GraphQL error. Only editing/viewing an existing PR/issue body hits the
+`projectCards` bug above; posting a fresh comment does not touch that field at all.
 
 ## Hardware Constraints (CRITICAL)
 
