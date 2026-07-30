@@ -14,6 +14,15 @@
 //! The dantesync daemon is a LIVE PTP sync process on real deployments (confirmed running on
 //! dev1 while writing this) — every test below that needs a "daemon not live" scenario stubs
 //! `pgrep` explicitly rather than relying on the real environment's process table.
+//!
+//! Unix-only (`#![cfg(unix)]` below): the scripts under test are bash + coreutils tooling for
+//! the Linux/macOS dev workflow (mirroring camera-box's own Linux-only purge backstop), and the
+//! test harness itself uses `std::os::unix::fs::{symlink, PermissionsExt}` (no `std::os::unix` on
+//! Windows at all). CI's ubuntu-latest `Test` job (`cargo test --test '*'`) is where this suite
+//! actually executes; windows-latest's `Build Check` job simply never compiles this file, per
+//! `.claude/rules/windows-only-code.md`'s existing `#[cfg(windows)]`/`#[cfg(unix)]` convention.
+
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;
