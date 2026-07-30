@@ -30,7 +30,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   4. Before trying new approaches, RESEARCH how other projects (PTPSync, Meinberg, ptpd) achieve <50µs on Windows
   5. Consult with user before switching approaches - do not endlessly iterate without results
 - **Test Quality:** All code must have 100% test coverage with high-quality, complex E2E tests. Never put out a broken version. The `tests/simulation_e2e.rs` contains critical simulation tests that validate the servo and controller behavior under various conditions.
-- **Local Verification:** Prioritize local `cargo build`, `cargo test`, and running the binary locally to verify changes before pushing to GitHub or deploying remotely
 - **CI/CD Verification:** Wait until GitHub Actions CI/CD pipeline has successfully finished (green checkmark) before telling the user to update or run commands. Monitor `gh run view` until completion
 - **Autonomous Deployment:** Install and verify updates on remote machines (Windows/Linux) listed in `TARGETS.md` using available tools (SSH, etc.)
 - **STRICT CI - Fight Regressions:** CI is configured to be maximally strict to prevent regressions:
@@ -53,21 +52,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **No direct pushes to master:** All changes to `master` must go through a PR merge from `dev`. Branch protection enforces this for all users including admins.
 - **Never create additional branches.** If a branch other than `master` or `dev` exists, it is a mistake and should be deleted.
 
-## Build Commands
+## Local Build Policy
+
+**Tier 0 (default) — CI builds the release binaries; local checkouts run cheap checks only.**
+
+`.github/workflows/release.yml` builds and publishes `dantesync-linux-amd64` and
+`dantesync-windows-amd64.exe` (plus `dantesync-tray-windows-amd64.exe`) on every tag push, gated
+all-or-nothing via `needs: build` (a failure on either platform skips `publish` entirely — no
+release with a missing asset). `ci.yml`'s own `test`/`build` jobs already run the full test suite
+and a real Linux+Windows compile on every PR. There is no reason to run a local release build or a
+full local test suite — CI is what actually produces and verifies the shipped binaries.
+
+Use `cargo check` and `cargo test`. Do NOT run `cargo build --release` locally — CI builds both
+Linux and Windows. Run locally before every push:
 
 ```bash
-# Build release binary
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run a specific test
-cargo test test_name
-
-# Run with logging
-RUST_LOG=debug cargo run
+cargo fmt --all --check
+cargo check
+cargo clippy -- -D warnings -A dead_code
+cargo test --no-run
 ```
+
+If you need to actually EXECUTE a test locally (e.g. to observe RED before GREEN on a bug fix),
+run only that one targeted test binary (`cargo test --test <file>` or `cargo test --lib <module>`),
+never the full suite and never `cargo build --release`.
+
+**Why:** cargo's project-local `target/` has no garbage collection (rust-lang/cargo#5026) — every
+incremental/profile/bin combination accumulates and is never auto-removed, so a local release
+build (or a full `cargo test` run) regrows `target/` unbounded over time. `scripts/purge-target.sh`
+(installed via `scripts/install-git-hooks.sh` as a `pre-push` hook) is the automated backstop: it
+purges `target/` once it crosses a size budget, and always skips while the dantesync daemon/tray
+is running.
 
 **Windows cross-compilation** requires Npcap SDK 1.13+ with `LIB` env var set to `npcap-sdk/Lib/x64`.
 
