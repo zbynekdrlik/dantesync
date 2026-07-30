@@ -188,3 +188,55 @@ canary evidence before continuing.
 - PR #59: https://github.com/zbynekdrlik/dantesync/pull/59 — green, `mergeable: MERGEABLE`,
   `mergeStateStatus: CLEAN`, all 7 required checks pass. NOT merged per this session's explicit
   instruction — supervisor merges, releases fresh tag v1.8.24, canaries to the fleet.
+
+## #61 — CLAUDE.md instructed local release builds in this Tier-0 repo; no target/-purge backstop
+
+- Version bump: `fe7f8a6` (1.8.25 -> 1.8.26)
+- Design comment (root cause + approach + rejected alternative), posted BEFORE any code:
+  https://github.com/zbynekdrlik/dantesync/issues/61#issuecomment-5128859083
+- RED: `14f0be3` — `tests/purge_target.rs`, 18 tests, 17 fail (scripts don't exist yet, no
+  `## Local Build Policy` in CLAUDE.md); only `claude_md_keeps_the_npcap_cross_compilation_note`
+  passes (pre-existing).
+- GREEN: `603542d` — `scripts/lib/purge-target-decision.sh` (pure `purge_target_should_purge`/
+  `purge_target_daemon_live`, unit-tested directly, unlike camera-box's own untested
+  purge-target.sh) + `scripts/purge-target.sh` (`purge_target_main`, executed-not-sourced guard
+  mirroring cam-disk-guard.sh's #403 convention) + `scripts/install-git-hooks.sh` (pre-push hook).
+  Daemon-live check matches by process NAME (`pgrep -x dantesync|dantesync-tray`), an ABSOLUTE
+  gate never overridden by `--force`.
+- GREEN: `85ef6dd` — CLAUDE.md: replaced the contradictory `Local Verification` bullet + old
+  `## Build Commands` (`cargo build --release`) with an explicit `## Local Build Policy` (Tier 0)
+  section naming `.github/workflows/release.yml` as the actual build+publish path; kept the
+  Npcap cross-compile note.
+- fix: `cf90ef4` — gated the whole test file behind `#![cfg(unix)]`: the harness uses
+  `std::os::unix::fs::{symlink, PermissionsExt}` (curated cargo-free `PATH` for the fallback-purge
+  test; executable-bit check on the installed hook), neither exists on Windows. CI's
+  windows-latest Build Check job failed to compile before this fix; ubuntu-latest's Test job is
+  where the suite actually runs.
+- Gotcha found live: this box has TWO `cargo` installs (`~/.cargo/bin` + an older apt one in
+  `/usr/bin`), so `PATH=/usr/bin:/bin` does NOT exclude cargo — the "cargo unavailable" fallback
+  test needed a curated symlink-only bin dir instead.
+- Gotcha found live: sourcing a script WITH trailing args (`. script.sh --check`) does not
+  auto-invoke a function gated behind an executed-not-sourced guard — the guard sees it as
+  sourced either way and the args are silently unused. Fixed by explicitly calling
+  `purge_target_main --check` after sourcing in the affected tests.
+- Real-world proof: on this box (whose live `dantesync` daemon PID was confirmed via `pgrep`),
+  `THRESHOLD_MB=1 scripts/purge-target.sh` correctly REFUSED to purge a real 775 MB `target/`,
+  printing the live-daemon skip message.
+- Local verification: `cargo test --test purge_target` 18/18 pass; `cargo fmt --all --check`,
+  `cargo check`, `cargo clippy -- -D warnings -A dead_code` (CI's exact invocation) all clean. A
+  broader `--all-targets` clippy run surfaces 10 pre-existing `field_reassign_with_default`
+  findings in `src/time_server.rs` test code — confirmed identical on `origin/master` via a
+  throwaway `git worktree`, unrelated, not touched.
+- PR #63: https://github.com/zbynekdrlik/dantesync/pull/63 — green (7/7 checks), `mergeable:
+  MERGEABLE`, `mergeStateStatus: CLEAN`. Merged `1fb8d403` (direct REST PUT — `gh pr merge`'s
+  "not up to date" false refusal, same repo GOTCHA as PR #697). Auto-closed #61. Tagged +
+  released `v1.8.26` (CI run 30532236993, both linux-amd64 + windows-amd64 + tray assets
+  published).
+- Filed `zbynekdrlik/airuleset#187`: `block-commit-without-design.sh` resolves the repo from a
+  stale session cwd (this dispatch's declared root was a sibling repo, camera-box) instead of the
+  `git commit`'s actual cwd (reached via an inline `cd &&`), so it reported "no design comment
+  posted for #61 (repo camera-box)" even though the real design comment was posted and verified
+  on `dantesync`#61. Bypassed with `[no-design: ...]` on every #61 commit, citing the marker +
+  filed issue.
+- No fleet deploy: zero functional daemon change (Cargo.toml version + CLAUDE.md + new dev-only
+  shell scripts only) — nothing to redeploy or verify on the live cam/imag/strih/stream fleet.
