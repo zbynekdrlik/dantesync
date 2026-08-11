@@ -296,6 +296,137 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // #68 — A BENIGN UDP RESET MUST NOT DEGRADE THE FLEET'S TIME SOURCE
+    // ========================================================================
+    // On Windows a UDP socket that has sent a datagram to a port with no
+    // listener gets WSAECONNRESET (os error 10054) on its NEXT recvfrom — the
+    // ICMP port-unreachable surfacing on a connectionless socket. It is normal
+    // and expected for a server whose clients come and go. Today it lands in
+    // run()'s catch-all arm: logged at error! severity and followed by a 100 ms
+    // sleep, during which the master answers NOBODY. A burst of them degrades
+    // the whole fleet's time source. (It does NOT kill the loop — verified
+    // against the deployed v1.8.25 — so the fix is classification, not a
+    // resurrection.)
+    // ========================================================================
+
+    #[test]
+    fn classify_recv_error_treats_a_udp_reset_as_benign_68() {
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::ConnectionReset),
+            RecvErrorAction::Benign,
+            "WSAECONNRESET is an expected UDP condition, not a server fault"
+        );
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::ConnectionRefused),
+            RecvErrorAction::Benign,
+            "the POSIX ICMP-unreachable equivalent is equally benign"
+        );
+    }
+
+    #[test]
+    fn classify_recv_error_keeps_idle_wakeups_free_68() {
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::WouldBlock),
+            RecvErrorAction::Idle
+        );
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::TimedOut),
+            RecvErrorAction::Idle
+        );
+    }
+
+    #[test]
+    fn classify_recv_error_backs_off_only_on_a_genuinely_unknown_error_68() {
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::PermissionDenied),
+            RecvErrorAction::Backoff
+        );
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::AddrInUse),
+            RecvErrorAction::Backoff
+        );
+    }
+
+    #[test]
+    fn a_benign_reset_never_stalls_the_server_68() {
+        // The 100 ms stall is the actual harm: while sleeping, the fleet's time
+        // source answers nobody.
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::ConnectionReset).backoff(),
+            None
+        );
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::TimedOut).backoff(),
+            None
+        );
+        assert_eq!(
+            classify_recv_error(std::io::ErrorKind::PermissionDenied).backoff(),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    /// The supervised server answers repeated client queries from one long-lived
+    /// loop and shuts down promptly when the running flag clears — so a restart
+    /// is never needed to get the NTP server back.
+    #[test]
+    fn run_supervised_serves_consecutive_requests_and_shuts_down_68() {
+        use std::net::UdpSocket as StdUdpSocket;
+
+        let server = NtpServer::new(0, 3).expect("bind ephemeral NTP server");
+        let addr = server
+            .local_addr()
+            .expect("server must expose its bound addr");
+        let port = addr.port();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = running.clone();
+        let handle = std::thread::spawn(move || run_supervised(server, server_running));
+
+        let client = StdUdpSocket::bind("127.0.0.1:0").expect("bind client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client read timeout");
+
+        for attempt in 1..=2 {
+            let mut request = [0u8; NTP_PACKET_SIZE];
+            request[0] = (4 << 3) | MODE_CLIENT; // v4 client
+            request[40 + attempt as usize] = 0xAB; // distinct originate stamp
+            client
+                .send_to(&request, ("127.0.0.1", port))
+                .unwrap_or_else(|e| panic!("send #{} failed: {}", attempt, e));
+
+            let mut response = [0u8; NTP_PACKET_SIZE];
+            let (n, _) = client
+                .recv_from(&mut response)
+                .unwrap_or_else(|e| panic!("no response to request #{}: {}", attempt, e));
+            assert_eq!(n, NTP_PACKET_SIZE, "short response to request #{}", attempt);
+            assert_eq!(
+                response[0] & 0x07,
+                MODE_SERVER,
+                "response #{} must be a server-mode packet",
+                attempt
+            );
+            assert_eq!(
+                &response[24..32],
+                &request[40..48],
+                "response #{} must echo this request's own originate timestamp",
+                attempt
+            );
+        }
+
+        running.store(false, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            handle.is_finished(),
+            "the supervised server must stop when the running flag clears"
+        );
+        handle.join().expect("supervisor thread panicked");
+    }
+
     #[test]
     fn test_system_time_to_ntp_epoch() {
         // Unix epoch (1970-01-01 00:00:00) should be NTP epoch + 70 years
