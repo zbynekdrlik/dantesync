@@ -601,6 +601,58 @@ mod tests {
         handle.join().expect("supervisor thread panicked");
     }
 
+    /// #68: the reference timestamp is the "when did I last read my own
+    /// reference" field of the NTP protocol. It was pinned to process start and
+    /// never moved, which was honest only while the master genuinely never
+    /// re-read upstream. Now that it does, the served value must follow the
+    /// last real upstream sync.
+    #[test]
+    fn the_served_reference_timestamp_follows_the_last_real_upstream_sync_68() {
+        let mut server = NtpServer {
+            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            stratum: 3,
+            port: 0,
+            reference_time: UNIX_EPOCH + Duration::from_secs(1_000_000),
+            status: None,
+        };
+
+        let status = Arc::new(std::sync::RwLock::new(crate::status::SyncStatus::default()));
+        status.write().unwrap().ntp_updated_ts = 1_786_439_763;
+        server.set_status_source(status);
+
+        let response = server.build_response(4, &[0u8; 8], 100, 200).unwrap();
+        let ref_secs = u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
+        assert_eq!(
+            ref_secs as u64,
+            1_786_439_763 + NTP_EPOCH_OFFSET,
+            "served reference timestamp must be the last upstream sync, not process start"
+        );
+    }
+
+    #[test]
+    fn the_reference_timestamp_falls_back_when_upstream_was_never_read_68() {
+        let created = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut server = NtpServer {
+            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            stratum: 3,
+            port: 0,
+            reference_time: created,
+            status: None,
+        };
+        // Status present, but nothing measured yet (ntp_updated_ts == 0).
+        server.set_status_source(Arc::new(std::sync::RwLock::new(
+            crate::status::SyncStatus::default(),
+        )));
+
+        let response = server.build_response(4, &[0u8; 8], 100, 200).unwrap();
+        let ref_secs = u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
+        assert_eq!(
+            ref_secs as u64,
+            1_000_000 + NTP_EPOCH_OFFSET,
+            "never-measured must fall back to server start, never to the 1970 epoch"
+        );
+    }
+
     #[test]
     fn test_system_time_to_ntp_epoch() {
         // Unix epoch (1970-01-01 00:00:00) should be NTP epoch + 70 years
