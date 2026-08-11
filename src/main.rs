@@ -725,13 +725,12 @@ fn run_sync_loop(
                 // days, with the whole fleet coherently following it).
                 controller.configure_ntp_server_mode(ntp_server_config.max_step_us);
 
-                // Start NTP server in background thread
+                // Start NTP server in a SUPERVISED background thread (#68) —
+                // if the loop ever exits unexpectedly it is re-bound and
+                // restarted loudly, instead of the daemon silently serving
+                // nothing until somebody restarts the service.
                 let server_running = running.clone();
-                thread::spawn(move || {
-                    if let Err(e) = ntp_srv.run(server_running) {
-                        error!("[NTP-Server] Server error: {}", e);
-                    }
-                });
+                thread::spawn(move || ntp_server::run_supervised(ntp_srv, server_running));
 
                 info!("[NTP-Server] Active - other machines can sync from this host");
             }

@@ -42,6 +42,97 @@ const MODE_CLIENT: u8 = 3;
 /// Reference ID for local clock (ASCII "LOCL")
 const REF_ID_LOCL: u32 = 0x4C4F434C;
 
+/// How `run()` should react to a `recv_from` error (#68).
+///
+/// A UDP receive loop must distinguish three very different things that all
+/// arrive as `io::Error`, because treating them alike is what made a routine
+/// condition degrade the fleet's time source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvErrorAction {
+    /// Nothing arrived within the read timeout — the normal idle path.
+    Idle,
+    /// An EXPECTED, harmless condition: a previously-sent datagram bounced
+    /// (ICMP port-unreachable) and the OS reports it on the next receive.
+    /// Windows calls this `WSAECONNRESET` (os error 10054) and raises it
+    /// routinely for a server whose clients come and go. Continue immediately.
+    Benign,
+    /// Genuinely unexpected — log it and back off briefly so a hard-failing
+    /// socket cannot spin the CPU.
+    Backoff,
+}
+
+impl RecvErrorAction {
+    /// How long to sleep before the next receive. `None` for everything that
+    /// is normal: a stalled server answers nobody, and on the fleet's time
+    /// source that is the actual harm a benign reset used to cause.
+    pub fn backoff(self) -> Option<Duration> {
+        match self {
+            RecvErrorAction::Idle | RecvErrorAction::Benign => None,
+            RecvErrorAction::Backoff => Some(RECV_ERROR_BACKOFF),
+        }
+    }
+}
+
+/// Backoff applied only to a genuinely unknown receive error.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// #68 — classify a `recv_from` error. Pure, so the policy is unit-tested
+/// directly instead of being inferred from a live socket (WSAECONNRESET in
+/// particular cannot be provoked at all on Linux, where an unconnected UDP
+/// socket never surfaces the ICMP error).
+pub fn classify_recv_error(kind: std::io::ErrorKind) -> RecvErrorAction {
+    match kind {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => RecvErrorAction::Idle,
+        // ConnectionReset  = WSAECONNRESET (Windows, the reported one).
+        // ConnectionRefused = the POSIX ICMP-unreachable equivalent.
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused => {
+            RecvErrorAction::Benign
+        }
+        _ => RecvErrorAction::Backoff,
+    }
+}
+
+/// #68 — Windows raises `WSAECONNRESET` on a UDP socket's next `recv_from`
+/// after one of its outbound datagrams drew an ICMP port-unreachable. That is
+/// pointless for a *server* socket, and `SIO_UDP_CONNRESET = FALSE` is the
+/// documented way to stop the stack reporting it at all (Microsoft's own
+/// guidance for UDP servers; the classifier above is the belt to this braces).
+///
+/// Never fatal: a failure here only means the benign errors keep surfacing, and
+/// `classify_recv_error` already handles them — so it is logged and ignored
+/// rather than taking down the fleet's time source at startup.
+#[cfg(windows)]
+fn disable_udp_conn_reset(socket: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET, SOCKET};
+
+    let raw = SOCKET(socket.as_raw_socket() as usize);
+    let mut disable: u32 = 0; // FALSE
+    let mut bytes_returned: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            raw,
+            SIO_UDP_CONNRESET,
+            Some(&mut disable as *mut u32 as *const std::ffi::c_void),
+            std::mem::size_of::<u32>() as u32,
+            None,
+            0,
+            &mut bytes_returned,
+            None,
+            None,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            "[NTP-Server] Could not disable SIO_UDP_CONNRESET: {} (harmless — benign \
+             resets are classified and ignored anyway)",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        debug!("[NTP-Server] SIO_UDP_CONNRESET disabled (spurious UDP resets suppressed)");
+    }
+}
+
 // ============================================================================
 // NTP SERVER
 // ============================================================================
@@ -56,6 +147,9 @@ const REF_ID_LOCL: u32 = 0x4C4F434C;
 pub struct NtpServer {
     socket: UdpSocket,
     stratum: u8,
+    /// The port this server was CONFIGURED with (#68) — kept so
+    /// `run_supervised` can re-bind an identical server if one is ever needed.
+    port: u16,
     /// When we synced from upstream NTP (for reference timestamp)
     reference_time: SystemTime,
 }
@@ -84,6 +178,10 @@ impl NtpServer {
         // the kernel between packets). Do NOT re-add set_nonblocking.
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
 
+        // #68: stop Windows raising WSAECONNRESET on this server socket at all.
+        #[cfg(windows)]
+        disable_udp_conn_reset(&socket);
+
         info!(
             "[NTP-Server] Listening on {} (stratum {})",
             bind_addr, stratum
@@ -92,8 +190,15 @@ impl NtpServer {
         Ok(NtpServer {
             socket,
             stratum,
+            port,
             reference_time: SystemTime::now(),
         })
+    }
+
+    /// The address this server is actually bound to (#68). Differs from the
+    /// configured port when bound to port 0.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.socket.local_addr()?)
     }
 
     /// Run the NTP server loop until the running flag is cleared.
@@ -114,18 +219,27 @@ impl NtpServer {
                         );
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No packet available, continue polling
-                    continue;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Read timeout, continue polling
-                    continue;
-                }
-                Err(e) => {
-                    error!("[NTP-Server] Socket error: {}", e);
-                    std::thread::sleep(Duration::from_millis(100));
-                }
+                // #68: three outcomes, not two — see `classify_recv_error`. A
+                // benign UDP reset used to land in the catch-all and cost a
+                // 100ms stall per occurrence, during which the fleet's time
+                // source answered nobody.
+                Err(e) => match classify_recv_error(e.kind()) {
+                    RecvErrorAction::Idle => continue,
+                    RecvErrorAction::Benign => {
+                        debug!(
+                            "[NTP-Server] Ignoring expected UDP condition: {} \
+                             (a previous reply bounced; the loop is unaffected)",
+                            e
+                        );
+                        continue;
+                    }
+                    RecvErrorAction::Backoff => {
+                        error!("[NTP-Server] Socket error: {}", e);
+                        if let Some(delay) = RecvErrorAction::Backoff.backoff() {
+                            std::thread::sleep(delay);
+                        }
+                    }
+                },
             }
         }
 
@@ -237,6 +351,66 @@ impl NtpServer {
         self.reference_time = time;
     }
 }
+
+/// #68 — run the NTP server under supervision until `running` clears.
+///
+/// `NtpServer::run()` provably cannot exit early today (no `?`, no `break`, and
+/// every receive error is classified rather than propagated), so in practice
+/// this loops exactly once. That is the point: the fleet's time source must not
+/// depend on that property continuing to hold after a future edit adds a `?` to
+/// the loop. If `run()` ever does return early, the server is re-bound on its
+/// configured port and restarted — loudly — instead of the daemon silently
+/// serving nothing until somebody notices and restarts the service.
+///
+/// A re-bind failure (port taken during the gap) is not fatal either: it backs
+/// off and retries, so a transient collision heals itself.
+pub fn run_supervised(server: NtpServer, running: Arc<AtomicBool>) {
+    let port = server.port;
+    let stratum = server.stratum;
+    let mut current = server;
+
+    while running.load(Ordering::SeqCst) {
+        match current.run(running.clone()) {
+            Ok(()) => break, // clean shutdown: `running` cleared
+            Err(e) => {
+                error!(
+                    "[NTP-Server] Loop exited unexpectedly: {} — restarting on port {}",
+                    e, port
+                );
+            }
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(SUPERVISOR_RESTART_BACKOFF);
+
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                return;
+            }
+            match NtpServer::new(port, stratum) {
+                Ok(fresh) => {
+                    warn!("[NTP-Server] Restarted after an unexpected loop exit");
+                    current = fresh;
+                    break;
+                }
+                Err(e) => {
+                    error!(
+                        "[NTP-Server] Re-bind on port {} failed: {} — retrying",
+                        port, e
+                    );
+                    std::thread::sleep(SUPERVISOR_RESTART_BACKOFF);
+                }
+            }
+        }
+    }
+
+    info!("[NTP-Server] Supervisor stopped");
+}
+
+/// Backoff between an unexpected server-loop exit and its restart.
+const SUPERVISOR_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 
 // ============================================================================
 // NTP TIMESTAMP HELPERS
@@ -497,6 +671,7 @@ mod tests {
         let server = NtpServer {
             socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
             stratum: 3,
+            port: 0,
             reference_time: SystemTime::now(),
         };
 
@@ -525,6 +700,7 @@ mod tests {
         let server = NtpServer {
             socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
             stratum: 3,
+            port: 0,
             reference_time: SystemTime::now(),
         };
 
@@ -540,6 +716,7 @@ mod tests {
         let server = NtpServer {
             socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
             stratum: 3,
+            port: 0,
             reference_time: SystemTime::now(),
         };
 
@@ -564,6 +741,7 @@ mod tests {
         let server = NtpServer {
             socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
             stratum: 3,
+            port: 0,
             reference_time: SystemTime::now(),
         };
 
@@ -578,6 +756,7 @@ mod tests {
         let mut server = NtpServer {
             socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
             stratum: 3,
+            port: 0,
             reference_time: UNIX_EPOCH,
         };
 
