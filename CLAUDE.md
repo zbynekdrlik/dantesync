@@ -100,6 +100,11 @@ is running.
 - Shell-script testing (`scripts/**`) — the source-guard + curated-PATH conventions from #61's
   purge-target backstop, and a clippy-scope gotcha → `.claude/rules/shell-script-testing.md`
   (auto-loads on its `paths:`)
+- Clock discipline + how to test a control loop (closed-loop mocks vs constant ones, MAD models
+  jitter not a drift ramp, Instant vs SystemTime on a daemon that steps its own clock, the
+  additive-only `/status` contract) → `.claude/rules/clock-discipline-and-testing.md`
+- Adding a config key (the `serde_json` `IndexMut` startup-panic trap, serde defaults, flooring
+  nonsense values) → `.claude/rules/config-migration.md`
 
 ## GOTCHA — `gh pr edit --body-file`/`--body` fails with a GraphQL "Projects (classic)" error
 

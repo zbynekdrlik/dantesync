@@ -236,7 +236,9 @@ impl NtpServer {
     }
 
     /// The address this server is actually bound to (#68). Differs from the
-    /// configured port when bound to port 0.
+    /// configured port when bound to port 0 — which is why this exists at all:
+    /// it is the seam that lets a test drive a real ephemeral-port server.
+    #[cfg(test)]
     fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }
