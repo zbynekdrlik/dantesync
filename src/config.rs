@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 pub struct SystemConfig {
     pub servo: ServoConfig,
     pub filters: FilterConfig,
+    /// #68 — how long (seconds) a node may go without a successful NTP
+    /// measurement before `ntp_failed` is raised and `/status` grades the
+    /// reading as stale.
+    ///
+    /// Default 180 s = 6× the 30 s query cadence, so a couple of missed or slow
+    /// bursts never alarm but a genuinely dead NTP path shows within minutes.
+    /// Before this, `ntp_failed` had exactly two writers, both inside the query
+    /// path — so a node that had simply STOPPED querying (the NTP master, by
+    /// design) reported `false` forever while drifting a second off UTC.
+    #[serde(default = "default_ntp_stale_secs")]
+    pub ntp_stale_secs: u64,
+}
+
+fn default_ntp_stale_secs() -> u64 {
+    180
 }
 
 /// NTP Server configuration for unified time source mode.
@@ -180,6 +195,9 @@ impl Default for SystemConfig {
                 // Warmup period (same on both platforms)
                 warmup_secs: 3.0,
             },
+
+            // #68: 6x the 30s NTP query cadence
+            ntp_stale_secs: default_ntp_stale_secs(),
         }
     }
 }

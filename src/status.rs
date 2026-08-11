@@ -84,6 +84,23 @@ pub struct SyncStatus {
     /// persistent `false` on a Windows node as worth investigating.
     #[serde(default)]
     pub pcap_ntp_active: bool,
+
+    /// dantesync#68: unix epoch second of the last SUCCESSFUL NTP measurement
+    /// (`0` = never measured). This is the field `updated_ts` is NOT: that one
+    /// is written by the PTP loop on every status refresh, so it kept advancing
+    /// beside an `ntp_offset_us` frozen 18 hours earlier, and a consumer had no
+    /// way to tell. Read this (or `ntp_age_s`) before trusting `ntp_offset_us`.
+    #[serde(default)]
+    pub ntp_updated_ts: u64,
+
+    /// dantesync#68: seconds since that measurement, computed at status-write
+    /// time; `null` when nothing has EVER been measured — deliberately not `0`,
+    /// which would read as "measured just now". This is the number a monitoring
+    /// gate should grade before grading `ntp_offset_us` at all: live on strih
+    /// the offset field read a perfect `0` because no measurement had ever been
+    /// published, not because the node was on time.
+    #[serde(default)]
+    pub ntp_age_s: Option<u64>,
 }
 
 impl SyncStatus {
@@ -117,6 +134,9 @@ impl Default for SyncStatus {
             ntp_spread_us: 0,
             ntp_sample_count: 0,
             pcap_ntp_active: false,
+            // #68: nothing measured yet — say so, never imply "just now"
+            ntp_updated_ts: 0,
+            ntp_age_s: None,
         }
     }
 }

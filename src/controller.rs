@@ -94,6 +94,21 @@ fn clamp_ntp_step_us(offset_us: i64, max_step_us: i64) -> i64 {
     offset_us.clamp(-max_step_us, max_step_us)
 }
 
+/// #68 — is this node's UTC measurement stale?
+///
+/// `ntp_failed` used to have exactly two writers, both inside the NTP query
+/// path, so a node that had simply STOPPED querying (the master, by design)
+/// reported `false` for 18 hours while a second of UTC error accumulated. A
+/// timeout is the only signal that covers "nothing is even trying".
+///
+/// When nothing has EVER been measured the age falls back to process uptime, so
+/// a fresh boot does not alarm before its first query lands, but an hour of
+/// silence does. Exactly `window` is not yet stale (the boundary belongs to the
+/// healthy side — a measurement arriving exactly on cadence is on time).
+fn ntp_is_stale(since_last_success: Option<Duration>, uptime: Duration, window: Duration) -> bool {
+    since_last_success.unwrap_or(uptime) > window
+}
+
 // ============================================================================
 // CONSTANTS - Organized by functional area
 // ============================================================================
@@ -303,6 +318,14 @@ where
     // NTP failure tracking
     ntp_consecutive_failures: usize,
     ntp_failed: bool,
+    /// #68: when the last SUCCESSFUL NTP measurement landed (monotonic, for the
+    /// staleness window) and its wall-clock epoch second (for `/status`).
+    /// `None` = never measured.
+    last_ntp_success: Option<Instant>,
+    last_ntp_success_epoch: Option<u64>,
+    /// #68: process start, so "never measured" can be graded against uptime
+    /// instead of alarming instantly at boot.
+    started_at: Instant,
 
     // ==========================================================================
     // ADAPTIVE SPIKE DETECTION
@@ -434,6 +457,10 @@ where
             // NTP failure tracking
             ntp_consecutive_failures: 0,
             ntp_failed: false,
+            // #68 freshness tracking
+            last_ntp_success: None,
+            last_ntp_success_epoch: None,
+            started_at: now,
             // Adaptive spike detection
             spike_filter: SpikeFilter::new(),
             // Adaptive jitter smoothing
@@ -451,6 +478,77 @@ where
         self.status_shared.clone()
     }
 
+    /// #68 — record a SUCCESSFUL upstream measurement: publish it to
+    /// `SyncStatus` (offset + quality + freshness) and reset the failure state.
+    ///
+    /// One place, called by BOTH the boot-time `run_ntp_sync()` and the
+    /// periodic `check_ntp_utc_tracking()`. The boot path published nothing at
+    /// all before, which is why strih served `ntp_offset_us: 0,
+    /// ntp_sample_count: 0` for 19 minutes after a restart that had in fact
+    /// measured +1.039 s and stepped the clock by it.
+    fn record_ntp_success(&mut self, offset_us: i64, measurement: &crate::ntp::NtpMeasurement) {
+        let now = Instant::now();
+        let epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_ntp_success = Some(now);
+        self.last_ntp_success_epoch = Some(epoch);
+
+        if self.ntp_failed {
+            info!("[NTP] Connection restored");
+        }
+        self.ntp_consecutive_failures = 0;
+        self.ntp_failed = false;
+
+        if let Ok(mut status) = self.status_shared.write() {
+            status.ntp_offset_us = offset_us;
+            status.ntp_failed = false;
+            status.ntp_spread_us = measurement.spread_us;
+            status.ntp_sample_count = measurement.sample_count;
+            status.pcap_ntp_active = measurement.pcap_active;
+            status.ntp_updated_ts = epoch;
+            status.ntp_age_s = Some(0);
+        }
+    }
+
+    /// #68 — raise `ntp_failed` when no fresh measurement has landed within the
+    /// configured window, even though no query ever explicitly failed.
+    ///
+    /// Runs from the 10-second status tick rather than inside the query path,
+    /// precisely because the failure being detected is "the query path is not
+    /// running at all" — the state the master sat in for 18 hours while
+    /// reporting `ntp_failed: false`.
+    fn check_ntp_freshness(&mut self) {
+        let stale = ntp_is_stale(
+            self.last_ntp_success.map(|t| t.elapsed()),
+            self.started_at.elapsed(),
+            Duration::from_secs(self.config.ntp_stale_secs),
+        );
+        if !stale || self.ntp_failed {
+            return;
+        }
+
+        self.ntp_failed = true;
+        match self.last_ntp_success {
+            Some(t) => warn!(
+                "[NTP] No successful measurement for {}s (window {}s) — UTC alignment is \
+                 no longer being maintained; treating this node's NTP reading as stale",
+                t.elapsed().as_secs(),
+                self.config.ntp_stale_secs
+            ),
+            None => warn!(
+                "[NTP] No successful measurement in {}s of uptime (window {}s) — this node \
+                 has never aligned to UTC",
+                self.started_at.elapsed().as_secs(),
+                self.config.ntp_stale_secs
+            ),
+        }
+        if let Ok(mut status) = self.status_shared.write() {
+            status.ntp_failed = true;
+        }
+    }
+
     pub fn run_ntp_sync(&mut self, skip: bool) {
         if skip {
             return;
@@ -465,6 +563,14 @@ where
                     "NTP Sync: Offset {}{:?} (spread:{}us samples:{})",
                     sign_str, offset, measurement.spread_us, measurement.sample_count
                 );
+
+                // #68: the boot measurement is a real measurement — publish it.
+                let offset_us = if sign > 0 {
+                    offset.as_micros() as i64
+                } else {
+                    -(offset.as_micros() as i64)
+                };
+                self.record_ntp_success(offset_us, &measurement);
 
                 if offset.as_millis() > 50 {
                     info!("Stepping clock (NTP)...");
@@ -556,12 +662,10 @@ where
                     -(offset.as_micros() as i64)
                 };
 
-                // NTP success - reset failure tracking
-                if self.ntp_failed {
-                    info!("[NTP] Connection restored");
-                }
-                self.ntp_consecutive_failures = 0;
-                self.ntp_failed = false;
+                // NTP success — reset failure tracking AND publish the reading
+                // together with WHEN it was taken (#68: one shared recorder, so
+                // the boot path and this path can never diverge again).
+                self.record_ntp_success(offset_us, &measurement);
 
                 // Add sample to buffer. #53: `offset_us` is now the burst-filtered
                 // (RTT-selected + median'd) value from NtpClient::get_offset(), not a
@@ -573,14 +677,8 @@ where
                     self.ntp_offset_samples.pop_front();
                 }
 
-                // Update shared status with NTP offset + quality (#53) for tray/HTTP display
-                if let Ok(mut status) = self.status_shared.write() {
-                    status.ntp_offset_us = offset_us;
-                    status.ntp_failed = false;
-                    status.ntp_spread_us = measurement.spread_us;
-                    status.ntp_sample_count = measurement.sample_count;
-                    status.pcap_ntp_active = measurement.pcap_active;
-                }
+                // (offset + quality (#53) + freshness (#68) were published to
+                // SyncStatus by record_ntp_success() above)
 
                 // Calculate adaptive threshold based on offset variance
                 let adaptive_threshold = self.calculate_ntp_adaptive_threshold();
@@ -823,7 +921,10 @@ where
         }
     }
 
-    pub fn log_status(&self) {
+    pub fn log_status(&mut self) {
+        // #68: the staleness check lives on this tick, not in the query path —
+        // the failure it detects is "the query path is not running at all".
+        self.check_ntp_freshness();
         // Just update shared status for IPC - no redundant logging
         self.update_shared_status();
     }
@@ -1493,7 +1594,12 @@ where
             };
             // Accumulated phase error since last NTP step
             status.accumulated_phase_us = self.accumulated_phase_error_us;
-            // NTP offset is updated separately via check_ntp_utc_tracking()
+            // NTP offset/quality are published by record_ntp_success(). Only the
+            // AGE is recomputed here (#68), so it keeps ticking up beside the
+            // frozen reading it describes instead of staying at whatever it was
+            // when that reading landed — that indistinguishability is the bug.
+            status.ntp_updated_ts = self.last_ntp_success_epoch.unwrap_or(0);
+            status.ntp_age_s = self.last_ntp_success.map(|t| t.elapsed().as_secs());
         }
     }
 }
