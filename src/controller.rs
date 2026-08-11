@@ -2423,4 +2423,163 @@ mod tests {
         // Should still be online
         assert!(!controller.ptp_offline, "Should stay online within timeout");
     }
+
+    // ========================================================================
+    // #68 — THE MASTER MUST KEEP DISCIPLINING ITSELF AGAINST UPSTREAM
+    // ========================================================================
+    // `ntp_server_mode` used to call `disable_ntp_tracking()`, so a healthy
+    // master (`ptp_offline == false`) took exactly ONE UTC measurement in its
+    // whole lifetime — the boot-time `run_ntp_sync()` — and then free-ran at
+    // the Dante grandmaster's rate, which is not UTC's rate. Measured live on
+    // strih: 6–19 ppm ⇒ ~21 ms of UTC error 19 minutes after a restart, 1.04 s
+    // over two days. A restart is NOT the remedy; a closed loop is.
+    // ========================================================================
+
+    #[test]
+    fn server_mode_keeps_periodic_upstream_discipline_enabled_68() {
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            c.ntp_tracking_enabled(),
+            "a master that stops re-reading its own reference is a free-running \
+             oscillator advertising itself as a time source"
+        );
+    }
+
+    #[test]
+    fn ntp_discipline_due_in_server_mode_even_when_ptp_is_not_locked_68() {
+        // The whole fleet's UTC hangs on this one node — its duty to track UTC
+        // does not depend on whether its OWN PTP happens to be locked.
+        assert!(ntp_discipline_due(
+            true,  // tracking_enabled
+            true,  // server_mode
+            false, // ptp_offline
+            false, // is_locked
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn ntp_discipline_not_due_before_the_interval_elapses_68() {
+        assert!(!ntp_discipline_due(
+            true,
+            true,
+            false,
+            true,
+            Duration::from_secs(29),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn ntp_discipline_for_a_client_node_still_requires_lock_or_offline_68() {
+        // Client semantics are unchanged: locked, or PTP offline (NTP-only).
+        assert!(!ntp_discipline_due(
+            true,
+            false,
+            false,
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        assert!(ntp_discipline_due(
+            true,
+            false,
+            false,
+            true,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        assert!(ntp_discipline_due(
+            true,
+            false,
+            true,
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn ntp_discipline_respects_the_tracking_master_switch_68() {
+        assert!(!ntp_discipline_due(
+            false, // tracking disabled
+            true,  // ... even in server mode
+            true,
+            true,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn clamp_ntp_step_leaves_a_steady_state_correction_untouched_68() {
+        // At 6–19 ppm a 30s interval accrues ~0.2–0.6 ms, so the bound never
+        // fires in steady state — it exists only for a rogue upstream.
+        assert_eq!(clamp_ntp_step_us(700, 100_000), 700);
+        assert_eq!(clamp_ntp_step_us(-1_500, 100_000), -1_500);
+        assert_eq!(clamp_ntp_step_us(100_000, 100_000), 100_000);
+    }
+
+    #[test]
+    fn clamp_ntp_step_bounds_a_large_correction_and_keeps_its_sign_68() {
+        assert_eq!(clamp_ntp_step_us(1_039_375, 100_000), 100_000);
+        assert_eq!(clamp_ntp_step_us(-1_039_375, 100_000), -100_000);
+        // A wildly wrong upstream cannot teleport the fleet in one jump.
+        assert_eq!(clamp_ntp_step_us(3_600_000_000, 100_000), 100_000);
+    }
+
+    #[test]
+    fn clamp_ntp_step_treats_a_non_positive_bound_as_unbounded_68() {
+        // Defensive: a misconfigured 0/negative bound must not freeze the
+        // master's UTC discipline at zero correction forever.
+        assert_eq!(clamp_ntp_step_us(1_039_375, 0), 1_039_375);
+        assert_eq!(clamp_ntp_step_us(1_039_375, -1), 1_039_375);
+    }
+
+    /// The whole defect, end to end: a server-mode master that is NOT PTP-locked
+    /// still queries upstream on its normal cadence, and the 1.039 s error it
+    /// finds is corrected by a bounded step (not one giant fleet-wide jump)
+    /// after the second agreeing sample — with no restart anywhere.
+    #[test]
+    fn master_queries_upstream_and_steps_a_bounded_correction_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+
+        // The measurement strih's own log printed after the manual restart.
+        mock_ntp.expect_get_offset().times(2).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(1_039_375),
+                sign: 1,
+                spread_us: 588,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        mock_clock
+            .expect_step_clock()
+            .with(eq(Duration::from_micros(100_000)), eq(1))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
+
+        c.configure_ntp_server_mode(100_000);
+        assert!(!c.is_locked, "the master is deliberately NOT PTP-locked here");
+
+        // First interval: over-threshold ⇒ only a step CANDIDATE (agreement gate).
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        // Second interval: the sample agrees ⇒ step, clamped to max_step_us.
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        // Mock expectations verify on drop: 2 upstream queries, 1 bounded step.
+    }
 }
