@@ -2684,4 +2684,168 @@ mod tests {
         c.check_ntp_utc_tracking();
         // Mock expectations verify on drop: 2 upstream queries, 1 bounded step.
     }
+
+    // ========================================================================
+    // #68 — A FROZEN NTP READING MUST BE VISIBLE AS SUCH
+    // ========================================================================
+    // Live on strih: `updated_ts` advanced every second (the PTP loop writes
+    // it) beside `ntp_offset_us`/`ntp_spread_us`/`ntp_sample_count` that were
+    // 18 hours old, with `ntp_failed: false` throughout. After the restart the
+    // same triple read 0/0/0 — never measured, and still `ntp_failed: false`.
+    // A consumer (camera-box's DanteSync gate) cannot distinguish either state
+    // from a healthy node.
+    // ========================================================================
+
+    #[test]
+    fn ntp_freshness_within_the_window_is_not_stale_68() {
+        assert!(!ntp_is_stale(
+            Some(Duration::from_secs(31)),
+            Duration::from_secs(3600),
+            Duration::from_secs(180),
+        ));
+    }
+
+    #[test]
+    fn ntp_freshness_beyond_the_window_is_stale_68() {
+        assert!(ntp_is_stale(
+            Some(Duration::from_secs(181)),
+            Duration::from_secs(3600),
+            Duration::from_secs(180),
+        ));
+        // The reported outage: 18 hours with no measurement at all.
+        assert!(ntp_is_stale(
+            Some(Duration::from_secs(65_234)),
+            Duration::from_secs(172_800),
+            Duration::from_secs(180),
+        ));
+    }
+
+    #[test]
+    fn ntp_freshness_at_exactly_the_window_is_not_yet_stale_68() {
+        assert!(!ntp_is_stale(
+            Some(Duration::from_secs(180)),
+            Duration::from_secs(3600),
+            Duration::from_secs(180),
+        ));
+    }
+
+    #[test]
+    fn never_measured_falls_back_to_uptime_so_boot_does_not_false_alarm_68() {
+        // Freshly started, no measurement yet — not an alarm.
+        assert!(!ntp_is_stale(
+            None,
+            Duration::from_secs(20),
+            Duration::from_secs(180)
+        ));
+        // Up for an hour and STILL no measurement — that is exactly the
+        // condition #68 is about, and it must alarm.
+        assert!(ntp_is_stale(
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(180)
+        ));
+    }
+
+    /// A successful check publishes WHEN it happened, not just what it found.
+    #[test]
+    fn a_successful_ntp_check_publishes_its_own_freshness_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(120),
+                sign: 1,
+                spread_us: 40,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status.clone(), config);
+
+        c.is_locked = true;
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        c.log_status();
+
+        let s = status.read().expect("status lock");
+        assert!(
+            s.ntp_updated_ts > 0,
+            "a successful measurement must stamp its own epoch second"
+        );
+        assert_eq!(
+            s.ntp_age_s,
+            Some(0),
+            "a measurement taken just now must report age 0, not null"
+        );
+        assert!(!s.ntp_failed);
+    }
+
+    /// The boot-time one-shot is a real measurement and must be published too.
+    /// It was not: live on strih 19 minutes after a restart that DID sync and
+    /// step +1.039 s, `/status` still read `ntp_offset_us: 0, ntp_sample_count: 0`.
+    #[test]
+    fn the_boot_time_sync_publishes_its_measurement_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(1_039_375),
+                sign: 1,
+                spread_us: 588,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            mock_net,
+            mock_ntp,
+            status.clone(),
+            SystemConfig::default(),
+        );
+        c.run_ntp_sync(false);
+
+        let s = status.read().expect("status lock");
+        assert_eq!(s.ntp_offset_us, 1_039_375);
+        assert_eq!(s.ntp_spread_us, 588);
+        assert_eq!(s.ntp_sample_count, 3);
+        assert!(s.ntp_updated_ts > 0, "the boot measurement has a timestamp");
+    }
+
+    /// No fresh measurement within the window ⇒ `ntp_failed`, even though no
+    /// query ever explicitly FAILED. That is the whole invisibility bug: the
+    /// old flag had two writers, both inside the query path the master never
+    /// reached.
+    #[test]
+    fn a_stale_reading_flips_ntp_failed_without_any_query_error_68() {
+        let (mut c, status) = create_nano_test_controller();
+
+        c.last_ntp_success = Some(Instant::now() - Duration::from_secs(65_234));
+        c.log_status();
+
+        let s = status.read().expect("status lock");
+        assert!(
+            s.ntp_failed,
+            "18 hours with no NTP measurement must not read as healthy"
+        );
+        assert!(
+            s.ntp_age_s.unwrap_or(0) > 180,
+            "the age must be published so a consumer can grade it"
+        );
+    }
 }
