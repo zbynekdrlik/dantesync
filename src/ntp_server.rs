@@ -48,7 +48,7 @@ const REF_ID_LOCL: u32 = 0x4C4F434C;
 /// arrive as `io::Error`, because treating them alike is what made a routine
 /// condition degrade the fleet's time source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvErrorAction {
+enum RecvErrorAction {
     /// Nothing arrived within the read timeout — the normal idle path.
     Idle,
     /// An EXPECTED, harmless condition: a previously-sent datagram bounced
@@ -65,7 +65,7 @@ impl RecvErrorAction {
     /// How long to sleep before the next receive. `None` for everything that
     /// is normal: a stalled server answers nobody, and on the fleet's time
     /// source that is the actual harm a benign reset used to cause.
-    pub fn backoff(self) -> Option<Duration> {
+    fn backoff(self) -> Option<Duration> {
         match self {
             RecvErrorAction::Idle | RecvErrorAction::Benign => None,
             RecvErrorAction::Backoff => Some(RECV_ERROR_BACKOFF),
@@ -80,7 +80,7 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// directly instead of being inferred from a live socket (WSAECONNRESET in
 /// particular cannot be provoked at all on Linux, where an unconnected UDP
 /// socket never surfaces the ICMP error).
-pub fn classify_recv_error(kind: std::io::ErrorKind) -> RecvErrorAction {
+fn classify_recv_error(kind: std::io::ErrorKind) -> RecvErrorAction {
     match kind {
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => RecvErrorAction::Idle,
         // ConnectionReset  = WSAECONNRESET (Windows, the reported one).
@@ -107,13 +107,18 @@ fn disable_udp_conn_reset(socket: &UdpSocket) {
     use windows::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET, SOCKET};
 
     let raw = SOCKET(socket.as_raw_socket() as usize);
-    let mut disable: u32 = 0; // FALSE
+    let disable: u32 = 0; // FALSE
     let mut bytes_returned: u32 = 0;
+    // SAFETY: `disable` and `bytes_returned` are stack locals that outlive this
+    // synchronous call (`lpOverlapped` is NULL, so WSAIoctl cannot complete
+    // later); the in-buffer is only READ by the ioctl and its declared size
+    // matches `u32` (layout-identical to the documented BOOL); `SOCKET(..)` is a
+    // non-owning handle wrapper, so nothing here can double-close the socket.
     let rc = unsafe {
         WSAIoctl(
             raw,
             SIO_UDP_CONNRESET,
-            Some(&mut disable as *mut u32 as *const std::ffi::c_void),
+            Some(&disable as *const u32 as *const std::ffi::c_void),
             std::mem::size_of::<u32>() as u32,
             None,
             0,
@@ -147,8 +152,11 @@ fn disable_udp_conn_reset(socket: &UdpSocket) {
 pub struct NtpServer {
     socket: UdpSocket,
     stratum: u8,
-    /// The port this server was CONFIGURED with (#68) — kept so
-    /// `run_supervised` can re-bind an identical server if one is ever needed.
+    /// The port this server was CONFIGURED with (#68) — kept so `run_supervised`
+    /// can re-bind after an unexpected exit. Note the rebuild is not identical:
+    /// the status source is re-attached explicitly by the supervisor, and a
+    /// server configured with port 0 re-binds to a DIFFERENT ephemeral port
+    /// (only reachable in tests; production always configures a real port).
     port: u16,
     /// Fallback reference timestamp: when this server was created. Used only
     /// until the first upstream measurement lands (#68).
@@ -214,7 +222,13 @@ impl NtpServer {
         if let Some(status) = &self.status {
             if let Ok(s) = status.read() {
                 if s.ntp_updated_ts > 0 {
-                    return UNIX_EPOCH + Duration::from_secs(s.ntp_updated_ts);
+                    // `checked_add`, not `+`: `SystemTime: Add<Duration>` PANICS
+                    // on overflow, and this runs on the server thread handling
+                    // network requests. A nonsensical timestamp degrades to the
+                    // fallback instead of killing the fleet's time source.
+                    return UNIX_EPOCH
+                        .checked_add(Duration::from_secs(s.ntp_updated_ts))
+                        .unwrap_or(self.reference_time);
                 }
             }
         }
@@ -223,7 +237,7 @@ impl NtpServer {
 
     /// The address this server is actually bound to (#68). Differs from the
     /// configured port when bound to port 0.
-    pub fn local_addr(&self) -> Result<SocketAddr> {
+    fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }
 
@@ -249,23 +263,21 @@ impl NtpServer {
                 // benign UDP reset used to land in the catch-all and cost a
                 // 100ms stall per occurrence, during which the fleet's time
                 // source answered nobody.
-                Err(e) => match classify_recv_error(e.kind()) {
-                    RecvErrorAction::Idle => continue,
-                    RecvErrorAction::Benign => {
-                        debug!(
+                Err(e) => {
+                    let action = classify_recv_error(e.kind());
+                    match action {
+                        RecvErrorAction::Idle => {}
+                        RecvErrorAction::Benign => debug!(
                             "[NTP-Server] Ignoring expected UDP condition: {} \
                              (a previous reply bounced; the loop is unaffected)",
                             e
-                        );
-                        continue;
+                        ),
+                        RecvErrorAction::Backoff => error!("[NTP-Server] Socket error: {}", e),
                     }
-                    RecvErrorAction::Backoff => {
-                        error!("[NTP-Server] Socket error: {}", e);
-                        if let Some(delay) = RecvErrorAction::Backoff.backoff() {
-                            std::thread::sleep(delay);
-                        }
+                    if let Some(delay) = action.backoff() {
+                        std::thread::sleep(delay);
                     }
-                },
+                }
             }
         }
 
@@ -372,44 +384,72 @@ impl NtpServer {
 
         Ok(response)
     }
-
-    /// Update the reference timestamp (call after initial NTP sync).
-    pub fn set_reference_time(&mut self, time: SystemTime) {
-        self.reference_time = time;
-    }
 }
 
 /// #68 — run the NTP server under supervision until `running` clears.
 ///
-/// `NtpServer::run()` provably cannot exit early today (no `?`, no `break`, and
-/// every receive error is classified rather than propagated), so in practice
-/// this loops exactly once. That is the point: the fleet's time source must not
-/// depend on that property continuing to hold after a future edit adds a `?` to
-/// the loop. If `run()` ever does return early, the server is re-bound on its
-/// configured port and restarted — loudly — instead of the daemon silently
-/// serving nothing until somebody notices and restarts the service.
+/// `NtpServer::run()` cannot exit early today (no `?`, no `break`, and every
+/// receive error is classified rather than propagated), so in practice this
+/// loops exactly once. The supervisor exists so the fleet's time source does not
+/// DEPEND on that property surviving a future edit — and it therefore treats
+/// **any** of the three ways the loop can stop while `running` is still set as
+/// an unexpected exit worth restarting:
 ///
-/// A re-bind failure (port taken during the gap) is not fatal either: it backs
-/// off and retries, so a transient collision heals itself.
+/// - `Err(..)` — a `?` added to the loop later;
+/// - `Ok(())` while `running` is still set — a `break` added to the loop later.
+///   This is the likelier regression, and reading it as "clean shutdown" would
+///   have exited the supervisor silently, which is exactly the outcome it is
+///   here to prevent;
+/// - a **panic** — caught, so one bad packet cannot leave the daemon alive but
+///   serving nothing.
+///
+/// The re-bound server inherits the original's status source, so a restart never
+/// silently reverts to advertising its own restart time as the NTP reference
+/// timestamp. A re-bind failure (port taken during the gap) is not fatal either:
+/// it backs off and retries, so a transient collision heals itself.
 pub fn run_supervised(server: NtpServer, running: Arc<AtomicBool>) {
+    run_supervised_with(server, running, |srv, run_flag| srv.run(run_flag));
+}
+
+/// The supervision loop, with the "run it once" step injectable so a test can
+/// reproduce an early exit that `run()` itself cannot currently produce.
+fn run_supervised_with<F>(server: NtpServer, running: Arc<AtomicBool>, mut run_once: F)
+where
+    F: FnMut(&NtpServer, Arc<AtomicBool>) -> Result<()>,
+{
     let port = server.port;
     let stratum = server.stratum;
+    // Carried across restarts: `NtpServer::new()` would otherwise hand back a
+    // server with `status: None`, silently reverting the reference-timestamp fix.
+    let status_source = server.status.clone();
     let mut current = server;
 
     while running.load(Ordering::SeqCst) {
-        match current.run(running.clone()) {
-            Ok(()) => break, // clean shutdown: `running` cleared
-            Err(e) => {
-                error!(
-                    "[NTP-Server] Loop exited unexpectedly: {} — restarting on port {}",
-                    e, port
-                );
-            }
-        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_once(&current, running.clone())
+        }));
 
+        // A requested shutdown is the ONLY clean way out.
         if !running.load(Ordering::SeqCst) {
             break;
         }
+
+        match outcome {
+            Ok(Ok(())) => error!(
+                "[NTP-Server] Loop returned while still running — restarting on port {}",
+                port
+            ),
+            Ok(Err(e)) => error!(
+                "[NTP-Server] Loop exited unexpectedly: {} — restarting on port {}",
+                e, port
+            ),
+            Err(_) => error!(
+                "[NTP-Server] Loop PANICKED — restarting on port {} (the daemon must \
+                 never stay alive serving nothing)",
+                port
+            ),
+        }
+
         std::thread::sleep(SUPERVISOR_RESTART_BACKOFF);
 
         loop {
@@ -417,7 +457,8 @@ pub fn run_supervised(server: NtpServer, running: Arc<AtomicBool>) {
                 return;
             }
             match NtpServer::new(port, stratum) {
-                Ok(fresh) => {
+                Ok(mut fresh) => {
+                    fresh.status = status_source.clone();
                     warn!("[NTP-Server] Restarted after an unexpected loop exit");
                     current = fresh;
                     break;
@@ -628,6 +669,61 @@ mod tests {
         handle.join().expect("supervisor thread panicked");
     }
 
+    /// #68 review finding: the supervisor guarded the ONE exit that cannot
+    /// happen and missed the two that can.
+    ///
+    /// `run()` has no `?` and no `break`, so its `Err` arm is unreachable — but
+    /// the regression a future edit is most likely to introduce is exactly a
+    /// `break`, which returns `Ok(())` and used to be read as "clean shutdown",
+    /// exiting the supervisor silently. And a re-bound server was built with
+    /// `NtpServer::new()`, which leaves `status: None` — so a restart silently
+    /// reverted the reference-timestamp fix and served its own restart time
+    /// forever after.
+    #[test]
+    fn an_early_return_while_still_running_restarts_with_the_status_source_68() {
+        let mut server = NtpServer::new(0, 3).expect("bind ephemeral NTP server");
+        server.set_status_source(Arc::new(std::sync::RwLock::new(
+            crate::status::SyncStatus::default(),
+        )));
+
+        let running = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(std::sync::Mutex::new(0usize));
+
+        let seen_status = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let calls_inner = calls.clone();
+        let seen_inner = seen_status.clone();
+        let running_inner = running.clone();
+
+        run_supervised_with(server, running.clone(), move |srv, _r| {
+            let mut n = calls_inner.lock().expect("call counter");
+            *n += 1;
+            seen_inner
+                .lock()
+                .expect("status witness")
+                .push(srv.status.is_some());
+            if *n >= 2 {
+                // Second pass: ask for a real shutdown so the test terminates.
+                running_inner.store(false, Ordering::SeqCst);
+            }
+            // Return Ok WHILE `running` is still set on the first pass — the
+            // shape a future `break` inside run()'s loop would produce.
+            Ok(())
+        });
+
+        assert_eq!(
+            *calls.lock().expect("call counter"),
+            2,
+            "an early Ok(()) while still running must restart the server, not exit"
+        );
+        let seen = seen_status.lock().expect("status witness");
+        assert_eq!(
+            seen.as_slice(),
+            &[true, true],
+            "the re-bound server must keep serving the real upstream reference \
+             timestamp — a restart that drops the status source silently reverts it"
+        );
+    }
+
     /// #68: the reference timestamp is the "when did I last read my own
     /// reference" field of the NTP protocol. It was pinned to process start and
     /// never moved, which was honest only while the master genuinely never
@@ -832,27 +928,5 @@ mod tests {
 
         let vn = (response[0] >> 3) & 0x07;
         assert_eq!(vn, 3, "Response should match client's version");
-    }
-
-    #[test]
-    fn test_set_reference_time() {
-        let mut server = NtpServer {
-            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
-            stratum: 3,
-            port: 0,
-            reference_time: UNIX_EPOCH,
-            status: None,
-        };
-
-        let new_time = SystemTime::now();
-        server.set_reference_time(new_time);
-
-        // The reference time should be updated
-        let diff = server
-            .reference_time
-            .duration_since(new_time)
-            .or_else(|_| new_time.duration_since(server.reference_time))
-            .unwrap_or_default();
-        assert!(diff.as_millis() < 10);
     }
 }

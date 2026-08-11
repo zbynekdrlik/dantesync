@@ -51,7 +51,19 @@ pub struct SyncStatus {
     /// Used for status display and icon state
     pub mode: String,
 
-    /// True when NTP sync has failed (can't reach server)
+    /// True when this node's UTC alignment is NOT being maintained.
+    ///
+    /// dantesync#68 widened this: it used to mean only "a query returned an
+    /// error", which meant a node that had simply STOPPED querying (the NTP
+    /// master, by design) reported `false` for 18 hours while drifting a second
+    /// off UTC. It now covers BOTH causes:
+    ///
+    /// - repeated query failures (upstream unreachable — the original meaning), and
+    /// - no successful measurement within `system.ntp_stale_secs`, whether or
+    ///   not anything was even attempted.
+    ///
+    /// Read `ntp_age_s` alongside it to tell the two apart, and never read
+    /// `ntp_offset_us` without checking one of them first.
     pub ntp_failed: bool,
 
     /// Accumulated phase error since last NTP step (microseconds)
