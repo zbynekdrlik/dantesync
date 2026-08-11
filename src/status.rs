@@ -51,7 +51,19 @@ pub struct SyncStatus {
     /// Used for status display and icon state
     pub mode: String,
 
-    /// True when NTP sync has failed (can't reach server)
+    /// True when this node's UTC alignment is NOT being maintained.
+    ///
+    /// dantesync#68 widened this: it used to mean only "a query returned an
+    /// error", which meant a node that had simply STOPPED querying (the NTP
+    /// master, by design) reported `false` for 18 hours while drifting a second
+    /// off UTC. It now covers BOTH causes:
+    ///
+    /// - repeated query failures (upstream unreachable — the original meaning), and
+    /// - no successful measurement within `system.ntp_stale_secs`, whether or
+    ///   not anything was even attempted.
+    ///
+    /// Read `ntp_age_s` alongside it to tell the two apart, and never read
+    /// `ntp_offset_us` without checking one of them first.
     pub ntp_failed: bool,
 
     /// Accumulated phase error since last NTP step (microseconds)
@@ -84,6 +96,23 @@ pub struct SyncStatus {
     /// persistent `false` on a Windows node as worth investigating.
     #[serde(default)]
     pub pcap_ntp_active: bool,
+
+    /// dantesync#68: unix epoch second of the last SUCCESSFUL NTP measurement
+    /// (`0` = never measured). This is the field `updated_ts` is NOT: that one
+    /// is written by the PTP loop on every status refresh, so it kept advancing
+    /// beside an `ntp_offset_us` frozen 18 hours earlier, and a consumer had no
+    /// way to tell. Read this (or `ntp_age_s`) before trusting `ntp_offset_us`.
+    #[serde(default)]
+    pub ntp_updated_ts: u64,
+
+    /// dantesync#68: seconds since that measurement, computed at status-write
+    /// time; `null` when nothing has EVER been measured — deliberately not `0`,
+    /// which would read as "measured just now". This is the number a monitoring
+    /// gate should grade before grading `ntp_offset_us` at all: live on strih
+    /// the offset field read a perfect `0` because no measurement had ever been
+    /// published, not because the node was on time.
+    #[serde(default)]
+    pub ntp_age_s: Option<u64>,
 }
 
 impl SyncStatus {
@@ -117,6 +146,9 @@ impl Default for SyncStatus {
             ntp_spread_us: 0,
             ntp_sample_count: 0,
             pcap_ntp_active: false,
+            // #68: nothing measured yet — say so, never imply "just now"
+            ntp_updated_ts: 0,
+            ntp_age_s: None,
         }
     }
 }
@@ -202,6 +234,62 @@ mod tests {
             !restored_old.pcap_ntp_active,
             "missing field must default to false, not silently claim the pcap path is active"
         );
+    }
+
+    /// #68: `/status` must let a consumer tell a LIVE NTP reading from a frozen
+    /// one. Live on strih, `updated_ts` advanced every second (the PTP loop
+    /// writes it) beside an `ntp_offset_us` that was 18 hours old — and after a
+    /// restart, beside one that had never been measured at all. Neither state
+    /// was distinguishable from a healthy node.
+    #[test]
+    fn test_sync_status_exposes_ntp_freshness_separately_from_updated_ts_68() {
+        let status = SyncStatus {
+            updated_ts: 1_786_439_763,
+            ntp_offset_us: -34_718,
+            ntp_updated_ts: 1_786_374_529,
+            ntp_age_s: Some(65_234),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize failed");
+        let restored: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(restored.ntp_updated_ts, 1_786_374_529);
+        assert_eq!(restored.ntp_age_s, Some(65_234));
+        assert_ne!(
+            restored.ntp_updated_ts, restored.updated_ts,
+            "NTP freshness must be its OWN field — updated_ts is written by the PTP loop"
+        );
+    }
+
+    /// A node that has never taken an NTP measurement must say so explicitly
+    /// (`null`), never imply "measured just now" with a plausible-looking zero.
+    #[test]
+    fn test_sync_status_never_measured_reports_null_age_68() {
+        let status = SyncStatus::default();
+        assert_eq!(status.ntp_updated_ts, 0);
+        assert_eq!(status.ntp_age_s, None);
+        let json = serde_json::to_string(&status).expect("serialize failed");
+        assert!(
+            json.contains("\"ntp_age_s\":null"),
+            "never-measured must serialize as an explicit null, got: {}",
+            json
+        );
+    }
+
+    /// Additive only: today's JSON (camera-box's DanteSync gate parses it) must
+    /// keep deserializing unchanged.
+    #[test]
+    fn test_sync_status_pre_68_json_still_deserializes() {
+        let old_json = r#"{"offset_ns":156875,"drift_ppm":-6.108,"gm_uuid":null,
+            "gm_source_ip":null,"settled":true,"updated_ts":1786439763,"is_locked":true,
+            "smoothed_rate_ppm":0.166,"ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,
+            "accumulated_phase_us":161.14,"ntp_spread_us":0,"ntp_sample_count":0,
+            "pcap_ntp_active":false}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(old_json).expect("pre-#68 JSON must still deserialize");
+        assert_eq!(restored.ntp_updated_ts, 0);
+        assert_eq!(restored.ntp_age_s, None);
+        assert_eq!(restored.mode, "LOCK");
     }
 
     #[test]

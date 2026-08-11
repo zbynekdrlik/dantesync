@@ -5,6 +5,62 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.29] - 2026-08-11
+
+### Fixed
+
+- **The NTP master no longer free-runs from boot (#68).** In `ntp_server_mode` DanteSync synced to
+  its upstream exactly ONCE at service start and then disabled periodic queries ("this machine IS
+  the time source"). That is true of the fleet's mutual coherence and false of UTC: the clock is
+  frequency-locked to the Dante grandmaster, whose rate is not UTC's, so the master's UTC phase
+  error integrated from boot with nothing subtracting from it — 6-19 ppm measured on the live rig,
+  i.e. ~21 ms nineteen minutes after a restart and 1.04 s over two days, with the whole fleet
+  coherently following it. The master now keeps re-querying upstream and disciplines itself,
+  reusing the same threshold + two-agreeing-samples + step machinery every client node uses.
+  Restarting the service is no longer the remedy for drift.
+- **A benign UDP reset no longer stalls the NTP server.** On Windows, `WSAECONNRESET` (os error
+  10054) is raised routinely on a server socket when an earlier reply drew an ICMP
+  port-unreachable. It was treated as an unexpected error — logged at error severity and followed
+  by a 100 ms sleep during which the fleet's time source answered nobody. It is now classified as
+  benign and skipped immediately, and on Windows `SIO_UDP_CONNRESET` is disabled at socket creation
+  so the stack stops raising it at all.
+- **`ntp_failed` reflects freshness, not only explicit query errors.** It previously had two
+  writers, both inside the query path, so a node that had stopped querying reported `false`
+  indefinitely. It is now also raised when no successful measurement lands within
+  `system.ntp_stale_secs` — and going stale now also ARMS the query, so a node whose PTP never
+  reaches lock keeps tracking UTC and recovers by itself instead of latching the alarm forever.
+- **The boot-time NTP sync publishes its measurement,** and a corrected offset is published as the
+  RESIDUAL. Neither happened before: nineteen minutes after a restart that measured +1.039 s and
+  stepped the clock by it, `/status` still served `ntp_offset_us: 0, ntp_sample_count: 0`.
+- **The served NTP reference timestamp tracks the last real upstream sync** (and is stamped with
+  the measured UTC instant, so it can never advertise a reference in the future, which RFC 5905 has
+  conforming clients discard).
+- **A malformed `ntp_server_mode` in `config.json` no longer aborts startup** — the version
+  migration checks the value is an object before indexing it.
+
+### Added
+
+- `/status` (and the named pipe) gain `ntp_updated_ts` (epoch second of the last successful NTP
+  measurement, `0` = never) and `ntp_age_s` (seconds since; `null` = never measured). Additive
+  only — no field renamed or removed, and pre-existing status JSON still parses. Grade these before
+  trusting `ntp_offset_us`: `updated_ts` is written by the PTP loop and says nothing about the NTP
+  fields beside it.
+- `ntp_server_mode.max_step_us` (default 100 000 µs) — upper bound on a single server-mode UTC
+  correction, so one wrong-but-consistent upstream reading cannot move the whole fleet at once.
+  Never fires in steady state; a 1.04 s error is worked off over ~10 minutes unattended. `0` =
+  unbounded. The boot-time sync is never bounded.
+- `system.ntp_stale_secs` (default 180 s = 6× the query cadence, floored at one cadence) — the
+  freshness window above.
+- The NTP server runs supervised: an unexpected loop exit — including a panic — re-binds and
+  restarts it, loudly, carrying its status source across.
+
+### Note for operators
+
+In server mode the master now takes small periodic steps it never took before (~0.7 ms every
+~2 min at 6 ppm, ~1.7 ms every ~1.5 min at 19 ppm), and each propagates to the fleet one or two
+client intervals later. That is the deliberate trade for UTC error that no longer grows without
+limit; `max_step_us` is the lever if it ever matters.
+
 ## [1.8.18] - 2026-07-10
 
 ### Added

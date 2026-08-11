@@ -482,14 +482,20 @@ mod app {
                                 if !state.first_update {
                                     // NTP failure transitions (critical)
                                     if status.ntp_failed && !state.was_ntp_failed {
+                                        // #68: ntp_failed now covers BOTH an
+                                        // unreachable upstream AND no fresh
+                                        // measurement inside the staleness
+                                        // window (a node that stopped querying
+                                        // at all). "Server unreachable" was
+                                        // simply false in the second case.
                                         show_notification(
                                             "DanteSync",
-                                            "NTP server unreachable"
+                                            "UTC alignment stale - NTP not tracking"
                                         );
                                     } else if !status.ntp_failed && state.was_ntp_failed {
                                         show_notification(
                                             "DanteSync",
-                                            "NTP connection restored"
+                                            "UTC alignment restored"
                                         );
                                     }
                                     // PTP offline transitions (highest priority)

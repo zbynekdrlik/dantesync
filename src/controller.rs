@@ -45,6 +45,87 @@ fn should_log_drift_summary(sample_count: u64, interval: u64) -> bool {
     interval != 0 && sample_count % interval == 0
 }
 
+/// #68 — decides whether the periodic upstream-NTP discipline runs this
+/// iteration. Pure, so the policy is unit-tested directly instead of being
+/// inferred from a live 30-second loop.
+///
+/// `tracking_enabled` is the master switch (all callers leave it on; it exists
+/// so a future NTP-free mode has one place to turn the loop off). Beyond that,
+/// the discipline runs when ANY role condition holds:
+///
+/// - `ptp_offline` — NTP is the only time source left (pre-existing behaviour).
+/// - `server_mode` — this node serves UTC to the whole fleet, so its duty to
+///   track UTC does NOT depend on its own PTP lock. This is the #68 addition:
+///   `ntp_server_mode` previously disabled the loop outright, leaving the
+///   master free-running at the Dante grandmaster's rate (6-19 ppm measured on
+///   strih ⇒ ~21 ms of UTC error 19 minutes after a restart, 1.04 s over two
+///   days) with `ntp_failed` reading `false` throughout.
+/// - `is_locked` — ordinary client behaviour, unchanged.
+/// - `stale` — nothing has measured UTC for a whole staleness window. Without
+///   this a node whose PTP never reaches LOCK (packets flowing, so `ptp_offline`
+///   never latches) would never query at all, and the freshness rule below would
+///   then mark it `ntp_failed` FOREVER, because the only code that clears the
+///   flag lives in the query path it cannot reach. Arming on staleness makes the
+///   node keep tracking UTC and recover by itself — no restart, which is the
+///   whole point of this ticket.
+fn ntp_discipline_due(
+    server_mode: bool,
+    ptp_offline: bool,
+    is_locked: bool,
+    stale: bool,
+    since_last_check: Duration,
+    interval: Duration,
+) -> bool {
+    let role_allows = ptp_offline || server_mode || is_locked || stale;
+    role_allows && since_last_check >= interval
+}
+
+/// #68 — bound a SINGLE periodic UTC correction while in NTP server mode.
+///
+/// This node's step is the whole fleet's step, so an upstream reading that is
+/// wrong but internally consistent (and therefore survives the step-agreement
+/// gate) must not be able to yank every box at once. In steady state the bound
+/// never fires: at the measured 6-19 ppm a 30 s interval accrues only ~0.2-0.6 ms,
+/// far under the default 100 ms. It only shapes the recovery of a genuinely large
+/// error — a 1.04 s post-upgrade offset is worked off over ~10 minutes of normal
+/// intervals, unattended and with no restart, instead of in one visible jump.
+///
+/// A non-positive bound means "unbounded" — a misconfigured `0` must degrade to
+/// today's behaviour, never to a master frozen at zero correction forever. The
+/// boot-time `run_ntp_sync()` step is deliberately NOT routed through here: a
+/// cold start must land on UTC immediately.
+fn clamp_ntp_step_us(offset_us: i64, max_step_us: i64) -> i64 {
+    if max_step_us <= 0 {
+        return offset_us;
+    }
+    offset_us.clamp(-max_step_us, max_step_us)
+}
+
+/// #68 — is this node's UTC measurement stale?
+///
+/// `ntp_failed` used to have exactly two writers, both inside the NTP query
+/// path, so a node that had simply STOPPED querying (the master, by design)
+/// reported `false` for 18 hours while a second of UTC error accumulated. A
+/// timeout is the only signal that covers "nothing is even trying".
+///
+/// When nothing has EVER been measured the age falls back to process uptime, so
+/// a fresh boot does not alarm before its first query lands, but an hour of
+/// silence does. Exactly `window` is not yet stale (the boundary belongs to the
+/// healthy side — a measurement arriving exactly on cadence is on time).
+fn ntp_is_stale(since_last_success: Option<Duration>, uptime: Duration, window: Duration) -> bool {
+    since_last_success.unwrap_or(uptime) > window
+}
+
+/// #68 — the effective staleness window, floored at one query cadence.
+///
+/// A configured `0` would make `ntp_is_stale` true for every node forever
+/// (anything is `> ZERO`), pinning `ntp_failed` — and the operator's tray toast
+/// — on permanently. `max_step_us` got the same defensive treatment for the
+/// same reason: a misconfiguration must degrade, never latch.
+fn effective_stale_window(configured_secs: u64) -> Duration {
+    Duration::from_secs(configured_secs.max(NTP_CHECK_INTERVAL_SECS))
+}
+
 // ============================================================================
 // CONSTANTS - Organized by functional area
 // ============================================================================
@@ -225,7 +306,14 @@ where
     // Periodic NTP UTC tracking state
     last_ntp_check: Instant,
     ntp_offset_samples: VecDeque<i64>, // in microseconds
-    ntp_tracking_enabled: bool,
+    /// #68: this node is the fleet's NTP server. It keeps disciplining itself
+    /// against upstream (a stratum-3 server that never re-reads its own
+    /// reference is just a free-running oscillator advertising itself as a time
+    /// source), and its corrections are bounded by `ntp_server_max_step_us`.
+    ntp_server_mode: bool,
+    /// #68: upper bound on a SINGLE server-mode correction, µs. See
+    /// `clamp_ntp_step_us`.
+    ntp_server_max_step_us: i64,
     // #50 step-agreement gate: a single over-threshold NTP measurement is NEVER trusted (a
     // queue-delay-biased round trip on a loaded LAN produces a false offset, the servo steps,
     // the next sample shows the negated bias and it steps right back — the live-event
@@ -246,6 +334,14 @@ where
     // NTP failure tracking
     ntp_consecutive_failures: usize,
     ntp_failed: bool,
+    /// #68: when the last SUCCESSFUL NTP measurement landed (monotonic, for the
+    /// staleness window) and its wall-clock epoch second (for `/status`).
+    /// `None` = never measured.
+    last_ntp_success: Option<Instant>,
+    last_ntp_success_epoch: Option<u64>,
+    /// #68: process start, so "never measured" can be graded against uptime
+    /// instead of alarming instantly at boot.
+    started_at: Instant,
 
     // ==========================================================================
     // ADAPTIVE SPIKE DETECTION
@@ -361,7 +457,9 @@ where
             // Dante provides device uptime, NOT UTC - so NTP is needed for real time
             last_ntp_check: now,
             ntp_offset_samples: VecDeque::with_capacity(NTP_SAMPLE_COUNT + 2),
-            ntp_tracking_enabled: true, // Always enabled - NTP is the UTC time source
+            // #68: set by configure_ntp_server_mode() when this node serves the fleet
+            ntp_server_mode: false,
+            ntp_server_max_step_us: 0,
             ntp_pending_step: None,
             last_ntp_step: None,
             // Accumulated phase error tracking
@@ -374,6 +472,10 @@ where
             // NTP failure tracking
             ntp_consecutive_failures: 0,
             ntp_failed: false,
+            // #68 freshness tracking
+            last_ntp_success: None,
+            last_ntp_success_epoch: None,
+            started_at: now,
             // Adaptive spike detection
             spike_filter: SpikeFilter::new(),
             // Adaptive jitter smoothing
@@ -391,6 +493,106 @@ where
         self.status_shared.clone()
     }
 
+    /// #68 — record a SUCCESSFUL upstream measurement: publish it to
+    /// `SyncStatus` (offset + quality + freshness) and reset the failure state.
+    ///
+    /// One place, called by BOTH the boot-time `run_ntp_sync()` and the
+    /// periodic `check_ntp_utc_tracking()`. The boot path published nothing at
+    /// all before, which is why strih served `ntp_offset_us: 0,
+    /// ntp_sample_count: 0` for 19 minutes after a restart that had in fact
+    /// measured +1.039 s and stepped the clock by it.
+    fn record_ntp_success(&mut self, offset_us: i64, measurement: &crate::ntp::NtpMeasurement) {
+        let now = Instant::now();
+        // The stamp is the measured UTC instant, NOT the local reading — this
+        // runs BEFORE the correction is applied, and the same epoch is served to
+        // every NTP client as the Reference Timestamp. Stamping the local clock
+        // would (a) make `ntp_updated_ts` (wall clock) disagree with `ntp_age_s`
+        // (monotonic) by the size of the correction, and (b) on a node running
+        // AHEAD of UTC put the served reference timestamp in the FUTURE, which
+        // RFC 5905 §11.2 has conforming clients discard outright.
+        let local_us = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i128;
+        let epoch = ((local_us + offset_us as i128).max(0) / 1_000_000) as u64;
+        self.last_ntp_success = Some(now);
+        self.last_ntp_success_epoch = Some(epoch);
+
+        if self.ntp_failed {
+            info!("[NTP] Connection restored");
+        }
+        self.ntp_consecutive_failures = 0;
+        self.ntp_failed = false;
+
+        if let Ok(mut status) = self.status_shared.write() {
+            status.ntp_offset_us = offset_us;
+            status.ntp_failed = false;
+            status.ntp_spread_us = measurement.spread_us;
+            status.ntp_sample_count = measurement.sample_count;
+            status.pcap_ntp_active = measurement.pcap_active;
+            status.ntp_updated_ts = epoch;
+            status.ntp_age_s = Some(0);
+        }
+    }
+
+    /// #68 — raise `ntp_failed` when no fresh measurement has landed within the
+    /// configured window, even though no query ever explicitly failed.
+    ///
+    /// Runs from the 10-second status tick rather than inside the query path,
+    /// precisely because the failure being detected is "the query path is not
+    /// running at all" — the state the master sat in for 18 hours while
+    /// reporting `ntp_failed: false`.
+    fn check_ntp_freshness(&mut self) {
+        if !self.ntp_measurement_is_stale() || self.ntp_failed {
+            return;
+        }
+
+        self.ntp_failed = true;
+        let window_s = effective_stale_window(self.config.ntp_stale_secs).as_secs();
+        match self.last_ntp_success {
+            Some(t) => warn!(
+                "[NTP] No successful measurement for {}s (window {}s) — UTC alignment is \
+                 no longer being maintained; treating this node's NTP reading as stale",
+                t.elapsed().as_secs(),
+                window_s
+            ),
+            None => warn!(
+                "[NTP] No successful measurement in {}s of uptime (window {}s) — this node \
+                 has never aligned to UTC",
+                self.started_at.elapsed().as_secs(),
+                window_s
+            ),
+        }
+        if let Ok(mut status) = self.status_shared.write() {
+            status.ntp_failed = true;
+        }
+    }
+
+    /// #68 — has this node gone a whole staleness window with no successful
+    /// measurement? Read by BOTH the freshness alarm and `ntp_discipline_due`,
+    /// so the alarm can never fire on a node the discipline is not even trying
+    /// to serve: going stale is exactly what arms the query.
+    fn ntp_measurement_is_stale(&self) -> bool {
+        ntp_is_stale(
+            self.last_ntp_success.map(|t| t.elapsed()),
+            self.started_at.elapsed(),
+            effective_stale_window(self.config.ntp_stale_secs),
+        )
+    }
+
+    /// #68 — after a correction lands, publish the offset that REMAINS.
+    ///
+    /// `record_ntp_success` runs before the step (it must: the step needs the
+    /// measurement), so without this `/status` advertises the error that was
+    /// just cancelled. Live consequence: for a whole interval after a restart
+    /// the master served `ntp_offset_us: 1039375` for an offset it had already
+    /// stepped away — and camera-box's gate thresholds exactly that field.
+    fn publish_post_step_residual(&self, residual_us: i64) {
+        if let Ok(mut status) = self.status_shared.write() {
+            status.ntp_offset_us = residual_us;
+        }
+    }
+
     pub fn run_ntp_sync(&mut self, skip: bool) {
         if skip {
             return;
@@ -406,12 +608,24 @@ where
                     sign_str, offset, measurement.spread_us, measurement.sample_count
                 );
 
+                // #68: the boot measurement is a real measurement — publish it.
+                let offset_us = if sign > 0 {
+                    offset.as_micros() as i64
+                } else {
+                    -(offset.as_micros() as i64)
+                };
+                self.record_ntp_success(offset_us, &measurement);
+
                 if offset.as_millis() > 50 {
                     info!("Stepping clock (NTP)...");
                     if let Err(e) = self.clock.step_clock(offset, sign) {
                         error!("Failed to step clock: {}", e);
                     } else {
                         info!("Clock stepped successfully.");
+                        // The boot step is unbounded, so it cancels the WHOLE
+                        // measured offset — publish the residual, not the error
+                        // that no longer exists (#68).
+                        self.publish_post_step_residual(0);
                     }
                 } else {
                     info!("Offset small, skipping step.");
@@ -463,19 +677,22 @@ where
     }
 
     pub fn check_ntp_utc_tracking(&mut self) {
-        // Run NTP sync when:
-        // 1. PTP is offline (NTP-only mode), OR
-        // 2. PTP is locked and tracking is enabled
-        let should_check = self.ptp_offline || (self.is_locked && self.ntp_tracking_enabled);
-        if !should_check {
-            return;
-        }
-
         // Adaptive NTP interval based on accumulated phase error:
         // - Higher error = check more frequently for tighter UTC alignment
         // - Low error = use default interval to reduce NTP overhead
         let ntp_interval_secs = self.calculate_adaptive_ntp_interval();
-        if self.last_ntp_check.elapsed() < Duration::from_secs(ntp_interval_secs) {
+
+        // #68: the run/skip decision is a pure, unit-tested policy — see
+        // `ntp_discipline_due`. A server-mode master runs it regardless of its
+        // own PTP lock state; every other node's semantics are unchanged.
+        if !ntp_discipline_due(
+            self.ntp_server_mode,
+            self.ptp_offline,
+            self.is_locked,
+            self.ntp_measurement_is_stale(),
+            self.last_ntp_check.elapsed(),
+            Duration::from_secs(ntp_interval_secs),
+        ) {
             return;
         }
 
@@ -493,12 +710,10 @@ where
                     -(offset.as_micros() as i64)
                 };
 
-                // NTP success - reset failure tracking
-                if self.ntp_failed {
-                    info!("[NTP] Connection restored");
-                }
-                self.ntp_consecutive_failures = 0;
-                self.ntp_failed = false;
+                // NTP success — reset failure tracking AND publish the reading
+                // together with WHEN it was taken (#68: one shared recorder, so
+                // the boot path and this path can never diverge again).
+                self.record_ntp_success(offset_us, &measurement);
 
                 // Add sample to buffer. #53: `offset_us` is now the burst-filtered
                 // (RTT-selected + median'd) value from NtpClient::get_offset(), not a
@@ -510,32 +725,60 @@ where
                     self.ntp_offset_samples.pop_front();
                 }
 
-                // Update shared status with NTP offset + quality (#53) for tray/HTTP display
-                if let Ok(mut status) = self.status_shared.write() {
-                    status.ntp_offset_us = offset_us;
-                    status.ntp_failed = false;
-                    status.ntp_spread_us = measurement.spread_us;
-                    status.ntp_sample_count = measurement.sample_count;
-                    status.pcap_ntp_active = measurement.pcap_active;
-                }
+                // (offset + quality (#53) + freshness (#68) were published to
+                // SyncStatus by record_ntp_success() above)
 
-                // Calculate adaptive threshold based on offset variance
-                let adaptive_threshold = self.calculate_ntp_adaptive_threshold();
+                // #68: the master does NOT use the MAD-widened threshold.
+                //
+                // `calculate_ntp_adaptive_threshold` models JITTER — it widens by
+                // 5x the MAD of recent samples so a noisy LAN does not provoke
+                // constant stepping. On the master the samples are not jitter:
+                // they are a deterministic monotonic ramp (the Dante-vs-UTC
+                // frequency error integrating at 6-19 ppm). The MAD of a 7-point
+                // ramp with per-interval step `s` is exactly `2s`, so the
+                // threshold self-inflates to `500 + 10s` — ten times the accrual
+                // it is meant to catch — and the master would sawtooth 2.5-6.8 ms
+                // (ceiling 10 ms) against UTC forever, with every one of those
+                // steps served to the fleet and chased by each client one or two
+                // of ITS intervals later. On the base threshold the same loop
+                // holds UTC inside ~0.7-1.7 ms. The outlier protection the MAD
+                // widening exists for is already provided here by the
+                // two-agreeing-samples step gate, which is unchanged.
+                let step_threshold = if self.ntp_server_mode {
+                    NTP_STEP_THRESHOLD_BASE_US
+                } else {
+                    self.calculate_ntp_adaptive_threshold()
+                };
 
                 // Log current offset with threshold info
-                if adaptive_threshold > NTP_STEP_THRESHOLD_BASE_US {
+                if step_threshold > NTP_STEP_THRESHOLD_BASE_US {
                     info!(
                         "[NTP] offset:{:+}us (threshold:{}us, adaptive)",
-                        offset_us, adaptive_threshold
+                        offset_us, step_threshold
                     );
                 } else {
                     info!("[NTP] offset:{:+}us", offset_us);
                 }
 
-                // Step clock if offset exceeds adaptive threshold — but NEVER on a single
+                // Step clock if offset exceeds the threshold — but NEVER on a single
                 // measurement: the agreement gate (#50) requires consecutive agreeing samples.
-                if self.ntp_step_gate(offset_us, adaptive_threshold) {
-                    let step_us = offset_us;
+                if self.ntp_step_gate(offset_us, step_threshold) {
+                    // #68: a correction is rate-bounded in server mode, where this
+                    // node's step is the whole fleet's step. `ntp_server_max_step_us`
+                    // is 0 for every other node and 0 means unbounded, so the same
+                    // call is the unchanged client behaviour.
+                    let step_us = clamp_ntp_step_us(offset_us, self.ntp_server_max_step_us);
+                    if step_us != offset_us {
+                        warn!(
+                            "[NTP-Server] upstream correction {:+}us exceeds the {}us bound — \
+                             stepping {:+}us now, {:+}us residual worked off over the next \
+                             intervals",
+                            offset_us,
+                            self.ntp_server_max_step_us,
+                            step_us,
+                            offset_us - step_us
+                        );
+                    }
 
                     // Apply the step (sets time, does NOT change frequency)
                     let step_dur = Duration::from_micros(step_us.unsigned_abs());
@@ -564,6 +807,9 @@ where
                         // Reset accumulated phase error - we just aligned to UTC
                         self.accumulated_phase_error_us = 0.0;
                         self.last_phase_accumulation_time = None;
+                        // #68: publish what REMAINS, not the error just cancelled
+                        // (0 for a full step, the remainder for a bounded one).
+                        self.publish_post_step_residual(offset_us - step_us);
                         info!("[NTP] Stepped {:+}us", step_us);
                     }
                 }
@@ -603,23 +849,48 @@ where
         }
     }
 
-    /// Enable or disable periodic NTP UTC tracking
-    pub fn set_ntp_tracking(&mut self, enabled: bool) {
-        self.ntp_tracking_enabled = enabled;
-        info!(
-            "[NTP-UTC] Tracking {}",
-            if enabled { "enabled" } else { "disabled" }
-        );
+    /// True while this node is the fleet's NTP server (#68).
+    pub fn ntp_server_mode(&self) -> bool {
+        self.ntp_server_mode
     }
 
-    /// Disable periodic NTP UTC tracking (convenience method for NTP server mode).
+    /// #68 — put this node into NTP **server** mode: it serves UTC to the fleet
+    /// AND keeps disciplining itself against its own upstream.
     ///
-    /// When DanteSync runs in NTP server mode, periodic NTP queries must be disabled
-    /// because this machine IS the time source. The PTP-disciplined clock advances
-    /// time naturally, and this machine serves that time to others via NTP.
-    pub fn disable_ntp_tracking(&mut self) {
-        self.set_ntp_tracking(false);
-        info!("[NTP-Server] Periodic NTP queries disabled (this machine is the time source)");
+    /// This REPLACES the old `disable_ntp_tracking()`, which was the whole
+    /// defect: it turned the periodic queries off on the theory that "this
+    /// machine IS the time source". That is true of the FLEET's mutual
+    /// coherence and false of UTC — no oscillator is a source of UTC. With the
+    /// loop off, the master's only UTC measurement was the boot-time one-shot,
+    /// after which it free-ran at the Dante grandmaster's rate: 6-19 ppm
+    /// measured on strih, i.e. ~21 ms of error 19 minutes after a restart and
+    /// 1.04 s over two days, with the whole fleet coherently following it.
+    ///
+    /// Discipline reuses the ordinary client machinery (base threshold → two
+    /// agreeing samples → `step_clock`), with three server-only properties: it
+    /// runs regardless of this node's own PTP lock state, a single correction is
+    /// bounded by `max_step_us` (see `clamp_ntp_step_us`), and it deliberately
+    /// skips the MAD-widened adaptive threshold, which mis-reads this node's
+    /// monotonic drift ramp as jitter.
+    ///
+    /// **Steady state, stated plainly:** the master now takes small periodic
+    /// steps it never took before — roughly 0.7 ms every ~2 min at 6 ppm, or
+    /// 1.7 ms every ~1.5 min at 19 ppm — and each one propagates to the fleet a
+    /// client interval or two later. That is the deliberate trade: a bounded,
+    /// sub-2 ms periodic excursion in exchange for UTC error that no longer
+    /// grows without limit. The lever if it ever matters on the rig is
+    /// `max_step_us`, which turns one larger jump into several smaller ones.
+    pub fn configure_ntp_server_mode(&mut self, max_step_us: i64) {
+        self.ntp_server_mode = true;
+        self.ntp_server_max_step_us = max_step_us;
+        info!(
+            "[NTP-Server] Upstream discipline ACTIVE — re-querying every {}s \
+             (adaptive, down to 10s), single correction bounded to {}us, staleness \
+             window {}s (this host serves the fleet, but UTC still comes from upstream)",
+            NTP_CHECK_INTERVAL_SECS,
+            max_step_us,
+            effective_stale_window(self.config.ntp_stale_secs).as_secs()
+        );
     }
 
     /// Calculate adaptive NTP step threshold based on measured offset variance.
@@ -724,8 +995,16 @@ where
         }
     }
 
-    pub fn log_status(&self) {
-        // Just update shared status for IPC - no redundant logging
+    /// The periodic status TICK (every 10 s from the main loop).
+    ///
+    /// Renamed from `log_status` in #68: it no longer merely publishes, it also
+    /// evaluates NTP freshness and can raise `ntp_failed`. A name that says
+    /// "log" hides a state transition from whoever schedules it.
+    pub fn tick_status(&mut self) {
+        // #68: the staleness check lives on this tick, not in the query path —
+        // the failure it detects is "the query path is not running at all".
+        self.check_ntp_freshness();
+        // Publish the current snapshot for IPC / HTTP status consumers
         self.update_shared_status();
     }
 
@@ -1394,7 +1673,12 @@ where
             };
             // Accumulated phase error since last NTP step
             status.accumulated_phase_us = self.accumulated_phase_error_us;
-            // NTP offset is updated separately via check_ntp_utc_tracking()
+            // NTP offset/quality are published by record_ntp_success(). Only the
+            // AGE is recomputed here (#68), so it keeps ticking up beside the
+            // frozen reading it describes instead of staying at whatever it was
+            // when that reading landed — that indistinguishability is the bug.
+            status.ntp_updated_ts = self.last_ntp_success_epoch.unwrap_or(0);
+            status.ntp_age_s = self.last_ntp_success.map(|t| t.elapsed().as_secs());
         }
     }
 }
@@ -2397,17 +2681,20 @@ mod tests {
 
     #[test]
     fn test_ntp_tracking_runs_when_ptp_offline() {
-        let (controller, _) = create_nano_test_controller();
-
-        // The check_ntp_utc_tracking function has this logic:
-        // let should_check = self.ptp_offline || (self.is_locked && self.ntp_tracking_enabled);
-
-        // When PTP is offline, NTP tracking should run regardless of lock state
-        // This is validated by the modified check_ntp_utc_tracking condition
-        assert!(
-            controller.ntp_tracking_enabled,
-            "NTP tracking should be enabled by default"
-        );
+        // #68: this used to assert the `ntp_tracking_enabled` flag, which is
+        // gone — it had no writer left once `disable_ntp_tracking()` (the
+        // defect) was removed, so it was a dormant switch that CLAUDE.md's MVP
+        // rule bans. The behaviour it was standing in for is now asserted
+        // directly against the policy: PTP offline ⇒ NTP is the only time
+        // source left, so the discipline runs regardless of lock state.
+        assert!(ntp_discipline_due(
+            false, // server_mode
+            true,  // ptp_offline
+            false, // is_locked
+            false, // stale
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
     }
 
     #[test]
@@ -2422,5 +2709,564 @@ mod tests {
 
         // Should still be online
         assert!(!controller.ptp_offline, "Should stay online within timeout");
+    }
+
+    // ========================================================================
+    // #68 — THE MASTER MUST KEEP DISCIPLINING ITSELF AGAINST UPSTREAM
+    // ========================================================================
+    // `ntp_server_mode` used to call `disable_ntp_tracking()`, so a healthy
+    // master (`ptp_offline == false`) took exactly ONE UTC measurement in its
+    // whole lifetime — the boot-time `run_ntp_sync()` — and then free-ran at
+    // the Dante grandmaster's rate, which is not UTC's rate. Measured live on
+    // strih: 6–19 ppm ⇒ ~21 ms of UTC error 19 minutes after a restart, 1.04 s
+    // over two days. A restart is NOT the remedy; a closed loop is.
+    // ========================================================================
+
+    #[test]
+    fn server_mode_keeps_periodic_upstream_discipline_enabled_68() {
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            c.ntp_server_mode(),
+            "a master that stops re-reading its own reference is a free-running \
+             oscillator advertising itself as a time source"
+        );
+        assert!(
+            ntp_discipline_due(
+                c.ntp_server_mode(),
+                false, // ptp_offline
+                false, // is_locked
+                false, // stale
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            ),
+            "server mode alone must arm the periodic upstream query"
+        );
+    }
+
+    #[test]
+    fn ntp_discipline_due_in_server_mode_even_when_ptp_is_not_locked_68() {
+        // The whole fleet's UTC hangs on this one node — its duty to track UTC
+        // does not depend on whether its OWN PTP happens to be locked.
+        assert!(ntp_discipline_due(
+            true,  // server_mode
+            false, // ptp_offline
+            false, // is_locked
+            false, // stale
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn ntp_discipline_not_due_before_the_interval_elapses_68() {
+        assert!(!ntp_discipline_due(
+            true,  // server_mode
+            false, // ptp_offline
+            true,  // is_locked
+            false, // stale
+            Duration::from_secs(29),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn ntp_discipline_for_a_client_node_still_requires_lock_or_offline_68() {
+        // Client semantics are unchanged: locked, or PTP offline (NTP-only).
+        assert!(!ntp_discipline_due(
+            false, // server_mode
+            false, // ptp_offline
+            false, // is_locked
+            false, // stale
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        assert!(ntp_discipline_due(
+            false, // server_mode
+            false, // ptp_offline
+            true,  // is_locked
+            false, // stale
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        assert!(ntp_discipline_due(
+            false, // server_mode
+            true,  // ptp_offline
+            false, // is_locked
+            false, // stale
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn clamp_ntp_step_leaves_a_steady_state_correction_untouched_68() {
+        // At 6–19 ppm a 30s interval accrues ~0.2–0.6 ms, so the bound never
+        // fires in steady state — it exists only for a rogue upstream.
+        assert_eq!(clamp_ntp_step_us(700, 100_000), 700);
+        assert_eq!(clamp_ntp_step_us(-1_500, 100_000), -1_500);
+        assert_eq!(clamp_ntp_step_us(100_000, 100_000), 100_000);
+    }
+
+    #[test]
+    fn clamp_ntp_step_bounds_a_large_correction_and_keeps_its_sign_68() {
+        assert_eq!(clamp_ntp_step_us(1_039_375, 100_000), 100_000);
+        assert_eq!(clamp_ntp_step_us(-1_039_375, 100_000), -100_000);
+        // A wildly wrong upstream cannot teleport the fleet in one jump.
+        assert_eq!(clamp_ntp_step_us(3_600_000_000, 100_000), 100_000);
+    }
+
+    #[test]
+    fn clamp_ntp_step_treats_a_non_positive_bound_as_unbounded_68() {
+        // Defensive: a misconfigured 0/negative bound must not freeze the
+        // master's UTC discipline at zero correction forever.
+        assert_eq!(clamp_ntp_step_us(1_039_375, 0), 1_039_375);
+        assert_eq!(clamp_ntp_step_us(1_039_375, -1), 1_039_375);
+    }
+
+    /// The whole defect, end to end: a server-mode master that is NOT PTP-locked
+    /// still queries upstream on its normal cadence, and the 1.039 s error it
+    /// finds is corrected by a bounded step (not one giant fleet-wide jump)
+    /// after the second agreeing sample — with no restart anywhere.
+    #[test]
+    fn master_queries_upstream_and_steps_a_bounded_correction_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+
+        // The measurement strih's own log printed after the manual restart.
+        mock_ntp.expect_get_offset().times(2).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(1_039_375),
+                sign: 1,
+                spread_us: 588,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        mock_clock
+            .expect_step_clock()
+            .with(eq(Duration::from_micros(100_000)), eq(1))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
+
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            !c.is_locked,
+            "the master is deliberately NOT PTP-locked here"
+        );
+
+        // First interval: over-threshold ⇒ only a step CANDIDATE (agreement gate).
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        // Second interval: the sample agrees ⇒ step, clamped to max_step_us.
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        // Mock expectations verify on drop: 2 upstream queries, 1 bounded step.
+    }
+
+    // ========================================================================
+    // #68 — A FROZEN NTP READING MUST BE VISIBLE AS SUCH
+    // ========================================================================
+    // Live on strih: `updated_ts` advanced every second (the PTP loop writes
+    // it) beside `ntp_offset_us`/`ntp_spread_us`/`ntp_sample_count` that were
+    // 18 hours old, with `ntp_failed: false` throughout. After the restart the
+    // same triple read 0/0/0 — never measured, and still `ntp_failed: false`.
+    // A consumer (camera-box's DanteSync gate) cannot distinguish either state
+    // from a healthy node.
+    // ========================================================================
+
+    #[test]
+    fn ntp_freshness_within_the_window_is_not_stale_68() {
+        assert!(!ntp_is_stale(
+            Some(Duration::from_secs(31)),
+            Duration::from_secs(3600),
+            Duration::from_secs(180),
+        ));
+    }
+
+    #[test]
+    fn ntp_freshness_beyond_the_window_is_stale_68() {
+        assert!(ntp_is_stale(
+            Some(Duration::from_secs(181)),
+            Duration::from_secs(3600),
+            Duration::from_secs(180),
+        ));
+        // The reported outage: 18 hours with no measurement at all.
+        assert!(ntp_is_stale(
+            Some(Duration::from_secs(65_234)),
+            Duration::from_secs(172_800),
+            Duration::from_secs(180),
+        ));
+    }
+
+    #[test]
+    fn ntp_freshness_at_exactly_the_window_is_not_yet_stale_68() {
+        assert!(!ntp_is_stale(
+            Some(Duration::from_secs(180)),
+            Duration::from_secs(3600),
+            Duration::from_secs(180),
+        ));
+    }
+
+    #[test]
+    fn never_measured_falls_back_to_uptime_so_boot_does_not_false_alarm_68() {
+        // Freshly started, no measurement yet — not an alarm.
+        assert!(!ntp_is_stale(
+            None,
+            Duration::from_secs(20),
+            Duration::from_secs(180)
+        ));
+        // Up for an hour and STILL no measurement — that is exactly the
+        // condition #68 is about, and it must alarm.
+        assert!(ntp_is_stale(
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(180)
+        ));
+    }
+
+    /// A successful check publishes WHEN it happened, not just what it found.
+    #[test]
+    fn a_successful_ntp_check_publishes_its_own_freshness_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(120),
+                sign: 1,
+                spread_us: 40,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status.clone(), config);
+
+        c.is_locked = true;
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        c.tick_status();
+
+        let s = status.read().expect("status lock");
+        assert!(
+            s.ntp_updated_ts > 0,
+            "a successful measurement must stamp its own epoch second"
+        );
+        assert_eq!(
+            s.ntp_age_s,
+            Some(0),
+            "a measurement taken just now must report age 0, not null"
+        );
+        assert!(!s.ntp_failed);
+    }
+
+    /// The boot-time one-shot is a real measurement and must be published too.
+    /// It was not: live on strih 19 minutes after a restart that DID sync and
+    /// step +1.039 s, `/status` still read `ntp_offset_us: 0, ntp_sample_count: 0`.
+    ///
+    /// Review correction: this test originally asserted `ntp_offset_us ==
+    /// 1_039_375` — it pinned the PRE-step measurement as the published offset,
+    /// which is a defect of its own (a consumer would read a full second of
+    /// error that the very same call had already corrected). The quality fields
+    /// and the freshness stamp are what belong here; the published offset itself
+    /// is now covered by
+    /// `a_corrected_offset_is_published_as_the_residual_not_the_measurement_68`.
+    #[test]
+    fn the_boot_time_sync_publishes_its_measurement_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(1_039_375),
+                sign: 1,
+                spread_us: 588,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            mock_net,
+            mock_ntp,
+            status.clone(),
+            SystemConfig::default(),
+        );
+        c.run_ntp_sync(false);
+
+        let s = status.read().expect("status lock");
+        assert_eq!(
+            s.ntp_spread_us, 588,
+            "measurement quality must be published"
+        );
+        assert_eq!(s.ntp_sample_count, 3);
+        assert!(s.ntp_updated_ts > 0, "the boot measurement has a timestamp");
+    }
+
+    /// No fresh measurement within the window ⇒ `ntp_failed`, even though no
+    /// query ever explicitly FAILED. That is the whole invisibility bug: the
+    /// old flag had two writers, both inside the query path the master never
+    /// reached.
+    #[test]
+    fn a_stale_reading_flips_ntp_failed_without_any_query_error_68() {
+        let (mut c, status) = create_nano_test_controller();
+
+        c.last_ntp_success = Some(Instant::now() - Duration::from_secs(65_234));
+        c.tick_status();
+
+        let s = status.read().expect("status lock");
+        assert!(
+            s.ntp_failed,
+            "18 hours with no NTP measurement must not read as healthy"
+        );
+        assert!(
+            s.ntp_age_s.unwrap_or(0) > 180,
+            "the age must be published so a consumer can grade it"
+        );
+    }
+
+    // ========================================================================
+    // #68 REVIEW FINDINGS — the fix must not trade one drift for another
+    // ========================================================================
+
+    /// **The blocker.** `calculate_ntp_adaptive_threshold()` models JITTER: it
+    /// widens the step threshold by 5x the MAD of recent samples. On the master
+    /// the samples are not jitter — they are a deterministic monotonic ramp (the
+    /// Dante-vs-UTC frequency error integrating at 6-19 ppm), and the MAD of a
+    /// 7-point ramp with per-interval step `s` is exactly `2s`, so the threshold
+    /// self-inflates to `500 + 10s` — ten times the accrual it is meant to catch.
+    ///
+    /// Left alone, the master would sawtooth 2.5-6.8 ms against UTC forever
+    /// (ceiling `NTP_STEP_THRESHOLD_MAX_US` = 10 ms), and every one of those
+    /// steps is served to the fleet: each client sees the jump, clears its own
+    /// 500 µs threshold and follows one or two of its own intervals later, at a
+    /// per-client phase. That converts a slow absolute error into a permanent
+    /// periodic COHERENCE excursion on a rig whose precision target is 50 µs.
+    ///
+    /// This is a closed-loop simulation: the mock upstream reports the live UTC
+    /// error, the mock clock subtracts every step the controller applies, and
+    /// the error accrues at 19 ppm between intervals — so the adaptive threshold
+    /// is genuinely exercised (the earlier constant-offset test never got past
+    /// 2 samples, which is exactly why this was invisible).
+    #[test]
+    fn the_master_holds_utc_within_a_sub_two_ms_envelope_over_an_hour_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // Live UTC error of the simulated master, in microseconds.
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 40,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let err_for_clock = error_us.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+
+        // 19 ppm over a 30 s interval = 570 µs of fresh UTC error per interval.
+        const ACCRUAL_US: i64 = 570;
+        const INTERVALS: usize = 120; // one simulated hour
+        let mut peak_us = 0_i64;
+        for _ in 0..INTERVALS {
+            *error_us.lock().expect("sim lock") += ACCRUAL_US;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+            peak_us = peak_us.max(error_us.lock().expect("sim lock").abs());
+        }
+
+        assert!(
+            peak_us < 2_000,
+            "the master must hold UTC inside a sub-2ms envelope, peaked at {}us — a \
+             MAD-inflated threshold turns the fleet's own time source into a \
+             multi-millisecond sawtooth that every client then chases",
+            peak_us
+        );
+    }
+
+    /// The correction must be measured against the clock the daemon is ABOUT to
+    /// correct, not the one it just left. `record_ntp_success` runs BEFORE the
+    /// step, so stamping the local reading makes `ntp_updated_ts` (wall clock)
+    /// and `ntp_age_s` (monotonic) disagree by the size of the correction — and
+    /// that same epoch is served to every NTP client as the Reference Timestamp,
+    /// where a backward correction puts it in the FUTURE. RFC 5905 has
+    /// conforming clients discard a reply whose reftime is later than its
+    /// transmit timestamp, so a master that boots ahead of UTC would be ignored
+    /// by ntpd/chrony/w32time until its next successful query.
+    #[test]
+    fn the_published_epoch_is_the_measured_utc_instant_not_the_local_clock_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mut mock_ntp = MockNtpSource::new();
+        // Local clock is a full hour BEHIND UTC.
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_secs(3600),
+                sign: 1,
+                spread_us: 500,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status.clone(),
+            SystemConfig::default(),
+        );
+        let local_now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        c.run_ntp_sync(false);
+
+        let s = status.read().expect("status lock");
+        let published = s.ntp_updated_ts;
+        assert!(
+            published >= local_now + 3595 && published <= local_now + 3605,
+            "expected the measured UTC instant (~local+3600s = {}), got {} — the local \
+             reading was published instead, so the served reference timestamp is an \
+             hour stale and disagrees with ntp_age_s",
+            local_now + 3600,
+            published
+        );
+    }
+
+    /// After a correction lands, `/status` must advertise the offset that
+    /// REMAINS, not the one that was just cancelled. Live consequence of getting
+    /// this wrong: for up to a full interval after a restart, the master served
+    /// `ntp_offset_us: 1039375` for an error it had already stepped away — and
+    /// camera-box's gate thresholds exactly that field.
+    #[test]
+    fn a_corrected_offset_is_published_as_the_residual_not_the_measurement_68() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_clock = MockSystemClock::new();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(1_039_375),
+                sign: 1,
+                spread_us: 588,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status.clone(),
+            SystemConfig::default(),
+        );
+        c.run_ntp_sync(false);
+
+        let s = status.read().expect("status lock");
+        assert_eq!(
+            s.ntp_offset_us, 0,
+            "the boot step cancelled the whole offset — publishing the pre-step \
+             measurement tells every consumer the node is 1.04s out when it is not"
+        );
+        assert_eq!(s.ntp_spread_us, 588, "measurement quality still published");
+        assert_eq!(s.ntp_sample_count, 3);
+    }
+
+    /// A node whose PTP never reaches LOCK (packets flowing, so `ptp_offline`
+    /// never latches) would otherwise never query at all — and would then be
+    /// marked `ntp_failed` forever by the new freshness rule, because the only
+    /// code that CLEARS the flag lives in the query path it cannot reach. The
+    /// discipline must arm itself on staleness so the node keeps tracking UTC
+    /// and recovers on its own.
+    #[test]
+    fn staleness_arms_the_discipline_on_a_node_that_never_locks_68() {
+        assert!(
+            !ntp_discipline_due(
+                false, // server_mode
+                false, // ptp_offline
+                false, // is_locked
+                false, // stale
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            ),
+            "a freshly-measured unlocked client stays on its normal schedule"
+        );
+        assert!(
+            ntp_discipline_due(
+                false,
+                false,
+                false,
+                true, // stale — no measurement inside the window
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            ),
+            "once stale, an unlocked node must query anyway or it can never recover"
+        );
+    }
+
+    /// A misconfigured `ntp_stale_secs: 0` must not pin `ntp_failed` (and the
+    /// operator's tray toast) on forever — `max_step_us` got exactly this
+    /// defensive treatment, and the same reasoning applies here.
+    #[test]
+    fn a_zero_staleness_window_is_floored_not_taken_literally_68() {
+        let (mut c, status) = create_nano_test_controller();
+        c.config.ntp_stale_secs = 0;
+        c.last_ntp_success = Some(Instant::now());
+        c.tick_status();
+        assert!(
+            !status.read().expect("status lock").ntp_failed,
+            "a measurement taken just now cannot be stale under any configured window"
+        );
     }
 }

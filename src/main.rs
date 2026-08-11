@@ -125,6 +125,64 @@ impl Default for Config {
     }
 }
 
+/// Fill in config keys added by later versions, returning `true` when anything
+/// changed (i.e. the file should be written back).
+///
+/// Extracted from `load_config()` in #68 so it is testable at all: `load_config`
+/// reads a hardcoded system path, which is why the migration had no test and a
+/// panicking mutable index reached the fleet's clock master.
+///
+/// **Never index a nested value mutably without proving it is an object first.**
+/// `serde_json`'s `IndexMut<&str>` panics on any value that is neither an object
+/// nor null, so a hand-edited `"ntp_server_mode": true` — a very plausible
+/// attempt to enable it — would abort the daemon at startup, which under a
+/// service manager is a restart loop rather than a degraded start. A malformed
+/// value is instead left alone and falls through to `load_config`'s existing
+/// log-loudly-then-default path.
+fn migrate_config_json(json: &mut serde_json::Value) -> bool {
+    let mut needs_migration = false;
+
+    // Migrate: add _ntp_server_examples if missing
+    if json.get("_ntp_server_examples").is_none() {
+        json["_ntp_server_examples"] = serde_json::Value::String(
+            "sk.pool.ntp.org, europe.pool.ntp.org, time.google.com, time.cloudflare.com"
+                .to_string(),
+        );
+        needs_migration = true;
+    }
+
+    // Migrate: add ntp_server_mode if missing
+    if json.get("ntp_server_mode").is_none() {
+        json["ntp_server_mode"] = serde_json::json!({
+            "enabled": false,
+            "port": 123,
+            "stratum": 3,
+            "max_step_us": 100_000
+        });
+        needs_migration = true;
+    } else if let Some(server_mode) = json["ntp_server_mode"].as_object_mut() {
+        // #68: an EXISTING master's config predates the correction bound.
+        // `#[serde(default)]` already supplies it, but writing it out makes the
+        // knob visible/tunable in the file the operator actually reads.
+        if !server_mode.contains_key("max_step_us") {
+            server_mode.insert("max_step_us".to_string(), serde_json::json!(100_000));
+            needs_migration = true;
+        }
+    }
+
+    // Migrate: add http_status if missing (#47 — existing installs get the
+    // endpoint enabled by default on next start, same as a fresh config)
+    if json.get("http_status").is_none() {
+        json["http_status"] = serde_json::json!({
+            "enabled": true,
+            "port": 8898
+        });
+        needs_migration = true;
+    }
+
+    needs_migration
+}
+
 fn load_config() -> Config {
     #[cfg(windows)]
     let path = r"C:\ProgramData\DanteSync\config.json";
@@ -134,36 +192,7 @@ fn load_config() -> Config {
     if let Ok(content) = std::fs::read_to_string(path) {
         // Try to parse as JSON Value first to check for missing fields
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
-            let mut needs_migration = false;
-
-            // Migrate: add _ntp_server_examples if missing
-            if json.get("_ntp_server_examples").is_none() {
-                json["_ntp_server_examples"] = serde_json::Value::String(
-                    "sk.pool.ntp.org, europe.pool.ntp.org, time.google.com, time.cloudflare.com"
-                        .to_string(),
-                );
-                needs_migration = true;
-            }
-
-            // Migrate: add ntp_server_mode if missing
-            if json.get("ntp_server_mode").is_none() {
-                json["ntp_server_mode"] = serde_json::json!({
-                    "enabled": false,
-                    "port": 123,
-                    "stratum": 3
-                });
-                needs_migration = true;
-            }
-
-            // Migrate: add http_status if missing (#47 — existing installs get the
-            // endpoint enabled by default on next start, same as a fresh config)
-            if json.get("http_status").is_none() {
-                json["http_status"] = serde_json::json!({
-                    "enabled": true,
-                    "port": 8898
-                });
-                needs_migration = true;
-            }
+            let needs_migration = migrate_config_json(&mut json);
 
             // Write back migrated config
             if needs_migration {
@@ -206,7 +235,8 @@ fn load_config() -> Config {
   "ntp_server_mode": {
     "enabled": false,
     "port": 123,
-    "stratum": 3
+    "stratum": 3,
+    "max_step_us": 100000
   },
   "http_status": {
     "enabled": true,
@@ -709,17 +739,23 @@ fn run_sync_loop(
 
         // Create NTP server
         match ntp_server::NtpServer::new(ntp_server_config.port, ntp_server_config.stratum) {
-            Ok(ntp_srv) => {
-                // Disable periodic NTP queries - this machine IS the time source now
-                controller.disable_ntp_tracking();
+            Ok(mut ntp_srv) => {
+                // #68: KEEP querying upstream. This host is the fleet's time
+                // source, not UTC's — with the periodic queries off it free-ran
+                // at the Dante grandmaster's rate (1.04 s of UTC drift over two
+                // days, with the whole fleet coherently following it).
+                controller.configure_ntp_server_mode(ntp_server_config.max_step_us);
 
-                // Start NTP server in background thread
+                // #68: serve a reference timestamp that reflects the last REAL
+                // upstream sync instead of process start.
+                ntp_srv.set_status_source(controller.get_status_shared());
+
+                // Start NTP server in a SUPERVISED background thread (#68) —
+                // if the loop ever exits unexpectedly it is re-bound and
+                // restarted loudly, instead of the daemon silently serving
+                // nothing until somebody restarts the service.
                 let server_running = running.clone();
-                thread::spawn(move || {
-                    if let Err(e) = ntp_srv.run(server_running) {
-                        error!("[NTP-Server] Server error: {}", e);
-                    }
-                });
+                thread::spawn(move || ntp_server::run_supervised(ntp_srv, server_running));
 
                 info!("[NTP-Server] Active - other machines can sync from this host");
             }
@@ -753,7 +789,7 @@ fn run_sync_loop(
 
     while running.load(Ordering::SeqCst) {
         if last_log.elapsed() >= Duration::from_secs(10) {
-            controller.log_status();
+            controller.tick_status();
 
             // Update systemd status with latest metrics
             #[cfg(unix)]
@@ -1026,6 +1062,47 @@ mod tests {
     fn config_default_has_expected_ntp_server() {
         let config = Config::default();
         assert_eq!(config.ntp_server, "10.77.8.2");
+    }
+
+    /// #68 review finding: the `max_step_us` migration indexed
+    /// `json["ntp_server_mode"]["max_step_us"]` mutably. `serde_json`'s
+    /// `IndexMut<&str>` PANICS on any value that is neither an object nor null,
+    /// so a hand-edited `"ntp_server_mode": true` (a very plausible attempt to
+    /// enable it) aborted the process at startup — on the fleet's clock master,
+    /// under a service manager, that is a restart loop rather than a degraded
+    /// start. The pre-existing code only ever indexed the top-level object and
+    /// had a deliberate log-loudly-and-fall-back path for malformed input; this
+    /// must not regress it.
+    #[test]
+    fn config_migration_never_panics_on_a_malformed_ntp_server_mode_68() {
+        for malformed in [
+            serde_json::json!(true),
+            serde_json::json!("yes"),
+            serde_json::json!(123),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            let mut json = serde_json::json!({
+                "ntp_server": "10.77.8.2",
+                "ntp_server_mode": malformed,
+            });
+            // Must return, not abort the daemon.
+            let _ = migrate_config_json(&mut json);
+        }
+    }
+
+    #[test]
+    fn config_migration_adds_max_step_us_to_an_existing_server_mode_object_68() {
+        let mut json = serde_json::json!({
+            "ntp_server": "10.77.8.2",
+            "ntp_server_mode": {"enabled": true, "port": 123, "stratum": 3},
+        });
+        assert!(
+            migrate_config_json(&mut json),
+            "migration must report a change"
+        );
+        assert_eq!(json["ntp_server_mode"]["max_step_us"], 100_000);
+        // Idempotent: a second pass changes nothing.
+        assert!(!migrate_config_json(&mut json));
     }
 
     #[test]
