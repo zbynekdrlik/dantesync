@@ -122,16 +122,63 @@ producing a multi-interval reset-pileup worse than the design intended (hand-tra
 empirically verified: 3 intervals / 1710us peak instead of the intended 2 / 1140us, at the
 original 570us/30s model).
 
-**The fix shape for a ramp-shaped signal: same-sign-only agreement (drop magnitude comparison
-entirely), plus a "fast lane" that skips the wait for small, routine corrections** (same-sign
+**CORRECTED on issue 76 — the fix below shipped as v1.8.31/v1.8.32, was verified only against a
+noiseless simulation, and made a LIVE REGRESSION on strih's real hardware canary worse than the
+sawtooth it replaced. Do not follow the struck-through guidance; read the corrected version after
+it.**
+
+~~The fix shape for a ramp-shaped signal: same-sign-only agreement (drop magnitude comparison
+entirely), plus a "fast lane" that skips the wait for small, routine corrections (same-sign
 persistence across even ONE additional sample is itself the confirming signal on a ramp — it does
-not spontaneously reverse direction). Keep the ORIGINAL magnitude-tolerance-style protection (or in
-this case, just the same-sign requirement is enough — see below) for LARGE/anomalous offsets, where
-a single bad reading producing a big fleet-wide jump is the real risk. Before reusing ANY
-agreement/outlier-rejection mechanism on a new signal (not just the NTP step gate — this applies to
-any future control-loop confirmation logic in this codebase), ask the same question the MAD-adaptive
-threshold section above already asks: **is this signal noise around a stable value, or a
-deterministic trend?** A mechanism tuned for one is often actively counterproductive on the other.
+not spontaneously reverse direction).~~ This assumed the master's signal is a CLEAN ramp. It is
+actually genuine drift PLUS real measurement noise from whatever upstream the node is configured
+against — and on a WAN upstream (issue 76: strih's own Cloudflare NTP server, `pcap_active:false`,
+the less-precise userspace fallback path issue 53 built the kernel-timestamped transport to avoid),
+consecutive burst offsets can scatter by MORE than the true per-check drift signal. "Small +
+same-sign" is not a reliable trust signal there — the fast lane chased that noise into a step
+roughly every ~10s on the live canary, worse than the original correction-lag bug.
+
+**The corrected fix shape: NO single-sample fast lane at any magnitude — ALWAYS require
+`NTP_STEP_AGREEMENT_N` same-sign agreeing samples — but replace the client's self-scaling
+`max(TOL, |cand|/2)` tolerance with a FIXED, non-scaling tolerance sized to the TRUE expected
+per-check accrual, not to a candidate's own (possibly noisy) magnitude.** The self-scaling formula
+is wrong in BOTH directions for a signal with drift + noise: too tight when starting from a small
+genuine candidate (the original issue-71 finding — causes a reset-pileup), too loose once a noisy
+large candidate has already inflated it (lets a second noisy reading "confirm" the first).
+A second, independent layer — excluding a burst whose own internal `spread_us` (issue 53's quality
+signal) exceeds a bound from the step decision entirely — helps but is NOT sufficient on its own:
+`spread_us` only measures WITHIN-burst consistency (a handful of round trips taken in under a
+second); it cannot detect a systematic bias shared across an entire burst (WAN path asymmetry, a
+congestion episode outlasting one burst), so a tight, low-spread burst can still carry a wrong
+value. Both layers together substantially reduce, but do not fully eliminate, a small residual risk
+of two independent noisy readings coincidentally landing within tolerance of each other.
+
+**Any FIXED (non-scaling) tolerance needs its own escape valve, or it can freeze forever.** If the
+true per-check accrual ever permanently exceeds the fixed tolerance (a faster oscillator than
+anything measured so far, or any other sustained one-directional signal), consecutive same-sign
+candidates will NEVER land within tolerance of each other — every reading CONTRADICTS the last,
+agreement count never reaches the target, and the master stops stepping FOREVER, silently, with
+unbounded linear error growth and no distinct alarm. This is a genuinely NEW failure class a fixed
+tolerance introduces that the old self-scaling formula never had (it always eventually converged,
+just with lag) — verified live in the issue-76 review by direct simulation (57ppm: 205ms of
+uncorrected error after one simulated hour, zero steps). The fix: track how many consecutive
+checks have passed with no actual step (regardless of WHY — tolerance never agreeing, or a
+quality gate excluding every burst) and force a step past ALL gates once that count crosses a
+generous bound (issue 76: 30 checks / 5 minutes at the 10s cadence — long enough that it
+essentially never fires under real, even noisy, conditions, short enough to bound the worst case).
+**Any new confirmation/outlier-rejection gate on a control loop in this codebase needs the SAME
+question asked before it ships: what happens if the SIGNAL this gate is tuned to reject legitimately
+persists longer than the gate's own patience? If the answer is "the gate rejects it forever," it
+needs an escape valve — verified by actually running a simulation past the gate's own tuned
+envelope, not just within it (see the section below).**
+
+Before reusing ANY agreement/outlier-rejection mechanism on a new signal (not just the NTP step
+gate — this applies to any future control-loop confirmation logic in this codebase), ask the same
+question the MAD-adaptive threshold section above already asks: **is this signal noise around a
+stable value, or a deterministic trend, or (as turned out to be the real answer here) BOTH at
+once?** A mechanism tuned for pure noise or a pure trend is often actively counterproductive on a
+signal that is genuinely a mix of the two — and any FIXED bound tuned to today's measured envelope
+needs an explicit plan for what happens outside it, not just for the case that's been observed.
 
 Checking whether dropping a magnitude-tolerance check reopens a HISTORICAL incident: re-derive
 what actually caught it. Issue 50's own reversal incident (`+2831us` then `-2825us`) is an
