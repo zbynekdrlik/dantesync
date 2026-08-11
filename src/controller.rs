@@ -828,6 +828,14 @@ where
                 // the boot path and this path can never diverge again).
                 self.record_ntp_success(offset_us, &measurement);
 
+                // #76: count this successful check toward the escape-valve
+                // starvation counter (see ntp_server_checks_since_step's own doc
+                // comment) — reset below whenever a step actually applies.
+                if self.ntp_server_mode {
+                    self.ntp_server_checks_since_step =
+                        self.ntp_server_checks_since_step.saturating_add(1);
+                }
+
                 // Add sample to buffer. #53: `offset_us` is now the burst-filtered
                 // (RTT-selected + median'd) value from NtpClient::get_offset(), not a
                 // single raw round trip — the MAD threshold below and the #50
@@ -899,9 +907,42 @@ where
                     );
                 }
 
+                // #76 review finding (critical): the tolerance-agreement gate and the burst-
+                // quality gate above can each independently reject a genuine same-sign trend
+                // FOREVER (an oscillator error whose accrual permanently exceeds the fixed
+                // tolerance; an upstream that never presents a low-enough-spread burst) --
+                // reproduced live in review as unbounded, silent, permanent growth. This is the
+                // shared last-resort escape valve: once too many checks have passed with no
+                // actual step, the next genuinely over-threshold reading forces one regardless
+                // of tolerance agreement OR burst quality. See NTP_SERVER_MAX_CHECKS_WITHOUT_STEP's
+                // own doc comment for why this essentially never fires under real conditions.
+                let server_starved = self.ntp_server_mode
+                    && self.ntp_server_checks_since_step >= NTP_SERVER_MAX_CHECKS_WITHOUT_STEP
+                    && offset_us.abs() > step_threshold;
+                if server_starved {
+                    warn!(
+                        "[NTP-Server] escape valve: {} checks ({}) without a step -- forcing \
+                         correction {:+}us past the tolerance/quality gates (starvation safety \
+                         net, spread was {}us)",
+                        self.ntp_server_checks_since_step,
+                        if low_quality_server_burst {
+                            "burst quality gate kept rejecting"
+                        } else {
+                            "agreement never confirmed"
+                        },
+                        offset_us,
+                        measurement.spread_us
+                    );
+                    self.ntp_pending_step = None;
+                }
+
                 // Step clock if offset exceeds the threshold — but NEVER on a single
                 // measurement: the agreement gate (#50) requires consecutive agreeing samples.
-                if !low_quality_server_burst && self.ntp_step_gate(offset_us, step_threshold) {
+                // #76: the escape valve (server_starved) bypasses BOTH the quality gate and the
+                // normal agreement gate as a last resort.
+                if server_starved
+                    || (!low_quality_server_burst && self.ntp_step_gate(offset_us, step_threshold))
+                {
                     // #68: a correction is rate-bounded in server mode, where this
                     // node's step is the whole fleet's step. `ntp_server_max_step_us`
                     // is 0 for every other node and 0 means unbounded, so the same
@@ -929,6 +970,9 @@ where
                         // Clear NTP samples after step to start fresh measurement
                         self.ntp_offset_samples.clear();
                         self.ntp_pending_step = None;
+                        // #76: any actual step (normal agreement OR the escape valve) resets
+                        // the starvation counter -- we just corrected, the clock is caught up.
+                        self.ntp_server_checks_since_step = 0;
                         // Clear PTP sample window to discard post-step transient samples
                         self.sample_window.clear();
                         // Set grace period to skip PTP samples for 2s after step
