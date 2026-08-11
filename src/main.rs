@@ -718,12 +718,16 @@ fn run_sync_loop(
 
         // Create NTP server
         match ntp_server::NtpServer::new(ntp_server_config.port, ntp_server_config.stratum) {
-            Ok(ntp_srv) => {
+            Ok(mut ntp_srv) => {
                 // #68: KEEP querying upstream. This host is the fleet's time
                 // source, not UTC's — with the periodic queries off it free-ran
                 // at the Dante grandmaster's rate (1.04 s of UTC drift over two
                 // days, with the whole fleet coherently following it).
                 controller.configure_ntp_server_mode(ntp_server_config.max_step_us);
+
+                // #68: serve a reference timestamp that reflects the last REAL
+                // upstream sync instead of process start.
+                ntp_srv.set_status_source(controller.get_status_shared());
 
                 // Start NTP server in a SUPERVISED background thread (#68) —
                 // if the loop ever exits unexpectedly it is re-bound and

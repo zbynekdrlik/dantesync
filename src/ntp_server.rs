@@ -150,8 +150,13 @@ pub struct NtpServer {
     /// The port this server was CONFIGURED with (#68) — kept so
     /// `run_supervised` can re-bind an identical server if one is ever needed.
     port: u16,
-    /// When we synced from upstream NTP (for reference timestamp)
+    /// Fallback reference timestamp: when this server was created. Used only
+    /// until the first upstream measurement lands (#68).
     reference_time: SystemTime,
+    /// #68: the live sync status, read for `ntp_updated_ts` — when this host
+    /// last actually re-read its own upstream reference. `None` (or a status
+    /// with nothing measured yet) falls back to `reference_time`.
+    status: Option<Arc<std::sync::RwLock<crate::status::SyncStatus>>>,
 }
 
 impl NtpServer {
@@ -192,7 +197,28 @@ impl NtpServer {
             stratum,
             port,
             reference_time: SystemTime::now(),
+            status: None,
         })
+    }
+
+    /// #68 — attach the live sync status so the served reference timestamp
+    /// tracks the last REAL upstream sync instead of process start.
+    pub fn set_status_source(&mut self, status: Arc<std::sync::RwLock<crate::status::SyncStatus>>) {
+        self.status = Some(status);
+    }
+
+    /// When this host last re-read its own upstream reference (#68), falling
+    /// back to server start while nothing has been measured yet — never to the
+    /// 1970 epoch a bare `ntp_updated_ts: 0` would produce.
+    fn reference_timestamp(&self) -> SystemTime {
+        if let Some(status) = &self.status {
+            if let Ok(s) = status.read() {
+                if s.ntp_updated_ts > 0 {
+                    return UNIX_EPOCH + Duration::from_secs(s.ntp_updated_ts);
+                }
+            }
+        }
+        self.reference_time
     }
 
     /// The address this server is actually bound to (#68). Differs from the
@@ -325,8 +351,9 @@ impl NtpServer {
         let ref_id = REF_ID_LOCL.to_be_bytes();
         response[12..16].copy_from_slice(&ref_id);
 
-        // Bytes 16-23: Reference Timestamp (when we synced from upstream)
-        let (ref_secs, ref_frac) = system_time_to_ntp(self.reference_time);
+        // Bytes 16-23: Reference Timestamp — when we last actually re-read
+        // upstream (#68), not when this process happened to start.
+        let (ref_secs, ref_frac) = system_time_to_ntp(self.reference_timestamp());
         response[16..20].copy_from_slice(&ref_secs.to_be_bytes());
         response[20..24].copy_from_slice(&ref_frac.to_be_bytes());
 
@@ -725,6 +752,7 @@ mod tests {
             stratum: 3,
             port: 0,
             reference_time: SystemTime::now(),
+            status: None,
         };
 
         let originate_ts = [0u8; 8];
@@ -754,6 +782,7 @@ mod tests {
             stratum: 3,
             port: 0,
             reference_time: SystemTime::now(),
+            status: None,
         };
 
         let originate_ts = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -770,6 +799,7 @@ mod tests {
             stratum: 3,
             port: 0,
             reference_time: SystemTime::now(),
+            status: None,
         };
 
         let recv_secs: u32 = 0x12345678;
@@ -795,6 +825,7 @@ mod tests {
             stratum: 3,
             port: 0,
             reference_time: SystemTime::now(),
+            status: None,
         };
 
         let response = server.build_response(3, &[0; 8], 100, 200).unwrap();
@@ -810,6 +841,7 @@ mod tests {
             stratum: 3,
             port: 0,
             reference_time: UNIX_EPOCH,
+            status: None,
         };
 
         let new_time = SystemTime::now();
