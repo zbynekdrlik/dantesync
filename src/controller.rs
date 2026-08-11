@@ -45,6 +45,55 @@ fn should_log_drift_summary(sample_count: u64, interval: u64) -> bool {
     interval != 0 && sample_count % interval == 0
 }
 
+/// #68 — decides whether the periodic upstream-NTP discipline runs this
+/// iteration. Pure, so the policy is unit-tested directly instead of being
+/// inferred from a live 30-second loop.
+///
+/// `tracking_enabled` is the master switch (all callers leave it on; it exists
+/// so a future NTP-free mode has one place to turn the loop off). Beyond that,
+/// the discipline runs when ANY role condition holds:
+///
+/// - `ptp_offline` — NTP is the only time source left (pre-existing behaviour).
+/// - `server_mode` — this node serves UTC to the whole fleet, so its duty to
+///   track UTC does NOT depend on its own PTP lock. This is the #68 addition:
+///   `ntp_server_mode` previously disabled the loop outright, leaving the
+///   master free-running at the Dante grandmaster's rate (6-19 ppm measured on
+///   strih ⇒ ~21 ms of UTC error 19 minutes after a restart, 1.04 s over two
+///   days) with `ntp_failed` reading `false` throughout.
+/// - `is_locked` — ordinary client behaviour, unchanged.
+fn ntp_discipline_due(
+    tracking_enabled: bool,
+    server_mode: bool,
+    ptp_offline: bool,
+    is_locked: bool,
+    since_last_check: Duration,
+    interval: Duration,
+) -> bool {
+    let role_allows = ptp_offline || server_mode || is_locked;
+    tracking_enabled && role_allows && since_last_check >= interval
+}
+
+/// #68 — bound a SINGLE periodic UTC correction while in NTP server mode.
+///
+/// This node's step is the whole fleet's step, so an upstream reading that is
+/// wrong but internally consistent (and therefore survives the step-agreement
+/// gate) must not be able to yank every box at once. In steady state the bound
+/// never fires: at the measured 6-19 ppm a 30 s interval accrues only ~0.2-0.6 ms,
+/// far under the default 100 ms. It only shapes the recovery of a genuinely large
+/// error — a 1.04 s post-upgrade offset is worked off over ~10 minutes of normal
+/// intervals, unattended and with no restart, instead of in one visible jump.
+///
+/// A non-positive bound means "unbounded" — a misconfigured `0` must degrade to
+/// today's behaviour, never to a master frozen at zero correction forever. The
+/// boot-time `run_ntp_sync()` step is deliberately NOT routed through here: a
+/// cold start must land on UTC immediately.
+fn clamp_ntp_step_us(offset_us: i64, max_step_us: i64) -> i64 {
+    if max_step_us <= 0 {
+        return offset_us;
+    }
+    offset_us.clamp(-max_step_us, max_step_us)
+}
+
 // ============================================================================
 // CONSTANTS - Organized by functional area
 // ============================================================================
@@ -226,6 +275,14 @@ where
     last_ntp_check: Instant,
     ntp_offset_samples: VecDeque<i64>, // in microseconds
     ntp_tracking_enabled: bool,
+    /// #68: this node is the fleet's NTP server. It keeps disciplining itself
+    /// against upstream (a stratum-3 server that never re-reads its own
+    /// reference is just a free-running oscillator advertising itself as a time
+    /// source), and its corrections are bounded by `ntp_server_max_step_us`.
+    ntp_server_mode: bool,
+    /// #68: upper bound on a SINGLE server-mode correction, µs. See
+    /// `clamp_ntp_step_us`.
+    ntp_server_max_step_us: i64,
     // #50 step-agreement gate: a single over-threshold NTP measurement is NEVER trusted (a
     // queue-delay-biased round trip on a loaded LAN produces a false offset, the servo steps,
     // the next sample shows the negated bias and it steps right back — the live-event
@@ -362,6 +419,9 @@ where
             last_ntp_check: now,
             ntp_offset_samples: VecDeque::with_capacity(NTP_SAMPLE_COUNT + 2),
             ntp_tracking_enabled: true, // Always enabled - NTP is the UTC time source
+            // #68: set by configure_ntp_server_mode() when this node serves the fleet
+            ntp_server_mode: false,
+            ntp_server_max_step_us: 0,
             ntp_pending_step: None,
             last_ntp_step: None,
             // Accumulated phase error tracking
@@ -463,19 +523,22 @@ where
     }
 
     pub fn check_ntp_utc_tracking(&mut self) {
-        // Run NTP sync when:
-        // 1. PTP is offline (NTP-only mode), OR
-        // 2. PTP is locked and tracking is enabled
-        let should_check = self.ptp_offline || (self.is_locked && self.ntp_tracking_enabled);
-        if !should_check {
-            return;
-        }
-
         // Adaptive NTP interval based on accumulated phase error:
         // - Higher error = check more frequently for tighter UTC alignment
         // - Low error = use default interval to reduce NTP overhead
         let ntp_interval_secs = self.calculate_adaptive_ntp_interval();
-        if self.last_ntp_check.elapsed() < Duration::from_secs(ntp_interval_secs) {
+
+        // #68: the run/skip decision is a pure, unit-tested policy — see
+        // `ntp_discipline_due`. A server-mode master runs it regardless of its
+        // own PTP lock state; every other node's semantics are unchanged.
+        if !ntp_discipline_due(
+            self.ntp_tracking_enabled,
+            self.ntp_server_mode,
+            self.ptp_offline,
+            self.is_locked,
+            self.last_ntp_check.elapsed(),
+            Duration::from_secs(ntp_interval_secs),
+        ) {
             return;
         }
 
@@ -535,7 +598,20 @@ where
                 // Step clock if offset exceeds adaptive threshold — but NEVER on a single
                 // measurement: the agreement gate (#50) requires consecutive agreeing samples.
                 if self.ntp_step_gate(offset_us, adaptive_threshold) {
-                    let step_us = offset_us;
+                    // #68: in server mode a single correction is rate-bounded —
+                    // this node's step is the whole fleet's step.
+                    let step_us = if self.ntp_server_mode {
+                        clamp_ntp_step_us(offset_us, self.ntp_server_max_step_us)
+                    } else {
+                        offset_us
+                    };
+                    if step_us != offset_us {
+                        warn!(
+                            "[NTP-Server] upstream correction {:+}us exceeds the {}us bound — \
+                             stepping {:+}us now, residual worked off over the next intervals",
+                            offset_us, self.ntp_server_max_step_us, step_us
+                        );
+                    }
 
                     // Apply the step (sets time, does NOT change frequency)
                     let step_dur = Duration::from_micros(step_us.unsigned_abs());
@@ -603,7 +679,7 @@ where
         }
     }
 
-    /// Enable or disable periodic NTP UTC tracking
+    /// Enable or disable periodic NTP UTC tracking (master switch).
     pub fn set_ntp_tracking(&mut self, enabled: bool) {
         self.ntp_tracking_enabled = enabled;
         info!(
@@ -612,14 +688,37 @@ where
         );
     }
 
-    /// Disable periodic NTP UTC tracking (convenience method for NTP server mode).
+    /// True while the periodic upstream-NTP discipline is armed.
+    pub fn ntp_tracking_enabled(&self) -> bool {
+        self.ntp_tracking_enabled
+    }
+
+    /// #68 — put this node into NTP **server** mode: it serves UTC to the fleet
+    /// AND keeps disciplining itself against its own upstream.
     ///
-    /// When DanteSync runs in NTP server mode, periodic NTP queries must be disabled
-    /// because this machine IS the time source. The PTP-disciplined clock advances
-    /// time naturally, and this machine serves that time to others via NTP.
-    pub fn disable_ntp_tracking(&mut self) {
-        self.set_ntp_tracking(false);
-        info!("[NTP-Server] Periodic NTP queries disabled (this machine is the time source)");
+    /// This REPLACES the old `disable_ntp_tracking()`, which was the whole
+    /// defect: it turned the periodic queries off on the theory that "this
+    /// machine IS the time source". That is true of the FLEET's mutual
+    /// coherence and false of UTC — no oscillator is a source of UTC. With the
+    /// loop off, the master's only UTC measurement was the boot-time one-shot,
+    /// after which it free-ran at the Dante grandmaster's rate: 6-19 ppm
+    /// measured on strih, i.e. ~21 ms of error 19 minutes after a restart and
+    /// 1.04 s over two days, with the whole fleet coherently following it.
+    ///
+    /// Discipline reuses the ordinary client machinery unchanged (adaptive
+    /// threshold → two agreeing samples → `step_clock`), with two server-only
+    /// properties: it runs regardless of this node's own PTP lock state, and a
+    /// single correction is bounded by `max_step_us` (see `clamp_ntp_step_us`).
+    pub fn configure_ntp_server_mode(&mut self, max_step_us: i64) {
+        self.ntp_server_mode = true;
+        self.ntp_server_max_step_us = max_step_us;
+        self.set_ntp_tracking(true);
+        info!(
+            "[NTP-Server] Upstream discipline ACTIVE — re-querying every {}s, \
+             single correction bounded to {}us (this host serves the fleet, \
+             but UTC still comes from upstream)",
+            NTP_CHECK_INTERVAL_SECS, max_step_us
+        );
     }
 
     /// Calculate adaptive NTP step threshold based on measured offset variance.
@@ -2572,7 +2671,10 @@ mod tests {
         let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
 
         c.configure_ntp_server_mode(100_000);
-        assert!(!c.is_locked, "the master is deliberately NOT PTP-locked here");
+        assert!(
+            !c.is_locked,
+            "the master is deliberately NOT PTP-locked here"
+        );
 
         // First interval: over-threshold ⇒ only a step CANDIDATE (agreement gate).
         c.last_ntp_check = Instant::now() - Duration::from_secs(60);

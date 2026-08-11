@@ -150,8 +150,16 @@ fn load_config() -> Config {
                 json["ntp_server_mode"] = serde_json::json!({
                     "enabled": false,
                     "port": 123,
-                    "stratum": 3
+                    "stratum": 3,
+                    "max_step_us": 100_000
                 });
+                needs_migration = true;
+            } else if json["ntp_server_mode"].get("max_step_us").is_none() {
+                // #68: an EXISTING master's config predates the correction
+                // bound. `#[serde(default)]` already supplies it, but writing it
+                // out makes the knob visible/tunable in the file the operator
+                // actually reads.
+                json["ntp_server_mode"]["max_step_us"] = serde_json::json!(100_000);
                 needs_migration = true;
             }
 
@@ -206,7 +214,8 @@ fn load_config() -> Config {
   "ntp_server_mode": {
     "enabled": false,
     "port": 123,
-    "stratum": 3
+    "stratum": 3,
+    "max_step_us": 100000
   },
   "http_status": {
     "enabled": true,
@@ -710,8 +719,11 @@ fn run_sync_loop(
         // Create NTP server
         match ntp_server::NtpServer::new(ntp_server_config.port, ntp_server_config.stratum) {
             Ok(ntp_srv) => {
-                // Disable periodic NTP queries - this machine IS the time source now
-                controller.disable_ntp_tracking();
+                // #68: KEEP querying upstream. This host is the fleet's time
+                // source, not UTC's — with the periodic queries off it free-ran
+                // at the Dante grandmaster's rate (1.04 s of UTC drift over two
+                // days, with the whole fleet coherently following it).
+                controller.configure_ntp_server_mode(ntp_server_config.max_step_us);
 
                 // Start NTP server in background thread
                 let server_running = running.clone();

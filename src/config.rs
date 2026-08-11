@@ -9,11 +9,21 @@ pub struct SystemConfig {
 /// NTP Server configuration for unified time source mode.
 ///
 /// When enabled, DanteSync becomes an NTP server that:
-/// 1. Syncs time ONCE from upstream NTP on startup
-/// 2. Stops all periodic NTP queries
-/// 3. Serves the PTP-disciplined time to other machines
+/// 1. Syncs time from upstream NTP on startup, and — since #68 — KEEPS
+///    re-querying that upstream on the normal cadence, disciplining itself
+///    with bounded corrections
+/// 2. Serves the PTP-disciplined time to other machines
 ///
 /// Only ONE machine per network should enable this (the "master").
+///
+/// #68 — this used to read "syncs ONCE on startup, stops all periodic NTP
+/// queries". That was the defect, not a footnote: PTP locks the master's
+/// FREQUENCY to the Dante grandmaster, whose rate is not UTC's rate, so with
+/// the periodic queries off the master's UTC phase error integrated from boot
+/// with nothing subtracting from it (6-19 ppm measured on strih ⇒ ~21 ms 19
+/// minutes after a restart, 1.04 s over two days) while `ntp_failed` stayed
+/// `false`. "This machine IS the time source" is true of the fleet's mutual
+/// coherence and false of UTC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NtpServerConfig {
     /// Enable NTP server mode (only one machine per network)
@@ -25,6 +35,19 @@ pub struct NtpServerConfig {
     /// Stratum to report to clients (default 3)
     #[serde(default = "default_ntp_server_mode_stratum")]
     pub stratum: u8,
+    /// #68 — upper bound (microseconds) on a SINGLE periodic UTC correction
+    /// while in server mode. Default 100 000 µs (100 ms).
+    ///
+    /// This node's step is the whole fleet's step, so a wrong-but-consistent
+    /// upstream reading (one that survives the two-agreeing-samples gate) must
+    /// not be able to move every box at once. In steady state the bound never
+    /// fires — at 6-19 ppm a 30 s interval accrues only ~0.2-0.6 ms. It only
+    /// shapes recovery from a genuinely large error: a 1.04 s offset is worked
+    /// off over ~10 minutes of ordinary intervals, unattended, no restart.
+    /// `0` (or negative) means unbounded. The boot-time sync is never bounded —
+    /// a cold start must land on UTC immediately.
+    #[serde(default = "default_ntp_server_mode_max_step_us")]
+    pub max_step_us: i64,
 }
 
 fn default_ntp_server_mode_enabled() -> bool {
@@ -39,12 +62,17 @@ fn default_ntp_server_mode_stratum() -> u8 {
     3
 }
 
+fn default_ntp_server_mode_max_step_us() -> i64 {
+    100_000
+}
+
 impl Default for NtpServerConfig {
     fn default() -> Self {
         Self {
             enabled: default_ntp_server_mode_enabled(),
             port: default_ntp_server_mode_port(),
             stratum: default_ntp_server_mode_stratum(),
+            max_step_us: default_ntp_server_mode_max_step_us(),
         }
     }
 }
@@ -270,6 +298,22 @@ mod tests {
         assert!(!config.enabled, "NTP server should be disabled by default");
         assert_eq!(config.port, 123, "Default port should be 123");
         assert_eq!(config.stratum, 3, "Default stratum should be 3");
+        assert_eq!(
+            config.max_step_us, 100_000,
+            "#68: a server-mode correction is bounded to 100ms by default"
+        );
+    }
+
+    /// #68: a master's EXISTING config predates `max_step_us`. It must still
+    /// parse (serde default), and default to the bounded 100 ms — never to 0
+    /// (unbounded), which would let one bad upstream reading move the whole
+    /// fleet in a single step.
+    #[test]
+    fn test_ntp_server_config_without_max_step_us_defaults_to_bounded_68() {
+        let json = r#"{"enabled": true, "port": 123, "stratum": 3}"#;
+        let config: NtpServerConfig =
+            serde_json::from_str(json).expect("a pre-#68 config must still parse");
+        assert_eq!(config.max_step_us, 100_000);
     }
 
     #[test]
@@ -278,6 +322,7 @@ mod tests {
             enabled: true,
             port: 1123,
             stratum: 2,
+            max_step_us: 250_000,
         };
 
         let json = serde_json::to_string(&config).expect("serialize failed");
@@ -286,6 +331,7 @@ mod tests {
         assert_eq!(restored.enabled, config.enabled);
         assert_eq!(restored.port, config.port);
         assert_eq!(restored.stratum, config.stratum);
+        assert_eq!(restored.max_step_us, config.max_step_us);
     }
 
     #[test]
@@ -305,12 +351,14 @@ mod tests {
             enabled: true,
             port: 8123,
             stratum: 4,
+            max_step_us: 100_000,
         };
         let cloned = config.clone();
 
         assert_eq!(cloned.enabled, config.enabled);
         assert_eq!(cloned.port, config.port);
         assert_eq!(cloned.stratum, config.stratum);
+        assert_eq!(cloned.max_step_us, config.max_step_us);
     }
 
     // ========================================================================
