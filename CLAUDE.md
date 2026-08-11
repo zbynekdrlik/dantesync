@@ -127,6 +127,37 @@ Same for `gh issue view <N>` (also fails the same way — use
 live (#61) with no GraphQL error. Only editing/viewing an existing PR/issue body hits the
 `projectCards` bug above; posting a fresh comment does not touch that field at all.
 
+## GOTCHA — the design/validated/reviewed-comment gate's repo resolution ignores an in-command `cd`
+
+The airuleset design-gate hook (`hooks/post-record-design-comment.sh`, external to this repo) that
+classifies a posted `gh issue comment` as a design/validated/reviewed marker resolves which repo
+the comment belongs to from the **session's own ambient working directory**, not from a `cd
+<path> &&` prefix inside the SAME Bash command. A worker whose session launched in a sibling repo
+(e.g. `camera-box`) and runs `cd /home/newlevel/devel/dantesync && gh issue comment 71 -F
+body.md` — even though the comment genuinely posts to the right repo (confirmed by the returned
+`.../dantesync/issues/71#issuecomment-...` URL) — has that comment silently classified against
+the WRONG repo (or not at all), because the hook's own `cwd` metadata never followed the `cd`.
+The commit-blocking gate (`hooks/block-commit-without-design.sh`) then fires as if no design
+comment exists at all, even though one is genuinely posted and readable on the issue.
+
+**This recurred across two separate work cycles** (issue 68's cycle, and issue 71's cycle) before
+being promoted here — it is not a one-off. **Always pass `-R zbynekdrlik/dantesync` explicitly on
+every `gh issue comment` call that posts a design/validated/reviewed marker**, regardless of
+whether the session is already `cd`'d into this repo:
+
+```bash
+gh issue comment <N> -R zbynekdrlik/dantesync -F body.md
+```
+
+`-R` makes the hook use the explicit repo directly, bypassing the ambient-cwd resolution entirely.
+If a commit is blocked despite a comment you're sure is posted, check
+`ls ~/.claude/design-posted/ ~/.claude/validated-posted/ ~/.claude/reviewed-posted/ | grep
+dantesync` for the missing marker, then simply repost the SAME comment with `-R` explicit (a
+duplicate comment on the issue thread is a harmless cosmetic cost next to a stuck commit gate) —
+each `gh issue comment` call only ever classifies its own invocation's LATEST fresh comment on
+that issue, so post design/validated/reviewed comments as SEPARATE Bash calls too, never batched
+together in one command with `&&`.
+
 ## Hardware Constraints (CRITICAL)
 
 **This project implements SOFTWARE-ONLY PTP frequency synchronization:**
