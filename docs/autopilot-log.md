@@ -296,3 +296,81 @@ canary evidence before continuing.
 - **No fleet deploy from this worker, by dispatch.** v1.8.29 is released and awaiting the
   supervisor's canary rollout. Nothing on cam/imag/strih/stream was touched; strih was only READ
   (`/status` over HTTP and an `ntpdate -q` query against its NTP server).
+
+## #71 — master steady-state residual sawtooth (0.9-2.5ms at real 19ppm) — correction lag from the agreeing-samples confirmation
+
+- Version bump: `04dbd13` (1.8.30 -> 1.8.31)
+- RED: `f035cae` — 6 new tests in `controller.rs` (`ntp_gate_server_mode_*_71`,
+  `the_master_holds_utc_well_under_the_71_target_at_real_19ppm_and_server_cadence`), 3 of them
+  genuinely failing against the unmodified gate (peaked 570us vs. a <400 bound)
+- GREEN: `5ac95c2` — 4 server-mode-only changes to `check_ntp_utc_tracking`/`ntp_step_gate`, all
+  gated on `ntp_server_mode` (client behaviour untouched): a dedicated check cadence independent of
+  the PTP-lock-quality signal `calculate_adaptive_ntp_interval` actually tracks, a lower step
+  threshold, same-sign-only agreement (drops the client's magnitude-tolerance check, which is what
+  produced the reset-pileup — each ramp sample is systematically LARGER than the last, not merely
+  noisily different), and a fast lane that steps on the FIRST over-threshold sample below a bound
+- **Root cause, precisely:** the client agreement gate's `tol = max(TOL, |cand|/2)` magnitude
+  check assumes stationary jitter; on a monotonic ramp each new sample routinely exceeds that
+  tolerance and CONTRADICTS the pending candidate instead of confirming it, so the confirmation
+  takes 3+ intervals (hand-traced + empirically verified: 1710us / 3-interval peak at the original
+  570us/30s model) instead of the intended 2 (1140us).
+- **Rejected alternative, argued on the ticket:** a second frequency actuator (trim the master's
+  clock rate toward UTC). Rejected because this node's PTP servo keeps tracking the REAL Dante
+  grandmaster in frequency regardless of server mode (nothing disables it), and
+  `.claude/rules/clock-discipline-and-testing.md` already documents why a second frequency
+  correction fights the PTP servo's own re-lock every ~125ms. "Small frequent steps" (the fix's
+  actual shape) is literally what that rule recommends.
+- **Independent fresh-context review found a real gap the first cut missed:** the original 5s
+  server-mode cadence pushed the PTP post-step grace-period duty cycle from ~2.2% (pre-#71) to
+  ~13.3%, argued but never validated. Cooled to 10s (duty cycle ~10%, worst-case pre-step magnitude
+  ~380us — still a 5.3x margin under camera-box's 2000us downstream gate bound) in a follow-up
+  commit (`0aa34bf`), which also: fixed a stale doc-comment + operator-facing log line on
+  `configure_ntp_server_mode` that still described pre-#71 numbers/machinery; added 2 tests pinning
+  `check_ntp_utc_tracking`'s actual interval SELECTION (the closed-loop sim force-sets
+  `last_ntp_check` every iteration, so it never proved the code picked the new cadence — a silent
+  revert of one `if` would have passed every other test); added a fast-lane exact-boundary test;
+  added a log line distinguishing a fast-laned step from a confirmed one; derived the closed-loop
+  test's accrual from the real constant instead of a hand-picked literal, and corrected a
+  hand-guessed "950us" pre-fix number to the actually-measured 570us (verified by literally running
+  the post-fix test against the pre-#71 baseline commit rather than trusting arithmetic).
+- **Lesson: verify a hand-derived number by running it, don't trust the arithmetic.** The
+  peak-measurement methodology in this test family samples the residual AFTER
+  `check_ntp_utc_tracking()` returns — a step that fires within the SAME call resets the residual
+  to ~0 before the sample is taken, so the observable peak is always the last NON-stepping tick,
+  one interval short of the true pre-step spike. Hand-tracing this by arithmetic got the pre-fix
+  number wrong by ~1.7x (950 guessed vs. 570 actual) on the first pass; splitting the working tree
+  into a temporary pre-fix baseline + the new test and actually running it caught the error before
+  it shipped in a doc comment.
+- Follow-ups filed (both `Scope-gate: needs-user-decision`, genuinely separate mechanisms):
+  - issue 72 — client-side adaptive-threshold inflation (cam1: 545 -> 9300us, clearing a genuine
+    1752us step) chasing this same sawtooth; this fix should shrink it ~6-9x but doesn't
+    eliminate the underlying gap (the MAD formula has no awareness its reference can be a
+    server-mode node, and no ceiling matched to this rig's 50us target)
+  - issue 74 — `ntp_step_gate` never consults `spread_us` (the issue-53 burst-filter quality signal) in
+    either mode; dropping the magnitude-tolerance check for server mode removes one incidental
+    guard against a same-sign-but-wild single bad reading
+- PR: 73 (dev->master), merged `94a16ce`. Auto-release's "Trigger release workflow" step failed
+  once on a TLS cert-verification error calling `api.github.com` FROM a GitHub-hosted runner
+  (`tls: failed to verify certificate: x509: certificate is not valid for any names`) — a transient
+  GitHub Actions infra glitch, not anything in this repo. **Gotcha: `gh run rerun --failed` re-runs
+  the WHOLE job, including the tag-creation step's idempotency guard** — since the tag had already
+  been created successfully before the TLS error hit, the rerun's own "tag already exists, skipping
+  release" branch short-circuited the `if: env.SKIP_RELEASE != 'true'` gate and the release
+  workflow was STILL never triggered, even though the job reported green. Caught by checking
+  `gh run list --workflow release.yml` for a genuinely NEW run after the "success" — none existed.
+  Fixed with a direct `gh workflow run release.yml -f tag=v1.8.31` (same recipe as camera-box's own
+  documented `gh run rerun`-vs-`gh workflow run` gotcha, but the OPPOSITE direction: there,
+  `workflow_dispatch` loses trigger-context flags a real event carries; here, a job-level RERUN's
+  own idempotency guard suppressed a step a caller might reasonably assume reran). Released
+  `v1.8.31` with the full asset set (linux/windows/tray binaries + sha256, Linux sha256 verified
+  locally against the downloaded binary).
+- Design-gate reminder (still true): pass `-R zbynekdrlik/dantesync` on every `gh issue comment`
+  when the session's ambient cwd might not match — confirmed AGAIN this cycle that a `cd dantesync
+  && gh issue comment ...` compound command's `cd` is NOT what the design-gate hook's `cwd`
+  resolves from (it appears to use the session's own launch directory), so the first two comments
+  posted this way were silently unclassified until reposted with `-R` explicit.
+- **No fleet deploy from this worker, by dispatch.** v1.8.31 is released and awaiting the
+  supervisor's canary rollout on strih — flagging explicitly for that canary: confirm PTP lock
+  quality (not just the DanteSync gate's spread check) holds under the new ~10s server-mode
+  stepping cadence before rolling the rest of the fleet, since that trade-off was argued from
+  first principles, not measured live.

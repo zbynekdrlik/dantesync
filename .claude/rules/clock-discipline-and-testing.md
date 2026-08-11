@@ -107,3 +107,52 @@ Two semantics worth preserving:
 Whenever a field's MEANING widens (as `ntp_failed` did, from "a query errored" to "UTC alignment is
 not being maintained"), update its doc comment AND every consumer's user-visible copy in the same
 change — the tray was still toasting "NTP server unreachable" for a node that had never tried.
+
+## An "agreement" gate designed for jitter is wrong for a ramp — check what the signal actually IS
+
+Hard-won on issue 71 (the server-mode master's steady-state sawtooth). `ntp_step_gate`'s
+two-agreeing-samples confirmation (issue 50) requires same-sign AND magnitude-within-tolerance —
+correct for a CLIENT, whose over-threshold samples are noisy readings of a roughly STATIONARY true
+value (two readings of the same real error should be close in magnitude). It is actively WRONG for
+the SERVER-mode master, whose samples are a deterministic MONOTONIC RAMP: each new sample is
+systematically LARGER than the last by roughly one interval's accrual, not merely noisily
+different. A magnitude-similarity requirement on a ramp routinely CONTRADICTS a genuine trend
+instead of confirming it (the next sample "disagrees" simply because the ramp kept moving),
+producing a multi-interval reset-pileup worse than the design intended (hand-traced AND
+empirically verified: 3 intervals / 1710us peak instead of the intended 2 / 1140us, at the
+original 570us/30s model).
+
+**The fix shape for a ramp-shaped signal: same-sign-only agreement (drop magnitude comparison
+entirely), plus a "fast lane" that skips the wait for small, routine corrections** (same-sign
+persistence across even ONE additional sample is itself the confirming signal on a ramp — it does
+not spontaneously reverse direction). Keep the ORIGINAL magnitude-tolerance-style protection (or in
+this case, just the same-sign requirement is enough — see below) for LARGE/anomalous offsets, where
+a single bad reading producing a big fleet-wide jump is the real risk. Before reusing ANY
+agreement/outlier-rejection mechanism on a new signal (not just the NTP step gate — this applies to
+any future control-loop confirmation logic in this codebase), ask the same question the MAD-adaptive
+threshold section above already asks: **is this signal noise around a stable value, or a
+deterministic trend?** A mechanism tuned for one is often actively counterproductive on the other.
+
+Checking whether dropping a magnitude-tolerance check reopens a HISTORICAL incident: re-derive
+what actually caught it. Issue 50's own reversal incident (`+2831us` then `-2825us`) is an
+OPPOSITE-SIGN pair — the same-sign check alone still catches it with zero magnitude comparison
+needed. Don't assume a compound check's protection is inseparable; trace which SPECIFIC part of it
+defeated the SPECIFIC historical case before relaxing the rest.
+
+## Verify a hand-derived "expected number" by RUNNING it, never trust the arithmetic alone
+
+A closed-loop simulation test's exact peak number is easy to get wrong by hand, because the
+methodology has a non-obvious wrinkle: it samples the residual AFTER `check_ntp_utc_tracking()`
+returns, and a call that ITSELF steps resets the residual to ~0 before the sample is taken — so the
+observably-recorded peak is always the LAST NON-STEPPING tick, one interval short of the true
+pre-step spike, not the naively-expected "threshold + one interval's accrual" figure. On issue 71,
+a hand-traced pre-fix number (950us) was off by ~1.7x from the actual measured value (570us).
+
+**When a doc comment or design writeup claims a specific number from this test family, verify it by
+actually running the test against the relevant code version — don't trust the arithmetic.** A cheap
+way to check an OLDER/BASELINE code path's behavior without a second git checkout: `git show
+<sha>:src/controller.rs > /tmp/baseline.rs`, splice in ONLY the test function you want to run (plus
+any new constants it references), swap it into place over the working tree temporarily, `cargo test
+--lib <test_name>` (see `## Local Build Policy` for the `# airuleset:build-ok` one-off bypass this
+needs), read the ACTUAL panic message's number, then restore the real working-tree file. Faster and
+safer than a temporary git worktree for a single-file, single-function check.

@@ -58,3 +58,28 @@ executing the binary) over the broadest one, IF the narrower one is still suffic
 — but don't let it hide an execution-time bug you actually need caught (#58: delay-loading the
 missing DLL let the Windows leg go back to real `cargo test --verbose` instead of settling for
 `--no-run` forever).
+
+## `gh run rerun --failed` re-runs the WHOLE job, including any idempotency guard inside it
+
+`ci.yml`'s `auto-release` job first creates+pushes a version tag, then (gated on
+`if: env.SKIP_RELEASE != 'true'`) triggers `release.yml` via `gh workflow run`. When the SECOND
+step failed on a transient `api.github.com` TLS error (a GitHub Actions infra glitch, not a repo
+bug), `gh run rerun <id> --failed` looked like the right one-shot fix — but it re-executes the
+job from its FIRST step too, and that step's own idempotency guard ("tag already exists, skip")
+had already been satisfied by the FIRST (failed) attempt, which HAD successfully created the tag
+before the later step failed. So the rerun set `SKIP_RELEASE=true` and never even attempted the
+"trigger release workflow" step — the job still reported green, but no NEW release.yml run was
+ever created.
+
+**Never trust a rerun's green checkmark as proof the originally-failed EFFECT happened — verify
+the actual downstream artifact.** Here: `gh run list --workflow release.yml --limit 3` for a
+genuinely new run created AFTER the rerun's timestamp. If the effect didn't happen (as here),
+trigger it directly rather than re-running the job again: `gh workflow run release.yml -f
+tag=vX.Y.Z` (issue 71 cycle, v1.8.31 — the tag already existed from the first attempt, so this
+is safe to call standalone once you've confirmed the tag is real via `git tag -l vX.Y.Z` /
+`git fetch --tags`).
+
+This is the general form of an idempotency guard silently absorbing a legitimate retry — any job
+with an early "already done, skip the rest" branch has the same risk under `--failed` rerun. When
+in doubt, read the job's own early steps for a skip/short-circuit condition before assuming a
+rerun re-attempts everything a human would expect it to.
