@@ -2983,6 +2983,139 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // #76 -- v1.8.32's fast lane chases real WAN measurement noise. strih's
+    // upstream (Cloudflare, over WAN, pcap_active:false) scatters +0.5..+2.5ms
+    // between consecutive bursts -- a magnitude comparable to or larger than
+    // the true ~190-380us/check drift signal the #71 fix was tuned against in
+    // a NOISELESS simulation. The fast lane's "small + same-sign = trustworthy"
+    // assumption is false on this upstream: "small" can just as easily be one
+    // noisy reading. See the design comment on dantesync#76 for the full
+    // derivation and the rejected alternatives.
+    // ========================================================================
+
+    /// strih's OWN logged `Stepped` sequence, 2026-08-11T19:59-20:00Z (v1.8.32
+    /// live canary regression). Under the fast lane, EVERY one of these was a
+    /// single raw reading that stepped immediately (each falls inside
+    /// `(NTP_SERVER_STEP_THRESHOLD_US, NTP_SERVER_FAST_LANE_US)` = (200, 2000)
+    /// -- 7 steps in ~70 seconds. Replaying the same sequence through a fixed,
+    /// non-scaling agreement tolerance (rather than the removed fast lane)
+    /// must reject nearly all of it: hand-traced deltas between consecutive
+    /// same-sign readings are 776, 977, 133, 1231, 1052, 465us -- only the
+    /// 133us pair (1668 -> 1801) is small enough to plausibly agree under a
+    /// few-hundred-us tolerance sized to the TRUE per-check accrual, not to
+    /// WAN noise. This is RED against the current fast lane (7 steps) and
+    /// must go GREEN at a small step count once the fast lane is removed.
+    #[test]
+    fn ntp_gate_server_mode_rejects_the_real_strih_wan_noise_sequence_76() {
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        let readings = [1467, 691, 1668, 1801, 570, 1622, 1157];
+        let mut step_count = 0;
+        for &r in &readings {
+            if c.ntp_step_gate(r, 200) {
+                step_count += 1;
+            }
+        }
+        assert!(
+            step_count <= 2,
+            "replaying strih's real v1.8.32 WAN-noise-triggered Stepped sequence must produce \
+             at most 2 steps (proper agreement, not the fast lane's zero-wait single-sample \
+             stepping), got {} steps out of {} readings",
+            step_count,
+            readings.len()
+        );
+    }
+
+    /// Closed-loop, end-to-end, WAN-noise variant of the #71 simulation: the
+    /// same real 19ppm drift PLUS a deterministic, mostly-positive noise term
+    /// shaped like strih's measured scatter (amplitude in the observed
+    /// 0.5-2.5ms range, asymmetric -- occasional small/negative excursions,
+    /// mostly large positive ones, matching "consecutive burst offsets
+    /// scatter +0.5..+2.5ms"). Counts how many of the simulated hour's checks
+    /// actually fire a `step_clock` call. RED (current fast lane): the vast
+    /// majority of over-threshold noisy readings step immediately -- expect
+    /// a HIGH step count, close to the number of over-threshold checks.
+    /// GREEN (after #76's fix): step count must drop to "sparse" -- at most
+    /// one step roughly every 20-60s, i.e. well under half the checks over
+    /// the simulated hour.
+    #[test]
+    fn the_master_stays_sparse_under_real_wan_measurement_noise_76() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // `true_error_us` is the REAL clock error: it accrues true 19ppm
+        // drift every check and is reduced ONLY by an actual step_clock call
+        // (applied by the amount the controller was actually told, i.e. the
+        // NOISY reported value -- a step based on a noisy measurement really
+        // does over/under-correct the true clock by that noise, same as on
+        // real hardware). The NTP mock reports true_error_us PLUS this
+        // check's noise sample -- a noisy VIEW of the true error, never
+        // stored back.
+        let true_error_us = Arc::new(std::sync::Mutex::new(0_i64));
+        let noise_idx = Arc::new(std::sync::Mutex::new(0_usize));
+        // Deterministic pseudo-noise sequence, hand-built from the shape strih
+        // actually measured (mostly-positive, 0.5-2.5ms amplitude, occasional
+        // small/negative readings) -- NOT random, so the test is reproducible.
+        // Cycles if INTERVALS exceeds its length.
+        const NOISE_US: [i64; 12] = [
+            1467, 691, 1668, 1801, 570, 1622, 1157, 2200, -150, 900, 2400, 300,
+        ];
+
+        let err_for_ntp = true_error_us.clone();
+        let idx_for_ntp = noise_idx.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let true_err = *err_for_ntp.lock().expect("sim lock");
+            let idx = *idx_for_ntp.lock().expect("sim lock");
+            let reported = true_err + NOISE_US[idx % NOISE_US.len()];
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(reported.unsigned_abs()),
+                sign: if reported >= 0 { 1 } else { -1 },
+                spread_us: 200, // a "reasonable" burst spread -- below any quality bound
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(0_u32));
+        let err_for_clock = true_error_us.clone();
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            *steps_for_clock.lock().expect("sim lock") += 1;
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+
+        const TRUE_ACCRUAL_US: i64 = 19 * NTP_SERVER_CHECK_INTERVAL_SECS as i64;
+        const INTERVALS: usize = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        for i in 0..INTERVALS {
+            *true_error_us.lock().expect("sim lock") += TRUE_ACCRUAL_US;
+            *noise_idx.lock().expect("sim lock") = i;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+
+        let steps = *step_events.lock().expect("sim lock");
+        assert!(
+            steps <= INTERVALS as u32 / 2,
+            "under real WAN measurement noise the master must step SPARSELY (at most every \
+             other check, target ~one per 20-60s), got {} step_clock calls across {} checks \
+             over the simulated hour -- v1.8.32's fast lane chases this noise on nearly every \
+             over-threshold reading",
+            steps,
+            INTERVALS
+        );
+    }
+
     #[test]
     fn test_ntp_adaptive_threshold_with_few_samples() {
         let (controller, _) = create_nano_test_controller();
