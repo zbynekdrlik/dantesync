@@ -240,3 +240,59 @@ canary evidence before continuing.
   filed issue.
 - No fleet deploy: zero functional daemon change (Cargo.toml version + CLAUDE.md + new dev-only
   shell scripts only) — nothing to redeploy or verify on the live cam/imag/strih/stream fleet.
+
+## 2026-08-11 — issue 68: the NTP master free-ran from boot (v1.8.29)
+
+- Root cause was by design, not a crash: `ntp_server_mode` called
+  `controller.disable_ntp_tracking()`, so a healthy master's only UTC measurement in its whole
+  lifetime was the boot-time one-shot. PTP frequency-locks the clock to the Dante grandmaster,
+  whose rate is not UTC's, so the phase error integrated from boot with nothing subtracting from
+  it and the fleet coherently followed it down.
+- Validated live before writing code: strih `/status` 19 min after the manual restart read
+  `ntp_offset_us: 0, ntp_sample_count: 0, ntp_failed: false` — the periodic path had produced
+  nothing and the boot sync published nothing, so the value was not stale but absent. Differential
+  from dev1 (Cloudflare +21.53 ms, Google +20.96 ms, strih +0.18 ms) put strih 21.3 ms behind UTC
+  after 1143 s ⇒ ~18.6 ppm. The restart bought ~19 minutes.
+- Scope correction recorded on the ticket: the reported "socket loop died on WSAECONNRESET" is not
+  supported by the code. `run()`'s catch-all arm logs, sleeps 100 ms and continues, and `run()` has
+  no `?` or `break` — identical in the deployed `v1.8.25` tag. The log went quiet because
+  successful serves log at debug and the client-side NTP lines were absent for the by-design
+  reason above. Real defect there: a benign, expected UDP condition classified as an unexpected
+  error, costing a 100 ms stall per occurrence during which the fleet's time source answers nobody.
+- Four `test:[red]` → `fix:[green]` pairs: master discipline + bounded correction; benign-reset
+  classification + supervised server; freshness fields + staleness alarm; served reference
+  timestamp. Then one consolidated review-fix commit (`5b3b2ff`).
+- **The review caught a real regression the first cut would have shipped.** Two independent Opus
+  passes (2 Critical, 6 Important, 14 Minor, all fixed in-branch). The Critical: the adaptive step
+  threshold widens by 5x the MAD of recent samples to absorb LAN jitter, but on the master the
+  samples are a monotonic drift ramp, and the MAD of a 7-point ramp is exactly `2s` — so the
+  threshold self-inflated to `500 + 10s` and the master would have sawtoothed 2.5–6.8 ms against
+  UTC forever, every step propagating to the fleet. Server mode now uses the base threshold (the
+  outlier protection is already provided by the two-agreeing-samples gate). Confirmed empirically
+  by reverting just that selection: peak 6270 us before, under 2000 us after. Note the widening
+  stays CORRECT for client nodes — a client measures against the master and both track the same
+  Dante rate, so its samples really are jitter; only the master measures against a source it does
+  not frequency-track.
+- The other Critical: `serde_json`'s `IndexMut<&str>` panics on a non-object, so the new
+  `max_step_us` migration would have crashed the daemon at startup on a hand-edited
+  `"ntp_server_mode": true` — a restart loop on the clock master. Migration extracted to a testable
+  `migrate_config_json()` with an `as_object_mut()` guard.
+- My first behavioural test fed a CONSTANT mock offset, so the sample buffer never reached 3 and
+  the adaptive threshold was never exercised — that is exactly why the sawtooth was invisible to
+  it. Replaced with a closed-loop simulation (mock upstream reports the live error, mock clock
+  subtracts every step, error accrues at 19 ppm for a simulated hour). **A mock that returns a
+  constant cannot exercise any adaptive/statistical code path; for a control loop the mock must
+  close the loop.**
+- PR 69: https://github.com/zbynekdrlik/dantesync/pull/69 — green (7/7 checks + Auto Release),
+  `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`. Plain `gh pr merge --merge` worked this time
+  (no "not up to date" false refusal). Merged `3983ff77bfe4a8a7ac4c034bc94abe1883268e49`, issue
+  auto-closed. Main CI green 8/8, tagged + released `v1.8.29` with the complete asset set.
+- Design-gate workaround worth reusing: pass `-R zbynekdrlik/dantesync` on every `gh issue comment`
+  when the session cwd is a sibling repo. The recorder resolves `repo_key` AND its read-back from
+  that flag, so the marker lands under the right repo and no `[no-design: ...]` bypass is needed
+  (the previous cycle had to bypass). One comment grants at most ONE evidence kind and only the
+  latest fresh comment is classified, so validation / design / review comments go in separate Bash
+  calls. Commented on the airuleset ticket rather than re-filing.
+- **No fleet deploy from this worker, by dispatch.** v1.8.29 is released and awaiting the
+  supervisor's canary rollout. Nothing on cam/imag/strih/stream was touched; strih was only READ
+  (`/status` over HTTP and an `ntpdate -q` query against its NTP server).
