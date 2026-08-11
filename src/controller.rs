@@ -284,6 +284,24 @@ const NTP_SERVER_CHECK_INTERVAL_SECS: u64 = 10; // independent of calculate_adap
 const NTP_SERVER_AGREEMENT_TOL_US: i64 = 400; // #76: FIXED (non-scaling) tolerance sized to the true ~190-380us/check accrual, not to a possibly-noisy candidate's own magnitude
 const NTP_SERVER_MAX_BURST_SPREAD_US: u64 = 600; // #76: a burst this noisy internally is low-quality evidence and is excluded from the step decision entirely -- 600, not the ~500 first suggested, so it does not also exclude strih's own genuine 588us-spread large-error-recovery reading (dantesync#68's own fixture); still well below the observed WAN noise burst spreads (up to 1356us)
 
+// #76 REVIEW FINDING (critical): both NTP_SERVER_AGREEMENT_TOL_US and NTP_SERVER_MAX_BURST_SPREAD_US
+// can, by their own construction, reject a genuine same-sign trend FOREVER with no other signal --
+// a true oscillator error whose per-check accrual permanently exceeds the fixed tolerance (~40ppm+
+// at this cadence, vs. 6-19ppm ever measured) would never find two in-tolerance readings; a
+// persistently-noisy upstream would never present a low-enough-spread burst. Reproduced live in
+// review: at 41+ppm the closed-loop simulation shows UNBOUNDED linear growth with zero recovery
+// (205ms after one simulated hour at 57ppm) and no distinct alarm -- this is a STRICTLY WORSE
+// failure class than either the pre-#71 self-scaling tolerance (always eventually converges, just
+// with lag) or the buggy #71/v1.8.32 fast lane (would fast-lane 570us just fine). See
+// ntp_server_checks_since_step's own doc comment for the escape-valve mechanism this constant
+// gates -- once this many consecutive successful checks pass with no actual step, the NEXT
+// over-threshold reading forces one regardless of tolerance/quality. 30 checks = 5 minutes at the
+// 10s cadence: far longer than the ~20-120s the tolerance-agreement path steps at under normal
+// (even noisy) operation -- per the closed-loop noisy-upstream simulation, steps occur roughly
+// once every 12 checks on average -- so this should essentially never fire under real-world
+// conditions, only as a genuine last resort.
+const NTP_SERVER_MAX_CHECKS_WITHOUT_STEP: u32 = 30;
+
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
 
@@ -391,6 +409,18 @@ where
     // over-threshold samples that AGREE (same sign, similar magnitude).
     ntp_pending_step: Option<(i64, usize)>, // (first candidate offset_us, agreeing sample count)
     last_ntp_step: Option<Instant>,         // Grace period after NTP stepping
+    /// #76: server-mode escape-valve counter -- how many CONSECUTIVE successful server-mode
+    /// checks have passed since the last actual `step_clock` call. Both the fixed-tolerance
+    /// agreement gate and the burst-quality gate can, by their own construction, reject a
+    /// same-sign trend indefinitely (a genuine oscillator error faster than
+    /// `NTP_SERVER_AGREEMENT_TOL_US`/check would never find two in-tolerance readings; a
+    /// persistently-noisy upstream would never present a low-enough-spread burst) -- neither
+    /// gate has any other way to notice this and would otherwise freeze corrections forever,
+    /// silently, with no distinct alarm. This counter is the shared last-resort: once it
+    /// reaches `NTP_SERVER_MAX_CHECKS_WITHOUT_STEP`, the NEXT over-threshold reading forces a
+    /// step regardless of tolerance agreement or burst quality. Reset to 0 on ANY step (normal
+    /// or escape-valve). Client mode never touches this field.
+    ntp_server_checks_since_step: u32,
 
     // Accumulated phase error tracking (estimated drift between NTP steps)
     accumulated_phase_error_us: f64,
@@ -532,6 +562,7 @@ where
             ntp_server_max_step_us: 0,
             ntp_pending_step: None,
             last_ntp_step: None,
+            ntp_server_checks_since_step: 0,
             // Accumulated phase error tracking
             accumulated_phase_error_us: 0.0,
             last_phase_accumulation_time: None,
@@ -3165,14 +3196,214 @@ mod tests {
 
         let steps = *step_events.lock().expect("sim lock");
         assert!(
-            steps <= INTERVALS as u32 / 2,
-            "under real WAN measurement noise the master must step SPARSELY (at most every \
-             other check, target ~one per 20-60s), got {} step_clock calls across {} checks \
-             over the simulated hour -- v1.8.32's fast lane chases this noise on nearly every \
-             over-threshold reading",
+            // #76 review finding: tightened from INTERVALS/2 (180) to
+            // INTERVALS/6 (60) -- actual measured behavior is ~30 steps/hour;
+            // /2 was 6x looser than reality and would miss a partial
+            // regression (e.g. degraded noise rejection back up to ~150/360)
+            // that never gets anywhere near the old fast lane's ~330/360.
+            steps <= INTERVALS as u32 / 6,
+            "under real WAN measurement noise the master must step SPARSELY (target ~one per \
+             20-60s, well under a step every ~60s = INTERVALS/6), got {} step_clock calls \
+             across {} checks over the simulated hour -- v1.8.32's fast lane chases this noise \
+             on nearly every over-threshold reading",
             steps,
             INTERVALS
         );
+    }
+
+    // ========================================================================
+    // #76 REVIEW FINDING (critical): the fixed-tolerance agreement gate and the
+    // burst-quality gate can each independently reject a genuine same-sign
+    // trend FOREVER with no escape -- reproduced live in review as unbounded,
+    // silent, permanent growth once true accrual exceeds
+    // NTP_SERVER_AGREEMENT_TOL_US (~40ppm+ at this cadence) or the upstream
+    // never presents a low-enough-spread burst. ntp_server_checks_since_step
+    // is the shared escape valve for both.
+    // ========================================================================
+
+    /// Closed-loop reproduction of the reviewer's own finding: at 57ppm (3x
+    /// the highest oscillator error ever measured on this fleet, and the
+    /// exact value the #76 fix's own commit message cites), the per-check
+    /// accrual (570us) permanently exceeds NTP_SERVER_AGREEMENT_TOL_US
+    /// (400us), so consecutive same-sign candidates NEVER land within
+    /// tolerance of each other -- WITHOUT the escape valve, this simulation
+    /// would show unbounded linear growth (peak_us == final error, no step
+    /// ever fires). WITH it, the master must step at least once within
+    /// NTP_SERVER_MAX_CHECKS_WITHOUT_STEP (+ a small margin) checks of true
+    /// error becoming detectable, and the peak error must stay bounded to a
+    /// small multiple of the escape-valve window's own worst-case accrual
+    /// (NTP_SERVER_MAX_CHECKS_WITHOUT_STEP x per-check accrual), not grow
+    /// without limit over the whole simulated hour.
+    #[test]
+    fn the_master_never_freezes_permanently_at_high_oscillator_error_76() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 200,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let err_for_clock = error_us.clone();
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            steps_for_clock.lock().expect("sim lock").push(applied);
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+
+        // 57 ppm -- 3x the highest oscillator error ever measured on this
+        // fleet (19ppm), and enough that per-check accrual (570us) exceeds
+        // NTP_SERVER_AGREEMENT_TOL_US (400us) on every single check.
+        const ACCRUAL_US: i64 = 57 * NTP_SERVER_CHECK_INTERVAL_SECS as i64;
+        const INTERVALS: usize = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        let mut peak_us = 0_i64;
+        let mut first_step_at_check: Option<usize> = None;
+        for i in 0..INTERVALS {
+            *error_us.lock().expect("sim lock") += ACCRUAL_US;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+            peak_us = peak_us.max(error_us.lock().expect("sim lock").abs());
+            if first_step_at_check.is_none() && !step_events.lock().expect("sim lock").is_empty() {
+                first_step_at_check = Some(i);
+            }
+        }
+
+        let total_steps = step_events.lock().expect("sim lock").len();
+        assert!(
+            total_steps > 0,
+            "at 57ppm (per-check accrual permanently exceeds the fixed agreement tolerance) the \
+             master must EVENTUALLY step via the escape valve -- got ZERO steps across {} \
+             checks over the simulated hour, meaning corrections froze permanently",
+            INTERVALS
+        );
+        assert!(
+            first_step_at_check.unwrap() <= NTP_SERVER_MAX_CHECKS_WITHOUT_STEP as usize + 2,
+            "the first step must fire at or shortly after NTP_SERVER_MAX_CHECKS_WITHOUT_STEP \
+             checks (the escape valve), got the first step at check {} (0-indexed)",
+            first_step_at_check.unwrap()
+        );
+        // Bounded, not unbounded: peak must stay within a small multiple of
+        // one escape-valve window's worth of accrual, never grow linearly
+        // for the whole hour the way an unbounded freeze would (which would
+        // reach ACCRUAL_US * INTERVALS = 570 * 360 = 205_200us, matching the
+        // reviewer's own reproduced number).
+        let one_window_worth = ACCRUAL_US * (NTP_SERVER_MAX_CHECKS_WITHOUT_STEP as i64 + 5);
+        assert!(
+            peak_us < one_window_worth * 2,
+            "peak error {}us must stay bounded to roughly one escape-valve window's worth of \
+             accrual (~{}us), not grow without limit across the simulated hour (an unbounded \
+             freeze would reach {}us)",
+            peak_us,
+            one_window_worth,
+            ACCRUAL_US * INTERVALS as i64
+        );
+    }
+
+    /// Behavioral pin on the escape valve's own boundary, through the REAL
+    /// `check_ntp_utc_tracking()` path (not direct field manipulation).
+    /// Alternates between two same-sign offsets (2500, 3500us -- delta
+    /// 1000us, always over NTP_SERVER_AGREEMENT_TOL_US) so the NORMAL
+    /// tolerance-agreement path never fires on its own: every consecutive
+    /// pair CONTRADICTS the other, exactly the frozen-forever scenario this
+    /// finding is about. Exactly `NTP_SERVER_MAX_CHECKS_WITHOUT_STEP - 1`
+    /// checks must produce ZERO steps; the very next one must produce
+    /// exactly one.
+    #[test]
+    fn ntp_server_escape_valve_fires_at_the_configured_check_count_76() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock_no_step = MockSystemClock::new(); // no expectations set -- panics if step_clock is called
+        let mock_net = MockPtpNetwork::new();
+        let call_idx = Arc::new(std::sync::Mutex::new(0_u32));
+        let idx_for_ntp = call_idx.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times((NTP_SERVER_MAX_CHECKS_WITHOUT_STEP - 1) as usize)
+            .returning(move || {
+                let i = *idx_for_ntp.lock().expect("sim lock");
+                *idx_for_ntp.lock().expect("sim lock") += 1;
+                let offset_us = if i % 2 == 0 { 2500 } else { 3500 };
+                Ok(crate::ntp::NtpMeasurement {
+                    offset: Duration::from_micros(offset_us),
+                    sign: 1,
+                    spread_us: 200,
+                    sample_count: 3,
+                    pcap_active: false,
+                })
+            });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(
+            mock_clock_no_step,
+            mock_net,
+            mock_ntp,
+            status.clone(),
+            config,
+        );
+        c.configure_ntp_server_mode(100_000);
+
+        for _ in 0..(NTP_SERVER_MAX_CHECKS_WITHOUT_STEP - 1) {
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking(); // would panic here (unexpected step_clock call) if the escape valve fired early
+        }
+        assert_eq!(
+            c.ntp_server_checks_since_step,
+            NTP_SERVER_MAX_CHECKS_WITHOUT_STEP - 1,
+            "the counter must track exactly the number of successful checks with no step"
+        );
+
+        // Rebuild with a clock that expects EXACTLY one step now, and the
+        // remaining single NTP query that pushes the counter to the bound.
+        let mut mock_clock_one_step = MockSystemClock::new();
+        mock_clock_one_step
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let mut mock_ntp_last = MockNtpSource::new();
+        mock_ntp_last.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(2500),
+                sign: 1,
+                spread_us: 200,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+        let mut c2 = PtpController::new(
+            mock_clock_one_step,
+            MockPtpNetwork::new(),
+            mock_ntp_last,
+            status,
+            SystemConfig::default(),
+        );
+        c2.configure_ntp_server_mode(100_000);
+        c2.ntp_server_checks_since_step = NTP_SERVER_MAX_CHECKS_WITHOUT_STEP - 1;
+        c2.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c2.check_ntp_utc_tracking();
+        // Mock expectations verify on drop: exactly 1 step_clock call.
     }
 
     #[test]
