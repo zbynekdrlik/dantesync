@@ -214,6 +214,55 @@ const NTP_ADAPTIVE_MULTIPLIER: f64 = 5.0; // Step if offset > base + 5*MAD (cove
 const NTP_STEP_AGREEMENT_N: usize = 2; // Consecutive AGREEING over-threshold measurements required to step
 const NTP_STEP_AGREEMENT_TOL_US: i64 = NTP_STEP_THRESHOLD_BASE_US; // Same-sign magnitude tolerance floor
 
+// ============================================================================
+// #71 -- SERVER-MODE-ONLY discipline constants
+// ============================================================================
+// The master's NTP samples are a deterministic monotonic ramp (Dante-vs-UTC
+// oscillator error, 6-19 ppm measured live), not client-mode jitter around a
+// stable offset -- the same distinction that already makes server mode skip
+// the MAD-widened adaptive threshold (see calculate_ntp_adaptive_threshold's
+// caller) applies here too: the client agreement gate's magnitude-tolerance
+// check assumes a stationary signal and repeatedly fails to keep up with a
+// ramp's own growth, piling residual up across several intervals before
+// finally confirming (hand-traced to a 1710us / 3-interval peak at the
+// pre-#71 500us/30s model, vs. the intended 2-interval/1140us). None of
+// these are new config surface -- consistent with NTP_STEP_THRESHOLD_BASE_US
+// et al already being hardcoded, and avoiding config-migration.md's JSON
+// risk for values only the fleet's own clock architecture should tune.
+// Client-mode behavior (threshold, cadence, agreement) is entirely
+// unaffected -- every use is gated on `self.ntp_server_mode`.
+// See the design comment on dantesync#71 for the full numeric derivation.
+//
+// GRACE-PERIOD DUTY CYCLE (review finding, #71): every step clears
+// sample_window/spike_filter and sets a 2s post-step grace period on the PTP
+// servo (see the reset block right after `step_clock` in
+// check_ntp_utc_tracking). More frequent server-mode stepping means more
+// TIME COASTING on this grace period, not just more transients -- at the
+// natural ~20s step interval these constants produce, that is a ~10% duty
+// cycle, vs. ~2.2% before #71 (2s / ~90s). NTP_SERVER_CHECK_INTERVAL_SECS is
+// deliberately 10s, not a more aggressive 5s: the natural step interval is
+// dominated by threshold/rate (~200us / 19ppm ~ 10.5s), not by how often the
+// check runs once cadence is fine enough to catch the crossing promptly, so
+// 5s bought negligible extra tightness over 10s while nearly doubling the
+// duty cycle. This trade-off has NOT been validated live -- the supervisor's
+// post-release canary on strih should confirm PTP lock quality holds under
+// the new stepping cadence before the fleet rolls, alongside the existing
+// DanteSync gate check.
+//
+// spread_us (dantesync#53's burst-filter quality signal, already computed
+// and published per measurement) is deliberately NOT consulted by
+// ntp_step_gate in EITHER mode, before or after this fix -- that omission
+// pre-dates #71. Dropping the magnitude-tolerance check for server mode
+// (same-sign-only agreement, see ntp_step_gate) removes one incidental guard
+// against a same-sign-but-wild single bad reading; a spread_us-based guard
+// would be a genuinely separate mechanism (what threshold, does client mode
+// need it too, how does it compose with NTP_FAILURE_THRESHOLD) and is left
+// as an accepted trade-off here, filed as its own follow-up.
+// ============================================================================
+const NTP_SERVER_STEP_THRESHOLD_US: i64 = 200; // still >>5-32us measured single-query noise (#53); catches the ramp earlier than the client's 500us floor
+const NTP_SERVER_CHECK_INTERVAL_SECS: u64 = 10; // independent of calculate_adaptive_ntp_interval, which tracks PTP-vs-Dante-GM lock quality -- irrelevant to this node's UTC duty; see the duty-cycle note above for why 10s, not a more aggressive 5s
+const NTP_SERVER_FAST_LANE_US: i64 = 2_000; // below this, a single over-threshold sample steps immediately (same-sign persistence IS the ramp's confirming signal); at/above it, 2 same-sign-agreeing samples are still required as a safety net against one wild upstream reading
+
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
 
@@ -677,10 +726,22 @@ where
     }
 
     pub fn check_ntp_utc_tracking(&mut self) {
-        // Adaptive NTP interval based on accumulated phase error:
+        // #71: server mode uses a dedicated, UTC-relevant cadence instead of
+        // the PTP-vs-Dante-GM lock-quality signal `calculate_adaptive_ntp_interval`
+        // is actually driven by (accumulated_phase_error_us tracks this
+        // node's own frequency-lock error against the Dante grandmaster, not
+        // against UTC -- see the NTP_SERVER_* doc comment above). Every other
+        // node's adaptive-interval behavior is unchanged.
+        //
+        // Adaptive NTP interval based on accumulated phase error (client
+        // mode only):
         // - Higher error = check more frequently for tighter UTC alignment
         // - Low error = use default interval to reduce NTP overhead
-        let ntp_interval_secs = self.calculate_adaptive_ntp_interval();
+        let ntp_interval_secs = if self.ntp_server_mode {
+            NTP_SERVER_CHECK_INTERVAL_SECS
+        } else {
+            self.calculate_adaptive_ntp_interval()
+        };
 
         // #68: the run/skip decision is a pure, unit-tested policy — see
         // `ntp_discipline_due`. A server-mode master runs it regardless of its
@@ -743,9 +804,16 @@ where
                 // of ITS intervals later. On the base threshold the same loop
                 // holds UTC inside ~0.7-1.7 ms. The outlier protection the MAD
                 // widening exists for is already provided here by the
-                // two-agreeing-samples step gate, which is unchanged.
+                // two-agreeing-samples step gate (server mode's own variant
+                // of it, see ntp_step_gate's #71 doc comment).
+                //
+                // #71: server mode also uses a LOWER floor than the client's
+                // 500us — still well clear of the ~5-32us single-query noise
+                // floor #53 measured, but catches the ramp earlier than the
+                // client's tuning, which exists for LAN jitter that does not
+                // apply to the master's monotonic signal.
                 let step_threshold = if self.ntp_server_mode {
-                    NTP_STEP_THRESHOLD_BASE_US
+                    NTP_SERVER_STEP_THRESHOLD_US
                 } else {
                     self.calculate_ntp_adaptive_threshold()
                 };
@@ -866,28 +934,39 @@ where
     /// measured on strih, i.e. ~21 ms of error 19 minutes after a restart and
     /// 1.04 s over two days, with the whole fleet coherently following it.
     ///
-    /// Discipline reuses the ordinary client machinery (base threshold → two
-    /// agreeing samples → `step_clock`), with three server-only properties: it
-    /// runs regardless of this node's own PTP lock state, a single correction is
-    /// bounded by `max_step_us` (see `clamp_ntp_step_us`), and it deliberately
-    /// skips the MAD-widened adaptive threshold, which mis-reads this node's
-    /// monotonic drift ramp as jitter.
+    /// Discipline reuses the ordinary client machinery (`step_clock` on a
+    /// confirmed correction), with server-only tuning throughout —
+    /// `NTP_SERVER_STEP_THRESHOLD_US`, `NTP_SERVER_CHECK_INTERVAL_SECS`,
+    /// same-sign-only agreement, and the `NTP_SERVER_FAST_LANE_US` fast lane
+    /// (see `ntp_step_gate`'s own doc comment, #71) — plus one property no
+    /// client shares: it runs regardless of this node's own PTP lock state.
+    /// A single correction is bounded by `max_step_us` (see
+    /// `clamp_ntp_step_us`).
     ///
-    /// **Steady state, stated plainly:** the master now takes small periodic
-    /// steps it never took before — roughly 0.7 ms every ~2 min at 6 ppm, or
-    /// 1.7 ms every ~1.5 min at 19 ppm — and each one propagates to the fleet a
-    /// client interval or two later. That is the deliberate trade: a bounded,
-    /// sub-2 ms periodic excursion in exchange for UTC error that no longer
-    /// grows without limit. The lever if it ever matters on the rig is
-    /// `max_step_us`, which turns one larger jump into several smaller ones.
+    /// **Steady state, stated plainly (post-#71):** at the real ~19 ppm
+    /// measured on strih, the master now takes small periodic steps —
+    /// deterministically ~190-380 us every ~20 s in the noiseless model, well
+    /// under 400 us in practice — replacing the pre-#71 behaviour's
+    /// 0.9-2.5 ms sawtooth on a ~60-90 s lag. Each step propagates to the
+    /// fleet a client interval or two later, same as before. That is the
+    /// deliberate trade: FAR smaller, more frequent excursions (with a
+    /// correspondingly higher PTP post-step grace-period duty cycle — see the
+    /// `NTP_SERVER_*` constants' own doc comment) in exchange for UTC error
+    /// that no longer grows without limit and no longer flakes a downstream
+    /// consumer's stability check. The lever if `max_step_us` ever matters on
+    /// the rig is unchanged: it turns one larger jump into several smaller
+    /// ones.
     pub fn configure_ntp_server_mode(&mut self, max_step_us: i64) {
         self.ntp_server_mode = true;
         self.ntp_server_max_step_us = max_step_us;
         info!(
-            "[NTP-Server] Upstream discipline ACTIVE — re-querying every {}s \
-             (adaptive, down to 10s), single correction bounded to {}us, staleness \
-             window {}s (this host serves the fleet, but UTC still comes from upstream)",
-            NTP_CHECK_INTERVAL_SECS,
+            "[NTP-Server] Upstream discipline ACTIVE — re-querying every {}s (fixed, \
+             server-mode cadence), threshold {}us with a {}us fast lane, single correction \
+             bounded to {}us, staleness window {}s (this host serves the fleet, but UTC still \
+             comes from upstream)",
+            NTP_SERVER_CHECK_INTERVAL_SECS,
+            NTP_SERVER_STEP_THRESHOLD_US,
+            NTP_SERVER_FAST_LANE_US,
             max_step_us,
             effective_stale_window(self.config.ntp_stale_secs).as_secs()
         );
@@ -904,11 +983,32 @@ where
     ///
     /// Returns true when the clock SHOULD step for `offset_us`. An over-threshold offset
     /// becomes a CANDIDATE first; only when NTP_STEP_AGREEMENT_N consecutive over-threshold
-    /// samples AGREE (same sign, magnitudes within max(NTP_STEP_AGREEMENT_TOL_US, |first|/2))
-    /// does the step fire. A disagreeing over-threshold sample REPLACES the candidate (it is
-    /// itself suspect); an under-threshold sample clears it. Kills the loaded-LAN outlier
-    /// step-reverse pairs (+2831us→-2825us) while a GENUINE offset still steps one interval
-    /// later (the next sample agrees).
+    /// samples AGREE does the step fire. A disagreeing over-threshold sample REPLACES the
+    /// candidate (it is itself suspect); an under-threshold sample clears it. Kills the
+    /// loaded-LAN outlier step-reverse pairs (+2831us→-2825us) while a GENUINE offset still
+    /// steps one interval later (the next sample agrees).
+    ///
+    /// Client mode (unchanged): "agree" additionally requires magnitude within
+    /// max(NTP_STEP_AGREEMENT_TOL_US, |first|/2) — correct for jitter around a roughly
+    /// stationary offset, where two over-threshold readings should be close in size if
+    /// they represent the same real error.
+    ///
+    /// #71 — server mode: the master's samples are a deterministic monotonic RAMP, not
+    /// stationary jitter, so a magnitude-similarity requirement is actively wrong — each new
+    /// sample is systematically LARGER than the last by roughly one interval's accrual, which
+    /// routinely exceeds the tolerance and repeatedly CONTRADICTS a genuine trend, piling
+    /// residual up across several intervals before the (growing) tolerance finally catches up.
+    /// Server mode instead:
+    ///   - requires only the SAME SIGN to agree (a ramp does not reverse sign between two
+    ///     consecutive real readings; the historical outlier this gate exists for, #50's
+    ///     +2831/-2825us pair, is an opposite-SIGN reversal and is still caught by this alone).
+    ///   - fast-lanes any offset under NTP_SERVER_FAST_LANE_US: it steps on the very FIRST
+    ///     over-threshold sample, skipping the agreement wait entirely. This is the dominant
+    ///     fix — the routine steady-state correction is small and self-correcting next cycle,
+    ///     so waiting for a second confirming sample only lets the ramp accrue further.
+    ///     At/above the fast-lane bound, the same-sign 2-sample requirement above still
+    ///     applies, as a safety net against a single wild/anomalous upstream reading producing
+    ///     a large, fleet-wide jump.
     fn ntp_step_gate(&mut self, offset_us: i64, adaptive_threshold: i64) -> bool {
         if offset_us.abs() <= adaptive_threshold {
             if self.ntp_pending_step.take().is_some() {
@@ -916,6 +1016,61 @@ where
             }
             return false;
         }
+
+        if self.ntp_server_mode {
+            if offset_us.abs() < NTP_SERVER_FAST_LANE_US {
+                if self.ntp_pending_step.take().is_some() {
+                    info!(
+                        "[NTP-Server] step candidate superseded by a fast-laned {:+}us step",
+                        offset_us
+                    );
+                } else {
+                    info!(
+                        "[NTP-Server] fast-laned step {:+}us (threshold:{}us, fast-lane <{}us) — \
+                         no agreement wait",
+                        offset_us, adaptive_threshold, NTP_SERVER_FAST_LANE_US
+                    );
+                }
+                self.ntp_pending_step = None;
+                return true;
+            }
+            return match self.ntp_pending_step {
+                Some((cand, n)) => {
+                    let same_sign = (cand > 0) == (offset_us > 0);
+                    if same_sign {
+                        let n = n + 1;
+                        if n >= NTP_STEP_AGREEMENT_N {
+                            self.ntp_pending_step = None;
+                            return true;
+                        }
+                        self.ntp_pending_step = Some((cand, n));
+                        info!(
+                            "[NTP-Server] step candidate {:+}us agreed by {:+}us ({}/{}) — awaiting agreement",
+                            cand, offset_us, n, NTP_STEP_AGREEMENT_N
+                        );
+                    } else {
+                        info!(
+                            "[NTP-Server] step candidate {:+}us CONTRADICTED by {:+}us (sign reversal) — replaced",
+                            cand, offset_us
+                        );
+                        self.ntp_pending_step = Some((offset_us, 1));
+                    }
+                    false
+                }
+                None => {
+                    info!(
+                        "[NTP-Server] step candidate {:+}us (threshold:{}us, fast-lane <{}us) — awaiting {} agreeing sample(s)",
+                        offset_us,
+                        adaptive_threshold,
+                        NTP_SERVER_FAST_LANE_US,
+                        NTP_STEP_AGREEMENT_N - 1
+                    );
+                    self.ntp_pending_step = Some((offset_us, 1));
+                    false
+                }
+            };
+        }
+
         match self.ntp_pending_step {
             Some((cand, n)) => {
                 let same_sign = (cand > 0) == (offset_us > 0);
@@ -2551,6 +2706,281 @@ mod tests {
         let (mut c, _) = create_nano_test_controller();
         assert!(!c.ntp_step_gate(-3000, 800));
         assert!(c.ntp_step_gate(-2900, 800));
+    }
+
+    // ========================================================================
+    // #71 — SERVER MODE'S AGREEMENT GATE MUST NOT ASSUME A STATIONARY SIGNAL
+    // ========================================================================
+    // The client-mode gate's magnitude-tolerance check assumes consecutive
+    // over-threshold samples are the SAME real value plus noise -- correct
+    // for a client (jitter around a stable offset), wrong for the master
+    // (a deterministic ramp where each new sample is systematically LARGER
+    // than the last). Hand-traced at the established 19ppm/570us-per-interval
+    // model: the CURRENT gate needs 3 intervals (1710us peak) instead of 2
+    // (1140us) because the tolerance repeatedly fails to keep up with the
+    // ramp's own growth. See the design comment on dantesync#71 for the full
+    // derivation.
+    // ========================================================================
+
+    #[test]
+    fn ntp_gate_server_mode_same_sign_large_jump_still_agrees_71() {
+        // Client mode: a same-sign but "wild" magnitude jump does NOT agree
+        // (ntp_gate_same_sign_but_wild_magnitude_does_not_agree, unchanged).
+        // Server mode: same-sign persistence on a ramp IS the confirming
+        // signal -- magnitude similarity is not required. Use offsets above
+        // NTP_SERVER_FAST_LANE_US so the fast lane (tested separately below)
+        // does not short-circuit this path.
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            !c.ntp_step_gate(2_500, 1_000),
+            "first over-threshold sample is only a candidate"
+        );
+        assert!(
+            c.ntp_step_gate(5_000, 1_000),
+            "same-sign second sample agrees regardless of magnitude jump in server mode"
+        );
+    }
+
+    #[test]
+    fn ntp_gate_server_mode_fast_lane_steps_on_first_sample_71() {
+        // A small over-threshold offset (well under NTP_SERVER_FAST_LANE_US)
+        // steps immediately in server mode -- this is the dominant fix: the
+        // routine steady-state correction no longer waits a full extra
+        // interval (or several, via the reset-pileup above) for a second
+        // confirming sample.
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            c.ntp_step_gate(700, 200),
+            "an offset well under the fast-lane bound steps on the FIRST sample in server mode"
+        );
+        assert!(
+            c.ntp_pending_step.is_none(),
+            "a fired step must never leave a stale pending candidate"
+        );
+    }
+
+    #[test]
+    fn ntp_gate_server_mode_fast_lane_exact_boundary_requires_agreement_71() {
+        // review finding (#71): pin the boundary explicitly -- an offset
+        // EQUAL to NTP_SERVER_FAST_LANE_US is NOT fast-laned (the check is
+        // `<`, not `<=`), so it falls to the same-sign-agreement safety net,
+        // same as anything strictly above the bound.
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            !c.ntp_step_gate(2_000, 200),
+            "exactly NTP_SERVER_FAST_LANE_US (2000us) must NOT fast-lane -- only a candidate"
+        );
+        assert!(
+            c.ntp_step_gate(2_050, 200),
+            "second same-sign sample agrees and fires the step"
+        );
+    }
+
+    #[test]
+    fn ntp_gate_server_mode_large_offset_still_requires_agreement_71() {
+        // At/above NTP_SERVER_FAST_LANE_US, server mode keeps the 2-sample
+        // safety net (same-sign only, no magnitude check) -- protects
+        // against a single wild/anomalous upstream reading producing a
+        // large, fleet-wide jump on ONE bad sample.
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(
+            !c.ntp_step_gate(2_500, 200),
+            "an offset at/above the fast-lane bound is only a candidate on the first sample"
+        );
+        assert!(
+            c.ntp_step_gate(3_100, 200),
+            "second same-sign large sample agrees and fires the step"
+        );
+    }
+
+    #[test]
+    fn ntp_gate_server_mode_opposite_sign_reversal_never_steps_71() {
+        // The historical outlier this gate exists for (dantesync#50):
+        // +2831us then -2825us. Both magnitudes are above the fast lane, so
+        // this must still require agreement, and the sign flip must still
+        // never agree -- the same-sign-only relaxation above must not
+        // reintroduce the exact incident that motivated the gate.
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(!c.ntp_step_gate(2_831, 200));
+        assert!(
+            !c.ntp_step_gate(-2_825, 200),
+            "opposite sign must still contradict in server mode"
+        );
+        assert!(
+            c.ntp_pending_step.is_some(),
+            "replaced by the new candidate, not cleared"
+        );
+    }
+
+    #[test]
+    fn ntp_gate_client_mode_unaffected_by_server_mode_changes_71() {
+        // A non-server-mode controller must see EXACTLY the pre-#71 behavior:
+        // same-sign-but-wild-magnitude does NOT agree, and a small offset
+        // still needs 2 agreeing samples (no fast lane).
+        let (mut c, _) = create_nano_test_controller();
+        assert!(!c.ntp_server_mode());
+        assert!(!c.ntp_step_gate(700, 200), "no fast lane on a client node");
+        assert!(
+            !c.ntp_step_gate(2_000, 200),
+            "unrelated candidate replaces, still just a candidate"
+        );
+    }
+
+    // ========================================================================
+    // #71 review finding — check_ntp_utc_tracking() must actually WIRE the
+    // server-mode cadence, not just have the constant exist unused. The
+    // closed-loop simulation below force-sets `last_ntp_check` far in the
+    // past on every iteration, so it never proves interval SELECTION itself
+    // — a silent revert of the `if self.ntp_server_mode { NTP_SERVER_CHECK_
+    // INTERVAL_SECS } else { ... }` line back to always calling
+    // calculate_adaptive_ntp_interval() would pass every other test in this
+    // file. These two pin the real 10s server-mode cadence directly via the
+    // upstream query call count, which only fires when a check is actually
+    // due.
+    // ========================================================================
+
+    #[test]
+    fn server_mode_does_not_query_upstream_before_its_own_cadence_elapses_71() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+        // NTP_SERVER_CHECK_INTERVAL_SECS is 10 -- 9s ago is NOT yet due. If
+        // this silently reverted to calculate_adaptive_ntp_interval() (which
+        // returns 30 here, since accumulated_phase_error_us is untouched by
+        // this test), 9s-ago would ALSO be not-due, so this half alone does
+        // not distinguish the two; the companion test below does.
+        mock_ntp.expect_get_offset().times(0);
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(9);
+        c.check_ntp_utc_tracking();
+        // Mock expectation (times(0)) verifies on drop.
+    }
+
+    #[test]
+    fn server_mode_queries_upstream_at_its_own_10s_cadence_not_the_client_30s_one_71() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock = MockSystemClock::new();
+        let mock_net = MockPtpNetwork::new();
+        let mut mock_ntp = MockNtpSource::new();
+        // 11s ago IS due under the #71 server-mode 10s cadence, but would
+        // NOT be due under the pre-#71 wiring (calculate_adaptive_ntp_interval
+        // returns 30 here) -- this is the half that actually pins the
+        // constant, not just "some cadence exists".
+        mock_ntp.expect_get_offset().times(1).returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(50),
+                sign: 1,
+                spread_us: 20,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(11);
+        c.check_ntp_utc_tracking();
+        // Mock expectation (times(1)) verifies on drop.
+    }
+
+    /// Closed-loop, end-to-end: at a REAL 19ppm ramp and the server-mode
+    /// cadence this fix establishes (10s -> 190us/interval accrual, derived
+    /// from `NTP_SERVER_CHECK_INTERVAL_SECS` below so this test tracks the
+    /// real constant instead of a hand-picked literal — review finding,
+    /// #71), the full pipeline (threshold selection, gate, clamp, reset)
+    /// must hold the master's steady-state residual well under the ~300us
+    /// target from dantesync#71 -- not merely under the older, too-loose
+    /// 2ms envelope `the_master_holds_utc_within_a_sub_two_ms_envelope_
+    /// over_an_hour_68` asserts. Deterministic (no measurement noise). NOTE
+    /// the peak this loop can OBSERVE is always one interval short of the
+    /// true pre-step value: it samples the residual AFTER
+    /// `check_ntp_utc_tracking()` runs, and a stepping call resets the
+    /// residual to ~0 in that SAME call — so the highest value ever
+    /// recorded is the last NON-stepping tick, not the tick that actually
+    /// crossed the gate. Against the CURRENT (pre-#71) threshold/agreement
+    /// logic this 190us/interval accrual peaks at 570us (verified by
+    /// temporarily running this exact test against the pre-#71 baseline
+    /// commit: threshold 500 is crossed and a candidate opens at interval
+    /// 3's 570us — the last recorded non-stepping tick; the CONTRADICT/
+    /// replace churn this ticket traces means the step that eventually
+    /// fires does so several intervals later, invisibly to this
+    /// methodology) -- comfortably failing a <400 bound. With all four #71
+    /// changes it peaks at 190us (threshold 200 crossed and fast-laned on interval
+    /// 2's 380us, invisibly; interval 1's 190us is the last recorded
+    /// non-stepping tick).
+    #[test]
+    fn the_master_holds_utc_well_under_the_71_target_at_real_19ppm_and_server_cadence() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 20,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let err_for_clock = error_us.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+
+        // 19 ppm over the #71 server-mode cadence (NTP_SERVER_CHECK_INTERVAL_SECS)
+        // of fresh UTC error per check -- derived from the real constant, not
+        // a hand-picked literal (review finding, #71).
+        const ACCRUAL_US: i64 = 19 * NTP_SERVER_CHECK_INTERVAL_SECS as i64;
+        const INTERVALS: usize = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        let mut peak_us = 0_i64;
+        for _ in 0..INTERVALS {
+            *error_us.lock().expect("sim lock") += ACCRUAL_US;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+            peak_us = peak_us.max(error_us.lock().expect("sim lock").abs());
+        }
+
+        assert!(
+            peak_us < 400,
+            "the master must hold UTC well under the dantesync#71 ~300us target at a real \
+             19ppm oscillator, peaked at {}us -- the agreement gate's magnitude-tolerance \
+             check (correct for client jitter) is the wrong shape for the master's monotonic \
+             ramp and lets residual pile up across several intervals before confirming",
+            peak_us
+        );
     }
 
     #[test]
