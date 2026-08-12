@@ -47,6 +47,11 @@ pub fn compute_step_target_100ns(
 ) -> Result<u64> {
     let offset_100ns = (offset.as_nanos() / 100) as u64;
     if sign > 0 {
+        // No overflow guard here (unlike the negative branch below), deliberately: a real
+        // FILETIME `before_100ns` around 2026 is ~1.3e17 (100ns ticks since 1601-01-01)
+        // against a `u64::MAX` of ~1.8e19 -- headroom of over 400 years even for an
+        // absurdly large `offset` (review finding, #80: worth stating explicitly, since a
+        // future reader has no reason to already know the FILETIME epoch is 1601).
         Ok(before_100ns + offset_100ns)
     } else if before_100ns > offset_100ns {
         Ok(before_100ns - offset_100ns)
@@ -102,6 +107,21 @@ mod tests {
         assert_eq!(
             compute_step_target_100ns(5_001, Duration::from_nanos(500_000), -1).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn zero_offset_returns_before_unchanged_either_sign() {
+        // Review finding, #80: a genuine zero-offset call never happens in production
+        // (controller.rs only steps for a measured over-threshold offset), but it costs
+        // nothing to pin as a defensive edge case -- neither sign should perturb the value.
+        assert_eq!(
+            compute_step_target_100ns(1_000_000, Duration::ZERO, 1).unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            compute_step_target_100ns(1_000_000, Duration::ZERO, -1).unwrap(),
+            1_000_000
         );
     }
 }

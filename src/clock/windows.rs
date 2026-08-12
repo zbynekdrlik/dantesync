@@ -31,6 +31,19 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 // analogous to GetSystemTimePreciseAsFileTime (Microsoft never shipped one).
 // Requires SeSystemtimePrivilege, already enabled at construction (see
 // `enable_privilege` below) for the legacy SetSystemTime call this replaces.
+//
+// Deliberately a STATIC link (`#[link(name = "ntdll")]`), unlike this codebase's own
+// established pattern for an undocumented/optional Windows surface -- net_pcap.rs's
+// `wpcap_runtime_available()` probes the (third-party, genuinely-optional) Npcap runtime
+// dynamically via `LoadLibraryW`/`GetProcAddress` specifically so a missing DLL degrades
+// gracefully instead of crashing the whole process at load time (review finding, #80).
+// `ntdll.dll` is different in kind: it is core, unconditionally-loaded OS infrastructure on
+// every NT-based Windows version (not optional third-party software), and `SetSystemTime`
+// itself is implemented on top of the same underlying NT mechanism `NtSetSystemTime` reaches
+// -- if `SetSystemTime` has ever worked on a given box, `NtSetSystemTime` necessarily works
+// identically. A dynamic probe here would add complexity for a failure mode (`ntdll.dll`
+// missing or this specific stable-since-NT-3.1 export vanishing) with no realistic path to
+// occurring on any Windows version this project targets.
 #[link(name = "ntdll")]
 extern "system" {
     fn NtSetSystemTime(new_time: *const i64, old_time: *mut i64) -> i32;
@@ -354,7 +367,12 @@ impl SystemClock for WindowsClock {
             let new_time_i64 = target_100ns as i64;
             let mut previous_time_i64: i64 = 0;
             let status = NtSetSystemTime(&new_time_i64, &mut previous_time_i64);
-            if status != 0 {
+            // NT_SUCCESS(status) is conventionally `status >= 0` (a positive value is an
+            // informational/warning code, still "success"); `status < 0` is the idiomatic
+            // check, used here rather than `!= 0` (review finding, #80) -- no informational
+            // NTSTATUS is documented for this specific call, so this is mostly a correctness
+            // nicety, but it avoids ever misreporting a benign non-zero success as a failure.
+            if status < 0 {
                 return Err(anyhow!(
                     "NtSetSystemTime failed with NTSTATUS 0x{:08X}",
                     status as u32
