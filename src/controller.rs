@@ -3421,6 +3421,86 @@ mod tests {
     }
 
     // ========================================================================
+    // #83 REVIEW FINDING (critical): the escape valve's own counter used to
+    // increment on EVERY successful check regardless of whether the offset
+    // was over threshold -- harmless under the tight threshold, but WRONG
+    // under the large PTP-locked deadband: its natural cadence (~38-66
+    // checks) is LONGER than the escape valve's 30-check patience, so by the
+    // time the offset first legitimately crosses the deadband, the counter
+    // had ALREADY exceeded its patience on checks that were never even over
+    // threshold -- forcing every deadband-driven step through the escape
+    // valve unconfirmed, on the FIRST over-threshold sample, bypassing both
+    // the 2-sample agreement gate and the burst-quality gate every time.
+    // ========================================================================
+
+    /// Reproduces the exact scenario: many checks held safely UNDER the
+    /// deadband (more than NTP_SERVER_MAX_CHECKS_WITHOUT_STEP of them --
+    /// under the pre-fix code the counter would already have exceeded its
+    /// patience purely from those, despite never once being over threshold),
+    /// then a SINGLE noisy over-threshold spike that is immediately
+    /// contradicted by the next reading (a one-off WAN outlier, exactly the
+    /// #76 scenario). The outlier must NEVER step on its own -- it must wait
+    /// for a genuine second agreeing sample, exactly like the not-locked
+    /// path already requires. RED (pre-fix): the escape valve's stale
+    /// counter forces an unconfirmed step on the spike itself.
+    #[test]
+    fn locked_mode_escape_valve_never_fires_on_a_single_outlier_after_many_under_threshold_checks_83(
+    ) {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock_no_step = MockSystemClock::new(); // no expectations set -- panics if step_clock is called
+        let mock_net = MockPtpNetwork::new();
+        let call_idx = Arc::new(std::sync::Mutex::new(0_u32));
+        let idx_for_ntp = call_idx.clone();
+        // #83: comfortably more than NTP_SERVER_MAX_CHECKS_WITHOUT_STEP (30) held-under-
+        // threshold checks, THEN one spike, then one contradiction.
+        const UNDER_THRESHOLD_CHECKS: u32 = NTP_SERVER_MAX_CHECKS_WITHOUT_STEP + 10;
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times((UNDER_THRESHOLD_CHECKS + 2) as usize)
+            .returning(move || {
+                let i = *idx_for_ntp.lock().expect("sim lock");
+                *idx_for_ntp.lock().expect("sim lock") += 1;
+                let offset_us: i64 = if i < UNDER_THRESHOLD_CHECKS {
+                    5_000 // well under the 25_000us deadband -- healthy, no candidate forms
+                } else if i == UNDER_THRESHOLD_CHECKS {
+                    30_000 // ONE noisy spike, over the deadband
+                } else {
+                    4_000 // immediately contradicts the spike -- back under threshold
+                };
+                Ok(crate::ntp::NtpMeasurement {
+                    offset: Duration::from_micros(offset_us.unsigned_abs()),
+                    sign: 1,
+                    spread_us: 200,
+                    sample_count: 3,
+                    pcap_active: false,
+                })
+            });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock_no_step, mock_net, mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        for _ in 0..(UNDER_THRESHOLD_CHECKS + 2) {
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+        // If a step had been called, MockSystemClock (no expectations set) would already
+        // have panicked inside check_ntp_utc_tracking above -- reaching this line at all
+        // is itself part of the proof. call_idx also confirms every scripted read ran.
+        assert_eq!(
+            *call_idx.lock().expect("sim lock"),
+            UNDER_THRESHOLD_CHECKS + 2,
+            "every scripted read must have been consumed"
+        );
+    }
+
+    // ========================================================================
     // #76 REVIEW FINDING (critical): the fixed-tolerance agreement gate and the
     // burst-quality gate can each independently reject a genuine same-sign
     // trend FOREVER with no escape -- reproduced live in review as unbounded,
