@@ -310,12 +310,25 @@ const NTP_SERVER_MAX_BURST_SPREAD_US: u64 = 600; // #76: a burst this noisy inte
 // failure class than either the pre-#71 self-scaling tolerance (always eventually converges, just
 // with lag) or the buggy #71/v1.8.32 fast lane (would fast-lane 570us just fine). See
 // ntp_server_checks_since_step's own doc comment for the escape-valve mechanism this constant
-// gates -- once this many consecutive successful checks pass with no actual step, the NEXT
+// gates -- once this many CONSECUTIVE OVER-THRESHOLD checks pass with no actual step, the NEXT
 // over-threshold reading forces one regardless of tolerance/quality. 30 checks = 5 minutes at the
 // 10s cadence: far longer than the ~20-120s the tolerance-agreement path steps at under normal
 // (even noisy) operation -- per the closed-loop noisy-upstream simulation, steps occur roughly
 // once every 12 checks on average -- so this should essentially never fire under real-world
 // conditions, only as a genuine last resort.
+//
+// #83 REVIEW FINDING (critical): this 30-check patience is comfortably longer than the TIGHT
+// threshold's own natural stepping cadence (~2-12 checks), but the PTP-locked deadband's own
+// natural cadence is LONGER than 30 checks (~38-66 checks at the 38-66ppm measured range) --
+// without ntp_server_checks_since_step's OWN under-threshold reset (added alongside this
+// comment), the counter would already exceed 30 well before the deadband was ever legitimately
+// crossed, so EVERY deadband-driven step would go through the escape valve unconfirmed, on the
+// very first over-threshold sample, defeating this whole gate for the primary #83 use case. The
+// under-threshold reset restores the INTENDED invariant ("far longer than normal cadence") for
+// BOTH thresholds without a second tunable constant -- the counter only ever accumulates while
+// genuinely over threshold, so its natural comparison is always against however many checks the
+// CURRENTLY active tolerance/quality gates take to confirm, not against how long it took to
+// first cross into over-threshold territory.
 const NTP_SERVER_MAX_CHECKS_WITHOUT_STEP: u32 = 30;
 
 // #83: while genuinely PTP-locked to a real grandmaster, the master's periodic UTC step was
@@ -450,7 +463,14 @@ where
     ntp_pending_step: Option<(i64, usize)>, // (first candidate offset_us, agreeing sample count)
     last_ntp_step: Option<Instant>,         // Grace period after NTP stepping
     /// #76: server-mode escape-valve counter -- how many CONSECUTIVE successful server-mode
-    /// checks have passed since the last actual `step_clock` call. Both the fixed-tolerance
+    /// checks have passed, WHILE THE OFFSET WAS OVER THRESHOLD, since the last actual
+    /// `step_clock` call (#83 review finding: reset to 0 on any check where the offset is NOT
+    /// over threshold too -- see the reset right after `step_threshold` is computed in
+    /// `check_ntp_utc_tracking`. Before that fix this counted EVERY successful check
+    /// unconditionally, which was harmless under the routine tight threshold (almost every
+    /// check WAS over threshold in that regime) but WRONG under #83's large PTP-locked
+    /// deadband, whose natural cadence is longer than the escape valve's own patience --
+    /// see that reset's own doc comment for the full incident). Both the fixed-tolerance
     /// agreement gate and the burst-quality gate can, by their own construction, reject a
     /// same-sign trend indefinitely (a genuine oscillator error faster than
     /// `NTP_SERVER_AGREEMENT_TOL_US`/check would never find two in-tolerance readings; a
@@ -459,7 +479,7 @@ where
     /// silently, with no distinct alarm. This counter is the shared last-resort: once it
     /// reaches `NTP_SERVER_MAX_CHECKS_WITHOUT_STEP`, the NEXT over-threshold reading forces a
     /// step regardless of tolerance agreement or burst quality. Reset to 0 on ANY step (normal
-    /// or escape-valve). Client mode never touches this field.
+    /// or escape-valve), or on any under-threshold check. Client mode never touches this field.
     ntp_server_checks_since_step: u32,
 
     // Accumulated phase error tracking (estimated drift between NTP steps)
@@ -922,6 +942,28 @@ where
                 } else {
                     self.calculate_ntp_adaptive_threshold()
                 };
+
+                // #83 REVIEW FINDING (critical): the escape-valve counter above increments on
+                // EVERY successful check regardless of whether THIS check's offset was even
+                // over threshold -- harmless under the routine tight threshold (almost every
+                // check WAS over threshold in that regime, so "checks since step" and "over-
+                // threshold checks since step" were the same number), but WRONG under the large
+                // PTP-locked deadband: the deadband's natural cadence (~66 checks at 38ppm,
+                // ~500-660s) is LONGER than the escape valve's 30-check/5-min patience, so by
+                // the time the offset first legitimately crosses the deadband, the counter had
+                // ALREADY exceeded its patience on checks that were never over threshold at
+                // all -- forcing every deadband-driven step through the escape valve,
+                // UNCONFIRMED, bypassing both the 2-sample agreement gate AND the burst-quality
+                // gate on the very first over-threshold reading, every single time (defeating
+                // the entire #76 confirmation/quality machinery for the primary locked-mode
+                // case, exactly the noisy-WAN-outlier scenario #76 exists to reject). Reset the
+                // counter whenever THIS check's offset is not currently over threshold, so it
+                // counts consecutive OVER-THRESHOLD-BUT-UNCONFIRMED checks -- the escape
+                // valve's actual documented intent -- and it naturally scales to whichever
+                // threshold is active, tight or deadband, with no new tunable constant.
+                if self.ntp_server_mode && offset_us.abs() <= step_threshold {
+                    self.ntp_server_checks_since_step = 0;
+                }
 
                 // Log current offset with threshold info
                 if step_threshold > NTP_STEP_THRESHOLD_BASE_US {
