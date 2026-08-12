@@ -208,6 +208,50 @@ reading immediately contradicted by the next) can distinguish "genuinely confirm
 valve fired prematurely" — see `locked_mode_escape_valve_never_fires_on_a_single_outlier_after_many_under_threshold_checks_83`
 in `src/controller.rs` for the pattern.
 
+**A hard clamp on a control-loop's OUTPUT needs a companion fix to its state-RESET logic, or a
+sustained adverse input makes the residual grow UNBOUNDED instead of converging (issue 83's
+second correction round).** Adding `NTP_SERVER_LOCKED_MAX_STEP_US` (a hard per-step ceiling,
+5000us) closed a real safety gap — at a high enough drift rate the escape valve could otherwise
+apply an oversized, unconfirmed correction — but a NAIVE version of the fix (clamp the step,
+keep the EXISTING "any step resets the counter" behavior unchanged) would have been WORSE than
+doing nothing: reset the counter to 0 on a CLAMPED step, and the counter needs ANOTHER full
+`NTP_SERVER_MAX_CHECKS_WITHOUT_STEP` (30-check) wait before it can fire again — during which
+MORE drift accrues than one clamp removed, so the residual left behind after each cycle is
+strictly LARGER than the one before it (unbounded growth, verified by tracing the exact
+arithmetic — `5000 removed` vs `30 checks × accrual_per_check added` — BEFORE writing any code,
+not discovered by accident afterward). The actual fix pairs the clamp with a DELIBERATE asymmetry:
+only a FULLY-applied step (no residual, `step_us == offset_us`) resets the counter; a clamped
+(partial) step leaves it armed, so the escape valve can re-fire on the very next over-threshold
+check — producing a rapid run of further clamped corrections that converges (each one removes
+MORE than a single interval's new accrual) instead of one that diverges. **The generalizable
+check: before shipping ANY output clamp on a control loop that has its own "confirmed vs.
+forced" state machine (a candidate, a starvation counter, a cooldown), trace what happens to
+that state machine's OWN reset/rearm behavior on a CLAMPED (as opposed to a full) application —
+if the state resets exactly as if nothing were left over, verify by tracing the worst-case
+input rate through several cycles by hand (or better, simulate it) whether removal-per-cycle
+actually exceeds accrual-per-cycle. A clamp that "looks safe" (bounds one number) can silently
+make the SYSTEM less safe (a different number, the accumulated residual, now grows instead of
+converging) if this isn't checked.** See the `at_80ppm_past_the_tolerance_breakeven_every_step_is_hard_capped_and_the_system_converges_83`
+test in `src/controller.rs` for both properties (the hard bound AND the convergence) proven
+together, not just the bound alone.
+
+**Verify a safety CLAIM (not just a numeric estimate) by actually running the real code path it
+describes, never by hand-deriving from a simplified mental model of the algorithm — even when
+the simplification "should" be equivalent (issue 83's second correction round, again).** A
+doc comment claimed a widened tolerance "lets through the SAME 2 of 6 transitions" an existing
+tolerance already accepted on a captured real WAN-noise fixture, reasoning from the raw
+consecutive DELTAS between readings. The REAL gate (`ntp_step_gate`) doesn't compare consecutive
+READINGS to each other — it compares each reading to the CURRENT CANDIDATE, which gets REPLACED
+(not just re-measured) on every contradiction. These two models silently diverge whenever a
+contradiction occurs, which this exact fixture triggers. Actually running the real
+candidate/contradiction logic (not just eyeballing the deltas) found the true answer was 1-vs-2
+steps, not "the same 2" — small in consequence here, but the METHOD gap is what matters: a
+"verified by running" claim is only as good as whether what was RUN is the real code path, not a
+paraphrase of it. When justifying a safety-relevant constant against a fixture, write the actual
+test (or a throwaway script using the exact same logic) FIRST, then quote its real output in the
+comment — never reason from "the deltas are X, and the tolerance is Y, so..." even when it feels
+obviously equivalent.
+
 Checking whether dropping a magnitude-tolerance check reopens a HISTORICAL incident: re-derive
 what actually caught it. Issue 50's own reversal incident (`+2831us` then `-2825us`) is an
 OPPOSITE-SIGN pair — the same-sign check alone still catches it with zero magnitude comparison

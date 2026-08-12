@@ -534,3 +534,41 @@ canary evidence before continuing.
 - No fleet deploy from this worker -- supervisor canaries strih by reading
   `C:\ProgramData\DanteSync\dantesync.log`, expecting steps at MINUTES cadence (not 20-40s), PTP
   lock quality unchanged, and the new `ntp_deadband_us` `/status` field present and correct.
+
+## #83 (correction) — the shipped 25ms deadband was UNSAFE; corrected to 2500us + hard ceiling
+
+- Supervisor follow-up (with evidence): a fleet clock STEP shifts every camera's genlock
+  timecode by the step size, and OBS ts-align only absorbs a jump comfortably below one frame
+  period (16.7ms@60fps, 33.3ms@30fps). 25ms exceeds the 60fps period outright -- v1.8.38 (the
+  original #83 fix) would have recurrently failed camera-box's zero-loss E2E gate. Proven-safe
+  band: camera-box's own E2E ran GREEN at +0.9..+2.5ms steps, 87min continuous A/V-sync lock.
+- Reopened #83; design comment posted (root cause, corrected value 2500us, evidence) BEFORE code.
+- Version bump: `52a48da` (1.8.39 -> 1.8.40)
+- RED: `f81d82d` / GREEN: `9f084fb` -- `NTP_SERVER_LOCKED_DEADBAND_US` 25_000 -> 2_500; discovered
+  mid-verification (not part of the original ask, fixed anyway per no-dropped-work.md) that 66ppm
+  (top of the live-measured range) exceeds the routine agreement tolerance (400us), so normal
+  confirmation never fires there and stepping falls through to the #76 escape valve, which would
+  apply the FULL ~21_780us accrued offset unconfirmed. Fix: `NTP_SERVER_LOCKED_AGREEMENT_TOL_US`
+  (750us, locked-only) so normal 2-sample confirmation governs the full 38-66ppm range. Verified
+  by running (never hand-derived): 38ppm ~45 steps/hr @~3040us, 66ppm ~72 steps/hr @~3300us, both
+  comfortably inside the frame-period margin.
+- **Independent review (2nd round) found 1 more critical, fixed in-branch:**
+  - RED: `20b51a8` / GREEN: `1510bd4` -- the 750us tolerance only covers up to its OWN breakeven
+    (~75ppm); PAST that, confirmation fails a SECOND time and the escape valve can apply
+    ~25-26ms unconfirmed (reproduced live: 26_400us at 80ppm) -- same order of magnitude as the
+    withdrawn 25ms mistake. Fix: a hard, ppm-independent ceiling
+    (`NTP_SERVER_LOCKED_MAX_STEP_US`, 5000us) on EVERY locked-mode step regardless of path, paired
+    with NOT resetting the escape-valve counter on a clamped (partial) step -- the companion fix
+    that makes the system converge (a rapid run of further clamped corrections) instead of the
+    residual growing unboundedly (verified: a naive full-reset would let accrual outpace one
+    clamp's removal every cycle). Also corrected an earlier draft's factually wrong "no material
+    increase in noise-susceptibility" claim (verified by actually running the real gate logic:
+    1 step at 400us tolerance vs 2 at 750us on the captured real WAN-noise fixture -- a genuine
+    but small, non-dangerous increase).
+- PR: #86 (dev->master), merged `ed2d386`, tagged+released as `v1.8.40` (auto-release; both Linux
+  AND Windows binary + tray sha256 verified locally). **v1.8.38/v1.8.39 are superseded -- the
+  safe, correct fix is v1.8.40.**
+- No fleet deploy from this worker. Discord card for #83 already fired (v1.8.38, before this
+  correction was known necessary) -- a re-fire with the corrected v1.8.40 was attempted but
+  deduped by the notify mechanism (one card per repo#issue, by design). Supervisor/user should
+  read v1.8.40 as the actually-shipped-safe version, not v1.8.38.
