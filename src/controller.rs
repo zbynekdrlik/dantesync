@@ -80,6 +80,22 @@ fn ntp_discipline_due(
     role_allows && since_last_check >= interval
 }
 
+/// #83 — which step threshold applies right now, in server mode. While genuinely PTP-locked to
+/// a real grandmaster (`is_locked && !ptp_offline`), the master's UTC step is chasing the
+/// grandmaster's own real, unfixable rate error vs UTC (see `NTP_SERVER_LOCKED_DEADBAND_US`'s
+/// own doc comment for the full derivation) -- a large, fixed deadband replaces the routine
+/// tight threshold, since the fleet needs internal (frequency) consistency, not tight absolute
+/// UTC, while genuinely locked. The MOMENT PTP is not the fleet's frequency reference (still
+/// acquiring, or `ptp_offline`), NTP becomes the master's only meaningful reference again, and
+/// the original tight tracking applies unchanged -- same as #71/#76/#80 always did.
+fn server_step_threshold_us(is_locked: bool, ptp_offline: bool) -> i64 {
+    if is_locked && !ptp_offline {
+        NTP_SERVER_LOCKED_DEADBAND_US
+    } else {
+        NTP_SERVER_STEP_THRESHOLD_US
+    }
+}
+
 /// #68 — bound a SINGLE periodic UTC correction while in NTP server mode.
 ///
 /// This node's step is the whole fleet's step, so an upstream reading that is
@@ -294,13 +310,50 @@ const NTP_SERVER_MAX_BURST_SPREAD_US: u64 = 600; // #76: a burst this noisy inte
 // failure class than either the pre-#71 self-scaling tolerance (always eventually converges, just
 // with lag) or the buggy #71/v1.8.32 fast lane (would fast-lane 570us just fine). See
 // ntp_server_checks_since_step's own doc comment for the escape-valve mechanism this constant
-// gates -- once this many consecutive successful checks pass with no actual step, the NEXT
+// gates -- once this many CONSECUTIVE OVER-THRESHOLD checks pass with no actual step, the NEXT
 // over-threshold reading forces one regardless of tolerance/quality. 30 checks = 5 minutes at the
 // 10s cadence: far longer than the ~20-120s the tolerance-agreement path steps at under normal
 // (even noisy) operation -- per the closed-loop noisy-upstream simulation, steps occur roughly
 // once every 12 checks on average -- so this should essentially never fire under real-world
 // conditions, only as a genuine last resort.
+//
+// #83 REVIEW FINDING (critical): this 30-check patience is comfortably longer than the TIGHT
+// threshold's own natural stepping cadence (~2-12 checks), but the PTP-locked deadband's own
+// natural cadence is LONGER than 30 checks (~38-66 checks at the 38-66ppm measured range) --
+// without ntp_server_checks_since_step's OWN under-threshold reset (added alongside this
+// comment), the counter would already exceed 30 well before the deadband was ever legitimately
+// crossed, so EVERY deadband-driven step would go through the escape valve unconfirmed, on the
+// very first over-threshold sample, defeating this whole gate for the primary #83 use case. The
+// under-threshold reset restores the INTENDED invariant ("far longer than normal cadence") for
+// BOTH thresholds without a second tunable constant -- the counter only ever accumulates while
+// genuinely over threshold, so its natural comparison is always against however many checks the
+// CURRENTLY active tolerance/quality gates take to confirm, not against how long it took to
+// first cross into over-threshold territory.
 const NTP_SERVER_MAX_CHECKS_WITHOUT_STEP: u32 = 30;
+
+// #83: while genuinely PTP-locked to a real grandmaster, the master's periodic UTC step was
+// chasing the Dante grandmaster's own REAL, PERSISTENT, UNFIXABLE rate error vs UTC (measured
+// live: ~38-66ppm on strih, vs PTP's own lock to that same grandmaster staying genuinely tight
+// and stable the whole time -- Drift within a few us/s, Adj -4..-6.7ppm, unrelated to the
+// NTP-measured figure). This is architecturally by design: Dante PTP provides frequency
+// coherence to the grandmaster's OWN rate, which has no defined relationship to UTC's rate (see
+// this file's own "CRITICAL: Dante Time vs UTC Time" doc, top of controller.rs / README) -- no
+// tuning of the confirmation/tolerance/quality-gate machinery below can remove a rate mismatch
+// that is real, external, and correctly invisible to PTP-vs-GM lock quality. #71/#76/#80 all
+// correctly tuned HOW a step is confirmed and applied; #83 changes WHETHER one should fire this
+// often at all, now that the confirmation/application machinery is provably correct.
+//
+// The rig needs INTERNAL consistency (fleet-vs-master spread, genlock timecodes), not tight
+// absolute UTC -- nothing downstream needs sub-second real-world time accuracy. While genuinely
+// locked, the step threshold becomes a large, fixed deadband instead of the routine tight one:
+// at 38-66ppm, 25ms of accrual takes ~380-660s (6.3-11 min) -- a 15-30x reduction in correction
+// frequency versus the pre-#83 ~20-40s staircase, while each individual correction stays a
+// small, predictable, bounded jump (not "hours" of accumulated drift landing in one large step).
+// When NOT genuinely locked (still acquiring, or ptp_offline -- PTP packets aren't even
+// flowing), NTP is the master's ONLY meaningful time reference (the original #68 rationale), so
+// the existing tight tracking applies completely unchanged -- same threshold, same tolerance,
+// same quality gate, same escape valve. See server_step_threshold_us's own doc comment.
+const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 25_000;
 
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
@@ -410,7 +463,14 @@ where
     ntp_pending_step: Option<(i64, usize)>, // (first candidate offset_us, agreeing sample count)
     last_ntp_step: Option<Instant>,         // Grace period after NTP stepping
     /// #76: server-mode escape-valve counter -- how many CONSECUTIVE successful server-mode
-    /// checks have passed since the last actual `step_clock` call. Both the fixed-tolerance
+    /// checks have passed, WHILE THE OFFSET WAS OVER THRESHOLD, since the last actual
+    /// `step_clock` call (#83 review finding: reset to 0 on any check where the offset is NOT
+    /// over threshold too -- see the reset right after `step_threshold` is computed in
+    /// `check_ntp_utc_tracking`. Before that fix this counted EVERY successful check
+    /// unconditionally, which was harmless under the routine tight threshold (almost every
+    /// check WAS over threshold in that regime) but WRONG under #83's large PTP-locked
+    /// deadband, whose natural cadence is longer than the escape valve's own patience --
+    /// see that reset's own doc comment for the full incident). Both the fixed-tolerance
     /// agreement gate and the burst-quality gate can, by their own construction, reject a
     /// same-sign trend indefinitely (a genuine oscillator error faster than
     /// `NTP_SERVER_AGREEMENT_TOL_US`/check would never find two in-tolerance readings; a
@@ -419,7 +479,7 @@ where
     /// silently, with no distinct alarm. This counter is the shared last-resort: once it
     /// reaches `NTP_SERVER_MAX_CHECKS_WITHOUT_STEP`, the NEXT over-threshold reading forces a
     /// step regardless of tolerance agreement or burst quality. Reset to 0 on ANY step (normal
-    /// or escape-valve). Client mode never touches this field.
+    /// or escape-valve), or on any under-threshold check. Client mode never touches this field.
     ntp_server_checks_since_step: u32,
 
     // Accumulated phase error tracking (estimated drift between NTP steps)
@@ -872,11 +932,38 @@ where
                 // floor #53 measured, but catches the ramp earlier than the
                 // client's tuning, which exists for LAN jitter that does not
                 // apply to the master's monotonic signal.
+                //
+                // #83: ...UNLESS the master is genuinely PTP-locked, in which case the
+                // threshold becomes a large deadband -- see server_step_threshold_us's own
+                // doc comment. Not locked (still acquiring, or ptp_offline) keeps the
+                // original tight threshold above, unchanged.
                 let step_threshold = if self.ntp_server_mode {
-                    NTP_SERVER_STEP_THRESHOLD_US
+                    server_step_threshold_us(self.is_locked, self.ptp_offline)
                 } else {
                     self.calculate_ntp_adaptive_threshold()
                 };
+
+                // #83 REVIEW FINDING (critical): the escape-valve counter above increments on
+                // EVERY successful check regardless of whether THIS check's offset was even
+                // over threshold -- harmless under the routine tight threshold (almost every
+                // check WAS over threshold in that regime, so "checks since step" and "over-
+                // threshold checks since step" were the same number), but WRONG under the large
+                // PTP-locked deadband: the deadband's natural cadence (~66 checks at 38ppm,
+                // ~500-660s) is LONGER than the escape valve's 30-check/5-min patience, so by
+                // the time the offset first legitimately crosses the deadband, the counter had
+                // ALREADY exceeded its patience on checks that were never over threshold at
+                // all -- forcing every deadband-driven step through the escape valve,
+                // UNCONFIRMED, bypassing both the 2-sample agreement gate AND the burst-quality
+                // gate on the very first over-threshold reading, every single time (defeating
+                // the entire #76 confirmation/quality machinery for the primary locked-mode
+                // case, exactly the noisy-WAN-outlier scenario #76 exists to reject). Reset the
+                // counter whenever THIS check's offset is not currently over threshold, so it
+                // counts consecutive OVER-THRESHOLD-BUT-UNCONFIRMED checks -- the escape
+                // valve's actual documented intent -- and it naturally scales to whichever
+                // threshold is active, tight or deadband, with no new tunable constant.
+                if self.ntp_server_mode && offset_us.abs() <= step_threshold {
+                    self.ntp_server_checks_since_step = 0;
+                }
 
                 // Log current offset with threshold info
                 if step_threshold > NTP_STEP_THRESHOLD_BASE_US {
@@ -1955,6 +2042,14 @@ where
             // when that reading landed — that indistinguishability is the bug.
             status.ntp_updated_ts = self.last_ntp_success_epoch.unwrap_or(0);
             status.ntp_age_s = self.last_ntp_success.map(|t| t.elapsed().as_secs());
+            // #83: the currently-active step threshold, server mode only -- lets a
+            // consumer grade ntp_offset_us against the box's OWN current tolerance
+            // (a large deadband while genuinely PTP-locked) instead of a fixed bound.
+            status.ntp_deadband_us = if self.ntp_server_mode {
+                Some(server_step_threshold_us(self.is_locked, self.ptp_offline))
+            } else {
+                None
+            };
         }
     }
 }
@@ -2087,6 +2182,49 @@ mod tests {
         assert!(
             s.pcap_ntp_active,
             "pcap_active must reach status, not just the offset/spread/count"
+        );
+    }
+
+    /// #83 review finding (suggestion): end-to-end proof of `ntp_deadband_us`
+    /// wiring through the REAL `update_shared_status()` path (not just the
+    /// pure `server_step_threshold_us` function or a hand-built `SyncStatus`
+    /// in isolation, which the other #83 tests already cover separately).
+    /// Also proves it publishes `Some(..)` as soon as server mode is
+    /// configured, WITHOUT needing a successful NTP check first (the doc
+    /// comment's own earlier, inaccurate claim this review finding fixed).
+    #[test]
+    fn ntp_deadband_us_publishes_through_the_real_status_wiring_end_to_end_83() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (mut c, status) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+
+        // Before any NTP check has ever run: still Some, reflecting the
+        // CURRENT (not-yet-locked) threshold -- proves this does NOT gate on
+        // ntp_offset_us's own freshness.
+        c.update_shared_status();
+        assert_eq!(
+            status.read().expect("status lock").ntp_deadband_us,
+            Some(NTP_SERVER_STEP_THRESHOLD_US),
+            "server mode configured but not yet locked -- Some(tight threshold), no NTP check needed"
+        );
+
+        // Genuinely locked -- the large deadband, through the real wiring.
+        c.is_locked = true;
+        c.ptp_offline = false;
+        c.update_shared_status();
+        assert_eq!(
+            status.read().expect("status lock").ntp_deadband_us,
+            Some(NTP_SERVER_LOCKED_DEADBAND_US),
+            "genuinely locked -- Some(deadband), through update_shared_status, not just the pure function"
+        );
+
+        // Client mode (server mode never configured) -- always None.
+        let (client_c, client_status) = create_nano_test_controller();
+        client_c.update_shared_status();
+        assert_eq!(
+            client_status.read().expect("status lock").ntp_deadband_us,
+            None,
+            "client mode must never publish a deadband"
         );
     }
 
@@ -3256,6 +3394,198 @@ mod tests {
     }
 
     // ========================================================================
+    // #83 -- while genuinely PTP-locked, the master's periodic UTC step was
+    // chasing the Dante grandmaster's own real, unfixable rate error vs UTC
+    // (measured live: ~38-66ppm, entirely unrelated to PTP's own lock quality,
+    // which stayed tight and stable throughout). A large deadband replaces the
+    // routine tight threshold while genuinely locked; not-locked keeps the
+    // original tight tracking (#71/#76/#80) completely unchanged.
+    // ========================================================================
+
+    /// Closed-loop, end-to-end: the ACTUAL live-measured drift rate on strih
+    /// today (~38ppm) with the master genuinely PTP-locked throughout.
+    /// Deliberately NOT a round number picked for convenience -- 38ppm's
+    /// per-interval accrual (380us/10s) sits just UNDER `NTP_SERVER_
+    /// AGREEMENT_TOL_US` (400us), which is exactly what makes two consecutive
+    /// readings agree and confirm a step almost every other check under the
+    /// PRE-#83 tight threshold (200us, always exceeded from the first
+    /// interval) -- reproducing the real ~20-40s staircase precisely, not
+    /// just "some sparse cadence". After #83, the large deadband delays that
+    /// first threshold-crossing to ~66-67 checks (~11 min), so stepping
+    /// becomes genuinely MINUTES-cadence and each step's magnitude stays
+    /// bounded near the deadband, not accumulating for the whole simulated
+    /// hour in one giant jump.
+    #[test]
+    fn the_locked_master_steps_at_minutes_cadence_not_seconds_83() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 100, // clean, well below the quality bound -- isolates the deadband's own effect
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let err_for_clock = error_us.clone();
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            steps_for_clock.lock().expect("sim lock").push(applied);
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        const ACCRUAL_US: i64 = 38 * NTP_SERVER_CHECK_INTERVAL_SECS as i64; // 38ppm -- today's live-measured strih rate (issue #83 evidence)
+        const INTERVALS: usize = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        for _ in 0..INTERVALS {
+            *error_us.lock().expect("sim lock") += ACCRUAL_US;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+
+        let steps = step_events.lock().expect("sim lock");
+        let step_count = steps.len();
+        // At 38ppm (380us/10s interval) the deadband (25000us) is first crossed
+        // around interval 66-67 (~11 min) -> roughly 5-6 steps in one simulated
+        // hour. Assert comfortably looser than that exact count (a step every
+        // 5+ minutes, i.e. at most 10/hour) so this stays a genuine regression
+        // guard without being brittle to a 1-sample timing wobble.
+        assert!(
+            step_count <= 10,
+            "a genuinely PTP-locked master at 38ppm must step at MINUTES cadence (at most ~10 \
+             times in a simulated hour, i.e. at least every ~6 min), got {} steps -- the \
+             pre-#83 behavior (tight 200us threshold regardless of lock state) confirms a step \
+             almost every 2 checks (~20s) at this rate, ~180 times in the same hour",
+            step_count
+        );
+        for &applied in steps.iter() {
+            assert!(
+                applied.unsigned_abs() < NTP_SERVER_LOCKED_DEADBAND_US as u64 * 2,
+                "each individual correction must stay bounded near the deadband (got {}us), not \
+                 accumulate drift for a long stretch and land in one oversized jump",
+                applied
+            );
+        }
+    }
+
+    /// The exact scenario the existing #76 tests already cover (not yet
+    /// PTP-locked) must be completely UNCHANGED by #83 -- proving this is an
+    /// additive change, not a behavior change for the "NTP is the only
+    /// reference" case. `create_nano_test_controller`/fresh `configure_ntp_
+    /// server_mode` default `is_locked=false`, matching every pre-#83 test in
+    /// this file that never set it explicitly.
+    #[test]
+    fn not_locked_master_keeps_the_pre_83_tight_tracking_83() {
+        let (mut c, _) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        assert!(!c.is_locked, "default state: not yet locked");
+        assert_eq!(
+            server_step_threshold_us(c.is_locked, c.ptp_offline),
+            NTP_SERVER_STEP_THRESHOLD_US,
+            "not-locked must keep using the routine tight threshold, unaffected by #83"
+        );
+    }
+
+    // ========================================================================
+    // #83 REVIEW FINDING (critical): the escape valve's own counter used to
+    // increment on EVERY successful check regardless of whether the offset
+    // was over threshold -- harmless under the tight threshold, but WRONG
+    // under the large PTP-locked deadband: its natural cadence (~38-66
+    // checks) is LONGER than the escape valve's 30-check patience, so by the
+    // time the offset first legitimately crosses the deadband, the counter
+    // had ALREADY exceeded its patience on checks that were never even over
+    // threshold -- forcing every deadband-driven step through the escape
+    // valve unconfirmed, on the FIRST over-threshold sample, bypassing both
+    // the 2-sample agreement gate and the burst-quality gate every time.
+    // ========================================================================
+
+    /// Reproduces the exact scenario: many checks held safely UNDER the
+    /// deadband (more than NTP_SERVER_MAX_CHECKS_WITHOUT_STEP of them --
+    /// under the pre-fix code the counter would already have exceeded its
+    /// patience purely from those, despite never once being over threshold),
+    /// then a SINGLE noisy over-threshold spike that is immediately
+    /// contradicted by the next reading (a one-off WAN outlier, exactly the
+    /// #76 scenario). The outlier must NEVER step on its own -- it must wait
+    /// for a genuine second agreeing sample, exactly like the not-locked
+    /// path already requires. RED (pre-fix): the escape valve's stale
+    /// counter forces an unconfirmed step on the spike itself.
+    #[test]
+    fn locked_mode_escape_valve_never_fires_on_a_single_outlier_after_many_under_threshold_checks_83(
+    ) {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mock_clock_no_step = MockSystemClock::new(); // no expectations set -- panics if step_clock is called
+        let mock_net = MockPtpNetwork::new();
+        let call_idx = Arc::new(std::sync::Mutex::new(0_u32));
+        let idx_for_ntp = call_idx.clone();
+        // #83: comfortably more than NTP_SERVER_MAX_CHECKS_WITHOUT_STEP (30) held-under-
+        // threshold checks, THEN one spike, then one contradiction.
+        const UNDER_THRESHOLD_CHECKS: u32 = NTP_SERVER_MAX_CHECKS_WITHOUT_STEP + 10;
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times((UNDER_THRESHOLD_CHECKS + 2) as usize)
+            .returning(move || {
+                let i = *idx_for_ntp.lock().expect("sim lock");
+                *idx_for_ntp.lock().expect("sim lock") += 1;
+                let offset_us: i64 = if i < UNDER_THRESHOLD_CHECKS {
+                    5_000 // well under the 25_000us deadband -- healthy, no candidate forms
+                } else if i == UNDER_THRESHOLD_CHECKS {
+                    30_000 // ONE noisy spike, over the deadband
+                } else {
+                    4_000 // immediately contradicts the spike -- back under threshold
+                };
+                Ok(crate::ntp::NtpMeasurement {
+                    offset: Duration::from_micros(offset_us.unsigned_abs()),
+                    sign: 1,
+                    spread_us: 200,
+                    sample_count: 3,
+                    pcap_active: false,
+                })
+            });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock_no_step, mock_net, mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        for _ in 0..(UNDER_THRESHOLD_CHECKS + 2) {
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+        // If a step had been called, MockSystemClock (no expectations set) would already
+        // have panicked inside check_ntp_utc_tracking above -- reaching this line at all
+        // is itself part of the proof. call_idx also confirms every scripted read ran.
+        assert_eq!(
+            *call_idx.lock().expect("sim lock"),
+            UNDER_THRESHOLD_CHECKS + 2,
+            "every scripted read must have been consumed"
+        );
+    }
+
+    // ========================================================================
     // #76 REVIEW FINDING (critical): the fixed-tolerance agreement gate and the
     // burst-quality gate can each independently reject a genuine same-sign
     // trend FOREVER with no escape -- reproduced live in review as unbounded,
@@ -3694,6 +4024,49 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(30),
         ));
+    }
+
+    // ========================================================================
+    // #83 -- server_step_threshold_us: a large deadband while genuinely PTP-locked
+    // (chasing the Dante grandmaster's own real, unfixable rate error vs UTC is
+    // pointless once the confirmation/tolerance/quality machinery is provably
+    // correct, per #71/#76/#80); tight tracking otherwise, unchanged.
+    // ========================================================================
+
+    #[test]
+    fn server_step_threshold_is_the_large_deadband_when_genuinely_locked_83() {
+        assert_eq!(
+            server_step_threshold_us(true, false),
+            NTP_SERVER_LOCKED_DEADBAND_US
+        );
+    }
+
+    #[test]
+    fn server_step_threshold_stays_tight_when_not_yet_locked_83() {
+        // Still acquiring -- NTP is not yet safely deferrable to a PTP lock that
+        // doesn't exist yet.
+        assert_eq!(
+            server_step_threshold_us(false, false),
+            NTP_SERVER_STEP_THRESHOLD_US
+        );
+    }
+
+    #[test]
+    fn server_step_threshold_stays_tight_when_ptp_offline_even_if_locked_flag_is_stale_83() {
+        // ptp_offline means PTP packets aren't even flowing right now -- NTP is the
+        // ONLY meaningful reference regardless of whatever is_locked last read.
+        assert_eq!(
+            server_step_threshold_us(true, true),
+            NTP_SERVER_STEP_THRESHOLD_US
+        );
+    }
+
+    #[test]
+    fn server_step_threshold_stays_tight_when_neither_locked_nor_online_83() {
+        assert_eq!(
+            server_step_threshold_us(false, true),
+            NTP_SERVER_STEP_THRESHOLD_US
+        );
     }
 
     #[test]

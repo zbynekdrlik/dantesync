@@ -192,6 +192,35 @@ comment posted yet for #N (repo camera-box)" while working in dantesync), check 
 worker's session `cwd` can be a sibling repo's checkout even mid-session, and this shape is the
 fix, not `-R` (which `git commit` has no equivalent flag for at all).
 
+## GOTCHA — `block-ungated-issue-filing.sh`'s `-F <file>` resolution reads the RAW command text, a shell `$VAR` in the path never resolves
+
+Cross-repo lesson from filing camera-box#1021 while working this issue (#83): the airuleset
+`Scope-gate:`/`Dedup-checked:` enforcement hook (`hooks/block-ungated-issue-filing.sh`, external to
+this repo, fires on ANY `gh issue create`/`gh api .../issues` call in ANY project) resolves a
+`-F <file>` / `--body-file <file>` argument by reading the **literal, un-expanded text** of the
+Bash tool call it receives — it never runs a real shell, so it cannot expand a variable. A command
+like:
+
+```bash
+SCRATCH=/tmp/some/scratchpad
+gh issue create -R owner/repo --title "..." -F "$SCRATCH/body.md"
+```
+
+makes the hook see the literal token `$SCRATCH/body.md` (dollar sign and all) as the file path —
+not the shell-expanded absolute path — so `os.path.isabs()` on it is `False`, the hook tries
+`os.path.join(cwd, "$SCRATCH/body.md")`, that path does not exist, the body resolves to `None`, and
+the whole call BLOCKS with `criterion=none dedup="none"` **even when the body file genuinely exists
+on disk with correct `Scope-gate:`/`Dedup-checked:` lines** — the block message gives no hint this
+is the actual cause (it lists the same generic 7 possible reasons regardless).
+
+**Fix: write the scratch body file (its own separate Bash call, per the global `gh-cli-recipes.md`
+atomic-block gotcha) and then reference it in `gh issue create -F` by its LITERAL, fully-expanded
+absolute path** — never a `$VAR` interpolation in that specific argument, even though the variable
+resolves correctly for every OTHER purpose (the file write itself, `cat`, etc. all work fine since
+those genuinely execute in a real shell). This is a narrower instance of the general "hook sees your
+command's TEXT, not its runtime-expanded result" class of gotcha already documented above for the
+design-gate's `cd` resolution.
+
 ## Hardware Constraints (CRITICAL)
 
 **This project implements SOFTWARE-ONLY PTP frequency synchronization:**

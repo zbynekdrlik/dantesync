@@ -113,6 +113,25 @@ pub struct SyncStatus {
     /// published, not because the node was on time.
     #[serde(default)]
     pub ntp_age_s: Option<u64>,
+
+    /// dantesync#83: the threshold (microseconds) this node would CURRENTLY apply to a step
+    /// decision if server mode is configured -- `None` on a client node (server mode only).
+    /// `Some(..)` as soon as `configure_ntp_server_mode()` has run, reflecting whichever
+    /// threshold applies given the node's CURRENT `is_locked`/`ptp_offline` state -- it does
+    /// NOT require a successful NTP check to have happened yet (review finding, #83: an
+    /// earlier draft of this doc claimed `None` "before the first server-mode check", which
+    /// was never actually true -- `update_shared_status()` computes this purely from
+    /// `server_step_threshold_us(is_locked, ptp_offline)`, independent of `ntp_offset_us`'s
+    /// own freshness). A residual in `ntp_offset_us` up to roughly this value is EXPECTED,
+    /// healthy behavior, not drift or instability: while genuinely PTP-locked, this node
+    /// deliberately uses a large deadband (the Dante grandmaster's own real, unfixable rate
+    /// error vs UTC is operationally irrelevant to the fleet's internal consistency, so UTC
+    /// phase is corrected only every few minutes instead of every ~20-40s) rather than the
+    /// tight tracking used while not yet locked. Any consumer grading `ntp_offset_us` for
+    /// stability (e.g. camera-box's own E2E DanteSync gate) should read this field FIRST and
+    /// grade against it, not against a fixed assumed bound.
+    #[serde(default)]
+    pub ntp_deadband_us: Option<i64>,
 }
 
 impl SyncStatus {
@@ -149,6 +168,8 @@ impl Default for SyncStatus {
             // #68: nothing measured yet — say so, never imply "just now"
             ntp_updated_ts: 0,
             ntp_age_s: None,
+            // #83: unknown until a server-mode check has actually run
+            ntp_deadband_us: None,
         }
     }
 }
@@ -272,6 +293,34 @@ mod tests {
         assert!(
             json.contains("\"ntp_age_s\":null"),
             "never-measured must serialize as an explicit null, got: {}",
+            json
+        );
+    }
+
+    /// #83: `ntp_deadband_us` reports the currently-active step threshold on a
+    /// server-mode node (present, Some as soon as server mode is configured --
+    /// it does NOT require a successful NTP check yet), and stays absent
+    /// (None) on a client node.
+    #[test]
+    fn test_sync_status_ntp_deadband_us_roundtrips_and_defaults_none_83() {
+        let server_locked = SyncStatus {
+            ntp_offset_us: 15_000,
+            ntp_deadband_us: Some(25_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&server_locked).expect("serialize failed");
+        let restored: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(restored.ntp_deadband_us, Some(25_000));
+
+        let client_or_unstarted = SyncStatus::default();
+        assert_eq!(
+            client_or_unstarted.ntp_deadband_us, None,
+            "client mode (or before the first server-mode check) must report no deadband"
+        );
+        let json = serde_json::to_string(&client_or_unstarted).expect("serialize failed");
+        assert!(
+            json.contains("\"ntp_deadband_us\":null"),
+            "must serialize as an explicit null, not be omitted, got: {}",
             json
         );
     }
