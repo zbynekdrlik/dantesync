@@ -114,13 +114,19 @@ pub struct SyncStatus {
     #[serde(default)]
     pub ntp_age_s: Option<u64>,
 
-    /// dantesync#83: the CURRENTLY ACTIVE step threshold (microseconds) this server-mode node
-    /// is using right now -- `None` on a client node (server mode only), or before the first
-    /// server-mode check has run. A residual in `ntp_offset_us` up to roughly this value is
-    /// EXPECTED, healthy behavior, not drift or instability: while genuinely PTP-locked, this
-    /// node deliberately uses a large deadband (the Dante grandmaster's own real, unfixable
-    /// rate error vs UTC is operationally irrelevant to the fleet's internal consistency, so
-    /// UTC phase is corrected only every few minutes instead of every ~20-40s) rather than the
+    /// dantesync#83: the threshold (microseconds) this node would CURRENTLY apply to a step
+    /// decision if server mode is configured -- `None` on a client node (server mode only).
+    /// `Some(..)` as soon as `configure_ntp_server_mode()` has run, reflecting whichever
+    /// threshold applies given the node's CURRENT `is_locked`/`ptp_offline` state -- it does
+    /// NOT require a successful NTP check to have happened yet (review finding, #83: an
+    /// earlier draft of this doc claimed `None` "before the first server-mode check", which
+    /// was never actually true -- `update_shared_status()` computes this purely from
+    /// `server_step_threshold_us(is_locked, ptp_offline)`, independent of `ntp_offset_us`'s
+    /// own freshness). A residual in `ntp_offset_us` up to roughly this value is EXPECTED,
+    /// healthy behavior, not drift or instability: while genuinely PTP-locked, this node
+    /// deliberately uses a large deadband (the Dante grandmaster's own real, unfixable rate
+    /// error vs UTC is operationally irrelevant to the fleet's internal consistency, so UTC
+    /// phase is corrected only every few minutes instead of every ~20-40s) rather than the
     /// tight tracking used while not yet locked. Any consumer grading `ntp_offset_us` for
     /// stability (e.g. camera-box's own E2E DanteSync gate) should read this field FIRST and
     /// grade against it, not against a fixed assumed bound.
@@ -292,8 +298,9 @@ mod tests {
     }
 
     /// #83: `ntp_deadband_us` reports the currently-active step threshold on a
-    /// server-mode node (present, Some), and stays absent (None) on a client
-    /// node or before any server-mode check has run.
+    /// server-mode node (present, Some as soon as server mode is configured --
+    /// it does NOT require a successful NTP check yet), and stays absent
+    /// (None) on a client node.
     #[test]
     fn test_sync_status_ntp_deadband_us_roundtrips_and_defaults_none_83() {
         let server_locked = SyncStatus {

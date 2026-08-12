@@ -2185,6 +2185,49 @@ mod tests {
         );
     }
 
+    /// #83 review finding (suggestion): end-to-end proof of `ntp_deadband_us`
+    /// wiring through the REAL `update_shared_status()` path (not just the
+    /// pure `server_step_threshold_us` function or a hand-built `SyncStatus`
+    /// in isolation, which the other #83 tests already cover separately).
+    /// Also proves it publishes `Some(..)` as soon as server mode is
+    /// configured, WITHOUT needing a successful NTP check first (the doc
+    /// comment's own earlier, inaccurate claim this review finding fixed).
+    #[test]
+    fn ntp_deadband_us_publishes_through_the_real_status_wiring_end_to_end_83() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (mut c, status) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+
+        // Before any NTP check has ever run: still Some, reflecting the
+        // CURRENT (not-yet-locked) threshold -- proves this does NOT gate on
+        // ntp_offset_us's own freshness.
+        c.update_shared_status();
+        assert_eq!(
+            status.read().expect("status lock").ntp_deadband_us,
+            Some(NTP_SERVER_STEP_THRESHOLD_US),
+            "server mode configured but not yet locked -- Some(tight threshold), no NTP check needed"
+        );
+
+        // Genuinely locked -- the large deadband, through the real wiring.
+        c.is_locked = true;
+        c.ptp_offline = false;
+        c.update_shared_status();
+        assert_eq!(
+            status.read().expect("status lock").ntp_deadband_us,
+            Some(NTP_SERVER_LOCKED_DEADBAND_US),
+            "genuinely locked -- Some(deadband), through update_shared_status, not just the pure function"
+        );
+
+        // Client mode (server mode never configured) -- always None.
+        let (client_c, client_status) = create_nano_test_controller();
+        client_c.update_shared_status();
+        assert_eq!(
+            client_status.read().expect("status lock").ntp_deadband_us,
+            None,
+            "client mode must never publish a deadband"
+        );
+    }
+
     /// Adversarial-review fix (#53 continuation): `pcap_ntp_active` must NOT
     /// go stale on a burst failure. Root cause: the success branch of
     /// `check_ntp_utc_tracking` writes `status.pcap_ntp_active =
