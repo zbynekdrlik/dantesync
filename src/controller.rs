@@ -912,8 +912,13 @@ where
                 // floor #53 measured, but catches the ramp earlier than the
                 // client's tuning, which exists for LAN jitter that does not
                 // apply to the master's monotonic signal.
+                //
+                // #83: ...UNLESS the master is genuinely PTP-locked, in which case the
+                // threshold becomes a large deadband -- see server_step_threshold_us's own
+                // doc comment. Not locked (still acquiring, or ptp_offline) keeps the
+                // original tight threshold above, unchanged.
                 let step_threshold = if self.ntp_server_mode {
-                    NTP_SERVER_STEP_THRESHOLD_US
+                    server_step_threshold_us(self.is_locked, self.ptp_offline)
                 } else {
                     self.calculate_ntp_adaptive_threshold()
                 };
@@ -1995,6 +2000,14 @@ where
             // when that reading landed — that indistinguishability is the bug.
             status.ntp_updated_ts = self.last_ntp_success_epoch.unwrap_or(0);
             status.ntp_age_s = self.last_ntp_success.map(|t| t.elapsed().as_secs());
+            // #83: the currently-active step threshold, server mode only -- lets a
+            // consumer grade ntp_offset_us against the box's OWN current tolerance
+            // (a large deadband while genuinely PTP-locked) instead of a fixed bound.
+            status.ntp_deadband_us = if self.ntp_server_mode {
+                Some(server_step_threshold_us(self.is_locked, self.ptp_offline))
+            } else {
+                None
+            };
         }
     }
 }
