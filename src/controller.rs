@@ -1150,14 +1150,31 @@ where
                     // node's step is the whole fleet's step. `ntp_server_max_step_us`
                     // is 0 for every other node and 0 means unbounded, so the same
                     // call is the unchanged client behaviour.
-                    let step_us = clamp_ntp_step_us(offset_us, self.ntp_server_max_step_us);
+                    //
+                    // #83 REVIEW FINDING (2nd round, critical): while genuinely locked, this is
+                    // ALSO bounded by NTP_SERVER_LOCKED_MAX_STEP_US regardless of the configured
+                    // ntp_server_max_step_us -- see that constant's own doc comment for the full
+                    // incident (an escape-valve-forced step at ppm > ~75 could otherwise apply
+                    // ~20-26ms unconfirmed, in one step). Not-locked path: completely unchanged.
+                    let locked_now = self.ntp_server_mode && self.is_locked && !self.ptp_offline;
+                    let effective_max_step_us = if locked_now {
+                        if self.ntp_server_max_step_us > 0 {
+                            self.ntp_server_max_step_us
+                                .min(NTP_SERVER_LOCKED_MAX_STEP_US)
+                        } else {
+                            NTP_SERVER_LOCKED_MAX_STEP_US
+                        }
+                    } else {
+                        self.ntp_server_max_step_us
+                    };
+                    let step_us = clamp_ntp_step_us(offset_us, effective_max_step_us);
                     if step_us != offset_us {
                         warn!(
                             "[NTP-Server] upstream correction {:+}us exceeds the {}us bound — \
                              stepping {:+}us now, {:+}us residual worked off over the next \
                              intervals",
                             offset_us,
-                            self.ntp_server_max_step_us,
+                            effective_max_step_us,
                             step_us,
                             offset_us - step_us
                         );
@@ -1175,7 +1192,22 @@ where
                         self.ntp_pending_step = None;
                         // #76: any actual step (normal agreement OR the escape valve) resets
                         // the starvation counter -- we just corrected, the clock is caught up.
-                        self.ntp_server_checks_since_step = 0;
+                        //
+                        // #83 REVIEW FINDING (2nd round, critical): NOT when genuinely locked
+                        // AND a residual remains (step_us != offset_us, i.e. NTP_SERVER_LOCKED_
+                        // MAX_STEP_US clamped this one) -- resetting to a full
+                        // NTP_SERVER_MAX_CHECKS_WITHOUT_STEP-check wait here would let a
+                        // sustained high-ppm residual accrue FASTER (30 checks' worth of new
+                        // drift) than one clamped correction removes, causing UNBOUNDED growth
+                        // instead of convergence (verified by simulation before choosing this
+                        // fix). Leaving the counter armed lets the escape valve re-fire on the
+                        // very next over-threshold check, producing a rapid run of further
+                        // clamped corrections until the residual clears -- see
+                        // NTP_SERVER_LOCKED_MAX_STEP_US's own doc comment. Not-locked path (and
+                        // any fully-applied locked step, step_us == offset_us): unchanged, reset.
+                        if !(locked_now && step_us != offset_us) {
+                            self.ntp_server_checks_since_step = 0;
+                        }
                         // Clear PTP sample window to discard post-step transient samples
                         self.sample_window.clear();
                         // Set grace period to skip PTP samples for 2s after step
