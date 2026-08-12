@@ -395,15 +395,36 @@ const NTP_SERVER_MAX_CHECKS_WITHOUT_STEP: u32 = 30;
 //
 // The rig needs INTERNAL consistency (fleet-vs-master spread, genlock timecodes), not tight
 // absolute UTC -- nothing downstream needs sub-second real-world time accuracy. While genuinely
-// locked, the step threshold becomes a large, fixed deadband instead of the routine tight one:
-// at 38-66ppm, 25ms of accrual takes ~380-660s (6.3-11 min) -- a 15-30x reduction in correction
-// frequency versus the pre-#83 ~20-40s staircase, while each individual correction stays a
-// small, predictable, bounded jump (not "hours" of accumulated drift landing in one large step).
+// locked, the step threshold becomes a large, fixed deadband instead of the routine tight one.
 // When NOT genuinely locked (still acquiring, or ptp_offline -- PTP packets aren't even
 // flowing), NTP is the master's ONLY meaningful time reference (the original #68 rationale), so
 // the existing tight tracking applies completely unchanged -- same threshold, same tolerance,
 // same quality gate, same escape valve. See server_step_threshold_us's own doc comment.
-const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 25_000;
+//
+// #83 CORRECTION (v1.8.38 shipped 25_000us here without the rig's own domain constraint -- this
+// was a design mistake, corrected before any fleet rollout beyond the strih canary): a fleet
+// clock STEP shifts every camera's genlock timecodes by the step size, and strih/imag OBS
+// ts-align only absorbs a timecode jump while it stays comfortably below one frame period
+// (16.7ms @60fps imag path, 33.3ms @30fps strih recording path). 25ms EXCEEDS the 60fps frame
+// period outright and is ~75% of the 30fps one -- each step event near-guarantees a held/dropped
+// frame, which surfaces as a copy+gap in camera-box's zero-loss E2E verdict (bar: 0 copies, 0
+// gaps over >=300s windows). At 38-66ppm a 25ms deadband steps every ~6-11min, so a 30-60min
+// gate run would eat ~5 step events -- recurrently RED, strictly WORSE for the gate than the
+// pre-#83 behavior this feature was meant to improve on.
+//
+// The corrected value, 2_500us (2.5ms), is the top of a PROVEN-safe band, not merely "a smaller
+// number": camera-box PR #1017's full E2E ran GREEN on 2026-08-11 with the fleet master (then
+// v1.8.30) stepping +0.9..+2.5ms every 20-40s (issue #71's own measurement of that build), and
+// the A/V-sync dock held LOCKED 87 minutes continuously through that exact stepping regime --
+// steps <=2.5ms are proven absorbed by the recorded gate, ts-align, and the dock. At the live
+// 38-66ppm this yields ~2.5ms steps roughly every 40-70s: SPARSER than the pre-#83 tight-
+// threshold cadence (which also fired sub-2.5ms steps off the 200us threshold at a similar or
+// tighter cadence), with every step now fully delivered (#80) and the step SIZE staying inside
+// the proven-safe band -- strictly better than both the pre-#83 state and the withdrawn 25ms
+// version. A plain constant, not made configurable: matches every other tunable this feature
+// introduces (all bare constants, no config-parsing surface), and this value is derived from
+// hard physical evidence (frame period), not an operator preference someone would retune.
+const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 2_500;
 
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
@@ -1282,11 +1303,14 @@ where
         }
 
         if self.ntp_server_mode {
+            // #83 correction: the agreement tolerance is WIDER while genuinely locked (see
+            // server_agreement_tolerance_us's own doc comment) -- everything else in this
+            // branch is unchanged from #76.
+            let agreement_tol_us = server_agreement_tolerance_us(self.is_locked, self.ptp_offline);
             return match self.ntp_pending_step {
                 Some((cand, n)) => {
                     let same_sign = (cand > 0) == (offset_us > 0);
-                    let agrees =
-                        same_sign && (offset_us - cand).abs() <= NTP_SERVER_AGREEMENT_TOL_US;
+                    let agrees = same_sign && (offset_us - cand).abs() <= agreement_tol_us;
                     if agrees {
                         let n = n + 1;
                         if n >= NTP_STEP_AGREEMENT_N {
@@ -1320,7 +1344,7 @@ where
                          awaiting {} agreeing sample(s)",
                         offset_us,
                         adaptive_threshold,
-                        NTP_SERVER_AGREEMENT_TOL_US,
+                        agreement_tol_us,
                         NTP_STEP_AGREEMENT_N - 1
                     );
                     self.ntp_pending_step = Some((offset_us, 1));
