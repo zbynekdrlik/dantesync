@@ -180,6 +180,34 @@ once?** A mechanism tuned for pure noise or a pure trend is often actively count
 signal that is genuinely a mix of the two — and any FIXED bound tuned to today's measured envelope
 needs an explicit plan for what happens outside it, not just for the case that's been observed.
 
+**A safety-net counter is only calibrated for as long as its PROXY stays coincident with the
+condition it actually measures — re-verify that coincidence every time a LATER change alters the
+proxy's own relationship to the real condition (issue 83's own critical review finding).** The
+escape valve above counts "consecutive successful checks since the last step" as a PROXY for its
+real intent, "consecutive checks the offset was over threshold but never confirmed" — under the
+ORIGINAL regime (issue 76, a tight ~200us threshold with per-check accrual usually already over
+it) those two things were nearly always the SAME number, so the proxy was safe and its 30-check
+patience was genuinely "far longer than normal step cadence". Issue 83 then introduced a SECOND,
+much larger threshold (a 25ms deadband, active while genuinely PTP-locked) whose natural
+over-threshold cadence (~38-66 checks) is LONGER than that same 30-check patience — so by the time
+the deadband was ever legitimately crossed, the proxy counter had ALREADY exceeded its patience
+purely from checks that were never over threshold at all, and the escape valve fired unconfirmed
+on literally the FIRST over-threshold sample every time, silently bypassing both the agreement gate
+and the quality gate for the codebase's entire new primary use case. The fix was to scope the
+counter to the REAL condition directly (reset to 0 on any under-threshold check, so it only ever
+accumulates while genuinely over threshold) rather than adding a second tunable constant — this
+also made the invariant correct for BOTH thresholds simultaneously, with nothing to keep in sync
+by hand. **The generalizable check: whenever a control-loop safety-net counter's own doc comment
+justifies its bound by reasoning about a SPECIFIC regime ("normal cadence is ~N checks, so M >> N
+is safe"), and a later change introduces a SECOND regime with a different natural cadence, that
+justification must be RE-DERIVED for the new regime, not assumed to still hold** — a closed-loop
+simulation using a NOISELESS deterministic ramp (as issue 83's own first-draft test did) cannot
+catch this, because a clean, unambiguous signal steps identically whether confirmed by 2 agreeing
+samples or forced by an unconfirmed escape valve; only a noisy-outlier scenario (a single spurious
+reading immediately contradicted by the next) can distinguish "genuinely confirmed" from "escape
+valve fired prematurely" — see `locked_mode_escape_valve_never_fires_on_a_single_outlier_after_many_under_threshold_checks_83`
+in `src/controller.rs` for the pattern.
+
 Checking whether dropping a magnitude-tolerance check reopens a HISTORICAL incident: re-derive
 what actually caught it. Issue 50's own reversal incident (`+2831us` then `-2825us`) is an
 OPPOSITE-SIGN pair — the same-sign check alone still catches it with zero magnitude comparison
