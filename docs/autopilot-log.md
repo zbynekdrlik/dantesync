@@ -488,3 +488,49 @@ canary evidence before continuing.
   `[StepClock] Actual step: X (expected: Y)` diagnostic on strih post-deploy, expecting `X == Y`
   (or within a few 100ns-tick rounding units) instead of the 27.6%-116.7% scatter this cycle's own
   evidence recorded — that is the fix's own most direct, convincing self-test.
+
+## #83 — locked master must stop chasing the Dante GM's real (unfixable) rate error vs UTC
+
+- Confirmed live (independent MCP re-verification on strih, distinct sample window from the
+  coordinator's own): #80's fix genuinely working (`Actual step: X == Y`), staircase persisted at
+  ~41.2ppm (matching the coordinator's ~38ppm), PTP lock stayed tight/stable throughout (Adj
+  -4.4..-5.7ppm) -- confirming the mismatch is architectural (Dante PTP frequency-coherence to the
+  GM's own rate has no defined relationship to UTC's rate), not a bug in #71/#76/#80's own
+  machinery.
+- Version bump: `2870e3b` (1.8.37 -> 1.8.38)
+- RED: `f476754` -- `the_locked_master_steps_at_minutes_cadence_not_seconds_83` at the ACTUAL
+  live-measured strih rate (38ppm, chosen because its 380us/10s accrual sits just under
+  `NTP_SERVER_AGREEMENT_TOL_US`'s 400us, reproducing the real ~20s staircase precisely: 180
+  steps/hour under the pre-fix tight-threshold-always wiring)
+- GREEN: `5c6c6fa` -- `server_step_threshold_us(is_locked, ptp_offline)`: a large 25ms deadband
+  while genuinely PTP-locked (`NTP_SERVER_LOCKED_DEADBAND_US`), routine 200us threshold otherwise
+  (unchanged #71/#76/#80 path); `SyncStatus.ntp_deadband_us` published (additive) so a consumer
+  can grade `ntp_offset_us` against the box's own current tolerance
+- Docs: `a21e828` -- captured the scope-gate hook's raw-text `-F $VAR` resolution gotcha (hit live
+  filing the cross-repo camera-box issue below)
+- **Independent fresh-context review (never the built-in review Skill) found 1 critical, all
+  fixed in-branch:**
+  - RED: `ab63a34` / GREEN: `d4cb865` -- the escape valve's counter incremented on EVERY check
+    unconditionally, so during the deadband's longer natural cadence (~38-66 checks) it had
+    ALREADY exceeded its 30-check patience before the deadband was ever legitimately crossed --
+    every deadband-driven step went through the escape valve UNCONFIRMED, bypassing both the
+    2-sample agreement gate and the burst-quality gate every single time (defeating #76's whole
+    confirmation machinery for the primary #83 case). Fix: reset the counter on any under-
+    threshold check, so it counts consecutive over-threshold-but-unconfirmed checks instead of
+    raw elapsed checks -- scales correctly to whichever threshold is active, no new constant.
+  - `8c7f37f` -- 🟡 corrected `ntp_deadband_us`'s doc (it publishes `Some(..)` the instant server
+    mode is configured, NOT gated on a successful NTP check); 🔵 added an end-to-end test driving
+    the real `update_shared_status()` wiring (not just the pure function/hand-built status).
+- **Reconciled the 19ppm (issue-71) vs 66ppm (yesterday) vs 38ppm (today) figures explicitly on
+  the issue**: the underlying GM-vs-UTC rate error is real and plausibly temperature-dependent
+  (66ppm evening -> 38ppm midday), but is architecturally IRRELEVANT once #83 ships -- the fleet no
+  longer chases it at seconds cadence regardless of its exact value.
+- Filed camera-box#1021 (dantesync-gate's fixed 2000us median bound will false-fail once this
+  fix's deadband ships -- the gate's existing #1014 "median-only" exemption only skips the SPREAD
+  check, never the median bound itself) per the design comment's own cross-repo flag. NOT edited
+  camera-box myself.
+- PR: #84 (dev->master), merged `dadb938`, tagged+released as `v1.8.38` (auto-release; both Linux
+  AND Windows binary + tray sha256 verified locally)
+- No fleet deploy from this worker -- supervisor canaries strih by reading
+  `C:\ProgramData\DanteSync\dantesync.log`, expecting steps at MINUTES cadence (not 20-40s), PTP
+  lock quality unchanged, and the new `ntp_deadband_us` `/status` field present and correct.
