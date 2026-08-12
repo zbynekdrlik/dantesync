@@ -9,7 +9,7 @@ use log::{debug, error, info, warn};
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, ERROR_NOT_ALL_ASSIGNED, FILETIME, HANDLE, LUID, SYSTEMTIME,
+    CloseHandle, GetLastError, BOOL, ERROR_NOT_ALL_ASSIGNED, HANDLE, LUID,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
@@ -17,11 +17,24 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime, SetSystemTime,
-    SetSystemTimeAdjustmentPrecise,
+    GetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime, SetSystemTimeAdjustmentPrecise,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::System::Time::FileTimeToSystemTime;
+
+// #80: NtSetSystemTime (ntdll.dll) sets the system clock from a raw FILETIME
+// (100ns-tick i64/LARGE_INTEGER) directly -- no SYSTEMTIME intermediate, hence
+// no millisecond-quantization. This is undocumented (not covered by
+// win32metadata, so not in the `windows` crate's generated bindings) but has
+// been a stable NTDLL export since NT 3.1, and is the well-established
+// mechanism every serious NTP/PTP daemon on Windows uses to step the clock
+// with full precision -- the public Win32 surface has no precise SETTER
+// analogous to GetSystemTimePreciseAsFileTime (Microsoft never shipped one).
+// Requires SeSystemtimePrivilege, already enabled at construction (see
+// `enable_privilege` below) for the legacy SetSystemTime call this replaces.
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSetSystemTime(new_time: *const i64, old_time: *mut i64) -> i32;
+}
 
 pub struct WindowsClock {
     original_increment: u64,
@@ -326,27 +339,27 @@ impl SystemClock for WindowsClock {
             let ft = GetSystemTimeAsFileTime();
             let before_u64 = (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64);
 
-            let mut u64_time = before_u64;
             let offset_100ns = offset.as_nanos() as u64 / 100;
+            let target_100ns = super::compute_step_target_100ns(before_u64, offset, sign)?;
 
-            if sign > 0 {
-                u64_time += offset_100ns;
-            } else {
-                if u64_time > offset_100ns {
-                    u64_time -= offset_100ns;
-                } else {
-                    return Err(anyhow!("Clock step would result in negative time"));
-                }
+            // #80: NtSetSystemTime takes the target directly as a raw FILETIME
+            // (100ns-tick i64), with NO SYSTEMTIME intermediate -- unlike the
+            // legacy SetSystemTime Win32 API this replaces, which silently
+            // discarded up to ~1ms of the computed target on every step
+            // (SYSTEMTIME.wMilliseconds has no field finer than whole
+            // milliseconds). Same precision model as SetSystemTimeAdjustmentPrecise
+            // already uses for the frequency path in this same file. Requires
+            // SeSystemtimePrivilege, already enabled at construction -- no new
+            // privilege, no new attack surface versus the call it replaces.
+            let new_time_i64 = target_100ns as i64;
+            let mut previous_time_i64: i64 = 0;
+            let status = NtSetSystemTime(&new_time_i64, &mut previous_time_i64);
+            if status != 0 {
+                return Err(anyhow!(
+                    "NtSetSystemTime failed with NTSTATUS 0x{:08X}",
+                    status as u32
+                ));
             }
-
-            let ft_new = FILETIME {
-                dwLowDateTime: (u64_time & 0xFFFFFFFF) as u32,
-                dwHighDateTime: (u64_time >> 32) as u32,
-            };
-
-            let mut st = SYSTEMTIME::default();
-            FileTimeToSystemTime(&ft_new, &mut st)?;
-            SetSystemTime(&st)?;
 
             // Verify
             let ft_after = GetSystemTimeAsFileTime();
