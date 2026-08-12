@@ -336,19 +336,64 @@ const NTP_SERVER_MAX_BURST_SPREAD_US: u64 = 600; // #76: a burst this noisy inte
 // before normal agreement even gets its second sample at 38ppm, defeating confirmed stepping at
 // the LOWER end of the same range).
 //
-// The chosen fix: widen the tolerance so normal 2-sample agreement keeps governing across the
-// FULL measured range, keeping the escape valve a genuine rare last resort (its own documented
-// purpose) rather than the routine path for half the ppm range. 750us was NOT chosen arbitrarily:
-// it comfortably exceeds 660us (66ppm) with ~14% margin for thermal drift, while checked against
-// the REAL captured WAN-noise sequence this project already has on record
-// (ntp_gate_server_mode_rejects_the_real_strih_wan_noise_sequence_76's own fixture:
-// [1467,691,1668,1801,570,1622,1157], consecutive deltas [776,977,133,1231,1052,465]) it lets
-// through the SAME 2 of 6 transitions (133, 465) the EXISTING 400us tolerance already accepts as
-// a documented residual risk -- no material increase in noise-susceptibility versus today's
-// already-shipped, already-accepted baseline. Applies ONLY while genuinely locked
-// (server_agreement_tolerance_us) -- the not-locked path keeps NTP_SERVER_AGREEMENT_TOL_US
-// completely unchanged, untouched by this correction.
+// The chosen fix: widen the tolerance so normal 2-sample agreement keeps governing across MOST
+// of the measured range, keeping the escape valve a rarer path than the pre-correction 25ms
+// deadband made it, rather than the routine path for half the ppm range. 750us was NOT chosen
+// arbitrarily: it comfortably exceeds 660us (66ppm) with ~14% margin for thermal drift.
+//
+// #83 REVIEW FINDING (2nd round, critical) -- checked against the REAL captured WAN-noise
+// sequence this project already has on record (ntp_gate_server_mode_rejects_the_real_
+// strih_wan_noise_sequence_76's own fixture: [1467,691,1668,1801,570,1622,1157]) by ACTUALLY
+// RUNNING the real candidate/contradiction gate logic (not hand-derived from the raw
+// consecutive deltas, which was an earlier draft's mistake and does not match the real
+// candidate-REPLACEMENT semantics in ntp_step_gate): the existing 400us (not-locked) tolerance
+// produces 1 step on this fixture; this 750us tolerance produces 2 -- a genuine 100% increase,
+// not "no material increase" as an earlier version of this comment incorrectly claimed. Neither
+// count is dangerous on its own (both extra corrections are small, sub-2ms, per-fixture-reading
+// values -- nowhere near the frame-period concern this whole ticket is about), but the more
+// important finding this same review round surfaced is architectural, not this comment's own
+// arithmetic: widening the tolerance ALONE does not bound the worst case at ppm rates ABOVE
+// where this tolerance itself stops covering (~75ppm, the point where per-check accrual
+// 10*ppm exceeds 750us again) -- see NTP_SERVER_LOCKED_MAX_STEP_US's own doc comment for the
+// hard safety-net fix that closes that gap regardless of tolerance value or ppm.
+//
+// Applies ONLY while genuinely locked (server_agreement_tolerance_us) -- the not-locked path
+// keeps NTP_SERVER_AGREEMENT_TOL_US completely unchanged, untouched by this correction.
 const NTP_SERVER_LOCKED_AGREEMENT_TOL_US: i64 = 750;
+
+// #83 REVIEW FINDING (2nd round, critical) -- a HARD safety net, not a tuning knob. Widening
+// the agreement tolerance (above) covers the live-measured range up to its own breakeven point
+// (per-check accrual 10*ppm exceeding the tolerance again -- currently ~75ppm), but does NOT by
+// itself bound the worst case ABOVE that point: at ppm > ~75, normal 2-sample confirmation stops
+// working AGAIN (the exact #76 scenario, just at a higher rate than before), so stepping falls
+// through to the escape valve -- which guarantees a step EVENTUALLY, never that its SIZE stays
+// bounded. Verified live in review by simulation: at 76-80ppm the escape valve accrues the
+// offset to ~25-26ms before firing, UNCONFIRMED -- the SAME order of magnitude as the withdrawn
+// 25ms mistake this whole ticket exists to fix, and this project has already observed drift
+// climb 19ppm -> 38-41ppm -> 66ppm across different sessions (plausibly diurnal/thermal), so a
+// further excursion past 75ppm is not a remote hypothetical.
+//
+// Rather than trying to out-guess every possible future ppm with an ever-widening tolerance
+// (which only pushes the SAME breakeven problem to a higher, still-finite ppm, and widens
+// same-sign WAN-noise exposure further each time), this bounds the CONSEQUENCE directly: NO
+// single server-mode step, confirmed OR escape-valve-forced, may exceed this ceiling while
+// genuinely locked -- wired in at the step-application site, independent of and in ADDITION to
+// the general ntp_server_max_step_us config bound (whose 100_000us/100ms default is far too
+// loose to matter at this scale; #68's own field, unrelated purpose -- bounding a large
+// post-upgrade offset for a different regime, left completely unchanged for the not-locked
+// path). 5_000us is comfortably ABOVE the ~3040-3700us ceiling normal confirmation already
+// produces across the full measured-plus-margin range (so it never interferes with normal,
+// healthy operation), and comfortably BELOW both frame periods with real margin (~30% of
+// 16.7ms@60fps, ~15% of 33.3ms@30fps).
+//
+// A clamped step leaves a RESIDUAL on the clock -- see the step-application site's own
+// companion fix (the escape-valve counter is NOT reset on a clamped/partial step) for why this
+// converges (a rapid run of further clamped corrections until the residual clears) instead of
+// growing unboundedly (which a naive "always reset on any step" would cause: the NEXT
+// residual-plus-new-accrual would then need another full NTP_SERVER_MAX_CHECKS_WITHOUT_STEP-
+// check wait, during which MORE accrues than one clamp removes -- verified this would NOT
+// converge before choosing the companion fix).
+const NTP_SERVER_LOCKED_MAX_STEP_US: i64 = 5_000;
 
 // #76 REVIEW FINDING (critical): both NTP_SERVER_AGREEMENT_TOL_US and NTP_SERVER_MAX_BURST_SPREAD_US
 // can, by their own construction, reject a genuine same-sign trend FOREVER with no other signal --
@@ -3374,12 +3419,15 @@ mod tests {
     }
 
     /// #83 CORRECTION: the SAME real WAN-noise sequence, replayed with the WIDENED locked-mode
-    /// tolerance (750us instead of 400us) -- proves the correction did not meaningfully reopen
-    /// #76's own vulnerability. NTP_SERVER_LOCKED_AGREEMENT_TOL_US's own doc comment claims this
-    /// widened tolerance lets through the SAME 2 of 6 consecutive-delta transitions in this exact
-    /// fixture ([776,977,133,1231,1052,465] -- only 133 and 465 are <=750) that the existing
-    /// 400us tolerance already accepts as a documented residual risk -- verified here by actually
-    /// running it, not just asserted in a comment.
+    /// tolerance (750us instead of 400us). #83 REVIEW FINDING (2nd round, honest correction of
+    /// this test's own earlier doc comment): the not-locked 400us tolerance produces 1 step on
+    /// this fixture; this widened 750us tolerance produces 2 -- a genuine increase, NOT "the
+    /// same bound" an earlier draft claimed. Bounding at <=2 (not <=1) is a deliberate, honest
+    /// acceptance of that measured increase, not a hidden one: both extra corrections are small
+    /// (sub-2ms per-reading values, nowhere near the frame-period concern this ticket is about),
+    /// and the more important mitigation for a genuinely larger excursion is
+    /// NTP_SERVER_LOCKED_MAX_STEP_US's own hard per-step ceiling, not this tolerance's exact
+    /// value.
     #[test]
     fn locked_mode_agreement_tolerance_does_not_meaningfully_reopen_the_76_wan_noise_vulnerability_83(
     ) {
@@ -3397,10 +3445,11 @@ mod tests {
         assert!(
             step_count <= 2,
             "replaying strih's real v1.8.32 WAN-noise-triggered Stepped sequence through the \
-             WIDENED locked-mode tolerance must STILL produce at most 2 steps -- the same bound \
-             the existing 400us (not-locked) tolerance already accepts -- got {} steps out of {} \
-             readings, meaning the #83 tolerance widening measurably increased noise-\
-             susceptibility beyond the already-accepted baseline",
+             WIDENED locked-mode tolerance must produce AT MOST 2 steps (measured: the \
+             not-locked 400us tolerance produces 1 on this exact fixture, this 750us tolerance \
+             produces 2 -- an honestly-accepted small increase, not zero) -- got {} steps out of \
+             {} readings, meaning the widening increased noise-susceptibility beyond even that \
+             accepted, measured bound",
             step_count,
             readings.len()
         );
@@ -3707,6 +3756,107 @@ mod tests {
                 applied
             );
         }
+    }
+
+    /// #83 REVIEW FINDING (2nd round, critical): PAST NTP_SERVER_LOCKED_AGREEMENT_TOL_US's own
+    /// breakeven (~75ppm -- the point where per-check accrual, 10*ppm, exceeds the 750us
+    /// tolerance again), normal confirmation stops working the SAME way it did before this
+    /// correction at 66ppm, and stepping falls through to the #76 escape valve. Without
+    /// NTP_SERVER_LOCKED_MAX_STEP_US, the escape valve would apply the FULL accrued offset
+    /// (verified live in review: ~25-26ms at 76-80ppm) in ONE unconfirmed step -- the same
+    /// order of magnitude as the withdrawn 25ms mistake. This proves the hard per-step ceiling
+    /// closes that gap: at 80ppm (well past the breakeven), EVERY applied step -- confirmed or
+    /// escape-valve-forced, clamped or not -- must stay <=NTP_SERVER_LOCKED_MAX_STEP_US, and the
+    /// system must actually CONVERGE (a clamped step's residual gets worked off by a rapid
+    /// follow-up run, not left to accumulate forever behind another full escape-valve wait).
+    #[test]
+    fn at_80ppm_past_the_tolerance_breakeven_every_step_is_hard_capped_and_the_system_converges_83()
+    {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 100,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let err_for_clock = error_us.clone();
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            steps_for_clock.lock().expect("sim lock").push(applied);
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        const ACCRUAL_US: i64 = 80 * NTP_SERVER_CHECK_INTERVAL_SECS as i64; // 80ppm -- past the ~75ppm tolerance breakeven (issue #83, 2nd review round)
+        const INTERVALS: usize = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        let mut peak_uncorrected_us = 0_i64;
+        for _ in 0..INTERVALS {
+            *error_us.lock().expect("sim lock") += ACCRUAL_US;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+            peak_uncorrected_us = peak_uncorrected_us.max(error_us.lock().expect("sim lock").abs());
+        }
+
+        let steps = step_events.lock().expect("sim lock");
+        // The critical safety assertion: no single step, however it was triggered, may exceed
+        // the hard ceiling.
+        for &applied in steps.iter() {
+            assert!(
+                applied.unsigned_abs() <= NTP_SERVER_LOCKED_MAX_STEP_US as u64,
+                "at 80ppm (past the tolerance breakeven, escape-valve-governed) every individual \
+                 step must stay <= the hard ceiling ({}us) -- got {}us, which would be an \
+                 unconfirmed step of the SAME order of magnitude as the withdrawn 25ms mistake \
+                 this whole correction exists to prevent",
+                NTP_SERVER_LOCKED_MAX_STEP_US,
+                applied
+            );
+        }
+        // The convergence assertion: the system must actually correct, not freeze (the #76
+        // guarantee, still required at this higher rate) or grow the uncorrected residual
+        // without bound (verified this would happen with a naive clamp-without-counter-fix,
+        // before choosing the companion counter-reset behavior).
+        assert!(
+            !steps.is_empty(),
+            "at 80ppm the master must still correct (never freeze permanently, the #76 \
+             guarantee) -- got ZERO steps across {} checks over the simulated hour",
+            INTERVALS
+        );
+        // Loosely bound the peak uncorrected residual ever observed (sampled AFTER each check,
+        // so this is one interval short of the true pre-step peak, same methodology this file's
+        // other closed-loop tests use) -- comfortably above the ~24-26ms one escape-valve cycle
+        // can accrue before its first clamped correction (verified in review), but rules out
+        // genuinely unbounded growth (which would reach ACCRUAL_US * INTERVALS = 288_000us if
+        // nothing ever converged).
+        assert!(
+            peak_uncorrected_us < 60_000,
+            "peak uncorrected residual {}us must stay bounded to roughly one escape-valve \
+             cycle's worth of accrual (~24-26ms) plus margin, not grow without bound across the \
+             simulated hour (unbounded growth would reach {}us)",
+            peak_uncorrected_us,
+            ACCRUAL_US * INTERVALS as i64
+        );
     }
 
     /// The exact scenario the existing #76 tests already cover (not yet
@@ -4346,6 +4496,69 @@ mod tests {
             !c.ntp_step_gate(5_000, 1_000),
             "a same-sign but WILD magnitude jump (delta 2500us) must NOT agree in the not-locked \
              path -- unaffected by the #83 locked-mode tolerance widening"
+        );
+    }
+
+    /// #83 REVIEW FINDING (2nd round): the companion fix to NTP_SERVER_LOCKED_MAX_STEP_US --
+    /// "don't reset the escape-valve counter on a CLAMPED step" -- is gated on `locked_now`, so
+    /// it must NEVER change the not-locked path's existing behavior (any step, clamped or not,
+    /// always resets the counter). Forces a genuine clamp through the REAL `check_ntp_utc_
+    /// tracking()` path with a deliberately small `ntp_server_max_step_us` (no existing test
+    /// configures one small enough to actually clamp at the integration level), then asserts
+    /// the counter is 0 immediately after -- exactly the pre-#83 (2nd round) behavior.
+    #[test]
+    fn not_locked_path_still_resets_the_escape_valve_counter_on_a_clamped_step_83() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // Constant 5000us offset -- two consecutive agreeing samples (delta 0, well within the
+        // routine 400us tolerance) confirm a step, clamped to the deliberately small 1000us
+        // bound (no existing test configures one small enough to actually clamp at the
+        // integration level).
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(|| {
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(5_000),
+                sign: 1,
+                spread_us: 100,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            steps_for_clock
+                .lock()
+                .expect("sim lock")
+                .push(d.as_micros() as i64 * sign as i64);
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(1_000); // deliberately small -- forces a genuine clamp
+        assert!(!c.is_locked, "default state: not yet locked");
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking(); // forms candidate, no step yet
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking(); // confirms + steps, clamped to 1000us (4000us residual)
+
+        assert_eq!(
+            *step_events.lock().expect("sim lock"),
+            vec![1_000],
+            "the confirmed 5000us offset must be clamped to the configured 1000us bound"
+        );
+        assert_eq!(
+            c.ntp_server_checks_since_step, 0,
+            "not-locked path must reset the escape-valve counter on ANY step, including a \
+             clamped one with a residual -- unlike the locked path's new companion behavior, \
+             this must stay completely unchanged"
         );
     }
 
