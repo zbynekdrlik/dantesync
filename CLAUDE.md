@@ -158,6 +158,40 @@ each `gh issue comment` call only ever classifies its own invocation's LATEST fr
 that issue, so post design/validated/reviewed comments as SEPARATE Bash calls too, never batched
 together in one command with `&&`.
 
+**The SAME family of gotcha hits `git commit` itself too (issue 80's cycle), with a different,
+narrower fix.** `hooks/block-commit-without-design.sh`'s own `resolve_work_cwd()` DOES honor an
+inline `cd <path> &&`/`cd <path>;` — but ONLY when it is the LITERAL FIRST statement of the SAME
+Bash tool call the `git commit` itself runs in. A shape like:
+
+```bash
+cd /home/newlevel/devel/dantesync && git add file1 file2
+git commit -m "$(cat <<'EOF'
+...
+EOF
+)"
+```
+
+— i.e. `cd && git add` on one line, then a NEWLINE, then `git commit` on the next line — still
+executes correctly (both commands genuinely run against the right repo; shell `cd` state persists
+across newline-separated statements within one Bash call) but gets BLOCKED anyway: the hook's own
+repo resolution apparently does not associate a `cd` that preceded an EARLIER, different statement
+with a `git commit` appearing later in the same multi-line call. The fix is to chain the `cd`
+directly through to the `git commit` invocation itself via literal `&&`, all on one shell line (a
+heredoc's OWN body lines are part of the SAME statement, not new top-level ones, so they don't
+break this):
+
+```bash
+cd /home/newlevel/devel/dantesync && git add file1 file2 && git commit -m "$(cat <<'EOF'
+...
+EOF
+)"
+```
+
+If a commit is blocked and reports the WRONG repo name in its own error message (e.g. "no design
+comment posted yet for #N (repo camera-box)" while working in dantesync), check `pwd` first — a
+worker's session `cwd` can be a sibling repo's checkout even mid-session, and this shape is the
+fix, not `-R` (which `git commit` has no equivalent flag for at all).
+
 ## Hardware Constraints (CRITICAL)
 
 **This project implements SOFTWARE-ONLY PTP frequency synchronization:**

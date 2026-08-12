@@ -435,3 +435,56 @@ canary evidence before continuing.
   `/status`'s `ntp_offset_us` publishes the POST-correction residual and reads ~0 between steps —
   it is BLIND to a stepping-frequency regression like this one. The log's own `Stepped` lines (or
   the new escape-valve `warn!` line, if it ever fires) are the honest signal to grep for.
+
+## #80 — step_clock() loses up to ~1ms per correction on Windows (SetSystemTime is ms-quantized)
+
+- Version bump: `015437e` (1.8.35 -> 1.8.36)
+- Fix: `03982b8` — replaced `FileTimeToSystemTime`+`SetSystemTime` with the native
+  `NtSetSystemTime` (ntdll.dll), which takes the target directly as a raw FILETIME (100ns-tick
+  i64/`LARGE_INTEGER`), no `SYSTEMTIME` intermediate. Extracted the precise-target arithmetic
+  (`compute_step_target_100ns`) into `clock/mod.rs` (NOT `#[cfg(windows)]`-gated, unlike
+  `windows.rs` itself), so it gets real Linux-CI test execution — 5 new tests.
+- Review-response: `dd44116` — 0 critical, 0 should-fix, 5 minor from an independent review that
+  pulled the live CI run for the reviewed commit and confirmed the REAL MSVC build had already
+  linked against the real symbol (stronger evidence than the commit's own cross-compile claim).
+  All 5 fixed same branch: `NT_SUCCESS`-style `status < 0` check (was `!= 0`); dropped the now-dead
+  `Win32_System_Time` Cargo feature; documented why the ntdll link is deliberately STATIC (unlike
+  `net_pcap.rs`'s own dynamic-probe pattern for the genuinely-optional Npcap runtime — `ntdll.dll`
+  is core, unconditionally-loaded OS infrastructure, not optional third-party software); documented
+  the positive-branch overflow safety (~400 years of `u64` headroom at real FILETIME values); added
+  the missing `offset == Duration::ZERO` defensive test.
+- **This is the ACTUAL root cause behind the drag issue-71/issue-76's own fixes kept chasing.**
+  Dispatched as a live investigation after the issue-76 canary (v1.8.35) showed better step
+  CADENCE but the master was still stepping forward every ~10-40s. Investigated directly on strih
+  via `mcp__win-strih__*` MCP tools (Shell, FileRead, FileList — never ssh, per the standing
+  Windows-box constraint) rather than guessing:
+  - Read `GetSystemTimeAdjustment` live: -6.4ppm, matching `[PTP] Adj` almost exactly — the
+    FREQUENCY path was never the problem (ruled out the "SetSystemTimeAdjustment scaling bug"
+    hypothesis outright).
+  - Confirmed `w32time` Stopped/Disabled (no competing consumer) and the Grandmaster UUID
+    identical across every restart today AND yesterday (ruled out a grandmaster change as the
+    explanation for 19ppm -> 66ppm).
+  - Read the dantesync log directly and found the smoking gun already sitting there, unexploited:
+    the EXISTING `[StepClock] Actual step: X (expected: Y)` diagnostic line was showing a large,
+    essentially random shortfall on nearly every step (27.6%-116.7% delivered across 30 live
+    samples) — a signature immediately recognizable as sub-millisecond truncation once
+    `SYSTEMTIME.wMilliseconds`'s own field width (a `u16`, ms-only) was checked against it.
+  - **Reconciled the 19ppm-vs-66ppm mystery the dispatch explicitly asked for**: NOT a
+    time-varying/thermal change in the true rate. issue-71's 19ppm came from a single ~21ms
+    boot-time correction (`run_ntp_sync()`, same `step_clock()` trait method, but at that scale
+    the SAME ~1ms truncation loss is only a ~5% relative error, buried in noise). issue-71/76 both
+    correctly shrank ROUTINE corrections to 0.8-2.5ms to fix the correction-lag problem — at THAT
+    scale, the identical ~1ms absolute loss becomes a 27%-100% relative error, dominating every
+    step. The master perpetually under-corrected; the residual compounded with genuine ongoing
+    drift; the apparent required correction rate ballooned to ~65-70ppm even though the true
+    oscillator error is likely close to the original ~19ppm.
+  - **Lesson for future clock-daemon investigations: the existing diagnostic logging (added for a
+    completely different purpose, likely just "does the step apply") had ALREADY been recording
+    the exact evidence needed for a totally different, much deeper bug — grep the log for every
+    existing per-step diagnostic line before reaching for new instrumentation.**
+- No fleet deploy from this worker. Released `v1.8.36` with the full asset set — both Linux AND
+  Windows binary sha256 verified locally this cycle (Windows specifically, since this fix is
+  Windows-only code). Flagging for the supervisor's canary: re-check the SAME
+  `[StepClock] Actual step: X (expected: Y)` diagnostic on strih post-deploy, expecting `X == Y`
+  (or within a few 100ns-tick rounding units) instead of the 27.6%-116.7% scatter this cycle's own
+  evidence recorded — that is the fix's own most direct, convincing self-test.

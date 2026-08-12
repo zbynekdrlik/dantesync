@@ -220,3 +220,21 @@ a genuine failure (not a compile error), commit, `git apply` the GREEN-only patc
 EXACTLY (catches an accidental hunk misclassification immediately, before it ships as a broken
 commit boundary). `git apply --check <patch>` first always, on both patches, before touching the
 working tree.
+
+## When a live-hardware mystery doesn't add up, grep the EXISTING logs before adding new instrumentation
+
+Issue 80's own investigation (strih's steady-state "drag" -- corrections that looked right in
+cadence but never converged) found its root cause not by adding new diagnostics, but by grepping
+what was ALREADY being logged for a completely different original purpose:
+`WindowsClock::step_clock()` has always logged `[StepClock] Actual step: X (expected: Y)` (a
+before/after `GetSystemTimeAsFileTime()` sanity check, presumably added to confirm the step syscall
+did SOMETHING) -- nobody had ever checked whether `X` and `Y` actually MATCH. They didn't, by a
+large and inconsistent margin, and that exact shortfall pattern (27.6%-116.7% delivered, no fixed
+ratio) was the whole proof of a millisecond-quantization bug once checked against `SYSTEMTIME`'s
+own field width. **Before reaching for new instrumentation on a live clock-daemon mystery, grep the
+target's OWN log for every existing per-operation diagnostic line first** -- a value that's been
+sitting there the whole time, logged for an unrelated reason, is often the fastest and most
+convincing evidence available, because it was captured under REAL production conditions rather
+than a synthetic repro. This generalizes past clock work too: `spread_us` (issue 53's own quality
+signal) sat unconsulted by the step-decision logic for two full cycles (issues 71 and 76) before
+issue 76 finally used it -- the same "an existing signal was already telling you something" shape.
