@@ -203,3 +203,20 @@ any new constants it references), swap it into place over the working tree tempo
 --lib <test_name>` (see `## Local Build Policy` for the `# airuleset:build-ok` one-off bypass this
 needs), read the ACTUAL panic message's number, then restore the real working-tree file. Faster and
 safer than a temporary git worktree for a single-file, single-function check.
+
+**The same splicing idea, generalized to produce a genuine RED commit after the tests AND the fix
+were already both written in one sitting** (issue 76's second RED/GREEN pair, for the review's own
+critical finding, was built this way): `git diff <base>` the whole working change, split the unified
+diff into hunks with a small Python script (`re.finditer(r'^@@', ...)`  over the patch text), sort
+each hunk into "test-only" vs. "production" (a hunk entirely inside `mod tests { ... }` is
+test-only; watch for hunks that mix inert NEW vocabulary — a constant, a struct field, its
+zero-init — with test-only hunks when the tests need that vocabulary to even COMPILE but the
+BEHAVIORAL wiring lives in a separate hunk, e.g. issue 76's `NTP_SERVER_MAX_CHECKS_WITHOUT_STEP`
+constant + field had to ship in the RED commit so the test would compile, while the actual
+if-condition using them stayed in GREEN), write the two hunk subsets to separate `.patch` files,
+`git checkout -- <file>` back to the base, `git apply` the RED-only patch, run the tests to confirm
+a genuine failure (not a compile error), commit, `git apply` the GREEN-only patch on top, and
+`diff -q` the result against the originally-saved full working-tree copy to confirm it reconstructs
+EXACTLY (catches an accidental hunk misclassification immediately, before it ships as a broken
+commit boundary). `git apply --check <patch>` first always, on both patches, before touching the
+working tree.
