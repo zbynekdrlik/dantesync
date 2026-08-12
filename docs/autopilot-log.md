@@ -374,3 +374,64 @@ canary evidence before continuing.
   quality (not just the DanteSync gate's spread check) holds under the new ~10s server-mode
   stepping cadence before rolling the rest of the fleet, since that trade-off was argued from
   first principles, not measured live.
+
+## #76 — v1.8.32 live-canary regression: fast lane chased real WAN measurement noise
+
+- Version bump: `ef981c5` (1.8.32 -> 1.8.33)
+- RED: `7067ff8` — `ntp_gate_server_mode_rejects_the_real_strih_wan_noise_sequence_76` (replays
+  strih's own logged Stepped sequence, 7/7 stepped under the fast lane) and
+  `the_master_stays_sparse_under_real_wan_measurement_noise_76` (closed-loop noisy-upstream sim,
+  330/360 checks stepped)
+- GREEN: `3a5d2f9` — removed `NTP_SERVER_FAST_LANE_US` and its single-sample branch entirely;
+  server mode now ALWAYS requires 2 same-sign agreeing samples. Replaced the tolerance with a
+  FIXED (non-scaling) `NTP_SERVER_AGREEMENT_TOL_US=400`, sized to the true ~190-380us/check
+  accrual rather than to a candidate's own possibly-noisy magnitude. Added
+  `NTP_SERVER_MAX_BURST_SPREAD_US=600`: a burst whose own `spread_us` exceeds this is excluded
+  entirely from the step decision (neither starts, confirms, nor contradicts a candidate) —
+  600, not the ~500 initially proposed, so it doesn't also exclude strih's own genuine 588us-spread
+  large-error-recovery fixture from the issue-68 cycle.
+- **Root cause: issue 71's own fix (v1.8.31/v1.8.32) was verified ONLY against a noiseless simulation
+  of a clean 19ppm ramp.** strih's real upstream is WAN (Cloudflare, `pcap_active:false` — the
+  less-precise userspace rsntp fallback issue 53 built the kernel-timestamped transport to avoid), where
+  consecutive burst offsets scatter +0.5..+2.5ms — comparable to or larger than the true drift
+  signal. The fast lane's "small + same-sign = trustworthy" assumption, true for a clean ramp, is
+  false there — "small" is just as easily one noisy WAN reading. This is the SAME general lesson
+  as issue 71's own root cause (a mechanism tuned for one signal shape can be actively wrong for a
+  different one) applied one layer deeper: even #71's OWN fix hadn't fully characterized the real
+  signal (drift PLUS substantial upstream-dependent noise, not a clean ramp).
+- **Independent fresh-context review this time ran ACTUAL simulations, not just read the diff** —
+  copied the source to a scratch dir, instrumented with `eprintln!`, ran parametrized closed-loop
+  sims to verify claims rather than trust them. Found a genuine 🔴: both the fixed tolerance and
+  the burst-quality gate can, by construction, reject a genuine same-sign trend FOREVER once true
+  accrual exceeds the tolerance (~40ppm+, vs. 6-19ppm ever measured) or the upstream never presents
+  a low-enough-spread burst — reproduced live via simulation (57ppm: 205ms of uncorrected error,
+  zero steps, after one simulated hour). A strictly WORSE failure class than either the pre-#71
+  self-scaling tolerance (always eventually converges) or the buggy fast lane (would have
+  fast-laned 570us just fine).
+- **Second RED/GREEN pair for the review's own 🔴 finding** (RED `db10802` / GREEN `e5edbd0`): a
+  shared escape valve. `ntp_server_checks_since_step` counts consecutive successful checks with no
+  actual step; at 30 (5 minutes at the 10s cadence — chosen far longer than the ~20-120s the
+  tolerance path steps at under real noisy conditions, per the review's own measured ~1 step/12
+  checks), the next over-threshold reading forces a step regardless of tolerance agreement or
+  burst quality. New tests reproduce the 57ppm freeze (RED: zero steps in a simulated hour) and
+  confirm the escape valve fires and bounds the error (GREEN).
+- 3 more 🟡/🔵 findings addressed on the ticket comment rather than all requiring code: tightened
+  the noisy-sim test's bound (`INTERVALS/2` → `INTERVALS/6`, matching the review's own measured
+  ~30 steps/hour, not a 6x-looser guess); corrected `.claude/rules/clock-discipline-and-testing.md`
+  (`7fd38ea`), which still taught the now-disproven same-sign-only+fast-lane shape verbatim — a
+  future session reading it stale could have reintroduced the exact bug; documented (not fixed) a
+  small residual coincidental-noise-agreement risk (~11x reduced exposure, self-correcting per the
+  review's own simulation, would need `ntp_step_gate`'s return type to grow from `bool` to
+  `(bool, i64)` across ~30 call sites to fully close — judged not worth that risk immediately
+  before a critical release) and the related step-magnitude-uses-raw-latest-sample 🔵.
+- PR: 77 (dev->master), merged `0a994ff`. Auto-release worked cleanly on BOTH pushes this cycle
+  (no TLS-transient repeat of #71's own Auto-Release gotcha) — verified the actual new
+  `release.yml` run each time regardless, per that cycle's own established discipline. Released
+  `v1.8.33` with the full asset set, Linux sha256 verified locally.
+- Design-gate `-R zbynekdrlik/dantesync` discipline held clean the whole cycle — no repeat of the
+  #71 cycle's silently-unclassified-comment issue.
+- **No fleet deploy from this worker, by dispatch.** v1.8.33 is released and awaiting the
+  supervisor's canary rollout on strih. Canary methodology note carried onto the ticket itself:
+  `/status`'s `ntp_offset_us` publishes the POST-correction residual and reads ~0 between steps —
+  it is BLIND to a stepping-frequency regression like this one. The log's own `Stepped` lines (or
+  the new escape-valve `warn!` line, if it ever fires) are the honest signal to grep for.
