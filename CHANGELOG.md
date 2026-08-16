@@ -5,6 +5,29 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.43] - 2026-08-16
+
+### Fixed
+
+- **A multi-homed box now attaches its PTP capture to the grandmaster's NIC (camera-box issue
+  1073, second half).** The Windows PTP receive path inherited the OS default interface
+  (`net::get_default_interface` → first non-wireless bindable NIC) for BOTH the pcap capture and the
+  IGMP `224.0.1.129` join. On the dual-homed stream box (rig `Ethernet` `10.77.9.204` + mbc
+  `Ethernet 2` `10.77.7.204`) that was the mbc NIC, so the box never joined the group on the rig NIC
+  and never captured the rig grandmaster `10.77.9.184` — it only saw the foreign `10.77.7.x` PTP
+  (correctly dropped by the 1.8.42 `gm_allowlist`, leaving the box in NTP fallback with no
+  grandmaster at all). DanteSync now picks the capture/join interface whose subnet is on a trusted
+  `gm_allowlist` prefix (`GmAllowlist::select_interface`), so both attach to the rig NIC and the box
+  receives `10.77.9.184`. This mirrors the dual-homed interface selection already proven for the NTP
+  transport in 1.8.x (`find_device_for_ntp_server`).
+
+  **Backward compatible — no config change for anyone already working.** An empty/unrestricted
+  `gm_allowlist` (the default), a `/0`-only allowlist, or a box with no interface on a trusted
+  subnet keeps the historical default-interface behavior byte-for-byte, so single-homed boxes are
+  unaffected. Only a **multi-homed** box **with** a restricting `gm_allowlist` whose default
+  interface is not on the grandmaster's subnet changes behavior — its PTP capture/join moves to the
+  grandmaster-subnet NIC. The Linux socket receive path is unchanged.
+
 ## [1.8.42] - 2026-08-16
 
 ### Fixed

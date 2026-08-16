@@ -54,6 +54,19 @@ impl Ipv4Prefix {
         (u32::from(ip) & Self::mask(self.prefix_len)) == self.base
     }
 
+    /// The most-significant `min(self.prefix_len, other.prefix_len)` bits of both
+    /// prefixes agree — i.e. the two networks OVERLAP (one contains the other, or
+    /// they are equal). Used to decide whether a local interface's subnet is on
+    /// the same network as a trusted grandmaster prefix; the symmetric "shorter
+    /// mask" test works for BOTH an exact-GM allowlist entry (`10.77.9.184/32`
+    /// overlaps the rig `/24` interface) and a CIDR entry (`10.77.9.0/24` overlaps
+    /// the rig interface whose own IP is inside it).
+    fn overlaps(&self, other: &Ipv4Prefix) -> bool {
+        let shorter = self.prefix_len.min(other.prefix_len);
+        let m = Self::mask(shorter);
+        (self.base & m) == (other.base & m)
+    }
+
     /// Parse `"a.b.c.d"` (exact, treated as `/32`) or `"a.b.c.d/N"` (CIDR).
     /// Surrounding whitespace is ignored. Returns a human-readable error for an
     /// invalid address or prefix length so the caller can surface it.
@@ -138,6 +151,58 @@ impl GmAllowlist {
     /// Entries that failed to parse, so the caller can warn loudly at startup.
     pub fn invalid_entries(&self) -> &[String] {
         &self.invalid
+    }
+
+    /// camera-box issue 1073 (interface-selection half): pick which local
+    /// interface a multi-homed box should attach its PTP capture / IGMP join to,
+    /// by which one is on the SAME network as a trusted grandmaster prefix.
+    ///
+    /// `candidates` are `(interface_ip, interface_netmask)` pairs in the caller's
+    /// enumeration order; the returned index is into that slice. Returns `None`
+    /// when the allowlist gives no discriminating signal (unrestricted, or only
+    /// `/0` entries) or no candidate is on a trusted subnet — the caller then
+    /// keeps its existing default-interface behavior, so single-homed and
+    /// no-allowlist boxes are byte-identical to before.
+    pub fn select_interface(&self, candidates: &[(Ipv4Addr, Option<Ipv4Addr>)]) -> Option<usize> {
+        // best: (index, matched trusted-prefix len, interface prefix len)
+        let mut best: Option<(usize, u8, u8)> = None;
+        for (i, (ip, netmask)) in candidates.iter().enumerate() {
+            // A candidate without a netmask, or the degenerate `0.0.0.0` netmask
+            // (junk/APIPA/misconfigured adapter — enumeration can genuinely
+            // report this), carries no real subnet and is skipped, mirroring the
+            // #53 `select_ntp_pcap_device` guard.
+            let netmask = match netmask {
+                Some(m) if *m != Ipv4Addr::UNSPECIFIED => *m,
+                _ => continue,
+            };
+            let iface = Ipv4Prefix {
+                base: u32::from(*ip) & u32::from(netmask),
+                prefix_len: u32::from(netmask).count_ones() as u8,
+            };
+            // The most specific TRUSTED prefix this interface is on. A `/0` entry
+            // ("trust everything") gives no discriminating signal for interface
+            // selection, so it is ignored here (unlike source filtering, where a
+            // `/0` is a real, if permissive, restriction).
+            let matched: Option<u8> = self
+                .prefixes
+                .iter()
+                .filter(|p| p.prefix_len > 0 && p.overlaps(&iface))
+                .map(|p| p.prefix_len)
+                .max();
+            if let Some(gm_len) = matched {
+                // More specific trusted prefix wins; tie → longer interface
+                // prefix; tie → keep the earlier (first-listed) candidate, so the
+                // choice is deterministic across restarts.
+                let take = match best {
+                    None => true,
+                    Some((_, b_gm, b_if)) => (gm_len, iface.prefix_len) > (b_gm, b_if),
+                };
+                if take {
+                    best = Some((i, gm_len, iface.prefix_len));
+                }
+            }
+        }
+        best.map(|(i, _, _)| i)
     }
 }
 
@@ -287,5 +352,123 @@ mod tests {
         ]);
         assert_eq!(a.prefix_count(), 2, "only the two valid entries are active");
         assert_eq!(a.invalid_entries().len(), 1);
+    }
+
+    fn nm(s: &str) -> Option<Ipv4Addr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn dual_homed_box_selects_the_rig_interface_over_mbc_camerabox_issue_1073() {
+        // The live incident: the stream box is dual-homed — rig NIC 10.77.9.204/24
+        // and mbc NIC 10.77.7.204/24 — and the PTP capture/IGMP join inherited the
+        // mbc NIC, so the box only ever saw the foreign 10.77.7.x grandmaster.
+        // With the rig subnet allowlisted, the capture interface MUST be the rig
+        // NIC (index 0 here).
+        let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig NIC
+            (ip("10.77.7.204"), nm("255.255.255.0")), // mbc NIC
+        ];
+        assert_eq!(
+            allow.select_interface(&candidates),
+            Some(0),
+            "the rig-subnet interface must be chosen on a dual-homed box"
+        );
+    }
+
+    #[test]
+    fn select_interface_is_order_independent_picks_rig_at_index_1() {
+        // Same as above but the mbc NIC is enumerated FIRST — the pick must still
+        // be the rig NIC, proving it is subnet-based, not "return the first".
+        let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let candidates = [
+            (ip("10.77.7.204"), nm("255.255.255.0")), // mbc NIC
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig NIC
+        ];
+        assert_eq!(allow.select_interface(&candidates), Some(1));
+    }
+
+    #[test]
+    fn exact_ip_allowlist_selects_the_interface_on_the_gm_subnet() {
+        // An exact-GM allowlist entry (10.77.9.184/32) must still select the rig
+        // interface (10.77.9.204/24), whose /24 subnet CONTAINS the GM — the
+        // symmetric-overlap test, not "interface IP inside the /32".
+        let allow = GmAllowlist::parse(&["10.77.9.184".to_string()]);
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig NIC
+            (ip("10.77.7.204"), nm("255.255.255.0")), // mbc NIC
+        ];
+        assert_eq!(allow.select_interface(&candidates), Some(0));
+    }
+
+    #[test]
+    fn no_interface_on_a_trusted_subnet_returns_none_falls_back_to_default() {
+        // If NO candidate is on a trusted subnet, return None so the caller keeps
+        // its existing default-interface behavior (never a wrong forced pick).
+        let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let candidates = [
+            (ip("10.77.7.204"), nm("255.255.255.0")),
+            (ip("10.77.8.204"), nm("255.255.255.0")),
+        ];
+        assert_eq!(allow.select_interface(&candidates), None);
+    }
+
+    #[test]
+    fn empty_allowlist_returns_none_backward_compatible() {
+        // Unrestricted allowlist → no signal → None → default-interface behavior
+        // (single-homed and no-allowlist boxes stay byte-identical to before).
+        let allow = GmAllowlist::parse(&[]);
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")),
+            (ip("10.77.7.204"), nm("255.255.255.0")),
+        ];
+        assert_eq!(allow.select_interface(&candidates), None);
+    }
+
+    #[test]
+    fn slash_zero_allowlist_gives_no_interface_signal_returns_none() {
+        // A /0 ("trust everything") is a real restriction for SOURCE filtering
+        // but useless for interface selection — it must not force a pick.
+        let allow = GmAllowlist::parse(&["0.0.0.0/0".to_string()]);
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")),
+            (ip("10.77.7.204"), nm("255.255.255.0")),
+        ];
+        assert_eq!(allow.select_interface(&candidates), None);
+    }
+
+    #[test]
+    fn zero_netmask_candidate_is_skipped_even_when_only_candidate() {
+        // A 0.0.0.0 netmask (junk/APIPA adapter) would vacuously "overlap" any
+        // prefix — it must be excluded, not selected (the #53 guard).
+        let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let candidates = [(ip("10.77.9.204"), nm("0.0.0.0"))];
+        assert_eq!(allow.select_interface(&candidates), None);
+        // A candidate with no netmask at all is likewise skipped.
+        let candidates_no_mask = [(ip("10.77.9.204"), None)];
+        assert_eq!(allow.select_interface(&candidates_no_mask), None);
+    }
+
+    #[test]
+    fn most_specific_trusted_prefix_wins_across_interfaces() {
+        // Two trusted prefixes overlap two different interfaces; the interface on
+        // the MORE SPECIFIC trusted prefix (the /24) wins over the one that only
+        // matches the broad /16.
+        let allow = GmAllowlist::parse(&["10.77.0.0/16".to_string(), "10.77.9.0/24".to_string()]);
+        let candidates = [
+            (ip("10.77.8.5"), nm("255.255.255.0")),   // matches /16 only
+            (ip("10.77.9.204"), nm("255.255.255.0")), // matches /24 AND /16
+        ];
+        assert_eq!(allow.select_interface(&candidates), Some(1));
+    }
+
+    #[test]
+    fn single_homed_box_with_matching_allowlist_selects_its_only_interface() {
+        // Single-homed box whose one NIC is on the trusted subnet — selected
+        // (the same NIC the default path would pick anyway; byte-identical net).
+        let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let candidates = [(ip("10.77.9.202"), nm("255.255.255.0"))];
+        assert_eq!(allow.select_interface(&candidates), Some(0));
     }
 }

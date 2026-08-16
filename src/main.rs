@@ -707,11 +707,19 @@ fn run_sync_loop(
     #[cfg(windows)]
     let network = {
         // Use Npcap with HostHighPrec timestamps (KeQuerySystemTimePrecise)
-        // This provides driver-level timestamps that are both precise AND synced with system time
-        match net_pcap::NpcapPtpNetwork::new(&iface_name) {
+        // This provides driver-level timestamps that are both precise AND synced with system time.
+        //
+        // camera-box issue 1073: on a multi-homed box the OS default interface
+        // (iface_name/iface_ip above) may be the WRONG NIC (e.g. the mbc side on
+        // the stream box), so hand NpcapPtpNetwork the trusted-source allowlist —
+        // it picks the capture/IGMP-join interface on the grandmaster's subnet
+        // when the allowlist can disambiguate, and otherwise falls back to the
+        // default interface (single-homed / no-allowlist boxes are unchanged).
+        let gm_allowlist = dantesync::gm_filter::GmAllowlist::parse(&system_config.gm_allowlist);
+        match net_pcap::NpcapPtpNetwork::new(&iface_name, &gm_allowlist) {
             Ok(npcap_net) => {
                 info!(
-                    "Using Npcap HostHighPrec timestamps on {} ({})",
+                    "Using Npcap HostHighPrec timestamps (default-interface hint {} / {})",
                     iface_name, iface_ip
                 );
                 npcap_net
