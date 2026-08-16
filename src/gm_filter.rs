@@ -61,8 +61,14 @@ impl Ipv4Prefix {
         let s = s.trim();
         let (addr_str, len) = match s.split_once('/') {
             Some((a, l)) => {
+                // Digit-only: `u8::from_str` otherwise accepts a leading `+`
+                // (`"/+24"` → 24) and an empty string is a parse error we want a
+                // clear message for.
+                let l = l.trim();
+                if l.is_empty() || !l.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!("invalid prefix length in '{s}'"));
+                }
                 let n: u8 = l
-                    .trim()
                     .parse()
                     .map_err(|_| format!("invalid prefix length in '{s}'"))?;
                 if n > 32 {
@@ -115,6 +121,12 @@ impl GmAllowlist {
     /// source is accepted, the historical last-writer-wins behavior.
     pub fn is_unrestricted(&self) -> bool {
         self.prefixes.is_empty()
+    }
+
+    /// Number of ACTIVE (successfully parsed) prefixes — for a startup log that
+    /// reports the effective policy rather than the raw (possibly-typo'd) config.
+    pub fn prefix_count(&self) -> usize {
+        self.prefixes.len()
     }
 
     /// True if `ip` is permitted as a grandmaster source. An unrestricted
@@ -247,5 +259,33 @@ mod tests {
         let a = GmAllowlist::parse(&["10.77.9.0/33".to_string()]);
         assert_eq!(a.invalid_entries().len(), 1);
         assert!(a.is_unrestricted());
+    }
+
+    #[test]
+    fn non_digit_or_empty_prefix_length_is_rejected() {
+        // `u8::from_str` accepts a leading '+' ("/+24" would silently become /24);
+        // an empty prefix ("10.0.0.0/") is a parse error we reject with a clear
+        // message. Both must land in invalid_entries, not be silently applied.
+        // (Surrounding whitespace like "/ 24" IS tolerated — it trims to "24".)
+        for bad in ["10.77.9.0/+24", "10.77.9.0/", "10.77.9.0/2x"] {
+            let a = GmAllowlist::parse(&[bad.to_string()]);
+            assert_eq!(
+                a.invalid_entries(),
+                &[bad.to_string()],
+                "'{bad}' must be rejected as an invalid prefix"
+            );
+            assert!(a.is_unrestricted());
+        }
+    }
+
+    #[test]
+    fn prefix_count_reports_only_active_parsed_prefixes() {
+        let a = GmAllowlist::parse(&[
+            "10.77.9.0/24".to_string(),
+            "garbage".to_string(),
+            "10.77.10.5".to_string(),
+        ]);
+        assert_eq!(a.prefix_count(), 2, "only the two valid entries are active");
+        assert_eq!(a.invalid_entries().len(), 1);
     }
 }

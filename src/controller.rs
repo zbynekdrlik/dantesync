@@ -511,6 +511,15 @@ where
     /// as-if it never arrived, so a foreign-subnet grandmaster cannot be adopted.
     /// Empty = unrestricted (historical last-writer-wins). See `crate::gm_filter`.
     gm_allowlist: GmAllowlist,
+    /// camera-box issue 1073 — observability for the source filter. Counts PTP
+    /// packets dropped by the allowlist since the last ALLOWED grandmaster packet
+    /// (reset to 0 on any accepted packet), so `check_ptp_status` can tell
+    /// "grandmaster genuinely absent" apart from "grandmaster present but blocked
+    /// by a mis-set allowlist" — the near-zero-diagnosability failure mode of a
+    /// valid-but-wrong allowlist on the fleet's sole clock authority.
+    gm_dropped_since_accepted: u64,
+    /// Rate-limiter (one loud warning per 30 s) for the dropped-packet warning.
+    last_gm_drop_warn: Option<Instant>,
 
     // Sample filtering
     sample_window: Vec<i64>,
@@ -690,9 +699,12 @@ where
         if gm_allowlist.is_unrestricted() {
             info!("GM source policy: UNRESTRICTED (accept any grandmaster source IP)");
         } else {
+            // Report the EFFECTIVE (successfully-parsed) policy, not the raw config
+            // — an unparseable entry was already warned about above and must not be
+            // presented here as if it were active.
             info!(
-                "GM source policy: RESTRICTED to allowlist {:?} — foreign-source PTP is dropped",
-                config.gm_allowlist
+                "GM source policy: RESTRICTED to {} active prefix(es) — foreign-source PTP is dropped",
+                gm_allowlist.prefix_count()
             );
         }
 
@@ -729,6 +741,8 @@ where
             current_sync_source: None,
             current_sync_source_ip: None,
             gm_allowlist,
+            gm_dropped_since_accepted: 0,
+            last_gm_drop_warn: None,
             sample_window: Vec::with_capacity(window_size),
             last_phase_offset_ns: 0,
             last_adj_ppm: 0.0,
@@ -959,10 +973,23 @@ where
             if !self.ptp_offline {
                 self.ptp_offline = true;
                 if !self.ptp_offline_logged {
-                    warn!(
-                        "[PTP] No packets received for {}s - PTP masters may be offline",
-                        PTP_TIMEOUT_SECS
-                    );
+                    // camera-box issue 1073: if packets ARE arriving but are being
+                    // dropped by the allowlist, the grandmaster is not offline —
+                    // it is present and blocked by (a likely mis-set) config. Say
+                    // so, instead of the misleading "masters may be offline".
+                    if self.gm_dropped_since_accepted > 0 {
+                        warn!(
+                            "[PTP] No ALLOWED packets for {}s, but {} packet(s) from \
+                             non-allowlisted source(s) were dropped — the grandmaster may be \
+                             present but blocked by config.gm_allowlist; verify the allowlist",
+                            PTP_TIMEOUT_SECS, self.gm_dropped_since_accepted
+                        );
+                    } else {
+                        warn!(
+                            "[PTP] No packets received for {}s - PTP masters may be offline",
+                            PTP_TIMEOUT_SECS
+                        );
+                    }
                     info!("[PTP] Continuing with NTP-only time sync");
                     self.ptp_offline_logged = true;
                 }
@@ -1576,13 +1603,43 @@ where
         // (historical last-writer-wins), so this is a no-op unless configured.
         if let Some(ip) = source_ip {
             if !self.gm_allowlist.allows(ip) {
-                debug!("Dropping PTP packet from non-allowlisted grandmaster source {ip}");
+                self.gm_dropped_since_accepted = self.gm_dropped_since_accepted.saturating_add(1);
+                // A foreign-source drop while NO allowed grandmaster is being seen
+                // is the signature of BOTH the bug this fixes AND a mis-set
+                // allowlist (a valid-but-wrong subnet drops the LEGITIMATE GM,
+                // silently degrading the clock to NTP-only). Warn loudly but
+                // rate-limited (once / 30 s) so it is diagnosable in the journal
+                // without spamming at Sync rate; ordinary drops stay at debug.
+                let now = Instant::now();
+                if self
+                    .last_gm_drop_warn
+                    .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(30))
+                {
+                    warn!(
+                        "gm_allowlist: dropped {} PTP packet(s) from non-allowlisted source(s) \
+                         (latest {ip}) since the last allowed grandmaster — if NO allowed GM \
+                         appears, check config.gm_allowlist",
+                        self.gm_dropped_since_accepted
+                    );
+                    self.last_gm_drop_warn = Some(now);
+                } else {
+                    debug!("Dropping PTP packet from non-allowlisted grandmaster source {ip}");
+                }
+                // Keep NTP discipline alive even under a foreign PTP flood — mirror
+                // the no-packet branch, so a dropped packet never starves the only
+                // clock left when PTP is offline.
+                if self.ptp_offline {
+                    self.check_ntp_utc_tracking();
+                }
                 return Ok(());
             }
         }
 
         // Packet received - update last_ptp_packet timestamp and source IP
         self.last_ptp_packet = Instant::now();
+        // An allowed packet arrived: clear the drop-since-accepted counter so the
+        // offline log and any future warning reflect only the CURRENT gap.
+        self.gm_dropped_since_accepted = 0;
         if source_ip.is_some() {
             self.current_sync_source_ip = source_ip;
         }
@@ -2719,6 +2776,117 @@ mod tests {
             Some(any_ip),
             "with an empty allowlist, any source is accepted (backward compatible)"
         );
+    }
+
+    /// GREEN companion (camera-box issue 1073): a packet whose transport cannot
+    /// report a source IP (`source_ip == None`) is ACCEPTED even under a
+    /// restricting allowlist — the filter can only restrict what it can see, and
+    /// failing closed here would take an edge-case transport offline. Pins the
+    /// comment-only contract so a future refactor can't silently flip it.
+    #[test]
+    fn none_source_ip_is_accepted_even_when_allowlist_restricts_camerabox_issue_1073() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let sync_pkt = make_sync_pkt(uuid, 0);
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000_000_000);
+
+        let mut mock_net = MockPtpNetwork::new();
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, None))));
+        mock_net.expect_recv_packet().returning(|| Ok(None));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.gm_allowlist = vec!["10.77.9.0/24".to_string()]; // restricting
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            mock_net,
+            MockNtpSource::new(),
+            status,
+            config,
+        );
+        let before = controller.last_ptp_packet;
+        controller
+            .process_loop_iteration()
+            .expect("iteration should not error");
+
+        assert_eq!(
+            controller.current_sync_source,
+            Some(uuid),
+            "a None-source packet must still be processed (filter only restricts known sources)"
+        );
+        assert!(
+            controller.last_ptp_packet >= before,
+            "a processed packet must advance PTP liveness"
+        );
+    }
+
+    /// GREEN companion (camera-box issue 1073): the dropped-since-accepted counter
+    /// increments per dropped foreign packet and resets on an accepted one — the
+    /// signal `check_ptp_status` uses to distinguish "GM absent" from "GM blocked
+    /// by a mis-set allowlist".
+    #[test]
+    fn drop_counter_counts_foreign_and_resets_on_allowed_camerabox_issue_1073() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let foreign_uuid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let rig_uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let foreign_ip: std::net::Ipv4Addr = "10.77.7.109".parse().unwrap();
+        let rig_ip: std::net::Ipv4Addr = "10.77.9.184".parse().unwrap();
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000_000_000);
+
+        let f0 = make_sync_pkt(foreign_uuid, 0);
+        let f1 = make_sync_pkt(foreign_uuid, 1);
+        let rig = make_sync_pkt(rig_uuid, 2);
+
+        let mut mock_net = MockPtpNetwork::new();
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((f0.clone(), 60, t2, Some(foreign_ip)))));
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((f1.clone(), 60, t2, Some(foreign_ip)))));
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((rig.clone(), 60, t2, Some(rig_ip)))));
+        mock_net.expect_recv_packet().returning(|| Ok(None));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.gm_allowlist = vec!["10.77.9.0/24".to_string()];
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            mock_net,
+            MockNtpSource::new(),
+            status,
+            config,
+        );
+
+        controller.process_loop_iteration().unwrap();
+        controller.process_loop_iteration().unwrap();
+        assert_eq!(
+            controller.gm_dropped_since_accepted, 2,
+            "two foreign packets must be counted as dropped"
+        );
+
+        controller.process_loop_iteration().unwrap();
+        assert_eq!(
+            controller.gm_dropped_since_accepted, 0,
+            "an accepted rig packet must reset the drop counter"
+        );
+        assert_eq!(controller.current_sync_source_ip, Some(rig_ip));
     }
 
     // ========================================================================
