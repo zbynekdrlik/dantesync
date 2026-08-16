@@ -96,6 +96,14 @@ use traits::PtpNetwork;
 /// All other parameters auto-adjust based on platform defaults
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
+    /// camera-box issue 1073: this gained `#[serde(default)]` so a file that
+    /// omits `ntp_server` (e.g. an operator who writes only
+    /// `{"system": {"gm_allowlist": [...]}}` during the fix rollout) parses
+    /// instead of failing the WHOLE-file parse — which would send `load_config`
+    /// down its overwrite-with-defaults path and SILENTLY DELETE the allowlist
+    /// they just added, re-exposing the box to the foreign grandmaster. Missing
+    /// → the fleet default (same value the fresh-config template already writes).
+    #[serde(default = "default_ntp_server")]
     ntp_server: String,
 
     /// NTP server mode configuration (optional - disabled by default)
@@ -114,10 +122,14 @@ struct Config {
     system: SystemConfig,
 }
 
+fn default_ntp_server() -> String {
+    "10.77.8.2".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            ntp_server: "10.77.8.2".to_string(),
+            ntp_server: default_ntp_server(),
             ntp_server_mode: NtpServerConfig::default(),
             http_status: HttpStatusConfig::default(),
             system: SystemConfig::default(),
@@ -1122,6 +1134,23 @@ mod tests {
             format!("{:?}", config.system),
             format!("{:?}", default_system)
         );
+    }
+
+    /// camera-box issue 1073: a config file that specifies ONLY the new
+    /// `system.gm_allowlist` (no `ntp_server`) must parse — otherwise
+    /// `load_config` would take its overwrite-with-defaults path and SILENTLY
+    /// DELETE the operator's freshly-added allowlist during the fix rollout.
+    /// `ntp_server` falls back to the fleet default.
+    #[test]
+    fn config_with_only_gm_allowlist_parses_and_defaults_ntp_server_1073() {
+        let json = r#"{"system": {"gm_allowlist": ["10.77.9.0/24"]}}"#;
+        let config: Config =
+            serde_json::from_str(json).expect("a minimal gm_allowlist-only config must parse");
+        assert_eq!(
+            config.ntp_server, "10.77.8.2",
+            "missing ntp_server must fall back to the fleet default, not fail the parse"
+        );
+        assert_eq!(config.system.gm_allowlist, vec!["10.77.9.0/24".to_string()]);
     }
 
     // ========================================================================

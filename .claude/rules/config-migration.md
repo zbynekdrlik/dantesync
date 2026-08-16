@@ -46,7 +46,12 @@ that feeds the migration a bool, a string, a number and an array.
   node permanently stale, so it is floored at one query cadence at read time
   (`effective_stale_window`), and `max_step_us <= 0` is treated as unbounded rather than as "never
   correct anything".
-- Only migrate a key into an EXISTING object when the operator is meant to tune it. `SystemConfig`
-  fields have no per-field defaults for `servo`/`filters`, so writing a partial `"system": {…}`
-  block into the file would make the whole config fail to parse — leave that section absent and log
-  the effective value at startup instead.
+- Only migrate a key into an EXISTING object when the operator is meant to tune it. As of
+  camera-box issue 1073, `SystemConfig`'s `servo`/`filters` DO carry `#[serde(default)]` (with
+  `Default` impls holding the former inline values), and `gm_allowlist` is `#[serde(default)]`
+  empty — so a partial `"system": {"gm_allowlist": [...]}}` block now parses cleanly (servo/filters
+  fall back to their defaults). A `system.gm_allowlist` key MAY therefore be safely migrated into an
+  existing file, or added by an operator, without breaking the parse. (Note the whole-FILE caveat:
+  `Config.ntp_server` also gained a `#[serde(default)]` for the same rollout, so even a file that
+  contains ONLY `{"system": {"gm_allowlist": [...]}}` parses instead of tripping `load_config`'s
+  overwrite-with-defaults path — which would silently delete the operator's allowlist.)

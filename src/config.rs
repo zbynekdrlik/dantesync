@@ -2,7 +2,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
+    // #47/#68 lesson (see the partial-object tests below): each optional sub-object
+    // carries its OWN `#[serde(default)]` so a config that specifies only ONE of
+    // them (e.g. a stream box setting just `gm_allowlist`) still deserializes —
+    // without this, `{"system": {"gm_allowlist": [...]}}` would fail on the missing
+    // `servo`/`filters` and load_config would silently overwrite the real config.
+    #[serde(default)]
     pub servo: ServoConfig,
+    #[serde(default)]
     pub filters: FilterConfig,
     /// #68 — how long (seconds) a node may go without a successful NTP
     /// measurement before `ntp_failed` is raised and `/status` grades the
@@ -15,6 +22,23 @@ pub struct SystemConfig {
     /// design) reported `false` forever while drifting a second off UTC.
     #[serde(default = "default_ntp_stale_secs")]
     pub ntp_stale_secs: u64,
+
+    /// camera-box issue 1073 — trusted grandmaster-source allowlist.
+    ///
+    /// Each entry is an exact IPv4 (`"10.77.9.184"`) or a CIDR prefix
+    /// (`"10.77.9.0/24"`). When non-empty, the PTP client DROPS any Sync/FollowUp
+    /// packet whose source IP is not permitted, as-if it never arrived — so a
+    /// foreign grandmaster leaking in from another subnet (the live incident: the
+    /// stream box seeing mbc's `10.77.7.x` and locking onto `10.77.7.109` instead
+    /// of the rig's `10.77.9.184`) can no longer steal the lock.
+    ///
+    /// EMPTY (the default, and every pre-existing config that lacks the field) =
+    /// UNRESTRICTED: accept any source, exactly the historical last-writer-wins
+    /// behavior. A single-GM network is unaffected. Parsing is fail-open (an
+    /// all-invalid list degrades to unrestricted with a loud warning) so a config
+    /// typo can never take the rig's clock offline. See `crate::gm_filter`.
+    #[serde(default)]
+    pub gm_allowlist: Vec<String>,
 }
 
 fn default_ntp_stale_secs() -> u64 {
@@ -147,12 +171,44 @@ pub struct ServoConfig {
     pub max_integral_ppm: f64,
 }
 
+impl Default for ServoConfig {
+    fn default() -> Self {
+        // Reference values only — the controller uses adaptive gains (see
+        // `SystemConfig::default`'s comment). Kept as the single source of truth
+        // so a partial `system` object without a `servo` key deserializes.
+        ServoConfig {
+            kp: 0.0005,
+            ki: 0.00005,
+            max_freq_adj_ppm: 500.0,
+            max_integral_ppm: 100.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterConfig {
     pub sample_window_size: usize,
     pub min_delta_ns: i64,
     pub calibration_samples: usize, // Number of samples for timestamp calibration (0 = disabled)
     pub warmup_secs: f64,           // Warmup period in seconds (0.0 = disabled, for tests)
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        // Platform-specific rate limiting and calibration, unchanged from the
+        // values `SystemConfig::default` used inline before they moved here.
+        #[cfg(windows)]
+        let (calibration, min_delta) = (3, 0_i64); // Windows: quick calibration (3 samples ≈ 3s), accept all samples
+        #[cfg(not(windows))]
+        let (calibration, min_delta) = (0, 1_000_000_i64); // Linux: no calibration, 1ms rate limit
+
+        FilterConfig {
+            sample_window_size: 4,
+            min_delta_ns: min_delta,
+            calibration_samples: calibration,
+            warmup_secs: 3.0,
+        }
+    }
 }
 
 impl Default for SystemConfig {
@@ -170,34 +226,19 @@ impl Default for SystemConfig {
         // The controller uses ADAPTIVE gains, so kp/ki values here are for reference only.
         // Actual gains are auto-tuned based on oscillation detection.
 
-        // Platform-specific values
-        #[cfg(windows)]
-        let (calibration, min_delta) = (3, 0_i64); // Windows: quick calibration (3 samples ≈ 3s), accept all samples
-        #[cfg(not(windows))]
-        let (calibration, min_delta) = (0, 1_000_000_i64); // Linux: no calibration, 1ms rate limit
-
         SystemConfig {
-            servo: ServoConfig {
-                // Reference values only - controller uses adaptive gains
-                kp: 0.0005,
-                ki: 0.00005,
-                max_freq_adj_ppm: 500.0,
-                max_integral_ppm: 100.0,
-            },
-            filters: FilterConfig {
-                // Sample window for median filtering (same on both platforms)
-                sample_window_size: 4,
-
-                // Platform-specific rate limiting and calibration
-                min_delta_ns: min_delta,
-                calibration_samples: calibration,
-
-                // Warmup period (same on both platforms)
-                warmup_secs: 3.0,
-            },
+            // Reference/platform defaults are now the single source of truth in
+            // ServoConfig::default / FilterConfig::default (so a partial `system`
+            // object deserializes) — reuse them here.
+            servo: ServoConfig::default(),
+            filters: FilterConfig::default(),
 
             // #68: 6x the 30s NTP query cadence
             ntp_stale_secs: default_ntp_stale_secs(),
+
+            // camera-box issue 1073: empty = unrestricted (accept any GM source),
+            // the historical last-writer-wins behavior. Backward compatible.
+            gm_allowlist: Vec::new(),
         }
     }
 }
@@ -481,5 +522,59 @@ mod tests {
             "missing port must fall back to the default"
         );
         assert_eq!(config.stratum, 2);
+    }
+
+    // ========================================================================
+    // GM ALLOWLIST CONFIG TESTS (camera-box issue 1073)
+    // ========================================================================
+
+    #[test]
+    fn gm_allowlist_defaults_to_empty_and_unrestricted() {
+        let config = SystemConfig::default();
+        assert!(
+            config.gm_allowlist.is_empty(),
+            "default must be empty = unrestricted = historical last-writer-wins"
+        );
+    }
+
+    #[test]
+    fn system_config_without_gm_allowlist_field_still_parses_empty() {
+        // Every pre-existing config predates this field: a full `system` object
+        // with servo/filters/ntp_stale_secs but no gm_allowlist must parse and
+        // default the field to empty (unrestricted) — backward compatible.
+        let json = r#"{
+            "servo": {"kp": 0.0005, "ki": 0.00005, "max_freq_adj_ppm": 500.0, "max_integral_ppm": 100.0},
+            "filters": {"sample_window_size": 4, "min_delta_ns": 1000000, "calibration_samples": 0, "warmup_secs": 3.0},
+            "ntp_stale_secs": 180
+        }"#;
+        let config: SystemConfig =
+            serde_json::from_str(json).expect("a pre-1073 system object must still parse");
+        assert!(config.gm_allowlist.is_empty());
+    }
+
+    #[test]
+    fn system_config_with_only_gm_allowlist_parses_defaulting_servo_and_filters() {
+        // The realistic rollout shape: the stream box's config gains ONLY a
+        // `system.gm_allowlist` without re-specifying servo/filters. Before the
+        // #47-style per-sub-object defaults this would have failed the whole
+        // parse (missing servo/filters) and load_config would have silently
+        // overwritten the real config.
+        let json = r#"{"gm_allowlist": ["10.77.9.0/24"]}"#;
+        let config: SystemConfig = serde_json::from_str(json)
+            .expect("a system object with only gm_allowlist must still parse");
+        assert_eq!(config.gm_allowlist, vec!["10.77.9.0/24".to_string()]);
+        // servo/filters fell back to their defaults.
+        assert!((config.servo.kp - 0.0005).abs() < f64::EPSILON);
+        assert_eq!(config.filters.sample_window_size, 4);
+        assert_eq!(config.ntp_stale_secs, 180);
+    }
+
+    #[test]
+    fn gm_allowlist_serde_roundtrip_preserves_entries() {
+        let mut config = SystemConfig::default();
+        config.gm_allowlist = vec!["10.77.9.184".to_string(), "10.77.10.0/24".to_string()];
+        let json = serde_json::to_string(&config).expect("serialize failed");
+        let restored: SystemConfig = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(restored.gm_allowlist, config.gm_allowlist);
     }
 }

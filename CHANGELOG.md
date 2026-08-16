@@ -5,6 +5,33 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.42] - 2026-08-16
+
+### Fixed
+
+- **A foreign-subnet grandmaster can no longer steal the PTP lock (camera-box issue 1073).** The
+  PTP client had no best-master election: it adopted the source of the last Sync packet the capture
+  saw (last-writer-wins), so a node that also sees a foreign subnet's PTP multicast could silently
+  lock onto the wrong grandmaster. Live incident: the stream box (rig `10.77.9.x`) also sees mbc's
+  `10.77.7.x` and locked onto `10.77.7.109` instead of the rig grandmaster `10.77.9.184`.
+
+### Added
+
+- **`system.gm_allowlist` — a trusted grandmaster-source allowlist.** Each entry is an exact IPv4
+  (`"10.77.9.184"`) or a CIDR prefix (`"10.77.9.0/24"`); a PTP packet whose source IP is not
+  permitted is dropped as-if it never arrived. **EMPTY (the default, and every existing config) =
+  UNRESTRICTED — accept any source, unchanged behavior**, so a single-GM network needs no change.
+  Parsing is fail-open (an all-invalid list degrades to unrestricted with a loud startup warning),
+  and a valid-but-wrong allowlist is made diagnosable (a rate-limited drop warning, and the
+  PTP-offline log distinguishes "grandmaster absent" from "grandmaster blocked by the allowlist").
+
+  To restrict a box to the rig subnet, add to its `config.json` (Linux `/etc/dantesync/config.json`,
+  Windows `C:\ProgramData\DanteSync\config.json`) and restart the service:
+
+  ```json
+  "system": { "gm_allowlist": ["10.77.9.0/24"] }
+  ```
+
 ## [1.8.29] - 2026-08-11
 
 ### Fixed
