@@ -160,10 +160,22 @@ mod tests {
         // The exact live values: rig subnet 10.77.9.0/24, foreign GM 10.77.7.109.
         let a = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
         assert!(!a.is_unrestricted());
-        assert!(!a.allows(ip("10.77.7.109")), "foreign subnet must be rejected");
-        assert!(a.allows(ip("10.77.9.184")), "rig grandmaster must be accepted");
-        assert!(a.allows(ip("10.77.9.1")), "any host on the rig subnet is accepted");
-        assert!(!a.allows(ip("10.77.8.184")), "an adjacent subnet is rejected");
+        assert!(
+            !a.allows(ip("10.77.7.109")),
+            "foreign subnet must be rejected"
+        );
+        assert!(
+            a.allows(ip("10.77.9.184")),
+            "rig grandmaster must be accepted"
+        );
+        assert!(
+            a.allows(ip("10.77.9.1")),
+            "any host on the rig subnet is accepted"
+        );
+        assert!(
+            !a.allows(ip("10.77.8.184")),
+            "an adjacent subnet is rejected"
+        );
     }
 
     #[test]
@@ -195,7 +207,10 @@ mod tests {
     #[test]
     fn slash_zero_matches_everything() {
         let a = GmAllowlist::parse(&["0.0.0.0/0".to_string()]);
-        assert!(!a.is_unrestricted(), "a /0 is a real (if permissive) restriction");
+        assert!(
+            !a.is_unrestricted(),
+            "a /0 is a real (if permissive) restriction"
+        );
         assert!(a.allows(ip("10.77.7.109")));
         assert!(a.allows(ip("8.8.8.8")));
     }

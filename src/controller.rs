@@ -1564,6 +1564,23 @@ where
             }
         };
 
+        // camera-box issue 1073: drop a packet from a non-allowlisted grandmaster
+        // source as-if it never arrived — BEFORE touching PTP liveness, the
+        // adopted source IP, or any handler. A restricting allowlist thus prevents
+        // a foreign-subnet grandmaster (the live incident: mbc's 10.77.7.109
+        // leaking onto the stream box) from being adopted, and a node that sees
+        // ONLY a foreign GM correctly ages into PTP-offline → NTP fallback rather
+        // than silently locking to the wrong clock. A `None` source_ip (a
+        // transport that cannot report the sender) is accepted — the filter can
+        // only restrict what it can see. An empty allowlist accepts everything
+        // (historical last-writer-wins), so this is a no-op unless configured.
+        if let Some(ip) = source_ip {
+            if !self.gm_allowlist.allows(ip) {
+                debug!("Dropping PTP packet from non-allowlisted grandmaster source {ip}");
+                return Ok(());
+            }
+        }
+
         // Packet received - update last_ptp_packet timestamp and source IP
         self.last_ptp_packet = Instant::now();
         if source_ip.is_some() {
@@ -2612,6 +2629,95 @@ mod tests {
             controller.last_ptp_packet <= before,
             "a dropped foreign packet must not advance the PTP-liveness timestamp \
              (so a box seeing ONLY a foreign GM correctly goes PTP-offline)"
+        );
+    }
+
+    /// GREEN companion (camera-box issue 1073): a Sync from a source ON the
+    /// allowed rig subnet IS adopted normally — the fix must reject only foreign
+    /// sources, never the legitimate grandmaster.
+    #[test]
+    fn rig_grandmaster_source_is_accepted_when_allowlist_permits_camerabox_issue_1073() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let rig_uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let rig_ip: std::net::Ipv4Addr = "10.77.9.184".parse().unwrap();
+        let sync_pkt = make_sync_pkt(rig_uuid, 0);
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000_000_000);
+
+        let mut mock_net = MockPtpNetwork::new();
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, Some(rig_ip)))));
+        mock_net.expect_recv_packet().returning(|| Ok(None));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.gm_allowlist = vec!["10.77.9.0/24".to_string()];
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            mock_net,
+            MockNtpSource::new(),
+            status,
+            config,
+        );
+        controller
+            .process_loop_iteration()
+            .expect("iteration should not error");
+
+        assert_eq!(
+            controller.current_sync_source_ip,
+            Some(rig_ip),
+            "the allowed rig grandmaster source must be adopted"
+        );
+        assert_eq!(
+            controller.current_gm_uuid,
+            Some(rig_uuid),
+            "the allowed rig grandmaster UUID must be adopted"
+        );
+    }
+
+    /// GREEN companion (camera-box issue 1073): an EMPTY allowlist (the default,
+    /// and every pre-existing config) accepts ANY source — the historical
+    /// last-writer-wins behavior is preserved, so a single-GM network is
+    /// unaffected by this change.
+    #[test]
+    fn empty_allowlist_accepts_any_source_backward_compatible_camerabox_issue_1073() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let uuid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let any_ip: std::net::Ipv4Addr = "10.77.7.109".parse().unwrap();
+        let sync_pkt = make_sync_pkt(uuid, 0);
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000_000_000);
+
+        let mut mock_net = MockPtpNetwork::new();
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, Some(any_ip)))));
+        mock_net.expect_recv_packet().returning(|| Ok(None));
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let config = SystemConfig::default(); // gm_allowlist empty = unrestricted
+
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            mock_net,
+            MockNtpSource::new(),
+            status,
+            config,
+        );
+        controller
+            .process_loop_iteration()
+            .expect("iteration should not error");
+
+        assert_eq!(
+            controller.current_sync_source_ip,
+            Some(any_ip),
+            "with an empty allowlist, any source is accepted (backward compatible)"
         );
     }
 
