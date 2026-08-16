@@ -11,6 +11,7 @@
 
 use crate::clock::SystemClock;
 use crate::config::SystemConfig;
+use crate::gm_filter::GmAllowlist;
 use crate::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header, PtpV1SyncMessageBody};
 use crate::spike_filter::{FilterMode, JitterEstimator, SpikeFilter};
 use crate::status::SyncStatus;
@@ -504,6 +505,13 @@ where
     /// IP address of the device sending PTP Sync messages (for display in tray app)
     current_sync_source_ip: Option<std::net::Ipv4Addr>,
 
+    /// camera-box issue 1073 — trusted grandmaster-source allowlist, parsed once
+    /// from `config.gm_allowlist`. When restricting (non-empty), a PTP packet
+    /// whose source IP is not permitted is dropped in `process_loop_iteration`
+    /// as-if it never arrived, so a foreign-subnet grandmaster cannot be adopted.
+    /// Empty = unrestricted (historical last-writer-wins). See `crate::gm_filter`.
+    gm_allowlist: GmAllowlist,
+
     // Sample filtering
     sample_window: Vec<i64>,
 
@@ -670,6 +678,24 @@ where
         let calibration_count = config.filters.calibration_samples;
         let calibration_complete = calibration_count == 0;
 
+        // camera-box issue 1073: parse the grandmaster-source allowlist once.
+        let gm_allowlist = GmAllowlist::parse(&config.gm_allowlist);
+        for bad in gm_allowlist.invalid_entries() {
+            warn!(
+                "gm_allowlist: ignoring unparseable entry {:?} (expected an IPv4 or CIDR like \
+                 10.77.9.184 or 10.77.9.0/24)",
+                bad
+            );
+        }
+        if gm_allowlist.is_unrestricted() {
+            info!("GM source policy: UNRESTRICTED (accept any grandmaster source IP)");
+        } else {
+            info!(
+                "GM source policy: RESTRICTED to allowlist {:?} — foreign-source PTP is dropped",
+                config.gm_allowlist
+            );
+        }
+
         info!("=== PTP Controller Initialization ===");
         info!("Mode: AUTO-ADAPTIVE DIRECT DRIFT MEASUREMENT");
         info!("  - Directly measures drift rate from offset samples");
@@ -702,6 +728,7 @@ where
             current_gm_uuid: None,
             current_sync_source: None,
             current_sync_source_ip: None,
+            gm_allowlist,
             sample_window: Vec::with_capacity(window_size),
             last_phase_offset_ns: 0,
             last_adj_ppm: 0.0,
@@ -2512,6 +2539,80 @@ mod tests {
         }
 
         assert!(controller.get_status_shared().read().unwrap().settled);
+    }
+
+    // ========================================================================
+    // GM-SOURCE ALLOWLIST TESTS (camera-box issue 1073)
+    // ========================================================================
+
+    /// Build a minimal PTPv1 Sync packet with the given source/grandmaster UUID,
+    /// mirroring `test_ptp_locking_flow`'s own `make_sync` byte layout.
+    fn make_sync_pkt(uuid: [u8; 6], seq: u16) -> Vec<u8> {
+        use byteorder::{BigEndian, WriteBytesExt};
+        let mut buf = vec![0u8; 60];
+        buf[0] = 0x10; // PTPv1 header
+        buf[32] = 0x00; // control = Sync
+        buf[22..28].copy_from_slice(&uuid); // source UUID
+        let mut w = &mut buf[30..32];
+        w.write_u16::<BigEndian>(seq).unwrap();
+        buf[49..55].copy_from_slice(&uuid); // grandmaster clock UUID
+        buf
+    }
+
+    /// RED (camera-box issue 1073): reproduces the live incident. The stream box,
+    /// also seeing mbc's foreign `10.77.7.x` subnet, must NOT adopt a Sync from
+    /// foreign grandmaster `10.77.7.109` when the allowlist restricts sources to
+    /// the rig subnet `10.77.9.0/24`. Before the fix, `process_loop_iteration`
+    /// adopts the source unconditionally (last-writer-wins), so every assertion
+    /// below fails; after the fix the foreign packet is dropped as-if-not-received.
+    #[test]
+    fn foreign_subnet_grandmaster_is_rejected_when_allowlist_restricts_camerabox_issue_1073() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let foreign_uuid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let foreign_ip: std::net::Ipv4Addr = "10.77.7.109".parse().unwrap();
+        let sync_pkt = make_sync_pkt(foreign_uuid, 0);
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_000_000_000);
+
+        let mut mock_net = MockPtpNetwork::new();
+        mock_net
+            .expect_recv_packet()
+            .times(1)
+            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, Some(foreign_ip)))));
+        mock_net.expect_recv_packet().returning(|| Ok(None));
+
+        let mock_clock = MockSystemClock::new();
+        let mock_ntp = MockNtpSource::new();
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.gm_allowlist = vec!["10.77.9.0/24".to_string()]; // rig subnet only
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+
+        let mut controller = PtpController::new(mock_clock, mock_net, mock_ntp, status, config);
+        let before = controller.last_ptp_packet;
+
+        controller
+            .process_loop_iteration()
+            .expect("iteration should not error");
+
+        assert_eq!(
+            controller.current_sync_source_ip, None,
+            "foreign-subnet source IP must not be adopted"
+        );
+        assert_eq!(
+            controller.current_sync_source, None,
+            "foreign Sync source UUID must not be adopted"
+        );
+        assert_eq!(
+            controller.current_gm_uuid, None,
+            "foreign grandmaster UUID must not be adopted"
+        );
+        assert!(
+            controller.last_ptp_packet <= before,
+            "a dropped foreign packet must not advance the PTP-liveness timestamp \
+             (so a box seeing ONLY a foreign GM correctly goes PTP-offline)"
+        );
     }
 
     // ========================================================================
