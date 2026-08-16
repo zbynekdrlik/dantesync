@@ -572,3 +572,46 @@ canary evidence before continuing.
   correction was known necessary) -- a re-fire with the corrected v1.8.40 was attempted but
   deduped by the notify mechanism (one card per repo#issue, by design). Supervisor/user should
   read v1.8.40 as the actually-shipped-safe version, not v1.8.38.
+
+## camera-box issue 1073 — foreign-grandmaster election fix (CODE half; cross-repo)
+
+- Branch `fix-1073-gm-election` off `master` (NOT pushed; supervisor merges). NO fleet deploy
+  (canary rollout is supervisor work), NO camera-box change (the `DANTESYNC_GATE_GM_ENFORCE=1`
+  flip is a separate camera-box step after rollout).
+- Version bump: `1b9d139` (1.8.41 -> 1.8.42).
+- Design comment (root cause + chosen approach + 3 rejected alternatives), posted BEFORE any code:
+  https://github.com/zbynekdrlik/camera-box/issues/1073#issuecomment-5307719247
+- Root cause: `controller::process_loop_iteration` adopted the source of the last Sync packet
+  (last-writer-wins) with NO best-master election; a box also seeing a foreign subnet's PTP
+  multicast could lock onto a foreign GM (live: stream box on rig 10.77.9.x also sees mbc
+  10.77.7.x and locked onto 10.77.7.109 vs rig GM 10.77.9.184).
+- Approach: configurable source allowlist (rejected full BMCA — heavy + a foreign Dante GM can
+  advertise equal/better quality so it wouldn't even fix this; rejected first-GM-sticky — a
+  restart race; rejected interface-bind — OS-coupled, untestable). New pure module
+  `src/gm_filter.rs` (`GmAllowlist`, IP/CIDR, empty=unrestricted=backward-compat, fail-open).
+- RED: `419fae9` — `controller::tests::foreign_subnet_grandmaster_is_rejected_when_allowlist_
+  restricts_camerabox_issue_1073` (foreign 10.77.7.109 IS adopted without the filter → fails).
+- GREEN: `c2e5867` — `process_loop_iteration` drops a non-allowlisted source before adopting it /
+  advancing PTP liveness / dispatching; companions
+  `rig_grandmaster_source_is_accepted_...`, `empty_allowlist_accepts_any_source_backward_compatible_...`.
+- Review (Fable adversarial, gate-open): SHIP, 0 critical / 1 warning / 7 suggestions — ALL fixed
+  in-branch in `daa1386`: drop-observability (rate-limited warn + `gm_dropped_since_accepted`
+  counter + a "GM present but blocked by allowlist" offline log), keep NTP alive on a dropped
+  packet, effective-policy startup log, `Config.ntp_server` `#[serde(default)]` (minimal
+  `{"system":{"gm_allowlist":[...]}}` file must not fail-parse and silently delete the allowlist),
+  digit-only prefix rejection, CHANGELOG 1.8.42 + corrected config-migration.md. Tests:
+  `none_source_ip_is_accepted_...`, `drop_counter_counts_foreign_and_resets_on_allowed_...`,
+  `non_digit_or_empty_prefix_length_is_rejected`, `prefix_count_...`,
+  `config_with_only_gm_allowlist_parses_and_defaults_ntp_server_1073`.
+- Local verify (Tier-0 note: this repo runs `cargo test` normally; the camera-box session's own
+  Tier-0 hook keys on the camera-box session cwd, so tests were run via `cargo test --no-run` +
+  direct test-binary exec): 263 lib + 18 bin(main) + 11 simulation_e2e + 18 purge_target all green;
+  `cargo fmt --all --check` clean; `cargo clippy -- -D warnings -A dead_code` (the repo's CI gate) clean.
+- Effectiveness on the rig confirmed by tracing the Linux transport: `net.rs recv_with_timestamp`
+  (`#[cfg(unix)]`) extracts the real sender IP via `recvmsg`/`msg.address` and main.rs threads it
+  through `recv_packet`, so `source_ip` is real on the production boxes and the filter is not a no-op.
+- Supervisor next: review + merge to `master`; release/tag v1.8.42; canary-first per-OS-class
+  rollout; on the stream box (and any box seeing the foreign subnet) set
+  `"system": { "gm_allowlist": ["10.77.9.0/24"] }` (or tighter `["10.77.9.184"]`) + restart, verify
+  `gm_source_ip`=10.77.9.184 & `is_locked` AND that it survives a restart; only once the WHOLE
+  fleet holds 10.77.9.184, flip `DANTESYNC_GATE_GM_ENFORCE=1` in camera-box (separate ticket).
