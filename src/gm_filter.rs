@@ -139,6 +139,25 @@ impl GmAllowlist {
     pub fn invalid_entries(&self) -> &[String] {
         &self.invalid
     }
+
+    /// camera-box issue 1073 (interface-selection half): pick which local
+    /// interface a multi-homed box should attach its PTP capture / IGMP join to,
+    /// by which one is on the SAME network as a trusted grandmaster prefix.
+    ///
+    /// `candidates` are `(interface_ip, interface_netmask)` pairs in the caller's
+    /// enumeration order; the returned index is into that slice. Returns `None`
+    /// when the allowlist gives no discriminating signal (unrestricted, or only
+    /// `/0` entries) or no candidate is on a trusted subnet — the caller then
+    /// keeps its existing default-interface behavior, so single-homed and
+    /// no-allowlist boxes are byte-identical to before.
+    pub fn select_interface(&self, candidates: &[(Ipv4Addr, Option<Ipv4Addr>)]) -> Option<usize> {
+        // NOT YET IMPLEMENTED (RED): the current PTP path does no interface
+        // selection at all — it inherits the OS default interface — so this
+        // faithfully returns `None` (fall back to the default) until the GREEN
+        // commit wires the real subnet-overlap selection.
+        let _ = candidates;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +306,28 @@ mod tests {
         ]);
         assert_eq!(a.prefix_count(), 2, "only the two valid entries are active");
         assert_eq!(a.invalid_entries().len(), 1);
+    }
+
+    fn nm(s: &str) -> Option<Ipv4Addr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn dual_homed_box_selects_the_rig_interface_over_mbc_camerabox_issue_1073() {
+        // The live incident: the stream box is dual-homed — rig NIC 10.77.9.204/24
+        // and mbc NIC 10.77.7.204/24 — and the PTP capture/IGMP join inherited the
+        // mbc NIC, so the box only ever saw the foreign 10.77.7.x grandmaster.
+        // With the rig subnet allowlisted, the capture interface MUST be the rig
+        // NIC (index 0 here).
+        let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig NIC
+            (ip("10.77.7.204"), nm("255.255.255.0")), // mbc NIC
+        ];
+        assert_eq!(
+            allow.select_interface(&candidates),
+            Some(0),
+            "the rig-subnet interface must be chosen on a dual-homed box"
+        );
     }
 }
