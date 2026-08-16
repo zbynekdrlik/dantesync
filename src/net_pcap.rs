@@ -196,6 +196,65 @@ pub(crate) fn find_device_for_ntp_server(server_ip: Ipv4Addr) -> Result<Device> 
     }
 }
 
+/// Select which Npcap device to capture PTP on (camera-box issue 1073).
+///
+/// On a MULTI-HOMED box a restricting `gm_allowlist` names the trusted
+/// grandmaster network; this picks the device whose OWN subnet is on that
+/// network, via the pure, unit-tested `GmAllowlist::select_interface`. Because
+/// `NpcapPtpNetwork::new` drives BOTH the IGMP membership join AND the pcap
+/// capture off the chosen device, both then attach to the NIC that actually
+/// reaches the rig grandmaster — not whichever NIC `net::get_default_interface`
+/// happened to enumerate first.
+///
+/// Falls back to the historical name-based `find_device(fallback_name)` when the
+/// allowlist gives no discriminating signal (unrestricted, or no device on a
+/// trusted subnet), so single-homed and no-allowlist boxes are byte-identical to
+/// before. This mirrors the dual-homed selection already proven for the NTP
+/// transport (`find_device_for_ntp_server`, dantesync#53).
+pub(crate) fn find_ptp_capture_device(
+    gm_allowlist: &crate::gm_filter::GmAllowlist,
+    fallback_name: &str,
+) -> Result<Device> {
+    let devices = list_devices_guarded()?;
+
+    // One (ip, netmask) candidate per device IPv4 address, remembering which
+    // device each came from (a device can carry several addresses).
+    let mut candidates: Vec<(Ipv4Addr, Option<Ipv4Addr>)> = Vec::new();
+    let mut candidate_device_idx: Vec<usize> = Vec::new();
+    for (idx, d) in devices.iter().enumerate() {
+        for a in &d.addresses {
+            if let std::net::IpAddr::V4(ip) = a.addr {
+                if !ip.is_loopback() {
+                    let netmask = match a.netmask {
+                        Some(std::net::IpAddr::V4(nm)) => Some(nm),
+                        _ => None,
+                    };
+                    candidates.push((ip, netmask));
+                    candidate_device_idx.push(idx);
+                }
+            }
+        }
+    }
+
+    if let Some(ci) = gm_allowlist.select_interface(&candidates) {
+        let device = devices[candidate_device_idx[ci]].clone();
+        info!(
+            "camera-box issue 1073: selected PTP capture interface {} ({}) — on the trusted \
+             grandmaster subnet per gm_allowlist (dual-homed-safe)",
+            device.name, candidates[ci].0
+        );
+        return Ok(device);
+    }
+
+    let device = find_device(fallback_name)?;
+    info!(
+        "PTP capture interface by default enumeration: {} ({:?}) — gm_allowlist gave no subnet \
+         preference (unrestricted, or no interface on a trusted subnet)",
+        device.name, device.desc
+    );
+    Ok(device)
+}
+
 /// The device's first non-loopback IPv4 address.
 ///
 /// Shared by the PTP capture path (below) and the NTP kernel-timestamped
@@ -258,13 +317,17 @@ pub struct NpcapPtpNetwork {
 }
 
 impl NpcapPtpNetwork {
-    pub fn new(interface_name: &str) -> Result<Self> {
+    pub fn new(interface_name: &str, gm_allowlist: &crate::gm_filter::GmAllowlist) -> Result<Self> {
         info!(
-            "Initializing Npcap capture on interface: {}",
+            "Initializing Npcap capture (default-interface hint: {})",
             interface_name
         );
 
-        let device = find_device(interface_name)?;
+        // camera-box issue 1073: on a multi-homed box prefer the interface on the
+        // trusted grandmaster subnet (gm_allowlist); otherwise the historical
+        // name-based selection. Both the IGMP join and the capture below use the
+        // chosen device, so they land on the NIC that reaches the rig GM.
+        let device = find_ptp_capture_device(gm_allowlist, interface_name)?;
         info!("Found device: {} ({:?})", device.name, device.desc);
 
         // Extract interface IP for multicast join
@@ -753,11 +816,32 @@ mod tests {
             );
             return;
         }
-        let result = NpcapPtpNetwork::new("eth0");
+        let result = NpcapPtpNetwork::new("eth0", &crate::gm_filter::GmAllowlist::default());
         assert!(
             result.is_err(),
             "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
              this used to crash the whole process (#58)"
+        );
+    }
+
+    /// camera-box issue 1073: the new gm_allowlist-aware capture-device selector
+    /// shares the SAME #58 runtime guard (it calls `list_devices_guarded` before
+    /// any real `pcap::` call), so on a runtime-less machine it returns a graceful
+    /// `Err` rather than crashing — with an empty (unrestricted) allowlist, which
+    /// is the byte-identical fallback path.
+    #[test]
+    fn test_find_ptp_capture_device_gracefully_errors_without_npcap_runtime() {
+        if wpcap_runtime_available() {
+            eprintln!(
+                "skipping test_find_ptp_capture_device_gracefully_errors_without_npcap_runtime: \
+                 Npcap runtime IS installed on this machine"
+            );
+            return;
+        }
+        let result = find_ptp_capture_device(&crate::gm_filter::GmAllowlist::default(), "eth0");
+        assert!(
+            result.is_err(),
+            "expected a graceful Err when the Npcap runtime is missing, got Ok"
         );
     }
 
