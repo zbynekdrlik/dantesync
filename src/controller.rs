@@ -4098,6 +4098,109 @@ mod tests {
     // original tight tracking (#71/#76/#80) completely unchanged.
     // ========================================================================
 
+
+    /// #94 shared closed-loop harness: run a genuinely-PTP-locked server-mode
+    /// master for one simulated hour at a constant GM-vs-UTC drift of `ppm`,
+    /// returning every applied step's signed microsecond size. Mirrors the #83
+    /// closed-loop tests' mock wiring exactly (MockNtpSource returns the live
+    /// UTC error; MockSystemClock subtracts each applied step and records it),
+    /// factored out so the #94 realized-step-size bound can be asserted at
+    /// several drift rates without duplicating the 40-line harness each time.
+    fn simulate_locked_master_step_sizes_94(ppm: i64) -> Vec<i64> {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 100, // clean, well under the quality bound -- isolates the deadband/step-size relationship
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let err_for_clock = error_us.clone();
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            steps_for_clock.lock().expect("sim lock").push(applied);
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        let accrual_us = ppm * NTP_SERVER_CHECK_INTERVAL_SECS as i64;
+        let intervals = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        for _ in 0..intervals {
+            *error_us.lock().expect("sim lock") += accrual_us;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+        let out = step_events.lock().expect("sim lock").clone();
+        out
+    }
+
+    /// #94 (RED before the fix): a genuinely-PTP-locked master's realized NTP
+    /// step must stay inside the PROVEN-ABSORBED 2500us band (camera-box PR
+    /// #1017: <=2.5ms steps proven green through the recorded E2E gate + the
+    /// A/V-sync dock held LOCKED 87min). The step SIZE is the offset at
+    /// CONFIRMATION time = trigger + up to two check-intervals of drift accrual,
+    /// so with the pre-#94 2500us trigger the realized step overshoots to
+    /// ~2.7-3.7ms at the live 23-66ppm GM error -- ABOVE the absorbed band,
+    /// which is the fleet-visible judder P0 this bounds. Asserted at BOTH the
+    /// current live rate (~23ppm) and the worst-ever measured (66ppm).
+    #[test]
+    fn every_locked_step_stays_within_the_proven_2500us_band_94() {
+        // Gather both rates FIRST (so the diagnostic prints the whole picture,
+        // 23ppm AND 66ppm, even when the first assertion below trips) -- then
+        // assert every realized step across both is within the proven band.
+        let measured: Vec<(i64, usize, u64)> = [23_i64, 66_i64]
+            .into_iter()
+            .map(|ppm| {
+                let steps = simulate_locked_master_step_sizes_94(ppm);
+                assert!(
+                    !steps.is_empty(),
+                    "at {}ppm a locked master must still step to track the GM's real UTC drift",
+                    ppm
+                );
+                let worst = steps.iter().map(|s| s.unsigned_abs()).max().unwrap();
+                eprintln!(
+                    "[#94] locked master {}ppm: {} steps/h, worst step {}us",
+                    ppm,
+                    steps.len(),
+                    worst
+                );
+                (ppm, steps.len(), worst)
+            })
+            .collect();
+
+        for (ppm, count, worst) in measured {
+            assert!(
+                worst <= 2_500,
+                "at {}ppm every realized NTP step must stay within the proven-absorbed 2500us \
+                 band (#94), but the worst was {}us -- that overshoot is the fleet-visible judder \
+                 this fix bounds ({} steps in the simulated hour)",
+                ppm,
+                worst,
+                count
+            );
+        }
+    }
+
     /// Closed-loop, end-to-end: the ACTUAL live-measured drift rate on strih
     /// today (~38ppm) with the master genuinely PTP-locked throughout.
     /// Deliberately NOT a round number picked for convenience -- 38ppm's
