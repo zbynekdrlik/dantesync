@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.8.45] - 2026-08-18
 
+> 1.8.44 is intentionally skipped — it is reserved for the concurrently-pending
+> `fix-1073-review-hardening` branch, so #91 took the next free number.
+
 ### Added
 
 - **Step-storm alarm on the fleet NTP master (issue #91).** When the PTP grandmaster goes
@@ -17,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frequency error away (PTP owns frequency), no threshold change can remove this; the honest fix
   is to make the degradation LOUD. The master now tracks its own trailing-hour step count and,
   when a server-mode node exceeds `NTP_STEP_STORM_THRESHOLD_PER_HOUR` (120/h — comfortably above
-  the ~84/h ceiling of healthy locked stepping at the worst-ever 66ppm GM rate), emits a loud,
+  the ~72/h measured ceiling of healthy locked stepping at the worst-ever 66ppm GM rate), emits a loud,
   grep-able `[NTP][STEP-STORM]` warning (rate-limited) and sets `/status.ntp_step_storm`. The
   raw metric is published as `/status.ntp_steps_last_hour` (the "steps/h" health signal issue
   #67 asked for), both additive fields a dev1 watchdog can poll. This closes the 19h-silent gap

@@ -345,13 +345,13 @@ what actually runs the bin unit tests). Match those, not a stricter self-imposed
 The master cannot slew (see the top of this file) — every UTC correction is a `step_clock` — so the
 step RATE is a direct readout of the Dante-clock-vs-UTC frequency error, and it is BOUNDED ABOVE
 while genuinely PTP-locked: at the 2500us `NTP_SERVER_LOCKED_DEADBAND_US` and the worst-ever measured
-Dante-GM rate error (66ppm, #83) a healthy locked master tops out near **~84 steps/h**. So a
+Dante-GM rate error (66ppm, #83) a healthy locked master tops out near ~72 steps/h (measured by the repo's own 66ppm locked-hour test; ~84/h by a looser hand figure). So a
 *sustained* rate above that ceiling can ONLY mean the PTP frequency reference is degraded — a GM
 outage makes `server_step_threshold_us` fall to the tight 200us threshold, which then step-corrects
 UTC almost every 10s check → the 129-180 steps/h storm observed live on strih (#91). Two consequences:
 
 - **A step-rate alarm is zero-false-alarm BY CONSTRUCTION.** `NTP_STEP_STORM_THRESHOLD_PER_HOUR = 120`
-  sits above the ~84/h healthy-locked ceiling (with thermal margin) and below the observed storm floor,
+  sits above the ~72/h measured healthy-locked ceiling and below the observed storm floor,
   so it can only fire on a genuinely degraded frequency reference, never on healthy locked stepping.
   When picking or moving this threshold, re-derive the healthy ceiling from the CURRENT deadband and
   the max plausible GM rate — never set it below what a healthy locked master legitimately produces.

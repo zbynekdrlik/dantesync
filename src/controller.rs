@@ -479,7 +479,10 @@ const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 2_500;
 // stepped, and the step RATE is a direct function of the Dante-clock-vs-UTC frequency error.
 // A genuinely-PTP-locked healthy master steps at the 2500us deadband cadence, bounded by the
 // Dante grandmaster's own real rate error: the worst ever measured on strih is 66ppm (#83),
-// which at the deadband is ~84 steps/h -- the ceiling of healthy operation. The live #91 storm
+// which at the deadband is ~72 steps/h MEASURED by the repo's own closed-loop test
+// (the_locked_master_at_66ppm_is_confirmation_governed_not_escape_valve_83; a looser hand
+// figure is ~84/h) -- the ceiling of healthy operation, and the zero-false-alarm test
+// healthy_locked_master_at_66ppm_stays_below_the_storm_alarm_91 pins it. The live #91 storm
 // (the PTP GM went L2-unreachable, so the master correctly fell back to the tight 200us
 // threshold and step-corrected UTC every ~10s check) ran 129-180 steps/h for 19h+ with NO
 // alarm -- every existing NTP health signal (freshness #68, unreachable #53) fires only when
@@ -489,8 +492,8 @@ const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 2_500;
 // to slow the storm is the masking #83 already proved drops frames. The only honest response is
 // to DETECT and ALARM so a watchdog/operator restores the grandmaster/PTP.
 //
-// The threshold sits comfortably ABOVE the ~84/h healthy-locked ceiling (~28ppm of thermal
-// margin) and BELOW the observed 129/h storm floor, so the alarm can only fire on a genuinely
+// The threshold sits comfortably ABOVE the ~72/h measured healthy-locked ceiling (~66% margin)
+// and BELOW the observed 129/h storm floor, so the alarm can only fire on a genuinely
 // degraded frequency reference -- never on healthy locked stepping (zero false alarm by
 // construction). A trailing-hour count (not a shorter window) is the honest "steps/h" metric
 // #67 named; a persistent storm -- the actual 19h failure mode -- is what it must catch.
@@ -2407,14 +2410,27 @@ where
             };
             // #91: keep the step-storm metric/flag fresh between steps so a
             // watchdog polling /status sees the storm CLEAR (steps aging out of
-            // the trailing window) without needing another step to fire. The
-            // loud warning is emitted only at the step site (record_ntp_step_and_
-            // check_storm); here we only recompute the published state. Server
-            // mode only -- a client node reports None/false.
+            // the trailing window) without needing another step to fire. The loud
+            // ONSET warning is emitted at the step site (record_ntp_step_and_
+            // check_storm); here we recompute the published state and log the
+            // CLEARING edge. Server mode only -- a client node reports None/false.
             if self.ntp_server_mode {
                 let steps_last_hour = self.ntp_steps_in_storm_window();
+                let storming = steps_last_hour > NTP_STEP_STORM_THRESHOLD_PER_HOUR;
+                // #91 (review S1): log the true->false edge so post-incident log
+                // archaeology can bound the storm's END, not just its onset. The
+                // previously-published flag is the edge memory (no extra mutable
+                // state), and this fires even when the storm ends because steps
+                // STOPPED entirely -- which the step site can never observe.
+                if status.ntp_step_storm && !storming {
+                    info!(
+                        "[NTP][STEP-STORM] cleared -- {} steps in the last hour (<= {}/h); the \
+                         PTP frequency reference appears restored",
+                        steps_last_hour, NTP_STEP_STORM_THRESHOLD_PER_HOUR
+                    );
+                }
                 status.ntp_steps_last_hour = Some(steps_last_hour);
-                status.ntp_step_storm = steps_last_hour > NTP_STEP_STORM_THRESHOLD_PER_HOUR;
+                status.ntp_step_storm = storming;
             } else {
                 status.ntp_steps_last_hour = None;
                 status.ntp_step_storm = false;
@@ -4484,6 +4500,84 @@ mod tests {
             "ntp_steps_last_hour ({}) must exceed the {}/h alarm threshold during the storm",
             reported,
             NTP_STEP_STORM_THRESHOLD_PER_HOUR
+        );
+    }
+
+    /// dantesync#91 — the zero-false-alarm boundary, LOCKED (not just asserted
+    /// in a comment). A genuinely-PTP-locked master at the worst-ever measured
+    /// Dante-GM rate error (66ppm, #83) steps at the deadband cadence -- ~72
+    /// steps/h, measured by `the_locked_master_at_66ppm_is_confirmation_governed_
+    /// not_escape_valve_83` above -- which is the CEILING of healthy operation.
+    /// The step-storm alarm must NOT fire there, or a future threshold lowering /
+    /// window widening would cry wolf on a healthy fleet master (the exact trust
+    /// erosion #91 exists to prevent). This pins the silent direction the same way
+    /// `master_step_storm_raises_the_alarm_91` pins the firing direction.
+    #[test]
+    fn healthy_locked_master_at_66ppm_stays_below_the_storm_alarm_91() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 100,
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let err_for_clock = error_us.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            *err_for_clock.lock().expect("sim lock") -= d.as_micros() as i64 * sign as i64;
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status.clone(),
+            config,
+        );
+        c.configure_ntp_server_mode(100_000);
+        // Genuinely PTP-locked -> the 2500us deadband, chasing only the GM's own
+        // real 66ppm rate error (the worst ever measured): the healthy ceiling.
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        const ACCRUAL_US: i64 = 66 * NTP_SERVER_CHECK_INTERVAL_SECS as i64;
+        const INTERVALS: usize = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        for _ in 0..INTERVALS {
+            *error_us.lock().expect("sim lock") += ACCRUAL_US;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+
+        let s = status.read().expect("status lock");
+        let reported = s
+            .ntp_steps_last_hour
+            .expect("a stepping server-mode master must publish ntp_steps_last_hour");
+        assert!(
+            reported <= NTP_STEP_STORM_THRESHOLD_PER_HOUR,
+            "a HEALTHY 66ppm-locked master (the worst-ever GM rate, ~72 steps/h measured) must \
+             stay at or below the {}/h alarm threshold -- it reported {}/h; a threshold set below \
+             the healthy ceiling would cry wolf on a fine fleet master",
+            NTP_STEP_STORM_THRESHOLD_PER_HOUR,
+            reported
+        );
+        assert!(
+            !s.ntp_step_storm,
+            "the step-storm alarm must NOT fire on a healthy 66ppm-locked master ({} steps/h)",
+            reported
         );
     }
 
