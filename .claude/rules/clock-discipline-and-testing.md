@@ -339,3 +339,30 @@ gate is `cargo fmt --all --check` + `cargo clippy -- -D warnings -A dead_code` (
 so the pervasive `field_reassign_with_default` lint in test code is deliberately not gated) + `cargo
 test --lib` + `cargo test --test '*'` + the release matrix's full `cargo test --verbose` (which is
 what actually runs the bin unit tests). Match those, not a stricter self-imposed `--all-targets`.
+
+## A master's NTP step RATE is a bounded health signal — a storm means the FREQUENCY reference is degraded (#91)
+
+The master cannot slew (see the top of this file) — every UTC correction is a `step_clock` — so the
+step RATE is a direct readout of the Dante-clock-vs-UTC frequency error, and it is BOUNDED ABOVE
+while genuinely PTP-locked: at the 2500us `NTP_SERVER_LOCKED_DEADBAND_US` and the worst-ever measured
+Dante-GM rate error (66ppm, #83) a healthy locked master tops out near ~72 steps/h (measured by the repo's own 66ppm locked-hour test; ~84/h by a looser hand figure). So a
+*sustained* rate above that ceiling can ONLY mean the PTP frequency reference is degraded — a GM
+outage makes `server_step_threshold_us` fall to the tight 200us threshold, which then step-corrects
+UTC almost every 10s check → the 129-180 steps/h storm observed live on strih (#91). Two consequences:
+
+- **A step-rate alarm is zero-false-alarm BY CONSTRUCTION.** `NTP_STEP_STORM_THRESHOLD_PER_HOUR = 120`
+  sits above the ~72/h measured healthy-locked ceiling and below the observed storm floor,
+  so it can only fire on a genuinely degraded frequency reference, never on healthy locked stepping.
+  When picking or moving this threshold, re-derive the healthy ceiling from the CURRENT deadband and
+  the max plausible GM rate — never set it below what a healthy locked master legitimately produces.
+- **No servo/threshold change can fix a storm — only restoring the PTP grandmaster/frequency source can.**
+  The rate tracks a REAL external frequency error the NTP loop cannot slew away; widening the deadband
+  to slow it is the masking #83 already proved drops frames. The honest response is to ALARM
+  (`[NTP][STEP-STORM]` log line + `/status.ntp_step_storm` / `ntp_steps_last_hour`), never to widen a gate.
+
+**Diagnostic — read the step SIZE to tell which threshold is active.** ~200-1200us steps every ~10-20s
+= the TIGHT threshold (NOT genuinely locked: degraded/absent PTP, NTP is the sole reference). ~2.5-2.7ms
+steps every ~40-70s = the LOCKED deadband (healthy, chasing only the GM's own real rate error). In the
+#91 storm the PEAK was small tight-threshold steps (0.35-1.2ms), while the "+2.7ms" quoted in the issue
+body was the later recovering/locked phase — so grep the log for BOTH regimes before concluding which
+one a reported step size represents.
