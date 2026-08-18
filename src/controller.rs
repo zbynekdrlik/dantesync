@@ -394,7 +394,22 @@ const NTP_SERVER_LOCKED_AGREEMENT_TOL_US: i64 = 750;
 // residual-plus-new-accrual would then need another full NTP_SERVER_MAX_CHECKS_WITHOUT_STEP-
 // check wait, during which MORE accrues than one clamp removes -- verified this would NOT
 // converge before choosing the companion fix).
-const NTP_SERVER_LOCKED_MAX_STEP_US: i64 = 5_000;
+//
+// #94: tightened 5000 -> 2500us. The 5000 value was explicitly chosen (above) to sit ABOVE the
+// pre-#94 ~3040-3700us NORMAL confirmed-step ceiling so it never interfered with healthy
+// operation -- but #94 lowers that normal ceiling to ~1980us (NTP_SERVER_LOCKED_DEADBAND_US's own
+// #94 note), so 5000 is now needlessly loose. Setting the hard cap to the SAME 2500us proven-
+// absorbed band makes "no locked step ever exceeds 2500us" a GUARANTEE rather than a
+// clean-simulation property: even a pathological WAN-noise reading that agrees within the 750us
+// tolerance, or the >75ppm escape-valve path, is clamped to 2500us with the residual worked off
+// by the SAME armed-counter convergence mechanism documented above (the counter is not reset on a
+// clamped locked step, so the escape valve re-fires next check -- verified to converge; at the
+// tighter 2500 cap it converges FASTER, since each clamp removes more than one escape-valve
+// re-fire accrues). In HEALTHY 23-66ppm operation this cap NEVER fires -- the lowered trigger
+// already keeps confirmed steps <=~1980us -- so it is purely a safety net for noise/degraded
+// regimes, which are already the storm-alarm's domain. Not-locked path: unchanged (this cap only
+// applies while genuinely locked; the general ntp_server_max_step_us config bound is untouched).
+const NTP_SERVER_LOCKED_MAX_STEP_US: i64 = 2_500;
 
 // #76 REVIEW FINDING (critical): both NTP_SERVER_AGREEMENT_TOL_US and NTP_SERVER_MAX_BURST_SPREAD_US
 // can, by their own construction, reject a genuine same-sign trend FOREVER with no other signal --
@@ -470,18 +485,41 @@ const NTP_SERVER_MAX_CHECKS_WITHOUT_STEP: u32 = 30;
 // version. A plain constant, not made configurable: matches every other tunable this feature
 // introduces (all bare constants, no config-parsing surface), and this value is derived from
 // hard physical evidence (frame period), not an operator preference someone would retune.
-const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 2_500;
+//
+// #94 CORRECTION (the value above, 2500us, described the TRIGGER; the realized STEP is larger):
+// the step SIZE is the offset at CONFIRMATION time, not at the deadband -- ntp_step_gate steps
+// on the SECOND agreeing over-threshold sample (#76), so the realized step = deadband + up to
+// two check-intervals of accrued drift = deadband + 2*(ppm * NTP_SERVER_CHECK_INTERVAL_SECS).
+// With the old 2500us trigger that overshot to +2760us (23ppm) / +3300us (66ppm) -- ABOVE the
+// 2500us band the derivation above proves absorbed -- and the fleet juddered (dantesync#94, live
+// 2026-08-18). The 2500us proven band is a STEP-SIZE bound, and it is now enforced in TWO places:
+// this trigger keeps NORMAL confirmed steps inside it, and NTP_SERVER_LOCKED_MAX_STEP_US is the
+// hard cap that keeps EVERY step inside it. To keep the realized confirmed step <= 2500us at the
+// worst-ever 66ppm: trigger <= 2500 - 2*(66ppm * 10s) = 2500 - 1320 = 1180us. 1000us is chosen
+// (below that ceiling with ~180us margin for WAN noise and any drift slightly past 66ppm): at
+// 66ppm the confirmed step is ~1980us, at the live 23ppm ~1380us -- both comfortably inside the
+// band, steps slightly smaller and more frequent (gentler on frame absorption, the whole point).
+// This raises the healthy 66ppm cadence to the storm-alarm's own 120/h line (a consequence of
+// conservation -- capping every step <=2500us at 66ppm's 237.6ms/h of drift FORCES >=95 steps/h,
+// ~120/h with discrete 2-sample confirmation), which the issue-91 storm test still tolerates
+// (fires only at >120/h) while the alarm still catches the real 129-180/h storm; see this file's
+// #94 design comment on the issue for the full conservation/margin analysis. The not-locked tight
+// path (server_step_threshold_us's else branch) is completely unchanged.
+const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 1_000;
 
 // dantesync#91 — step-storm detection on a server-mode (master) node.
 //
 // The NTP loop CANNOT slew here (PTP owns frequency; a slew is read back by the PTP servo as
 // drift and cancelled -- see clock-discipline-and-testing.md), so a UTC phase error is ALWAYS
 // stepped, and the step RATE is a direct function of the Dante-clock-vs-UTC frequency error.
-// A genuinely-PTP-locked healthy master steps at the 2500us deadband cadence, bounded by the
-// Dante grandmaster's own real rate error: the worst ever measured on strih is 66ppm (#83),
-// which at the deadband is ~72 steps/h MEASURED by the repo's own closed-loop test
-// (the_locked_master_at_66ppm_is_confirmation_governed_not_escape_valve_83; a looser hand
-// figure is ~84/h) -- the ceiling of healthy operation, and the zero-false-alarm test
+// A genuinely-PTP-locked healthy master steps at the locked deadband cadence, bounded by the
+// Dante grandmaster's own real rate error: the worst ever measured on strih is 66ppm (#83).
+// Pre-#94 that was ~72 steps/h at the old 2500us deadband; #94 lowered the trigger to 1000us to
+// keep every realized step inside the 2500us proven band, which by conservation RAISES the
+// healthy-66ppm ceiling to ~120 steps/h (capping each step to <=2500us at 66ppm's 237.6ms/h of
+// drift forces ~120 steps/h) -- MEASURED by the repo's own closed-loop test
+// (the_locked_master_at_66ppm_is_confirmation_governed_not_escape_valve_83) -- the ceiling of
+// healthy operation, and the zero-false-alarm test
 // healthy_locked_master_at_66ppm_stays_below_the_storm_alarm_91 pins it. The live #91 storm
 // (the PTP GM went L2-unreachable, so the master correctly fell back to the tight 200us
 // threshold and step-corrected UTC every ~10s check) ran 129-180 steps/h for 19h+ with NO
@@ -492,11 +530,15 @@ const NTP_SERVER_LOCKED_DEADBAND_US: i64 = 2_500;
 // to slow the storm is the masking #83 already proved drops frames. The only honest response is
 // to DETECT and ALARM so a watchdog/operator restores the grandmaster/PTP.
 //
-// The threshold sits comfortably ABOVE the ~72/h measured healthy-locked ceiling (~66% margin)
-// and BELOW the observed 129/h storm floor, so the alarm can only fire on a genuinely
-// degraded frequency reference -- never on healthy locked stepping (zero false alarm by
-// construction). A trailing-hour count (not a shorter window) is the honest "steps/h" metric
-// #67 named; a persistent storm -- the actual 19h failure mode -- is what it must catch.
+// The threshold sits AT the #94 ~120/h measured healthy-locked ceiling (pre-#94 it sat ~66%
+// above the then-72/h ceiling) and BELOW the observed 129/h storm floor, so the alarm still fires
+// only on a genuinely degraded frequency reference -- it triggers at strictly >120/h, which a
+// healthy locked master cannot reach without a GM drift past ~118ppm (nearly 2x the worst ever
+// measured, itself an anomaly worth flagging), while the tight-threshold not-locked storm path
+// (the real #91 failure: 129-180/h) is entirely unaffected by #94 and still fires. #94's step-
+// size cap consumed the old rate margin but not the alarm's discriminating power: it still
+// catches every real storm. A trailing-hour count (not a shorter window) is the honest "steps/h"
+// metric #67 named; a persistent storm -- the actual 19h failure mode -- is what it must catch.
 const NTP_STEP_STORM_THRESHOLD_PER_HOUR: u32 = 120;
 const NTP_STEP_STORM_WINDOW: Duration = Duration::from_secs(3600);
 // Rate-limit the loud line so a sustained storm logs once per interval, not once per step.
@@ -4098,6 +4140,108 @@ mod tests {
     // original tight tracking (#71/#76/#80) completely unchanged.
     // ========================================================================
 
+    /// #94 shared closed-loop harness: run a genuinely-PTP-locked server-mode
+    /// master for one simulated hour at a constant GM-vs-UTC drift of `ppm`,
+    /// returning every applied step's signed microsecond size. Mirrors the #83
+    /// closed-loop tests' mock wiring exactly (MockNtpSource returns the live
+    /// UTC error; MockSystemClock subtracts each applied step and records it),
+    /// factored out so the #94 realized-step-size bound can be asserted at
+    /// several drift rates without duplicating the 40-line harness each time.
+    fn simulate_locked_master_step_sizes_94(ppm: i64) -> Vec<i64> {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let error_us = Arc::new(std::sync::Mutex::new(0_i64));
+
+        let err_for_ntp = error_us.clone();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp.expect_get_offset().returning(move || {
+            let e = *err_for_ntp.lock().expect("sim lock");
+            Ok(crate::ntp::NtpMeasurement {
+                offset: Duration::from_micros(e.unsigned_abs()),
+                sign: if e >= 0 { 1 } else { -1 },
+                spread_us: 100, // clean, well under the quality bound -- isolates the deadband/step-size relationship
+                sample_count: 3,
+                pcap_active: false,
+            })
+        });
+
+        let step_events = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let err_for_clock = error_us.clone();
+        let steps_for_clock = step_events.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock.expect_step_clock().returning(move |d, sign| {
+            let applied = d.as_micros() as i64 * sign as i64;
+            *err_for_clock.lock().expect("sim lock") -= applied;
+            steps_for_clock.lock().expect("sim lock").push(applied);
+            Ok(())
+        });
+
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status, config);
+        c.configure_ntp_server_mode(100_000);
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        let accrual_us = ppm * NTP_SERVER_CHECK_INTERVAL_SECS as i64;
+        let intervals = 3600 / NTP_SERVER_CHECK_INTERVAL_SECS as usize; // one simulated hour
+        for _ in 0..intervals {
+            *error_us.lock().expect("sim lock") += accrual_us;
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+        let out = step_events.lock().expect("sim lock").clone();
+        out
+    }
+
+    /// #94 (RED before the fix): a genuinely-PTP-locked master's realized NTP
+    /// step must stay inside the PROVEN-ABSORBED 2500us band (camera-box PR
+    /// #1017: <=2.5ms steps proven green through the recorded E2E gate + the
+    /// A/V-sync dock held LOCKED 87min). The step SIZE is the offset at
+    /// CONFIRMATION time = trigger + up to two check-intervals of drift accrual,
+    /// so with the pre-#94 2500us trigger the realized step overshoots to
+    /// ~2.7-3.7ms at the live 23-66ppm GM error -- ABOVE the absorbed band,
+    /// which is the fleet-visible judder P0 this bounds. Asserted at BOTH the
+    /// current live rate (~23ppm) and the worst-ever measured (66ppm).
+    #[test]
+    fn every_locked_step_stays_within_the_proven_2500us_band_94() {
+        // Gather both rates FIRST (so the diagnostic prints the whole picture,
+        // 23ppm AND 66ppm, even when the first assertion below trips) -- then
+        // assert every realized step across both is within the proven band.
+        let measured: Vec<(i64, usize, u64)> = [23_i64, 66_i64]
+            .into_iter()
+            .map(|ppm| {
+                let steps = simulate_locked_master_step_sizes_94(ppm);
+                assert!(
+                    !steps.is_empty(),
+                    "at {}ppm a locked master must still step to track the GM's real UTC drift",
+                    ppm
+                );
+                let worst = steps.iter().map(|s| s.unsigned_abs()).max().unwrap();
+                eprintln!(
+                    "[#94] locked master {}ppm: {} steps/h, worst step {}us",
+                    ppm,
+                    steps.len(),
+                    worst
+                );
+                (ppm, steps.len(), worst)
+            })
+            .collect();
+
+        for (ppm, count, worst) in measured {
+            assert!(
+                worst <= 2_500,
+                "at {}ppm every realized NTP step must stay within the proven-absorbed 2500us \
+                 band (#94), but the worst was {}us -- that overshoot is the fleet-visible judder \
+                 this fix bounds ({} steps in the simulated hour)",
+                ppm,
+                worst,
+                count
+            );
+        }
+    }
+
     /// Closed-loop, end-to-end: the ACTUAL live-measured drift rate on strih
     /// today (~38ppm) with the master genuinely PTP-locked throughout.
     /// Deliberately NOT a round number picked for convenience -- 38ppm's
@@ -4106,17 +4250,16 @@ mod tests {
     /// NTP_SERVER_LOCKED_AGREEMENT_TOL_US (750us), which is exactly what
     /// makes two consecutive readings agree and confirm a step almost every
     /// other over-threshold check -- normal 2-sample confirmation, not the
-    /// escape valve. #83 CORRECTION: the deadband is 2500us (2.5ms), not the
-    /// originally-shipped 25ms -- see NTP_SERVER_LOCKED_DEADBAND_US's own
-    /// doc comment for the frame-period evidence. Note the applied step
-    /// (~3040us, verified by running -- see the assertion below) runs
-    /// somewhat ABOVE the raw 2500us deadband: the 2-sample confirmation
-    /// mechanism steps using the SECOND (confirming) reading's value, which
-    /// has accrued one more interval's worth of drift past the reading that
-    /// first crossed the threshold -- an inherent property of requiring
-    /// confirmation, not a bug. Still comfortably inside the safety margin:
-    /// ~3040us is ~18% of the 60fps frame period (16.7ms) and ~9% of the
-    /// 30fps one (33.3ms), nowhere near either.
+    /// escape valve. #94: the locked deadband is the TRIGGER (1000us), and the
+    /// realized applied step = trigger + the 2-sample confirmation mechanism's
+    /// own inherent one-extra-interval overshoot (it steps using the SECOND,
+    /// confirming reading's value, one interval's worth of drift past the reading
+    /// that first crossed the trigger -- an inherent property of requiring
+    /// confirmation, not a bug). Pre-#94 that overshoot ran to ~3040us at 38ppm
+    /// (ABOVE the 2500us proven band -- the judder this fix removes); with the
+    /// lowered 1000us trigger it is ~1520us here, comfortably INSIDE the band
+    /// (~9% of the 60fps frame period 16.7ms, ~5% of the 30fps 33.3ms). See
+    /// NTP_SERVER_LOCKED_DEADBAND_US's own doc comment for the derivation.
     #[test]
     fn the_locked_master_steps_at_proven_safe_cadence_and_size_83() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -4166,35 +4309,34 @@ mod tests {
 
         let steps = step_events.lock().expect("sim lock");
         let step_count = steps.len();
-        // At 38ppm (380us/10s interval, under the 400us agreement tolerance) the
-        // deadband (2500us) is first crossed around interval 7, confirmed on
-        // interval 8 via normal 2-sample agreement -> a step roughly every 80s,
-        // ~45/hour. Verified by running (not hand-derived alone, per this
-        // project's own standing rule): a prior run of this exact simulation
-        // measured exactly 45 steps. Bound loosely (30-60) so this stays a
-        // genuine regression guard without being brittle to a 1-sample wobble,
-        // while still catching a regression back toward ~180/hour (pre-#83
-        // tight-threshold-always) or toward single digits (an escape-valve-
-        // governed cadence, the residual this correction explicitly checks for).
+        // #94: the locked deadband is now 1000us (the TRIGGER; the realized step
+        // = trigger + confirmation overshoot must stay <= the 2500us proven band).
+        // At 38ppm (380us/10s interval, under the 750us locked agreement tolerance)
+        // the deadband is first crossed around interval 3, confirmed on interval 4
+        // via normal 2-sample agreement -> a step roughly every 40s, ~90/hour, each
+        // ~1520us. Verified by running (not hand-derived alone, per this project's
+        // own standing rule). Bound loosely (80-100) so this stays a genuine
+        // regression guard without being brittle to a 1-sample wobble, while still
+        // catching a regression back toward ~180/hour (pre-#83 tight-threshold-
+        // always) or toward single digits (an escape-valve-governed cadence, the
+        // residual the #83 correction checks for).
         assert!(
-            (30..=60).contains(&step_count),
+            (80..=100).contains(&step_count),
             "a genuinely PTP-locked master at 38ppm (under the agreement tolerance) must step via \
-             normal 2-sample confirmation at ~40-70s cadence (~30-60 steps/hour), got {} steps -- \
-             too few suggests an escape-valve-governed cadence (the residual this correction \
-             checks for), too many suggests the deadband regressed back toward the pre-#83 \
-             tight-threshold-always behavior (~180/hour)",
+             normal 2-sample confirmation at the #94 lowered-trigger cadence (~90 steps/hour), \
+             got {} steps -- too few suggests an escape-valve-governed cadence (the residual the \
+             #83 correction checks for), too many suggests the deadband regressed below the #94 \
+             1000us trigger toward the pre-#83 tight-threshold-always behavior (~180/hour)",
             step_count
         );
         for &applied in steps.iter() {
             assert!(
-                applied.unsigned_abs() <= 4_000,
-                "each individual correction must stay SAFELY inside the frame-period margin --\
-                 camera-box PR #1017 proved <=2.5ms exactly safe (its own measured 0.9-2.5ms \
-                 range), and the 2-sample confirmation mechanism's own inherent one-extra-\
-                 interval overshoot (~3040us measured here, verified by running) is expected \
-                 and still ~18%/9% of the 60fps/30fps frame periods -- 4000us leaves comfortable \
-                 headroom above that while still catching a real regression (an oversized \
-                 escape-valve-forced step, or the withdrawn 25ms deadband), got {}us",
+                applied.unsigned_abs() <= 2_500,
+                "#94: each individual locked correction must stay INSIDE the proven-absorbed \
+                 2500us band (camera-box PR #1017: <=2.5ms proven safe, dock LOCKED 87min) -- the \
+                 lowered 1000us trigger keeps the confirmed step (trigger + one-extra-interval \
+                 overshoot) at ~1520us here, well inside the band; exceeding 2500us would be the \
+                 pre-#94 overshoot regression this fix removes, got {}us",
                 applied
             );
         }
@@ -4269,30 +4411,33 @@ mod tests {
         let steps = step_events.lock().expect("sim lock");
         let step_count = steps.len();
         // Verified by running this exact simulation (never hand-derived alone, per this
-        // project's own standing rule): with NTP_SERVER_LOCKED_AGREEMENT_TOL_US (750us)
-        // comfortably covering the 660us/interval accrual, the deadband is first crossed
-        // around interval 4, confirmed on interval 5 via NORMAL 2-sample agreement (not the
-        // escape valve) -> a step roughly every 50s, ~72/hour, each ~3300us. Faster cadence
-        // than 38ppm's ~45/hour (expected: less time to cross the SAME deadband at a higher
-        // ppm) but each step's SIZE stays just as safely bounded. Bound loosely (55-90) so
-        // this stays a genuine regression guard without being brittle to a 1-sample wobble,
-        // while still catching a regression back toward escape-valve-governed behavior
-        // (single digits/hour, each potentially tens of ms -- the bug this fix corrects).
+        // project's own standing rule): with the #94 lowered 1000us trigger and
+        // NTP_SERVER_LOCKED_AGREEMENT_TOL_US (750us) comfortably covering the 660us/interval
+        // accrual, the deadband is first crossed around interval 2, confirmed on interval 3 via
+        // NORMAL 2-sample agreement (not the escape valve) -> a step roughly every 30s, ~120/hour,
+        // each ~1980us. Faster/smaller than the pre-#94 ~72/hour x ~3300us (the #94 conservation
+        // trade: capping the step SIZE at <=2500us at 66ppm's 237.6ms/h of drift FORCES ~120
+        // steps/h) but every step's SIZE now stays INSIDE the 2500us proven band. Bound loosely
+        // (105-130) so this stays a genuine regression guard without being brittle to a 1-sample
+        // wobble, while still catching a regression back toward escape-valve-governed behavior
+        // (single digits/hour, each potentially tens of ms -- the #83 bug) or below the 1000us
+        // trigger (toward the tight-threshold ~180/hour storm cadence).
         assert!(
-            (55..=90).contains(&step_count),
-            "at 66ppm, with the locked-mode tolerance covering this rate, normal confirmation \
-             must govern at ~40-70s cadence (~55-90 steps/hour), got {} steps -- too few \
-             suggests the escape valve is governing again (the exact bug this correction fixes, \
-             which produced ~21_780us unconfirmed steps when it happened)",
+            (105..=130).contains(&step_count),
+            "at 66ppm, with the #94 lowered trigger and the locked-mode tolerance covering this \
+             rate, normal confirmation must govern at the ~30s cadence (~120 steps/hour), got {} \
+             steps -- too few suggests the escape valve is governing again (the #83 bug, which \
+             produced ~21_780us unconfirmed steps), too many suggests the trigger dropped below \
+             1000us toward the tight-threshold storm cadence",
             step_count
         );
         for &applied in steps.iter() {
             assert!(
-                applied.unsigned_abs() <= 4_000,
-                "each individual correction must stay SAFELY inside the frame-period margin -- \
-                 got {}us (measured here: ~3300us, ~20%/10% of the 60fps/30fps frame periods) -- \
-                 exceeding 4000us would suggest the escape valve fired instead of normal \
-                 confirmation, which can produce a MUCH larger, unconfirmed step",
+                applied.unsigned_abs() <= 2_500,
+                "#94: each individual locked correction must stay INSIDE the proven-absorbed \
+                 2500us band -- got {}us (the #94 lowered trigger keeps the confirmed step at \
+                 ~1980us here, vs the pre-#94 ~3300us overshoot that caused the fleet judder); \
+                 exceeding 2500us is the regression this fix removes",
                 applied
             );
         }
@@ -4505,13 +4650,18 @@ mod tests {
 
     /// dantesync#91 — the zero-false-alarm boundary, LOCKED (not just asserted
     /// in a comment). A genuinely-PTP-locked master at the worst-ever measured
-    /// Dante-GM rate error (66ppm, #83) steps at the deadband cadence -- ~72
-    /// steps/h, measured by `the_locked_master_at_66ppm_is_confirmation_governed_
-    /// not_escape_valve_83` above -- which is the CEILING of healthy operation.
-    /// The step-storm alarm must NOT fire there, or a future threshold lowering /
-    /// window widening would cry wolf on a healthy fleet master (the exact trust
-    /// erosion #91 exists to prevent). This pins the silent direction the same way
-    /// `master_step_storm_raises_the_alarm_91` pins the firing direction.
+    /// Dante-GM rate error (66ppm, #83) steps at the deadband cadence, which is
+    /// the CEILING of healthy operation. #94 raised that ceiling: bounding every
+    /// step to the <=2500us proven band at 66ppm's 237.6ms/h of drift FORCES ~120
+    /// steps/h (conservation), so the healthy ceiling now sits AT the 120/h alarm
+    /// line (measured by `the_locked_master_at_66ppm_is_confirmation_governed_not_
+    /// escape_valve_83` above), not the pre-#94 ~72/h. The step-storm alarm must
+    /// still NOT fire there (it fires only at strictly >120/h, and still catches the
+    /// real 129-180/h #91 storm and any drift past ~118ppm, where cadence drops to
+    /// 2) -- a future threshold lowering / window widening must not cry wolf on a
+    /// healthy fleet master (the exact trust erosion #91 exists to prevent). This
+    /// pins the silent direction the same way `master_step_storm_raises_the_alarm_91`
+    /// pins the firing direction.
     #[test]
     fn healthy_locked_master_at_66ppm_stays_below_the_storm_alarm_91() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -4549,8 +4699,9 @@ mod tests {
             config,
         );
         c.configure_ntp_server_mode(100_000);
-        // Genuinely PTP-locked -> the 2500us deadband, chasing only the GM's own
-        // real 66ppm rate error (the worst ever measured): the healthy ceiling.
+        // Genuinely PTP-locked -> the #94 1000us deadband, chasing only the GM's
+        // own real 66ppm rate error (the worst ever measured): the healthy ceiling,
+        // which #94 raises to ~120/h (each step now <=2500us, so more of them).
         c.is_locked = true;
         c.ptp_offline = false;
 
@@ -4568,9 +4719,9 @@ mod tests {
             .expect("a stepping server-mode master must publish ntp_steps_last_hour");
         assert!(
             reported <= NTP_STEP_STORM_THRESHOLD_PER_HOUR,
-            "a HEALTHY 66ppm-locked master (the worst-ever GM rate, ~72 steps/h measured) must \
-             stay at or below the {}/h alarm threshold -- it reported {}/h; a threshold set below \
-             the healthy ceiling would cry wolf on a fine fleet master",
+            "a HEALTHY 66ppm-locked master (the worst-ever GM rate, ~120 steps/h under the #94 \
+             <=2500us step-size cap) must stay at or below the {}/h alarm threshold -- it reported \
+             {}/h; a threshold set below the healthy ceiling would cry wolf on a fine fleet master",
             NTP_STEP_STORM_THRESHOLD_PER_HOUR,
             reported
         );

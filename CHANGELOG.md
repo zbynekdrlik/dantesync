@@ -5,6 +5,26 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.46] - 2026-08-18
+
+### Fixed
+
+- **Locked-master NTP steps now stay inside the proven 2500us band (issue #94).** While a
+  server-mode master is genuinely PTP-locked, its periodic UTC step chases the Dante
+  grandmaster's own real, unfixable rate error vs UTC (~23ppm live, 66ppm worst-ever). The
+  realized step size is the offset at *confirmation* time — the trigger plus up to two 10s
+  check-intervals of accrued drift — so with the previous 2500us locked trigger the realized
+  step overshot to +2.4..+3.7ms at 23-66ppm, ABOVE the ≤2.5ms band camera-box proved absorbed
+  (PR #1017 E2E green + the A/V-sync dock LOCKED 87min). That overshoot showed up as
+  fleet-visible judder on every output. The fix lowers the locked trigger
+  (`NTP_SERVER_LOCKED_DEADBAND_US` 2500 -> 1000) so the realized confirmed step stays ~1980us at
+  66ppm / ~1380us at 23ppm, and tightens the locked hard step cap
+  (`NTP_SERVER_LOCKED_MAX_STEP_US` 5000 -> 2500) so *no* locked step can exceed the proven band
+  even under WAN noise or the >75ppm escape valve (residual worked off via the existing armed-
+  counter convergence path). Steps become slightly smaller and more frequent — gentler on frame
+  absorption. The issue-91 step-storm alarm is UNCHANGED (120/h threshold, trailing-hour count,
+  counting semantics all byte-identical); the not-locked tight-200us path is untouched.
+
 ## [1.8.45] - 2026-08-18
 
 > 1.8.44 is intentionally skipped — it is reserved for the concurrently-pending
