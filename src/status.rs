@@ -132,6 +132,27 @@ pub struct SyncStatus {
     /// grade against it, not against a fixed assumed bound.
     #[serde(default)]
     pub ntp_deadband_us: Option<i64>,
+
+    /// dantesync#91: how many NTP clock STEPS this node applied in the trailing
+    /// hour — the honest "steps/h" health metric #67 asked for. `None` on a
+    /// client node (or a node that has never served in server mode). A healthy,
+    /// genuinely-PTP-locked master tops out near ~84/h (the 2500us deadband at
+    /// the worst-ever 66ppm Dante-GM rate error, #83); a sustained value above
+    /// `NTP_STEP_STORM_THRESHOLD_PER_HOUR` means this master's PTP FREQUENCY
+    /// reference is degraded (a GM outage drops it to the tight 200us threshold,
+    /// which then step-storms at every check) and the whole NTP fleet is chasing
+    /// the storm. A dev1 watchdog can grade this directly.
+    #[serde(default)]
+    pub ntp_steps_last_hour: Option<u32>,
+
+    /// dantesync#91: true while this server-mode node's `ntp_steps_last_hour`
+    /// exceeds `NTP_STEP_STORM_THRESHOLD_PER_HOUR` — the step-storm alarm surface
+    /// (the loud, grep-able `[NTP][STEP-STORM]` log line is the log-side
+    /// equivalent). Always false on a client node. The storm itself can only be
+    /// cleared by restoring the PTP grandmaster / frequency reference — this flag
+    /// exists so the 19h-silent degradation that motivated #91 pages instead.
+    #[serde(default)]
+    pub ntp_step_storm: bool,
 }
 
 impl SyncStatus {
@@ -170,6 +191,9 @@ impl Default for SyncStatus {
             ntp_age_s: None,
             // #83: unknown until a server-mode check has actually run
             ntp_deadband_us: None,
+            // #91: no steps counted / not storming until a server-mode step lands
+            ntp_steps_last_hour: None,
+            ntp_step_storm: false,
         }
     }
 }
@@ -339,6 +363,39 @@ mod tests {
         assert_eq!(restored.ntp_updated_ts, 0);
         assert_eq!(restored.ntp_age_s, None);
         assert_eq!(restored.mode, "LOCK");
+    }
+
+    /// dantesync#91: the two new step-storm fields are additive. Pre-#91 JSON
+    /// (which has ntp_deadband_us but neither step field) must still deserialize,
+    /// defaulting to "no steps counted / not storming"; and a storming master
+    /// round-trips both fields.
+    #[test]
+    fn test_sync_status_step_storm_fields_are_additive_91() {
+        let pre_91 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1786439763,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "ntp_spread_us":0,"ntp_sample_count":0,"pcap_ntp_active":false,"ntp_updated_ts":0,
+            "ntp_age_s":null,"ntp_deadband_us":2500}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(pre_91).expect("pre-#91 JSON must still deserialize");
+        assert_eq!(
+            restored.ntp_steps_last_hour, None,
+            "absent step count must default to None (never measured), not Some(0)"
+        );
+        assert!(
+            !restored.ntp_step_storm,
+            "absent storm flag must default to false"
+        );
+
+        let storming = SyncStatus {
+            ntp_steps_last_hour: Some(159),
+            ntp_step_storm: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&storming).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(back.ntp_steps_last_hour, Some(159));
+        assert!(back.ntp_step_storm);
     }
 
     #[test]
