@@ -264,19 +264,37 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libpcap-dev
 
+      - name: Cache Npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: npcap-sdk.zip
+          key: npcap-sdk-1.13-dad1f2bf
+
       - name: Install Npcap SDK (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           $expectedHash = "dad1f2bf1b02b787be08ca4862f99e39a876c1f274bac4ac0cedc9bbc58f94fd"
-          Invoke-WebRequest -Uri https://npcap.com/dist/npcap-sdk-1.13.zip -OutFile npcap-sdk.zip
-          $actualHash = (Get-FileHash npcap-sdk.zip -Algorithm SHA256).Hash.ToLower()
-          if ($actualHash -ne $expectedHash) {
-            Write-Error "Npcap SDK checksum mismatch! Expected: $expectedHash, Got: $actualHash"
-            exit 1
+          $ok = $false
+          if (Test-Path npcap-sdk.zip) {
+            if ((Get-FileHash npcap-sdk.zip -Algorithm SHA256).Hash.ToLower() -eq $expectedHash) { $ok = $true; Write-Host "Npcap SDK restored from cache" }
           }
-          Write-Host "Npcap SDK checksum verified: $actualHash"
-          Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk
+          if (-not $ok) {
+            foreach ($attempt in 1..5) {
+              try {
+                Invoke-WebRequest -Uri https://npcap.com/dist/npcap-sdk-1.13.zip -OutFile npcap-sdk.zip -UseBasicParsing
+                $actualHash = (Get-FileHash npcap-sdk.zip -Algorithm SHA256).Hash.ToLower()
+                if ($actualHash -eq $expectedHash) { $ok = $true; Write-Host "Npcap SDK downloaded on attempt ${attempt}: $actualHash"; break }
+                Write-Host "Attempt ${attempt}: checksum mismatch ($actualHash) -- retrying"
+              } catch {
+                Write-Host "Attempt ${attempt}: download failed ($($_.Exception.Message)) -- retrying"
+              }
+              Start-Sleep -Seconds (30 * $attempt)
+            }
+          }
+          if (-not $ok) { Write-Error "Npcap SDK unavailable after 5 attempts (npcap.com throttles GitHub runner IPs -- dantesync issue 66)"; exit 1 }
+          Expand-Archive npcap-sdk.zip -DestinationPath npcap-sdk -Force
           echo "LIB=$PWD\npcap-sdk\Lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Run Tests (Windows) [#58 -- delay-loaded wpcap.dll now lets this actually execute]
