@@ -105,6 +105,9 @@ is running.
   additive-only `/status` contract) → `.claude/rules/clock-discipline-and-testing.md`
 - Adding a config key (the `serde_json` `IndexMut` startup-panic trap, serde defaults, flooring
   nonsense values) → `.claude/rules/config-migration.md`
+- Multi-homed PTP receive interface selection (net.rs/net_pcap.rs/gm_filter.rs — pick the NIC on the
+  trusted GM subnet, reuse the #53 selector, pure-logic-in-gm_filter vs Windows-glue split, overlap
+  semantics + ambiguity guard) → `.claude/rules/multi-homed-interface-selection.md`
 
 ## GOTCHA — `gh pr edit --body-file`/`--body` fails with a GraphQL "Projects (classic)" error
 

@@ -163,9 +163,33 @@ impl GmAllowlist {
     /// `/0` entries) or no candidate is on a trusted subnet — the caller then
     /// keeps its existing default-interface behavior, so single-homed and
     /// no-allowlist boxes are byte-identical to before.
+    ///
+    /// This is the single-answer convenience wrapper over
+    /// [`best_interface_matches`](Self::best_interface_matches): the first-listed
+    /// of the best-scoring candidates, so an exact tie is resolved deterministically
+    /// (first-listed) across restarts. A caller that must DETECT an ambiguous tie
+    /// (more than one interface equally on a trusted network — an over-broad
+    /// allowlist) uses `best_interface_matches` directly.
     pub fn select_interface(&self, candidates: &[(Ipv4Addr, Option<Ipv4Addr>)]) -> Option<usize> {
-        // best: (index, matched trusted-prefix len, interface prefix len)
-        let mut best: Option<(usize, u8, u8)> = None;
+        self.best_interface_matches(candidates).first().copied()
+    }
+
+    /// The candidate indices (ascending) that ALL achieve the best interface
+    /// match — the most-specific trusted prefix, then the longest interface
+    /// prefix. Empty when no candidate is on a trusted subnet.
+    ///
+    /// Normally length 0 (no match) or 1 (a unique winner — the real fleet case,
+    /// e.g. a `/24` allowlist matching exactly the rig NIC). Length ≥ 2 means the
+    /// allowlist is too broad to disambiguate two distinct interfaces (e.g. a
+    /// `/16` that spans both the rig and mbc subnets); `find_ptp_capture_device`
+    /// treats that as ambiguous and keeps the default interface rather than let
+    /// pcap enumeration order silently decide (review 🟡, camera-box issue 1073).
+    pub fn best_interface_matches(
+        &self,
+        candidates: &[(Ipv4Addr, Option<Ipv4Addr>)],
+    ) -> Vec<usize> {
+        // (index, matched trusted-prefix len, interface prefix len) per match.
+        let mut scored: Vec<(usize, u8, u8)> = Vec::new();
         for (i, (ip, netmask)) in candidates.iter().enumerate() {
             // A candidate without a netmask, or the degenerate `0.0.0.0` netmask
             // (junk/APIPA/misconfigured adapter — enumeration can genuinely
@@ -175,6 +199,12 @@ impl GmAllowlist {
                 Some(m) if *m != Ipv4Addr::UNSPECIFIED => *m,
                 _ => continue,
             };
+            // `prefix_len` from `count_ones()` and `base` from `ip & netmask`
+            // agree for a CONTIGUOUS mask (every real NIC); a non-contiguous mask
+            // is RFC-4632-invalid and the OS never produces one. If it somehow
+            // occurred, `overlaps` masks to the shorter length either way, so the
+            // effect is at worst a conservative false MISS (→ fallback), never a
+            // false match.
             let iface = Ipv4Prefix {
                 base: u32::from(*ip) & u32::from(netmask),
                 prefix_len: u32::from(netmask).count_ones() as u8,
@@ -190,19 +220,22 @@ impl GmAllowlist {
                 .map(|p| p.prefix_len)
                 .max();
             if let Some(gm_len) = matched {
-                // More specific trusted prefix wins; tie → longer interface
-                // prefix; tie → keep the earlier (first-listed) candidate, so the
-                // choice is deterministic across restarts.
-                let take = match best {
-                    None => true,
-                    Some((_, b_gm, b_if)) => (gm_len, iface.prefix_len) > (b_gm, b_if),
-                };
-                if take {
-                    best = Some((i, gm_len, iface.prefix_len));
-                }
+                scored.push((i, gm_len, iface.prefix_len));
             }
         }
-        best.map(|(i, _, _)| i)
+        // Best key = (most specific trusted prefix, then longest interface
+        // prefix). Every candidate sharing that exact key is returned in
+        // ascending index order, so the caller sees ties AND the first-listed
+        // stays first (deterministic across restarts).
+        let best_key = scored.iter().map(|&(_, g, f)| (g, f)).max();
+        match best_key {
+            Some(bk) => scored
+                .iter()
+                .filter(|&&(_, g, f)| (g, f) == bk)
+                .map(|&(i, _, _)| i)
+                .collect(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -470,5 +503,70 @@ mod tests {
         let allow = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
         let candidates = [(ip("10.77.9.202"), nm("255.255.255.0"))];
         assert_eq!(allow.select_interface(&candidates), Some(0));
+    }
+
+    #[test]
+    fn exact_tie_keeps_the_first_listed_candidate_deterministically() {
+        // Review 🟡: the "deterministic across restarts" tie-break was untested,
+        // and a `>` -> `>=` mutant in the selection would survive. Two interfaces
+        // with the SAME (trusted-prefix, interface-prefix) key -> the first-listed
+        // MUST win, and both must be reported as an ambiguous tie.
+        let allow = GmAllowlist::parse(&["10.77.0.0/16".to_string()]);
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")), // both inside 10.77.0.0/16
+            (ip("10.77.7.204"), nm("255.255.255.0")), // same (gm_len=16, if_len=24)
+        ];
+        assert_eq!(
+            allow.select_interface(&candidates),
+            Some(0),
+            "an exact tie must keep the first-listed candidate"
+        );
+        assert_eq!(
+            allow.best_interface_matches(&candidates),
+            vec![0, 1],
+            "both tied interfaces must be reported so the caller can detect ambiguity"
+        );
+    }
+
+    #[test]
+    fn interface_prefix_secondary_tiebreak_beats_a_wide_mask_nic() {
+        // Review 🟡: the SECONDARY interface-prefix-length tie-break is load-bearing.
+        // With an exact-GM /32 entry, a stray wide-mask NIC (10.1.2.3/8) also
+        // "overlaps" at gm_len=32 (top 8 bits agree), so ONLY the longer interface
+        // prefix keeps the rig /24 NIC winning. This is what a `>` -> `>=` or a
+        // dropped secondary key would break.
+        let allow = GmAllowlist::parse(&["10.77.9.184".to_string()]); // exact GM /32
+        let candidates = [
+            (ip("10.1.2.3"), nm("255.0.0.0")), // /8 — overlaps at gm_len=32, if_len=8
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig /24 — gm_len=32, if_len=24
+        ];
+        assert_eq!(
+            allow.select_interface(&candidates),
+            Some(1),
+            "the longer interface prefix (rig /24) must beat the wide /8 NIC"
+        );
+        assert_eq!(
+            allow.best_interface_matches(&candidates),
+            vec![1],
+            "the rig /24 is a UNIQUE winner — no ambiguity"
+        );
+    }
+
+    #[test]
+    fn broad_allowlist_spanning_two_subnets_is_reported_as_ambiguous() {
+        // Review 🟡: an over-broad /16 that spans BOTH the rig and mbc subnets can
+        // no longer silently let pcap enumeration order decide — best_interface_matches
+        // returns BOTH so find_ptp_capture_device keeps the default interface.
+        let allow = GmAllowlist::parse(&["10.77.0.0/16".to_string()]);
+        let candidates = [
+            (ip("10.77.7.204"), nm("255.255.255.0")), // mbc
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig
+        ];
+        let matches = allow.best_interface_matches(&candidates);
+        assert_eq!(
+            matches.len(),
+            2,
+            "an ambiguous broad allowlist reports both"
+        );
     }
 }

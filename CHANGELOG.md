@@ -5,6 +5,25 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.44] - 2026-08-17
+
+### Fixed
+
+- **Multi-homed PTP interface selection — adversarial-review hardening (camera-box issue 1073
+  follow-up to 1.8.43).** The 1.8.43 selector is correct for the deployed `/24` allowlist; this
+  patch closes two review-flagged edge cases and adds the missing determinism coverage:
+  - An **over-broad `gm_allowlist`** (e.g. a `/16` that spans BOTH the rig and the mbc subnet) used
+    to match two distinct NICs equally and let pcap enumeration order silently pick one — which could
+    flip a previously-working box to the wrong NIC. DanteSync now DETECTS that ambiguity, keeps the
+    OS default interface (never worse than before), and warns loudly to narrow the allowlist.
+  - The multicast IGMP join now uses the **exact allowlist-matched address** (not the device's first
+    IPv4), so on a multi-IP NIC the join and the selection log always agree.
+  - Added tie-break determinism tests (an exact tie keeps the first-listed interface; the
+    interface-prefix-length secondary key is proven load-bearing against a wide-mask NIC).
+
+  Backward compatibility is unchanged from 1.8.43: an empty/unrestricted allowlist, or no interface
+  on a trusted subnet, keeps the historical default-interface behavior byte-for-byte.
+
 ## [1.8.43] - 2026-08-16
 
 ### Fixed

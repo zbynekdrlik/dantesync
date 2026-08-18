@@ -615,3 +615,36 @@ canary evidence before continuing.
   `"system": { "gm_allowlist": ["10.77.9.0/24"] }` (or tighter `["10.77.9.184"]`) + restart, verify
   `gm_source_ip`=10.77.9.184 & `is_locked` AND that it survives a restart; only once the WHOLE
   fleet holds 10.77.9.184, flip `DANTESYNC_GATE_GM_ENFORCE=1` in camera-box (separate ticket).
+
+## camera-box issue 1073 — multi-homed PTP capture-interface selection (SECOND code half; cross-repo)
+
+- Follow-up to the CODE half above. The v1.8.42 allowlist DROPS a foreign GM but does nothing to
+  make a multi-homed box RECEIVE the rig GM. Root cause (traced): Windows PTP receive
+  (`NpcapPtpNetwork::new`) inherited `net::get_default_interface()` (first non-wireless bindable NIC)
+  for BOTH the pcap capture and the IGMP 224.0.1.129 join; on the dual-homed stream box that is the
+  mbc NIC (10.77.7.204), so the box never joined/captured the rig GM 10.77.9.184 — only saw foreign
+  10.77.7.x (then dropped by the allowlist → NTP fallback, no grandmaster). Supervisor drop-counter
+  evidence confirmed: ~1477 dropped in 2.5 min, ALL from 10.77.7.x, ZERO from the rig GM.
+- Approach: reuse the issue-53 dual-homed NTP selector pattern (subnet containment). New pure
+  `gm_filter::GmAllowlist::select_interface` / `best_interface_matches` pick the NIC on the trusted
+  GM subnet (symmetric overlap → handles exact-GM /32 and CIDR); `net_pcap::find_ptp_capture_device`
+  enumerates devices → selects → falls back to name-based `find_device`. Rejected: join on every NIC
+  (multi-capture rewrite); a config field pinning the interface (extra config). Linux path unchanged.
+- RED `f5ed8ef` (`select_interface` stub → None, dual-homed test asserts rig pick fails) → GREEN
+  `402f30b`. Bump 1.8.43, CHANGELOG. Merged to master via PR 90 (`96aa0c5`, tag v1.8.43) by the
+  supervisor's integration during a session-limit interruption — correct-as-shipped for the deployed
+  /24 (unique NIC match).
+- Adversarial review (fresh-context, salvaged from the reviewer's transcript after a session-limit
+  kill — it had completed before the wrapping result record was written): SHIP-WITH-FIXES, 0 crit /
+  2 warn / 4 sugg. All addressed in follow-up branch `fix-1073-review-hardening` (v1.8.44, commit
+  `ac8f9e6`): over-broad-allowlist ambiguity guard (>1 distinct matched device → keep default +
+  warn), join-on-matched-IP, tie-break determinism tests (the secondary interface-prefix key is
+  load-bearing), non-contiguous-mask + stale-doc comments. New paths-scoped rule
+  `.claude/rules/multi-homed-interface-selection.md` (commit `07319aa`).
+- Local verify (Tier-0 via `--no-run` + direct exec): lib 275 + bin 19 + simulation_e2e 11 +
+  purge_target 18 green; fmt clean; `clippy -- -D warnings -A dead_code` clean; gnu-target
+  `cargo check --bin dantesync --tests --lib` clean.
+- Supervisor next: merge `fix-1073-review-hardening` → master (v1.8.44) with/after v1.8.43 in the
+  canary-first rollout; keep `"system": { "gm_allowlist": ["10.77.9.0/24"] }` on stream; verify
+  `is_locked=true` + `gm_source_ip=10.77.9.184` on stream :8898/status AND survives a restart; only
+  then flip `DANTESYNC_GATE_GM_ENFORCE=1` (separate camera-box ticket).
