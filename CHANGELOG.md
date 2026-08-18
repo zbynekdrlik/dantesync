@@ -5,6 +5,45 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.45] - 2026-08-18
+
+> 1.8.44 is intentionally skipped — it is reserved for the concurrently-pending
+> `fix-1073-review-hardening` branch, so #91 took the next free number.
+
+### Added
+
+- **Step-storm alarm on the fleet NTP master (issue #91).** When the PTP grandmaster goes
+  unreachable, the master correctly falls out of genuine lock and `server_step_threshold_us`
+  drops to the tight 200us threshold, which against a real oscillator-vs-UTC frequency error
+  step-corrects UTC every ~10s check — 129–180 steps/h, live-observed on strih — and the whole
+  NTP fleet chases each step (fleet-wide frame skips). Because the NTP loop cannot slew a real
+  frequency error away (PTP owns frequency), no threshold change can remove this; the honest fix
+  is to make the degradation LOUD. The master now tracks its own trailing-hour step count and,
+  when a server-mode node exceeds `NTP_STEP_STORM_THRESHOLD_PER_HOUR` (120/h — comfortably above
+  the ~72/h measured ceiling of healthy locked stepping at the worst-ever 66ppm GM rate), emits a loud,
+  grep-able `[NTP][STEP-STORM]` warning (rate-limited) and sets `/status.ntp_step_storm`. The
+  raw metric is published as `/status.ntp_steps_last_hour` (the "steps/h" health signal issue
+  #67 asked for), both additive fields a dev1 watchdog can poll. This closes the 19h-silent gap
+  that let the storm run unalerted. No step threshold was widened.
+## [1.8.44] - 2026-08-17
+
+### Fixed
+
+- **Multi-homed PTP interface selection — adversarial-review hardening (camera-box issue 1073
+  follow-up to 1.8.43).** The 1.8.43 selector is correct for the deployed `/24` allowlist; this
+  patch closes two review-flagged edge cases and adds the missing determinism coverage:
+  - An **over-broad `gm_allowlist`** (e.g. a `/16` that spans BOTH the rig and the mbc subnet) used
+    to match two distinct NICs equally and let pcap enumeration order silently pick one — which could
+    flip a previously-working box to the wrong NIC. DanteSync now DETECTS that ambiguity, keeps the
+    OS default interface (never worse than before), and warns loudly to narrow the allowlist.
+  - The multicast IGMP join now uses the **exact allowlist-matched address** (not the device's first
+    IPv4), so on a multi-IP NIC the join and the selection log always agree.
+  - Added tie-break determinism tests (an exact tie keeps the first-listed interface; the
+    interface-prefix-length secondary key is proven load-bearing against a wide-mask NIC).
+
+  Backward compatibility is unchanged from 1.8.43: an empty/unrestricted allowlist, or no interface
+  on a trusted subnet, keeps the historical default-interface behavior byte-for-byte.
+
 ## [1.8.43] - 2026-08-16
 
 ### Fixed

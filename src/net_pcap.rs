@@ -211,10 +211,16 @@ pub(crate) fn find_device_for_ntp_server(server_ip: Ipv4Addr) -> Result<Device> 
 /// trusted subnet), so single-homed and no-allowlist boxes are byte-identical to
 /// before. This mirrors the dual-homed selection already proven for the NTP
 /// transport (`find_device_for_ntp_server`, dantesync#53).
+///
+/// Returns `(device, Some(matched_ip))` when the allowlist uniquely selects a
+/// trusted-subnet interface — `matched_ip` is the EXACT address that matched, so
+/// the caller joins the multicast group on it (review 🔵: on a multi-IP NIC the
+/// device's first IPv4 could differ from the trusted one). `(device, None)` for
+/// the fallback path, where the caller joins on the device's first IPv4.
 pub(crate) fn find_ptp_capture_device(
     gm_allowlist: &crate::gm_filter::GmAllowlist,
     fallback_name: &str,
-) -> Result<Device> {
+) -> Result<(Device, Option<Ipv4Addr>)> {
     let devices = list_devices_guarded()?;
 
     // One (ip, netmask) candidate per device IPv4 address, remembering which
@@ -236,23 +242,50 @@ pub(crate) fn find_ptp_capture_device(
         }
     }
 
-    if let Some(ci) = gm_allowlist.select_interface(&candidates) {
-        let device = devices[candidate_device_idx[ci]].clone();
-        info!(
-            "camera-box issue 1073: selected PTP capture interface {} ({}) — on the trusted \
-             grandmaster subnet per gm_allowlist (dual-homed-safe)",
-            device.name, candidates[ci].0
-        );
-        return Ok(device);
+    let matches = gm_allowlist.best_interface_matches(&candidates);
+    // Distinct DEVICES among the best-scoring candidates. A single device with
+    // several matching addresses is NOT ambiguity; two different NICs are.
+    let mut matched_devices: Vec<usize> =
+        matches.iter().map(|&ci| candidate_device_idx[ci]).collect();
+    matched_devices.sort_unstable();
+    matched_devices.dedup();
+
+    match matched_devices.len() {
+        1 => {
+            let ci = matches[0];
+            let device = devices[candidate_device_idx[ci]].clone();
+            let matched_ip = candidates[ci].0;
+            info!(
+                "camera-box issue 1073: selected PTP capture interface {} ({}) — on the trusted \
+                 grandmaster subnet per gm_allowlist (dual-homed-safe)",
+                device.name, matched_ip
+            );
+            return Ok((device, Some(matched_ip)));
+        }
+        n if n >= 2 => {
+            // Review 🟡: an over-broad allowlist (e.g. a /16 spanning both the rig
+            // and mbc subnets) matches several distinct NICs equally. Rather than
+            // let pcap enumeration order silently decide — and possibly flip a
+            // previously-working box to the wrong NIC — keep the OS default
+            // interface (the pre-change behavior, never WORSE than before) and
+            // warn loudly to narrow the allowlist.
+            warn!(
+                "camera-box issue 1073: gm_allowlist matches {} distinct interfaces — too broad to \
+                 disambiguate the PTP capture interface; keeping the default interface. Narrow the \
+                 allowlist to the grandmaster's subnet (e.g. a /24) or its exact IP (/32).",
+                n
+            );
+        }
+        _ => {} // 0 — no interface on a trusted subnet; fall through to default.
     }
 
     let device = find_device(fallback_name)?;
     info!(
-        "PTP capture interface by default enumeration: {} ({:?}) — gm_allowlist gave no subnet \
-         preference (unrestricted, or no interface on a trusted subnet)",
+        "PTP capture interface by default enumeration: {} ({:?}) — gm_allowlist gave no unambiguous \
+         subnet preference (unrestricted, no interface on a trusted subnet, or too broad)",
         device.name, device.desc
     );
-    Ok(device)
+    Ok((device, None))
 }
 
 /// The device's first non-loopback IPv4 address.
@@ -327,11 +360,17 @@ impl NpcapPtpNetwork {
         // trusted grandmaster subnet (gm_allowlist); otherwise the historical
         // name-based selection. Both the IGMP join and the capture below use the
         // chosen device, so they land on the NIC that reaches the rig GM.
-        let device = find_ptp_capture_device(gm_allowlist, interface_name)?;
+        let (device, matched_ip) = find_ptp_capture_device(gm_allowlist, interface_name)?;
         info!("Found device: {} ({:?})", device.name, device.desc);
 
-        // Extract interface IP for multicast join
-        let iface_ip = device_ipv4(&device)?;
+        // Extract interface IP for the multicast join. Prefer the allowlist-MATCHED
+        // address (review 🔵: on a multi-IP NIC device_ipv4's first address could
+        // differ from the trusted one we selected on); fall back to the device's
+        // first IPv4 on the name-based path.
+        let iface_ip = match matched_ip {
+            Some(ip) => ip,
+            None => device_ipv4(&device)?,
+        };
         info!("Using interface IP {} for multicast join", iface_ip);
 
         // CRITICAL: Join multicast group via sockets to trigger IGMP
@@ -804,9 +843,11 @@ mod tests {
         );
     }
 
-    /// #58 regression: the PTP capture path (`NpcapPtpNetwork::new`) shares
-    /// `find_device()` with `PcapNtpTransport::new` -- same guard, same
-    /// graceful-Err expectation when the runtime is missing.
+    /// #58 regression: the PTP capture path (`NpcapPtpNetwork::new`) goes through
+    /// `find_ptp_capture_device` (camera-box issue 1073), which shares the same
+    /// `list_devices_guarded()` #58 guard as `PcapNtpTransport::new` (reaching the
+    /// name-based `find_device()` only on the fallback path) -- same graceful-Err
+    /// expectation when the Npcap runtime is missing.
     #[test]
     fn test_npcap_ptp_network_new_gracefully_errors_without_npcap_runtime() {
         if wpcap_runtime_available() {
