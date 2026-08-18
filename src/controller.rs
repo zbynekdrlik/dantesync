@@ -1321,6 +1321,9 @@ where
                         // (0 for a full step, the remainder for a bounded one).
                         self.publish_post_step_residual(offset_us - step_us);
                         info!("[NTP] Stepped {:+}us", step_us);
+                        // #91: record this step for storm-rate detection and raise
+                        // the alarm if a server-mode master is step-storming.
+                        self.record_ntp_step_and_check_storm();
                     }
                 }
             }
@@ -2299,6 +2302,68 @@ where
     // UTILITY METHODS
     // ========================================================================
 
+    /// #91: count NTP steps still inside the trailing storm window. Immutable (no
+    /// prune), so `update_shared_status(&self)` can call it — a step older than the
+    /// window is filtered out of the count here even if it has not been physically
+    /// pruned yet (pruning only happens at step time), so the reported rate decays
+    /// correctly between steps.
+    fn ntp_steps_in_storm_window(&self) -> u32 {
+        self.ntp_step_times
+            .iter()
+            .filter(|t| t.elapsed() < NTP_STEP_STORM_WINDOW)
+            .count() as u32
+    }
+
+    /// #91: record a successful NTP `step_clock` and evaluate the step-storm alarm.
+    /// Called at the single successful-step site in `check_ntp_utc_tracking`. Prunes
+    /// the trailing-window deque, refreshes the two `/status` fields, and emits the
+    /// loud, rate-limited `[NTP][STEP-STORM]` warning while a SERVER-mode master is
+    /// storming. This does NOT stop the storm — only restoring the PTP grandmaster /
+    /// frequency reference can (the NTP loop cannot slew a real frequency error away;
+    /// see clock-discipline-and-testing.md) — it exists so the degradation is LOUD
+    /// instead of running 19h+ silent as it did live (#91).
+    fn record_ntp_step_and_check_storm(&mut self) {
+        let now = Instant::now();
+        self.ntp_step_times.push_back(now);
+        // Prune anything older than the trailing window (front is oldest).
+        while let Some(&front) = self.ntp_step_times.front() {
+            if now.duration_since(front) >= NTP_STEP_STORM_WINDOW {
+                self.ntp_step_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        let steps_last_hour = self.ntp_step_times.len() as u32;
+        let storming = self.ntp_server_mode && steps_last_hour > NTP_STEP_STORM_THRESHOLD_PER_HOUR;
+
+        if storming {
+            let warn_due = self
+                .last_step_storm_warn
+                .map(|t| t.elapsed() >= NTP_STEP_STORM_WARN_INTERVAL)
+                .unwrap_or(true);
+            if warn_due {
+                warn!(
+                    "[NTP][STEP-STORM] this NTP MASTER stepped {} times in the last hour \
+                     (> {}/h) -- its PTP frequency reference is degraded and every NTP client \
+                     is chasing these steps (fleet-wide frame skips). Restore the PTP \
+                     grandmaster / frequency source; no NTP-side change can slew a real \
+                     frequency error away.",
+                    steps_last_hour, NTP_STEP_STORM_THRESHOLD_PER_HOUR
+                );
+                self.last_step_storm_warn = Some(now);
+            }
+        }
+
+        // Refresh /status immediately (server mode only) so a step lands the alarm
+        // without waiting for the next update_shared_status tick.
+        if self.ntp_server_mode {
+            if let Ok(mut status) = self.status_shared.write() {
+                status.ntp_steps_last_hour = Some(steps_last_hour);
+                status.ntp_step_storm = storming;
+            }
+        }
+    }
+
     fn update_shared_status(&self) {
         if let Ok(mut status) = self.status_shared.write() {
             // Core fields
@@ -2340,6 +2405,20 @@ where
             } else {
                 None
             };
+            // #91: keep the step-storm metric/flag fresh between steps so a
+            // watchdog polling /status sees the storm CLEAR (steps aging out of
+            // the trailing window) without needing another step to fire. The
+            // loud warning is emitted only at the step site (record_ntp_step_and_
+            // check_storm); here we only recompute the published state. Server
+            // mode only -- a client node reports None/false.
+            if self.ntp_server_mode {
+                let steps_last_hour = self.ntp_steps_in_storm_window();
+                status.ntp_steps_last_hour = Some(steps_last_hour);
+                status.ntp_step_storm = steps_last_hour > NTP_STEP_STORM_THRESHOLD_PER_HOUR;
+            } else {
+                status.ntp_steps_last_hour = None;
+                status.ntp_step_storm = false;
+            }
         }
     }
 }
@@ -4355,8 +4434,13 @@ mod tests {
         let mut config = SystemConfig::default();
         config.filters.calibration_samples = 0;
         config.filters.warmup_secs = 0.0;
-        let mut c =
-            PtpController::new(mock_clock, MockPtpNetwork::new(), mock_ntp, status.clone(), config);
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status.clone(),
+            config,
+        );
         c.configure_ntp_server_mode(100_000);
         // The degraded regime: PTP grandmaster unreachable -> not genuinely
         // locked -> the tight 200us threshold (NTP is the only UTC reference).

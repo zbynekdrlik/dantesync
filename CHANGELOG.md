@@ -5,6 +5,24 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.45] - 2026-08-18
+
+### Added
+
+- **Step-storm alarm on the fleet NTP master (issue #91).** When the PTP grandmaster goes
+  unreachable, the master correctly falls out of genuine lock and `server_step_threshold_us`
+  drops to the tight 200us threshold, which against a real oscillator-vs-UTC frequency error
+  step-corrects UTC every ~10s check — 129–180 steps/h, live-observed on strih — and the whole
+  NTP fleet chases each step (fleet-wide frame skips). Because the NTP loop cannot slew a real
+  frequency error away (PTP owns frequency), no threshold change can remove this; the honest fix
+  is to make the degradation LOUD. The master now tracks its own trailing-hour step count and,
+  when a server-mode node exceeds `NTP_STEP_STORM_THRESHOLD_PER_HOUR` (120/h — comfortably above
+  the ~84/h ceiling of healthy locked stepping at the worst-ever 66ppm GM rate), emits a loud,
+  grep-able `[NTP][STEP-STORM]` warning (rate-limited) and sets `/status.ntp_step_storm`. The
+  raw metric is published as `/status.ntp_steps_last_hour` (the "steps/h" health signal issue
+  #67 asked for), both additive fields a dev1 watchdog can poll. This closes the 19h-silent gap
+  that let the storm run unalerted. No step threshold was widened.
+
 ## [1.8.43] - 2026-08-16
 
 ### Fixed
