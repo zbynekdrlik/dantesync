@@ -328,34 +328,41 @@ than a synthetic repro. This generalizes past clock work too: `spread_us` (issue
 signal) sat unconsulted by the step-decision logic for two full cycles (issues 71 and 76) before
 issue 76 finally used it -- the same "an existing signal was already telling you something" shape.
 
-## Running `cargo test` here from a camera-box Claude session — `--no-run` + exec the binary
+## Working dantesync from a camera-box Claude session — you CANNOT compile locally at all (#557)
 
-dantesync runs `cargo test` normally (it is NOT a Tier-0 repo). BUT when this repo is worked from a
-**camera-box** Claude session (the usual fleet dispatch — dantesync is Claude-stewarded but has no
-session of its own), camera-box's own `block-tier0-local-build.sh` PreToolUse hook fires on every
-Bash call and keys its camera-box detection on the **session cwd** (the tool payload's `.cwd`,
-which is the camera-box checkout), NOT on the directory your `cd dantesync && cargo test` command
-actually runs in. So it (a) BLOCKS a plain `cargo test`/`cargo test --lib` as a "heavy build in the
-camera-box repo", and (b) DISABLES the `# airuleset:build-ok` marker and `AIRULESET_ALLOW_LOCAL_BUILD`
-(both are camera-box-specific carve-outs, #477) — so the usual bypass does NOT work either.
-`cargo check`, `cargo clippy`, and `cargo test --no-run` are still allowed.
+dantesync runs `cargo test` normally in its OWN session (it is NOT a Tier-0 repo). BUT the usual
+fleet dispatch works it from a **camera-box** session (dantesync is Claude-stewarded but has no
+session of its own), and camera-box's `block-tier0-local-build.sh` PreToolUse hook fires on every
+Bash call keyed on the **session cwd** (the tool payload's `.cwd` = the camera-box checkout), NOT on
+the `cd dantesync &&` inside your command.
 
-Workaround (fully within the hook's letter AND spirit — no repeated recompiles hammering the box):
+**As of airuleset #557 (owner directive 2026-08-18) that hook blocks EVERY compiling cargo shape —
+`build`/`test`/`bench`/`run`/`check`/`clippy`/`doc`/`rustc`, narrow OR whole-workspace, `--no-run`
+or not — as an allowlist inversion (unknown subcommand fails SAFE to blocked). The old `--no-run` +
+exec-the-binary workaround this section used to document is GONE (verified live on #97: `cargo test
+--lib --no-run` was blocked), and the `# airuleset:build-ok` / `AIRULESET_ALLOW_LOCAL_BUILD`
+bypasses are disabled for camera-box (#477).** So from a camera-box session you have NO local
+compile, type-check, or test-run path whatsoever.
 
-```bash
-cd /home/newlevel/devel/dantesync && cargo test --lib --no-run   # allowed; prints the test binary path
-BIN=$(ls -t target/debug/deps/dantesync-* | grep -v '\.d$' | head -1)
-"$BIN" <name-filter> --nocapture     # run specific tests directly — a plain exec, not a cargo cmd
-"$BIN"                                # run the whole lib suite
-```
+**Your ONLY local net is `cargo fmt --all --check`** (fmt is on the non-compiling allowlist). It is
+a purely SYNTACTIC tool — it parses every file (following `#[cfg] mod` paths, so it even checks
+Windows-only code), catching a stray brace / broken literal / bad token, but it does NOT type-check.
+Run `cargo fmt --all` then `cargo fmt --all --check` after every edit as your parse-check.
 
-The `main.rs` (bin) unit tests live in a SEPARATE target: `cargo test --bin dantesync --no-run` →
-`target/debug/deps/dantesync-<hash>` (a DIFFERENT hash than the lib binary). Integration tests:
-`cargo test --test '*' --no-run` → `target/debug/deps/simulation_e2e-*` / `purge_target-*`. CI's own
-gate is `cargo fmt --all --check` + `cargo clippy -- -D warnings -A dead_code` (NOT `--all-targets`,
-so the pervasive `field_reassign_with_default` lint in test code is deliberately not gated) + `cargo
-test --lib` + `cargo test --test '*'` + the release matrix's full `cargo test --verbose` (which is
-what actually runs the bin unit tests). Match those, not a stricter self-imposed `--all-targets`.
+**Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
+ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually
+verify a branch, **open a PR to `master`** (that fires the `pull_request` CI); monitor it to green;
+do NOT merge if your lane is implement-only (the supervisor owns integration/rollout). CI runs, in
+parallel: Version Consistency, Lint (`cargo clippy -- -D warnings -A dead_code` — this is a FULL
+type-check of the lib, so a green Lint proves the production code compiles + is clippy-clean; NOT
+`--all-targets`, so test-code `field_reassign_with_default` is deliberately not gated), Test
+(`cargo test --lib` + `--test '*'` — compiles + runs test code, the only place test-compile errors
+and failing assertions surface), Build Check (Linux + **Windows** — the Windows compile is your only
+proof `#[cfg(windows)]` code builds), Coverage (runs the suite under instrumentation — a green
+Coverage implies the tests compiled AND passed), Security Audit. Because you cannot run tests
+locally, write them with extra care (trace assertion arithmetic against the impl by hand or in a
+throwaway `python3` sim) and expect CI to be the FIRST place a type mistake or a wrong assertion
+shows. Match CI's gate, never a stricter self-imposed `--all-targets`.
 
 ## A master's NTP step RATE is a bounded health signal — a storm means the FREQUENCY reference is degraded (#91)
 
