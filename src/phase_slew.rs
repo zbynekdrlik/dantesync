@@ -170,14 +170,50 @@ impl PhaseSlewServo {
     /// `f_phase` to add to `f_ptp`. Callers MUST only reach this for `|e| ≤ STEP_BOUNDARY_US`
     /// (`should_step` is false); a larger error is a step, not a slew.
     pub fn update(&mut self, e_us: i64, dt_s: f64) -> PhaseSlewOutput {
-        // ---- STUB (RED): unimplemented; returns neutral values so the tests compile and FAIL. ----
-        let _ = (e_us, dt_s);
+        let dt = dt_s.max(0.0);
+        let e = e_us as f64;
+
+        // --- Proportional term, with the deadbeat-capped effective gain (stable at any cadence).
+        // Clamped to the composite cap so the reported P contribution never exceeds what can be
+        // applied, and so a huge error inside the slew band cannot momentarily overflow it.
+        let p = (effective_kp(dt) * e).clamp(-F_PHASE_CAP_PPM, F_PHASE_CAP_PPM);
+
+        // Anti-windup decision uses the tentative composite BEFORE this update's integration.
+        let tentative = p + self.i_ppm;
+        let would_saturate = tentative.abs() > F_PHASE_CAP_PPM;
+
+        // --- Integrator: frozen inside the deadband (so client jitter cannot random-walk the
+        // frequency); rate-limited to ≤ I_RATE_PPM_PER_S; anti-windup (never integrate further
+        // INTO saturation); hard-clamped to ±I_CLAMP_PPM.
+        if e_us.abs() > I_DEADBAND_US {
+            let unbounded = K_I_PPM_PER_US_S * e * dt;
+            let rate_cap = I_RATE_PPM_PER_S * dt;
+            let delta = unbounded.clamp(-rate_cap, rate_cap);
+            let deepens_saturation = would_saturate && (delta > 0.0) == (tentative > 0.0);
+            if !deepens_saturation {
+                self.i_ppm = (self.i_ppm + delta).clamp(-I_CLAMP_PPM, I_CLAMP_PPM);
+            }
+        }
+
+        // --- Composite phase slew, capped.
+        let f_phase = (p + self.i_ppm).clamp(-F_PHASE_CAP_PPM, F_PHASE_CAP_PPM);
+        let saturated = f_phase.abs() >= F_PHASE_CAP_PPM - 1e-9;
+
+        // --- "Slew saturated" guard: dwell accumulates only while the slew is capped AND the error
+        // is genuinely large; any recovery below either threshold resets it.
+        if saturated && e_us.abs() > SAT_ALARM_E_US {
+            self.saturated_dwell_s += dt;
+        } else {
+            self.saturated_dwell_s = 0.0;
+        }
+        let alarm = self.saturated_dwell_s >= SAT_ALARM_DWELL_S;
+
         PhaseSlewOutput {
-            f_phase_ppm: 0.0,
-            p_ppm: 0.0,
+            f_phase_ppm: f_phase,
+            p_ppm: p,
             i_ppm: self.i_ppm,
-            saturated: false,
-            alarm: false,
+            saturated,
+            alarm,
         }
     }
 
