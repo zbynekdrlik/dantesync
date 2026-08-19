@@ -68,12 +68,29 @@ PTP owns frequency (`adjust_frequency`) and re-measures phase against the Dante 
 frequency offset injected to correct UTC phase is read back by the PTP servo as drift and cancelled
 within seconds — the two loops fight and the casualty is the <50 µs precision target. A UTC
 correction is therefore always `step_clock`, and the only lever on its aggressiveness is the
-threshold and `max_step_us`. Do not add a second servo.
+threshold and `max_step_us`. Do not add a second servo — **UNLESS you decouple it (see #97 below).**
+
+**AMENDED by #97 (`src/phase_slew.rs`), behind a DEFAULT-OFF flag (`system.phase_slew.enabled`).**
+The "two loops fight" claim above is only true for a NAIVE second servo. #97 adds a bounded PI
+phase-slew servo that IS safe on the same clock via **feed-forward decoupling**: the commanded
+`f_phase` (a bounded frequency slew) is composed into the single frequency word `f_total = f_ptp +
+f_phase`, and — the load-bearing part — `f_phase` is SUBTRACTED from every PTP rate observation
+(`decouple_ptp_rate`) BEFORE the PTP servo consumes it, so the PTP servo never reads the deliberate
+slew as grandmaster disagreement and cannot cancel it. The two servos then coexist (PTP owns the
+oscillator-vs-GM rate; phase owns UTC phase), with time-constant separation reinforcing it (PTP in
+fractions of a second, the phase integrator in minutes). The sign is derived, not assumed (`offset
+= local - master`, so a faster local clock grows the offset ⇒ subtract). With the flag OFF (the
+default, and the whole fleet until the canary rollout) the frequency- and step-paths are
+byte-for-byte the behaviour this section describes — so everything below still holds as the default
+reality; #97 is the deliberate, decoupled exception, not a repeal. Any FUTURE second control loop on
+this clock still owes the same proof: show the decoupling that keeps it from fighting PTP, or it is
+the naive servo this rule bans.
 
 Stepping itself is safe for PTP: the existing post-step machinery (2 s grace, `sample_window.clear()`,
 `spike_filter.clear()`, `prev_t1_ns = 0`) absorbs the transient. But every master step propagates to
 the fleet one or two client intervals later, so its SIZE is a fleet-coherence budget, not a private
-matter.
+matter. (#97's slew avoids the step entirely for a sub-50ms error while locked — no propagated step,
+no grace transient — but keeps the step path for cold boot / |e|>50ms / acquisition / PTP-offline.)
 
 ## `Instant` vs `SystemTime` — this daemon steps its own wall clock
 
