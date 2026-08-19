@@ -5,6 +5,23 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.47] - 2026-08-19
+
+### Added
+
+- **`phase_slew` PI phase servo — bounded micro-slew instead of NTP micro-steps (issue #97),
+  DEFAULT OFF.** New `src/phase_slew.rs` pure PI servo that corrects sub-50ms UTC phase error by
+  a bounded, rate-limited frequency slew (`f_phase`) composed with the PTP frequency word into one
+  composite word `f_total = f_ptp + f_phase`, instead of a discrete `step_clock`. The two servos on
+  one clock are made safe by **feed-forward decoupling**: the commanded `f_phase` is subtracted from
+  every PTP rate observation, so the PTP frequency servo never reads the slew as grandmaster
+  disagreement and cannot fight it. The step path stays for cold boot / faults / `|e| > 50ms`,
+  loudly logged and separately counted. Phase-servo telemetry (`e`, `f_phase` P/I split, `f_ptp`,
+  saturation) is published to `/status` (additive fields) and the journal, with a "slew saturated"
+  alarm when `f_phase` is capped AND `|e| > 10ms` for 60s. Gated behind `system.phase_slew.enabled`
+  (default **false**) — with the flag off the frequency- and step-paths are byte-for-byte the prior
+  behaviour, so merging changes nothing on the fleet until a box opts in during the canary rollout.
+
 ## [1.8.46] - 2026-08-18
 
 ### Fixed
