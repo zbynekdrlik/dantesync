@@ -761,6 +761,10 @@ where
     /// #97: monotonic time of the last phase-servo update, for its `dt`. `Instant` because this
     /// daemon steps its own wall clock.
     last_phase_slew_update: Option<Instant>,
+    /// #97 (review 🟡): edge state for the "slew saturated" alarm. `out.alarm` is a LEVEL (stays
+    /// true for the whole saturation episode), so this latch makes `log_saturated_alarm` fire ONCE
+    /// at the onset instead of every NTP cadence for minutes — honouring that fn's edge contract.
+    phase_slew_alarm_active: bool,
 }
 
 struct PendingSync {
@@ -918,6 +922,7 @@ where
             last_applied_f_phase_ppm: 0.0,
             last_phase_slew_output: None,
             last_phase_slew_update: None,
+            phase_slew_alarm_active: false,
         }
     }
 
@@ -1184,6 +1189,21 @@ where
                         self.ntp_server_checks_since_step.saturating_add(1);
                 }
 
+                // Add sample to buffer. #53: `offset_us` is now the burst-filtered
+                // (RTT-selected + median'd) value from NtpClient::get_offset(), not a
+                // single raw round trip — the MAD threshold below and the #50
+                // step-agreement gate deliberately keep consuming this same per-check
+                // value unchanged; they just get a cleaner input now.
+                //
+                // #97 (review 🔵): recorded BEFORE the slew early-return below, so the
+                // adaptive-MAD threshold's history stays fresh even while a box is slewing —
+                // a later slew→step transition (error jumps >50ms) then reads a real buffer,
+                // not an empty one.
+                self.ntp_offset_samples.push_back(offset_us);
+                if self.ntp_offset_samples.len() > NTP_SAMPLE_COUNT + 2 {
+                    self.ntp_offset_samples.pop_front();
+                }
+
                 // #97: PHASE SLEW. While genuinely PTP-locked, a small (<50ms) UTC error is
                 // corrected by a bounded frequency slew instead of a discrete step — see
                 // `crate::phase_slew`. The step path below is kept UNCHANGED for: a large/insane
@@ -1208,16 +1228,6 @@ where
                         );
                     }
                     self.reset_phase_slew();
-                }
-
-                // Add sample to buffer. #53: `offset_us` is now the burst-filtered
-                // (RTT-selected + median'd) value from NtpClient::get_offset(), not a
-                // single raw round trip — the MAD threshold below and the #50
-                // step-agreement gate deliberately keep consuming this same per-check
-                // value unchanged; they just get a cleaner input now.
-                self.ntp_offset_samples.push_back(offset_us);
-                if self.ntp_offset_samples.len() > NTP_SAMPLE_COUNT + 2 {
-                    self.ntp_offset_samples.pop_front();
                 }
 
                 // (offset + quality (#53) + freshness (#68) were published to
@@ -1498,9 +1508,12 @@ where
             self.ntp_server_checks_since_step = 0;
         }
 
-        if out.alarm {
+        // #97 (review 🟡): edge-triggered — the loud WARN fires ONCE at the alarm's onset, not on
+        // every update for the whole (multi-minute) saturation episode.
+        if out.alarm && !self.phase_slew_alarm_active {
             PhaseSlewServo::log_saturated_alarm(offset_us, out.f_phase_ppm);
         }
+        self.phase_slew_alarm_active = out.alarm;
         info!(
             "[PHASE-SLEW] e={:+}us f_phase={:+.2}ppm (P={:+.2} I={:+.2}) f_ptp={:+.2}ppm{}",
             offset_us,
@@ -1523,6 +1536,8 @@ where
         self.pending_f_phase_ppm = 0.0;
         self.last_phase_slew_output = None;
         self.last_phase_slew_update = None;
+        // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
+        self.phase_slew_alarm_active = false;
     }
 
     /// True while this node is the fleet's NTP server (#68).
@@ -2205,8 +2220,12 @@ where
             if dt_secs > 0.1 {
                 // Need meaningful time delta
                 let delta_offset = offset_us - prev_offset;
-                // Convert: us/s = ppm
-                (delta_offset / dt_secs).clamp(-500.0, 500.0)
+                // Convert: us/s = ppm.
+                // #97 (review 🔵): the ±500 spike clamp moved to AFTER the decoupling below, so it
+                // bounds the RESIDUAL the PTP servo actually consumes, not the pre-decoupled raw
+                // (which would corrupt the residual if `true_drift + f_phase` ever exceeded 500 —
+                // unreachable on this fleet, but the residual is the correct thing to bound).
+                delta_offset / dt_secs
             } else {
                 self.smoothed_rate_ppm // Keep previous
             }
@@ -2223,12 +2242,15 @@ where
         // frequency servo never reads our own commanded slew as grandmaster disagreement and
         // cannot fight it. Sign is `-` (offset = local - master; a faster local clock grows the
         // observed offset). A no-op when the servo is disabled (`last_applied_f_phase_ppm` is
-        // held at 0), so the pre-#97 rate is unchanged.
+        // held at 0). The ±500 clamp is applied AFTER, to the value the servo consumes — for the
+        // disabled path this is byte-identical (the `delta/dt` branch was clamped here before; the
+        // smoothed/0.0 fallbacks are already within range, so clamping them is a no-op).
         let raw_rate_ppm = if self.phase_slew.is_some() {
             phase_slew::decouple_ptp_rate(raw_rate_ppm, self.last_applied_f_phase_ppm)
         } else {
             raw_rate_ppm
-        };
+        }
+        .clamp(-500.0, 500.0);
 
         // =======================================================================
         // ADAPTIVE SPIKE DETECTION
@@ -6199,7 +6221,10 @@ mod tests {
             status,
             slew_config(),
         );
-        c.is_locked = false;
+        // is_locked=true so the slew gate's `!ptp_offline` clause is what actually rejects the
+        // slew (review 🔵: with is_locked=false the `is_locked` clause short-circuits first and the
+        // test would pass even if the ptp_offline guard were removed).
+        c.is_locked = true;
         c.ptp_offline = true;
 
         c.last_ntp_check = Instant::now() - Duration::from_secs(60);
