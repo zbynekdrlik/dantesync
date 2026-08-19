@@ -253,6 +253,12 @@ fn load_config() -> Config {
   "http_status": {
     "enabled": true,
     "port": 8898
+  },
+  "system": {
+    "_phase_slew": "dantesync#97 — set enabled:true (per-box, canary rollout) to SLEW sub-50ms UTC errors instead of stepping",
+    "phase_slew": {
+      "enabled": false
+    }
   }
 }"#;
     let _ = std::fs::write(path, simple_config);

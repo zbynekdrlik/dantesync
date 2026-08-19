@@ -12,6 +12,7 @@
 use crate::clock::SystemClock;
 use crate::config::SystemConfig;
 use crate::gm_filter::GmAllowlist;
+use crate::phase_slew::{self, PhaseSlewOutput, PhaseSlewServo};
 use crate::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header, PtpV1SyncMessageBody};
 use crate::spike_filter::{FilterMode, JitterEstimator, SpikeFilter};
 use crate::status::SyncStatus;
@@ -739,6 +740,31 @@ where
     /// log line (`should_log_drift_summary`). Increments once per call to
     /// `apply_self_tuning_servo`.
     drift_log_sample_count: u64,
+
+    // ==========================================================================
+    // PHASE-SLEW SERVO STATE (dantesync#97)
+    // ==========================================================================
+    /// The bounded PI phase-slew servo, `Some` only when `config.phase_slew.enabled` — so `None`
+    /// (the default) makes every branch below a no-op and the frequency/step paths byte-identical
+    /// to the pre-#97 behaviour.
+    phase_slew: Option<PhaseSlewServo>,
+    /// #97: the phase slew (ppm) to compose into the frequency word — updated at NTP cadence by
+    /// `slew_phase`, consumed every PTP sample by `apply_self_tuning_servo`. `0.0` = idle.
+    pending_f_phase_ppm: f64,
+    /// #97: the phase slew that was ACTUALLY applied at the end of the previous
+    /// `apply_self_tuning_servo` — i.e. the `f_phase` in effect over the just-measured PTP
+    /// interval. Subtracted from the raw PTP rate observation (feed-forward decoupling) so the PTP
+    /// servo never fights the deliberate slew.
+    last_applied_f_phase_ppm: f64,
+    /// #97: the last phase-servo output, for `/status` telemetry (P/I split + saturation).
+    last_phase_slew_output: Option<PhaseSlewOutput>,
+    /// #97: monotonic time of the last phase-servo update, for its `dt`. `Instant` because this
+    /// daemon steps its own wall clock.
+    last_phase_slew_update: Option<Instant>,
+    /// #97 (review 🟡): edge state for the "slew saturated" alarm. `out.alarm` is a LEVEL (stays
+    /// true for the whole saturation episode), so this latch makes `log_saturated_alarm` fire ONCE
+    /// at the onset instead of every NTP cadence for minutes — honouring that fn's edge contract.
+    phase_slew_alarm_active: bool,
 }
 
 struct PendingSync {
@@ -766,6 +792,8 @@ where
         let window_size = config.filters.sample_window_size;
         let calibration_count = config.filters.calibration_samples;
         let calibration_complete = calibration_count == 0;
+        // #97: read the flag before `config` is moved into the struct below.
+        let config_phase_slew_enabled = config.phase_slew.enabled;
 
         // camera-box issue 1073: parse the grandmaster-source allowlist once.
         let gm_allowlist = GmAllowlist::parse(&config.gm_allowlist);
@@ -883,6 +911,18 @@ where
             jitter_estimator: JitterEstimator::new(),
             // #679 — throttled drift summary log counter
             drift_log_sample_count: 0,
+            // #97 — phase-slew servo; Some only when the flag is set, so None = pre-#97 behaviour
+            phase_slew: if config_phase_slew_enabled {
+                info!("[PHASE-SLEW] enabled — sub-50ms UTC errors will SLEW (bounded PI servo, feed-forward decoupled), not step");
+                Some(PhaseSlewServo::new())
+            } else {
+                None
+            },
+            pending_f_phase_ppm: 0.0,
+            last_applied_f_phase_ppm: 0.0,
+            last_phase_slew_output: None,
+            last_phase_slew_update: None,
+            phase_slew_alarm_active: false,
         }
     }
 
@@ -1154,9 +1194,40 @@ where
                 // single raw round trip — the MAD threshold below and the #50
                 // step-agreement gate deliberately keep consuming this same per-check
                 // value unchanged; they just get a cleaner input now.
+                //
+                // #97 (review 🔵): recorded BEFORE the slew early-return below, so the
+                // adaptive-MAD threshold's history stays fresh even while a box is slewing —
+                // a later slew→step transition (error jumps >50ms) then reads a real buffer,
+                // not an empty one.
                 self.ntp_offset_samples.push_back(offset_us);
                 if self.ntp_offset_samples.len() > NTP_SAMPLE_COUNT + 2 {
                     self.ntp_offset_samples.pop_front();
+                }
+
+                // #97: PHASE SLEW. While genuinely PTP-locked, a small (<50ms) UTC error is
+                // corrected by a bounded frequency slew instead of a discrete step — see
+                // `crate::phase_slew`. The step path below is kept UNCHANGED for: a large/insane
+                // error (|e|>50ms, cold boot), the acquisition regime (not yet locked), and
+                // NTP-only fallback (ptp_offline) — the three cases where a step is still correct
+                // and where injecting a decoupled slew would be unsafe. When the servo is disabled
+                // (`None`, the default) this whole block is skipped and the step path is
+                // byte-identical to before.
+                if self.phase_slew.is_some() {
+                    if self.is_locked && !self.ptp_offline && !phase_slew::should_step(offset_us) {
+                        self.slew_phase(offset_us);
+                        return; // slewed, not stepped — skip the entire step-decision block
+                    }
+                    // Not slewable (large error / acquiring / PTP offline): drop any held slew so
+                    // the decoupling decays to a no-op, then fall through to the STEP path.
+                    if phase_slew::should_step(offset_us) {
+                        info!(
+                            "[PHASE-SLEW] |e|={}us exceeds the {}us slew boundary — STEPPING \
+                             (cold boot / large offset the servo must not slow-walk)",
+                            offset_us,
+                            phase_slew::STEP_BOUNDARY_US
+                        );
+                    }
+                    self.reset_phase_slew();
                 }
 
                 // (offset + quality (#53) + freshness (#68) were published to
@@ -1405,6 +1476,68 @@ where
                 }
             }
         }
+    }
+
+    /// #97 — feed a small (<50ms) UTC phase error to the bounded PI phase-slew servo instead of
+    /// stepping. Updates the held `pending_f_phase_ppm` (applied continuously by
+    /// `apply_self_tuning_servo`), clears any half-formed step candidate, raises the "slew
+    /// saturated" alarm when the guard trips, and publishes telemetry. `dt` is the real elapsed
+    /// time since the last slew update (clamped to a sane range) so the servo's deadbeat gain cap
+    /// and integrator are correct across the client's variable NTP cadence.
+    fn slew_phase(&mut self, offset_us: i64) {
+        let now = Instant::now();
+        let dt = self
+            .last_phase_slew_update
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(NTP_SERVER_CHECK_INTERVAL_SECS as f64)
+            .clamp(1.0, 120.0);
+        self.last_phase_slew_update = Some(now);
+
+        let out = self
+            .phase_slew
+            .as_mut()
+            .expect("slew_phase is only reached when phase_slew is Some")
+            .update(offset_us, dt);
+        self.pending_f_phase_ppm = out.f_phase_ppm;
+        self.last_phase_slew_output = Some(out);
+
+        // We corrected via slew, so no step is pending and the server-mode starvation counter is
+        // not meaningful (it gates the step path, which we are bypassing).
+        self.ntp_pending_step = None;
+        if self.ntp_server_mode {
+            self.ntp_server_checks_since_step = 0;
+        }
+
+        // #97 (review 🟡): edge-triggered — the loud WARN fires ONCE at the alarm's onset, not on
+        // every update for the whole (multi-minute) saturation episode.
+        if out.alarm && !self.phase_slew_alarm_active {
+            PhaseSlewServo::log_saturated_alarm(offset_us, out.f_phase_ppm);
+        }
+        self.phase_slew_alarm_active = out.alarm;
+        info!(
+            "[PHASE-SLEW] e={:+}us f_phase={:+.2}ppm (P={:+.2} I={:+.2}) f_ptp={:+.2}ppm{}",
+            offset_us,
+            out.f_phase_ppm,
+            out.p_ppm,
+            out.i_ppm,
+            self.last_adj_ppm,
+            if out.saturated { " SATURATED" } else { "" }
+        );
+        self.update_shared_status();
+    }
+
+    /// #97 — disengage the phase slew (lock loss / large error / PTP offline). The servo's
+    /// integrator is reset so a re-lock relearns the DC afresh, and the held slew drops to 0 so
+    /// the decoupling in `apply_self_tuning_servo` becomes a no-op again.
+    fn reset_phase_slew(&mut self) {
+        if let Some(servo) = self.phase_slew.as_mut() {
+            *servo = PhaseSlewServo::new();
+        }
+        self.pending_f_phase_ppm = 0.0;
+        self.last_phase_slew_output = None;
+        self.last_phase_slew_update = None;
+        // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
+        self.phase_slew_alarm_active = false;
     }
 
     /// True while this node is the fleet's NTP server (#68).
@@ -2087,8 +2220,12 @@ where
             if dt_secs > 0.1 {
                 // Need meaningful time delta
                 let delta_offset = offset_us - prev_offset;
-                // Convert: us/s = ppm
-                (delta_offset / dt_secs).clamp(-500.0, 500.0)
+                // Convert: us/s = ppm.
+                // #97 (review 🔵): the ±500 spike clamp moved to AFTER the decoupling below, so it
+                // bounds the RESIDUAL the PTP servo actually consumes, not the pre-decoupled raw
+                // (which would corrupt the residual if `true_drift + f_phase` ever exceeded 500 —
+                // unreachable on this fleet, but the residual is the correct thing to bound).
+                delta_offset / dt_secs
             } else {
                 self.smoothed_rate_ppm // Keep previous
             }
@@ -2099,6 +2236,21 @@ where
         // Store for next iteration
         self.last_offset_us = Some(offset_us);
         self.last_offset_time = Some(now);
+
+        // #97: FEED-FORWARD DECOUPLING (the carrier line). Subtract the phase slew that was
+        // actually in effect over THIS interval from the raw PTP rate observation, so the PTP
+        // frequency servo never reads our own commanded slew as grandmaster disagreement and
+        // cannot fight it. Sign is `-` (offset = local - master; a faster local clock grows the
+        // observed offset). A no-op when the servo is disabled (`last_applied_f_phase_ppm` is
+        // held at 0). The ±500 clamp is applied AFTER, to the value the servo consumes — for the
+        // disabled path this is byte-identical (the `delta/dt` branch was clamped here before; the
+        // smoothed/0.0 fallbacks are already within range, so clamping them is a no-op).
+        let raw_rate_ppm = if self.phase_slew.is_some() {
+            phase_slew::decouple_ptp_rate(raw_rate_ppm, self.last_applied_f_phase_ppm)
+        } else {
+            raw_rate_ppm
+        }
+        .clamp(-500.0, 500.0);
 
         // =======================================================================
         // ADAPTIVE SPIKE DETECTION
@@ -2297,10 +2449,27 @@ where
             }
         }
 
-        // Apply correction
+        // Apply correction. `total_correction` is f_ptp — the PTP servo's own frequency word,
+        // computed from the DECOUPLED rate above (so its meaning, and `drift_ppm`, are unchanged).
         self.last_adj_ppm = total_correction;
         self.applied_freq_ppm = total_correction;
-        let factor = 1.0 + (total_correction / 1_000_000.0);
+
+        // #97: compose the ONE frequency word actually applied to the clock — f_total = f_ptp +
+        // f_phase — through the SAME `adjust_frequency` path on every platform (so the Windows
+        // rate mechanism composes with the slew automatically; there is no second frequency path).
+        // Then remember the applied f_phase for the NEXT interval's decoupling. When the servo is
+        // disabled this is exactly `total_correction` and `last_applied_f_phase_ppm` stays 0.
+        let f_total = if self.phase_slew.is_some() {
+            phase_slew::compose_frequency(total_correction, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
+        } else {
+            total_correction
+        };
+        self.last_applied_f_phase_ppm = if self.phase_slew.is_some() {
+            self.pending_f_phase_ppm
+        } else {
+            0.0
+        };
+        let factor = 1.0 + (f_total / 1_000_000.0);
 
         let status = if self.in_nano_mode {
             "NANO"
@@ -2476,6 +2645,23 @@ where
             } else {
                 status.ntp_steps_last_hour = None;
                 status.ntp_step_storm = false;
+            }
+
+            // #97: phase-slew telemetry. `f_ptp_ppm` mirrors `drift_ppm` (the decoupled PTP
+            // correction), surfaced explicitly beside the f_phase split so both composed frequency
+            // terms are readable. All fields default to the "off / idle" reading when disabled.
+            status.phase_slew_enabled = self.phase_slew.is_some();
+            status.f_ptp_ppm = self.last_adj_ppm;
+            if let Some(out) = self.last_phase_slew_output {
+                status.f_phase_ppm = out.f_phase_ppm;
+                status.f_phase_p_ppm = out.p_ppm;
+                status.f_phase_i_ppm = out.i_ppm;
+                status.phase_slew_saturated = out.saturated;
+            } else {
+                status.f_phase_ppm = self.pending_f_phase_ppm;
+                status.f_phase_p_ppm = 0.0;
+                status.f_phase_i_ppm = 0.0;
+                status.phase_slew_saturated = false;
             }
         }
     }
@@ -5914,6 +6100,272 @@ mod tests {
         assert!(
             !status.read().expect("status lock").ntp_failed,
             "a measurement taken just now cannot be stale under any configured window"
+        );
+    }
+
+    // ========================================================================
+    // PHASE-SLEW WIRING (dantesync#97)
+    // ========================================================================
+
+    fn slew_config() -> SystemConfig {
+        let mut config = SystemConfig::default();
+        config.phase_slew.enabled = true;
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        config
+    }
+
+    fn one_offset(us: i64, sign: i8) -> crate::ntp::NtpMeasurement {
+        crate::ntp::NtpMeasurement {
+            offset: Duration::from_micros(us.unsigned_abs()),
+            sign,
+            spread_us: 40,
+            sample_count: 3,
+            pcap_active: false,
+        }
+    }
+
+    #[test]
+    fn phase_slew_enabled_and_locked_slews_a_small_error_without_stepping() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times(1)
+            .returning(|| Ok(one_offset(3_000, 1)));
+        // No clock expectations: any step_clock / adjust_frequency in this path is unexpected and
+        // fails the test — proving a small locked error slews rather than steps.
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status.clone(),
+            slew_config(),
+        );
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+
+        assert!(c.phase_slew.is_some());
+        assert!(
+            c.pending_f_phase_ppm > 0.0,
+            "a +3ms error must command a positive (speed-up) slew, got {}ppm",
+            c.pending_f_phase_ppm
+        );
+        assert!(c.last_phase_slew_output.is_some());
+        let st = status.read().expect("status lock");
+        assert!(st.phase_slew_enabled);
+        assert!(st.f_phase_ppm > 0.0);
+    }
+
+    #[test]
+    fn phase_slew_enabled_but_a_large_error_steps_not_slews() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // 100ms > the 50ms slew boundary ⇒ the step path must run (cold boot / insane clock).
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times(2)
+            .returning(|| Ok(one_offset(100_000, 1)));
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status,
+            slew_config(),
+        );
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        // Two agreeing over-boundary samples: candidate then step (the #50 agreement gate).
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+
+        assert_eq!(
+            c.pending_f_phase_ppm, 0.0,
+            "a stepped error must leave no held slew"
+        );
+    }
+
+    #[test]
+    fn phase_slew_enabled_but_ptp_offline_steps_not_slews() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // NTP-only fallback: PTP is dead, so there is no PTP servo to decouple against — even a
+        // small error must STEP, never slew.
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times(2)
+            .returning(|| Ok(one_offset(3_000, 1)));
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status,
+            slew_config(),
+        );
+        // is_locked=true so the slew gate's `!ptp_offline` clause is what actually rejects the
+        // slew (review 🔵: with is_locked=false the `is_locked` clause short-circuits first and the
+        // test would pass even if the ptp_offline guard were removed).
+        c.is_locked = true;
+        c.ptp_offline = true;
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+
+        assert_eq!(c.pending_f_phase_ppm, 0.0);
+    }
+
+    #[test]
+    fn composite_frequency_word_is_f_ptp_plus_f_phase() {
+        // Known f_ptp (drift baseline, rate decoupled to ~0) + a held f_phase ⇒ the factor applied
+        // to the clock must be 1 + (f_ptp + f_phase)/1e6.
+        let captured = Arc::new(std::sync::Mutex::new(1.0_f64));
+        let cap = captured.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock
+            .expect_adjust_frequency()
+            .returning(move |factor| {
+                *cap.lock().expect("cap lock") = factor;
+                Ok(())
+            });
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            slew_config(),
+        );
+        c.is_locked = true;
+        c.drift_baseline_ppm = 30.0;
+        c.pending_f_phase_ppm = 50.0;
+        c.last_applied_f_phase_ppm = 50.0;
+        // Feed a rate equal to the applied slew ⇒ decoupling drives the PTP-observed rate to ~0,
+        // so f_ptp stays at the 30ppm baseline.
+        c.last_offset_us = Some(0.0);
+        c.last_offset_time = Some(Instant::now() - Duration::from_secs(1));
+        c.apply_self_tuning_servo(50.0);
+
+        let ppm = (*captured.lock().expect("cap lock") - 1.0) * 1_000_000.0;
+        assert!(
+            (ppm - 80.0).abs() < 1.5,
+            "f_total must be f_ptp(30) + f_phase(50) = 80ppm, got {}ppm",
+            ppm
+        );
+        assert_eq!(
+            c.last_applied_f_phase_ppm, 50.0,
+            "the applied f_phase must be remembered for the next interval's decoupling"
+        );
+    }
+
+    #[test]
+    fn phase_slew_disabled_applies_only_f_ptp_and_never_decouples() {
+        // Byte-identical pre-#97 behaviour: a stray pending f_phase must be ignored, only f_ptp is
+        // applied, and the decoupling term is never populated.
+        let captured = Arc::new(std::sync::Mutex::new(1.0_f64));
+        let cap = captured.clone();
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock
+            .expect_adjust_frequency()
+            .returning(move |factor| {
+                *cap.lock().expect("cap lock") = factor;
+                Ok(())
+            });
+        let mut config = SystemConfig::default(); // phase_slew OFF (default)
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            config,
+        );
+        assert!(c.phase_slew.is_none());
+        c.drift_baseline_ppm = 30.0;
+        c.pending_f_phase_ppm = 999.0; // must be ignored when disabled
+        c.apply_self_tuning_servo(0.0); // rate 0 ⇒ f_ptp = baseline
+
+        let ppm = (*captured.lock().expect("cap lock") - 1.0) * 1_000_000.0;
+        assert!(
+            (ppm - 30.0).abs() < 1.0,
+            "disabled ⇒ only f_ptp(30) applied, got {}ppm",
+            ppm
+        );
+        assert_eq!(
+            c.last_applied_f_phase_ppm, 0.0,
+            "disabled must never populate the decoupling term"
+        );
+    }
+
+    #[test]
+    fn decoupling_stops_the_ptp_servo_from_chasing_the_commanded_slew() {
+        // Drive the PTP servo with an offset growing at +50us/s (as it would while the clock slews
+        // at +50ppm). With decoupling the observed residual rate must be ~0; without it, the servo
+        // chases the full 50ppm — the exact fight the decoupling exists to prevent.
+        fn smoothed_after(decoupled: bool) -> f64 {
+            let mut config = SystemConfig::default();
+            config.phase_slew.enabled = decoupled;
+            config.filters.calibration_samples = 0;
+            config.filters.warmup_secs = 0.0;
+            let mut mock_clock = MockSystemClock::new();
+            mock_clock.expect_adjust_frequency().returning(|_| Ok(()));
+            let mut c = PtpController::new(
+                mock_clock,
+                MockPtpNetwork::new(),
+                MockNtpSource::new(),
+                Arc::new(RwLock::new(SyncStatus::default())),
+                config,
+            );
+            c.is_locked = true;
+            if decoupled {
+                c.pending_f_phase_ppm = 50.0;
+                c.last_applied_f_phase_ppm = 50.0;
+            }
+            let mut offset = 0.0_f64;
+            for _ in 0..30 {
+                c.last_offset_time = Some(Instant::now() - Duration::from_secs(1));
+                c.apply_self_tuning_servo(offset);
+                offset += 50.0; // +50us per ~1s ⇒ raw observed rate ≈ +50ppm
+            }
+            c.smoothed_rate_ppm
+        }
+        let decoupled = smoothed_after(true).abs();
+        let raw = smoothed_after(false).abs();
+        assert!(
+            decoupled < 5.0,
+            "decoupled PTP rate should be ~0, was {}ppm",
+            decoupled
+        );
+        assert!(
+            raw > 20.0,
+            "the un-decoupled control must chase the slew, was {}ppm",
+            raw
+        );
+        assert!(
+            decoupled < raw,
+            "decoupling must strictly reduce the observed rate ({} vs {})",
+            decoupled,
+            raw
         );
     }
 }

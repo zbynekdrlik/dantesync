@@ -103,6 +103,9 @@ is running.
 - Clock discipline + how to test a control loop (closed-loop mocks vs constant ones, MAD models
   jitter not a drift ramp, Instant vs SystemTime on a daemon that steps its own clock, the
   additive-only `/status` contract) → `.claude/rules/clock-discipline-and-testing.md`
+- Phase-slew PI servo (#97 — the feed-forward decoupling sign invariant, the deadbeat gain cap for
+  the client's slow cadence, the I-deadband, verify-by-simulation, the canary re-tighten proof) →
+  `.claude/rules/phase-slew-servo.md` (auto-loads on `src/phase_slew.rs`)
 - Adding a config key (the `serde_json` `IndexMut` startup-panic trap, serde defaults, flooring
   nonsense values) → `.claude/rules/config-migration.md`
 - Multi-homed PTP receive interface selection (net.rs/net_pcap.rs/gm_filter.rs — pick the NIC on the
