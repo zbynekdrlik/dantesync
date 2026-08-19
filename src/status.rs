@@ -153,6 +153,43 @@ pub struct SyncStatus {
     /// exists so the 19h-silent degradation that motivated #91 pages instead.
     #[serde(default)]
     pub ntp_step_storm: bool,
+
+    // ========================================================================
+    // Phase-slew telemetry (dantesync#97) — all additive, all default to the
+    // pre-#97 "feature off" reading so an old JSON blob still deserializes and
+    // camera-box's DanteSync gate is unaffected until a box opts in.
+    // ========================================================================
+    /// dantesync#97: true when the bounded PI phase-slew servo is enabled on this node (the
+    /// `system.phase_slew.enabled` flag). `false` (default) = the classic step-only UTC path.
+    #[serde(default)]
+    pub phase_slew_enabled: bool,
+
+    /// dantesync#97: the total commanded phase slew currently composed into the frequency word
+    /// (ppm), `P + I` capped to ±200. `0.0` when the servo is disabled or idle.
+    #[serde(default)]
+    pub f_phase_ppm: f64,
+
+    /// dantesync#97: the proportional part of `f_phase` (ppm) — the fast responder to the current
+    /// phase error `e` (which is published as `ntp_offset_us`).
+    #[serde(default)]
+    pub f_phase_p_ppm: f64,
+
+    /// dantesync#97: the integral part of `f_phase` (ppm) — on a master it converges toward the
+    /// node's constant Dante-vs-UTC rate error (≈23 ppm), so the phase error trims to ~0.
+    #[serde(default)]
+    pub f_phase_i_ppm: f64,
+
+    /// dantesync#97: the PTP frequency-servo correction (ppm) AFTER feed-forward decoupling — the
+    /// same value as `drift_ppm`, surfaced explicitly beside `f_phase_*` so the two composed
+    /// frequency terms (`f_total = f_ptp + f_phase`) are both readable. `0.0` on a fresh node.
+    #[serde(default)]
+    pub f_ptp_ppm: f64,
+
+    /// dantesync#97: true while the phase slew is capped at ±200 ppm — a sustained `true` with a
+    /// large `ntp_offset_us` is the "slew saturated" condition the `[PHASE-SLEW][SATURATED]` alarm
+    /// keys on (the servo cannot keep up; the step path should probably have taken the correction).
+    #[serde(default)]
+    pub phase_slew_saturated: bool,
 }
 
 impl SyncStatus {
@@ -194,6 +231,13 @@ impl Default for SyncStatus {
             // #91: no steps counted / not storming until a server-mode step lands
             ntp_steps_last_hour: None,
             ntp_step_storm: false,
+            // #97: phase slew off / idle by default
+            phase_slew_enabled: false,
+            f_phase_ppm: 0.0,
+            f_phase_p_ppm: 0.0,
+            f_phase_i_ppm: 0.0,
+            f_ptp_ppm: 0.0,
+            phase_slew_saturated: false,
         }
     }
 }
@@ -396,6 +440,45 @@ mod tests {
         let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
         assert_eq!(back.ntp_steps_last_hour, Some(159));
         assert!(back.ntp_step_storm);
+    }
+
+    /// dantesync#97: the phase-slew telemetry fields are additive. A pre-#97 JSON blob (which has
+    /// the #91 step-storm fields but none of the phase-slew ones) must still deserialize,
+    /// defaulting to "feature off / idle"; and an enabled, slewing node round-trips all fields.
+    #[test]
+    fn test_sync_status_phase_slew_fields_are_additive_97() {
+        let pre_97 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1786439763,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "ntp_spread_us":0,"ntp_sample_count":0,"pcap_ntp_active":false,"ntp_updated_ts":0,
+            "ntp_age_s":null,"ntp_deadband_us":2500,"ntp_steps_last_hour":3,"ntp_step_storm":false}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(pre_97).expect("pre-#97 JSON must still deserialize");
+        assert!(
+            !restored.phase_slew_enabled,
+            "absent phase_slew_enabled must default to false, never claim the feature is on"
+        );
+        assert_eq!(restored.f_phase_ppm, 0.0);
+        assert_eq!(restored.f_phase_p_ppm, 0.0);
+        assert_eq!(restored.f_phase_i_ppm, 0.0);
+        assert_eq!(restored.f_ptp_ppm, 0.0);
+        assert!(!restored.phase_slew_saturated);
+
+        let slewing = SyncStatus {
+            phase_slew_enabled: true,
+            f_phase_ppm: 22.5,
+            f_phase_p_ppm: 2.5,
+            f_phase_i_ppm: 20.0,
+            f_ptp_ppm: 33.4,
+            phase_slew_saturated: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&slewing).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert!(back.phase_slew_enabled);
+        assert!((back.f_phase_ppm - 22.5).abs() < f64::EPSILON);
+        assert!((back.f_phase_i_ppm - 20.0).abs() < f64::EPSILON);
+        assert!((back.f_ptp_ppm - 33.4).abs() < f64::EPSILON);
     }
 
     #[test]

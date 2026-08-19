@@ -39,10 +39,43 @@ pub struct SystemConfig {
     /// typo can never take the rig's clock offline. See `crate::gm_filter`.
     #[serde(default)]
     pub gm_allowlist: Vec<String>,
+
+    /// dantesync#97 — the phase-slew feature switch (default OFF, per-box canary opt-in).
+    ///
+    /// Its own `#[serde(default)]` (plus the sub-object's per-field default) means every
+    /// pre-#97 config that lacks the key still parses and defaults to DISABLED — with it off the
+    /// controller's frequency- and step-paths are byte-for-byte the prior behaviour, so shipping
+    /// this changes nothing on the fleet until a box sets `phase_slew.enabled = true`. See
+    /// `crate::phase_slew`.
+    #[serde(default)]
+    pub phase_slew: PhaseSlewConfig,
 }
 
 fn default_ntp_stale_secs() -> u64 {
     180
+}
+
+/// dantesync#97 — phase-slew servo switch. Only the on/off flag is configurable; the servo's
+/// gains / caps / rate limits are hard constants in `crate::phase_slew` (the same way the PTP
+/// servo's own gains are hardcoded and auto-tuned — see `ServoConfig`'s "legacy" note).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseSlewConfig {
+    /// Enable the bounded PI phase-slew servo (default: false). When false the NTP UTC path steps
+    /// exactly as before; when true, a sub-50ms error slews instead of stepping.
+    #[serde(default = "default_phase_slew_enabled")]
+    pub enabled: bool,
+}
+
+fn default_phase_slew_enabled() -> bool {
+    false
+}
+
+impl Default for PhaseSlewConfig {
+    fn default() -> Self {
+        PhaseSlewConfig {
+            enabled: default_phase_slew_enabled(),
+        }
+    }
 }
 
 /// NTP Server configuration for unified time source mode.
@@ -239,6 +272,10 @@ impl Default for SystemConfig {
             // camera-box issue 1073: empty = unrestricted (accept any GM source),
             // the historical last-writer-wins behavior. Backward compatible.
             gm_allowlist: Vec::new(),
+
+            // dantesync#97: phase slew is OFF by default — merging it changes nothing on the
+            // fleet until a box opts in during the canary rollout.
+            phase_slew: PhaseSlewConfig::default(),
         }
     }
 }
@@ -576,5 +613,64 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize failed");
         let restored: SystemConfig = serde_json::from_str(&json).expect("deserialize failed");
         assert_eq!(restored.gm_allowlist, config.gm_allowlist);
+    }
+
+    // ========================================================================
+    // PHASE SLEW CONFIG TESTS (dantesync#97)
+    // ========================================================================
+
+    #[test]
+    fn phase_slew_defaults_to_disabled() {
+        let config = SystemConfig::default();
+        assert!(
+            !config.phase_slew.enabled,
+            "default MUST be disabled — merging #97 changes nothing on the fleet until a box opts in"
+        );
+        assert!(!PhaseSlewConfig::default().enabled);
+    }
+
+    #[test]
+    fn system_config_without_phase_slew_field_still_parses_disabled() {
+        // Every pre-#97 config predates this key: a full `system` object with servo/filters/
+        // ntp_stale_secs/gm_allowlist but no phase_slew must parse and default it to DISABLED.
+        let json = r#"{
+            "servo": {"kp": 0.0005, "ki": 0.00005, "max_freq_adj_ppm": 500.0, "max_integral_ppm": 100.0},
+            "filters": {"sample_window_size": 4, "min_delta_ns": 1000000, "calibration_samples": 0, "warmup_secs": 3.0},
+            "ntp_stale_secs": 180,
+            "gm_allowlist": []
+        }"#;
+        let config: SystemConfig =
+            serde_json::from_str(json).expect("a pre-#97 system object must still parse");
+        assert!(!config.phase_slew.enabled);
+    }
+
+    #[test]
+    fn system_config_with_only_phase_slew_parses_defaulting_the_rest() {
+        // The realistic canary shape: a box's config gains ONLY `system.phase_slew.enabled=true`.
+        let json = r#"{"phase_slew": {"enabled": true}}"#;
+        let config: SystemConfig = serde_json::from_str(json)
+            .expect("a system object with only phase_slew must still parse");
+        assert!(config.phase_slew.enabled);
+        // the rest fell back to defaults
+        assert!((config.servo.kp - 0.0005).abs() < f64::EPSILON);
+        assert_eq!(config.filters.sample_window_size, 4);
+        assert!(config.gm_allowlist.is_empty());
+    }
+
+    #[test]
+    fn phase_slew_empty_object_defaults_to_disabled() {
+        // `system.phase_slew: {}` (present but no fields) must still parse to disabled.
+        let json = r#"{"phase_slew": {}}"#;
+        let config: SystemConfig = serde_json::from_str(json).expect("empty phase_slew must parse");
+        assert!(!config.phase_slew.enabled);
+    }
+
+    #[test]
+    fn phase_slew_serde_roundtrip() {
+        let mut config = SystemConfig::default();
+        config.phase_slew.enabled = true;
+        let json = serde_json::to_string(&config).expect("serialize failed");
+        let restored: SystemConfig = serde_json::from_str(&json).expect("deserialize failed");
+        assert!(restored.phase_slew.enabled);
     }
 }
