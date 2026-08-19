@@ -189,7 +189,7 @@ impl PhaseSlewServo {
             let unbounded = K_I_PPM_PER_US_S * e * dt;
             let rate_cap = I_RATE_PPM_PER_S * dt;
             let delta = unbounded.clamp(-rate_cap, rate_cap);
-            let deepens_saturation = would_saturate && (delta > 0.0) == (tentative > 0.0);
+            let deepens_saturation = would_saturate && ((delta > 0.0) == (tentative > 0.0));
             if !deepens_saturation {
                 self.i_ppm = (self.i_ppm + delta).clamp(-I_CLAMP_PPM, I_CLAMP_PPM);
             }
