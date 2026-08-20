@@ -494,4 +494,112 @@ mod tests {
             "dwell must have reset — 50s is not yet an alarm"
         );
     }
+
+    // ---- #103: damping under a realistic loop delay --------------------------
+    //
+    // The #97 convergence tests above drive a ZERO-DELAY plant, where a deadbeat servo
+    // (`k_p·dt = 1`) is genuinely stable — which is why they never caught the production
+    // oscillation. The REAL loop has ≈1 sample of transport delay (the burst-median NTP measurement
+    // reflects a lagged clock state; the composite PTP+phase word and the integrator pole add more).
+    // These tests add that one missing sample of delay and assert the servo does not ring.
+
+    /// Closed loop with ONE sample of transport delay: the f_phase commanded at step n only affects
+    /// the plant at step n+1 (`e_{n+1} = e_n + (inflow − f_phase_{n-1})·dt`). Returns the
+    /// steady-state peak |e| and the worst rolling 6-sample spread (the exact metric camera-box's
+    /// E2E clock gate bounds at 2000 µs).
+    fn closed_loop_one_sample_delay(
+        inflow_ppm: f64,
+        dt_s: f64,
+        e0_us: f64,
+        steps: usize,
+    ) -> (f64, f64) {
+        let mut s = PhaseSlewServo::new();
+        let mut e = e0_us;
+        let mut f_delayed = 0.0_f64;
+        let mut window: Vec<f64> = Vec::new();
+        let mut steady_peak = 0.0_f64;
+        let mut worst_spread6 = 0.0_f64;
+        let warmup = steps / 2;
+        for n in 0..steps {
+            let out = s.update(e.round() as i64, dt_s);
+            e += (inflow_ppm - f_delayed) * dt_s; // plant integrates LAST step's command (the delay)
+            f_delayed = out.f_phase_ppm;
+            window.push(e);
+            if window.len() > 6 {
+                window.remove(0);
+            }
+            if n > warmup {
+                steady_peak = steady_peak.max(e.abs());
+                let mx = window.iter().cloned().fold(f64::MIN, f64::max);
+                let mn = window.iter().cloned().fold(f64::MAX, f64::min);
+                worst_spread6 = worst_spread6.max(mx - mn);
+            }
+        }
+        (steady_peak, worst_spread6)
+    }
+
+    #[test]
+    fn damped_servo_does_not_ring_on_a_one_sample_delay_plant() {
+        // 23 ppm Dante-vs-UTC DC, 10 s master cadence, starting mid-swing like the live +455..+568us.
+        let (peak, spread6) = closed_loop_one_sample_delay(23.0, 10.0, 500.0, 400);
+        // A deadbeat servo rings to a ~4000us sustained 6-sample spread here (the prod incident, which
+        // fails camera-box's 2000us clock gate); a damped one settles inside the phase deadband.
+        assert!(
+            spread6 < 500.0,
+            "6-sample spread {}us must be well under the 2000us gate (a deadbeat servo rings to ~4ms)",
+            spread6
+        );
+        assert!(
+            peak < 400.0,
+            "steady peak |e| {}us must converge, not sustain a limit cycle",
+            peak
+        );
+    }
+
+    #[test]
+    fn damped_servo_makes_only_smooth_frequency_changes() {
+        // Track the largest steady-state f_phase step. The live incident swung f_phase
+        // +100.81 -> +15.60 -> +8.00 -> +35.19 ppm (~85 ppm/step); a damped servo moves it a few ppm.
+        let mut s = PhaseSlewServo::new();
+        let mut e = 500.0_f64;
+        let mut f_delayed = 0.0_f64;
+        let mut last_f = 0.0_f64;
+        let mut max_df = 0.0_f64;
+        for n in 0..400 {
+            let out = s.update(e.round() as i64, 10.0);
+            e += (23.0 - f_delayed) * 10.0;
+            f_delayed = out.f_phase_ppm;
+            if n > 200 {
+                max_df = max_df.max((out.f_phase_ppm - last_f).abs());
+            }
+            last_f = out.f_phase_ppm;
+        }
+        assert!(
+            max_df < 20.0,
+            "steady-state |Δf_phase/step| {}ppm must stay smooth (a deadbeat servo swings 100+ppm)",
+            max_df
+        );
+    }
+
+    #[test]
+    fn no_phase_correction_at_all_inside_the_deadband() {
+        // A steady 150us error is inside the ≈200us full deadband (the NTP-path noise floor). Once
+        // settled the servo must inject NO clock motion at all — neither P nor the held integrator.
+        // (A deadbeat servo has no P deadband: it applies P = 0.1·150 = 15ppm and keeps nudging.)
+        let mut s = PhaseSlewServo::new();
+        let mut out = s.update(150, 10.0);
+        for _ in 0..50 {
+            out = s.update(150, 10.0);
+        }
+        assert!(
+            out.p_ppm.abs() < 1e-9,
+            "proportional term must be frozen inside the deadband, got {}ppm",
+            out.p_ppm
+        );
+        assert!(
+            out.f_phase_ppm.abs() < 1e-9,
+            "no phase correction at all inside the deadband, got {}ppm",
+            out.f_phase_ppm
+        );
+    }
 }
