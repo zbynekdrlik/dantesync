@@ -1214,6 +1214,14 @@ where
                 // byte-identical to before.
                 if self.phase_slew.is_some() {
                     if self.is_locked && !self.ptp_offline && !phase_slew::should_step(offset_us) {
+                        // Log-surface CONTRACT: the whole camera-box gate ecosystem parses the
+                        // exact `[NTP] offset:{:+}us` line for FRESHNESS (dantesync_offset_verdict,
+                        // the #326 painter gate, verify-device (d)). The slew replaces the STEP,
+                        // never the telemetry — keep emitting the line on every slewed cycle, or
+                        // every freshness consumer reads a phase-slew box as stale/UNKNOWN and
+                        // fail-closes (live incident: camera-box E2E painter gate exit 11,
+                        // 2026-08-20).
+                        info!("[NTP] offset:{:+}us", offset_us);
                         self.slew_phase(offset_us);
                         return; // slewed, not stepped — skip the entire step-decision block
                     }
