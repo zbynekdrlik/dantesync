@@ -101,6 +101,51 @@ pub const SAT_ALARM_E_US: i64 = 10_000;
 pub const SAT_ALARM_DWELL_S: f64 = 60.0;
 
 // ============================================================================
+// #105 — ACQUISITION mode (fast catch of the frequency DC) + convergence latch
+// ============================================================================
+//
+// The #103 tracking gains above are deliberately slow so the STEADY-STATE loop never oscillates.
+// But on a high-DC box (~50 ppm Dante-vs-UTC, e.g. cam1) the slow integrator cannot build the ~50 ppm
+// holding frequency before the offset runs away, and a step then resets it — the #105 runaway loop.
+// So the servo runs a faster ACQUISITION gain set until it first converges, then latches into the
+// #103 TRACKING gains above. The acquisition gains stay DELAY-ROBUST (loop gain 0.4, stable at 1-2
+// sample delay — verified by closed-loop simulation across dt and delay before this code was written).
+
+/// Acquisition proportional gain (ppm/µs): loop gain `k_p·dt = 0.4` at 10 s — critically damped for
+/// the one-sample-delay plant and still stable at two samples. 2× the tracking `K_P` (0.02), so the
+/// acquisition transient is arrested fast without the deadbeat aggressiveness #103 removed.
+pub const K_P_ACQUIRE_PPM_PER_US: f64 = 0.04;
+
+/// Acquisition loop-gain ceiling: caps `k_p_eff·dt ≤ 0.5` at any cadence (the acquisition counterpart
+/// of `MAX_LOOP_GAIN`).
+pub const MAX_LOOP_GAIN_ACQUIRE: f64 = 0.5;
+
+/// Acquisition integrator rate limit (ppm/s): the integrator may build ~this fast while acquiring, so
+/// it reaches a ~50 ppm DC in ~tens of seconds instead of the ~333 s the tracking `I_RATE` (0.15)
+/// would take. `K_I` is UNCHANGED — a higher `K_I` overshoots the DC; the rate CAP is the lever.
+pub const I_RATE_ACQUIRE_PPM_PER_S: f64 = 5.0;
+
+/// Acquisition output slew-rate limiter (ppm/s): lets `f_phase` track the fast-building integrator
+/// during acquisition (the tracking 1.5 ppm/s would itself throttle the catch). Drops back to the
+/// tracking limiter once converged.
+pub const F_PHASE_SLEW_RATE_ACQUIRE_PPM_PER_S: f64 = 20.0;
+
+/// Convergence latch band (µs): the servo latches from ACQUISITION into TRACKING once `|e|` has been
+/// within this band for `CONVERGENCE_SAMPLES` consecutive updates. Just above the deadband so a box
+/// that has genuinely settled (not merely dipped through zero mid-drift) enters the damped mode.
+pub const CONVERGENCE_BAND_US: i64 = 300;
+
+/// Consecutive in-band samples required to latch convergence (so a single drift-through-zero sample
+/// on a still-acquiring high-DC box does not prematurely switch to the slow tracking gains).
+pub const CONVERGENCE_SAMPLES: u32 = 3;
+
+/// Re-acquire hysteresis band (µs): a TRACKING servo whose error exceeds this drops BACK to
+/// acquisition — a large excursion means the held DC is wrong or a disturbance hit, and the fast
+/// gains must re-catch it before it reaches the step threshold. Above the tracking steady range,
+/// below the box's small adaptive step threshold, so re-acquisition pre-empts a step.
+pub const REACQUIRE_BAND_US: i64 = 1000;
+
+// ============================================================================
 // PURE HELPERS (feed-forward decoupling + composite word) — no state
 // ============================================================================
 
@@ -126,14 +171,20 @@ pub fn should_step(e_us: i64) -> bool {
     e_us.abs() > STEP_BOUNDARY_US
 }
 
-/// The effective, damping-capped proportional gain for a given update interval (`k_p_eff = min(k_p,
-/// MAX_LOOP_GAIN / dt)`, so `k_p_eff·dt ≤ MAX_LOOP_GAIN` at any cadence). Exposed for testing the
-/// stability cap directly.
-pub fn effective_kp(dt_s: f64) -> f64 {
+/// The damping-capped proportional gain for a given `(k_p, ceiling)` pair and update interval
+/// (`k_p_eff = min(k_p, ceiling / dt)`, so `k_p_eff·dt ≤ ceiling` at any cadence). The mode-agnostic
+/// core used by both the tracking and the #105 acquisition gains.
+pub fn effective_kp_with(k_p: f64, max_gain: f64, dt_s: f64) -> f64 {
     if dt_s <= 0.0 {
         return 0.0;
     }
-    K_P_PPM_PER_US.min(MAX_LOOP_GAIN / dt_s)
+    k_p.min(max_gain / dt_s)
+}
+
+/// The effective, damping-capped TRACKING proportional gain for a given update interval (`k_p_eff =
+/// min(K_P, MAX_LOOP_GAIN / dt)`). Exposed for testing the stability cap directly.
+pub fn effective_kp(dt_s: f64) -> f64 {
+    effective_kp_with(K_P_PPM_PER_US, MAX_LOOP_GAIN, dt_s)
 }
 
 // ============================================================================
@@ -157,6 +208,9 @@ pub struct PhaseSlewOutput {
     pub saturated: bool,
     /// True when the "slew saturated" guard has tripped (saturated AND `|e| > 10ms` for ≥60s).
     pub alarm: bool,
+    /// #105 — false while the servo is in fast ACQUISITION (still catching the frequency DC), true
+    /// once it has latched into damped TRACKING. Surfaced for telemetry / the `[PHASE-SLEW]` log.
+    pub converged: bool,
 }
 
 /// Bounded PI phase-slew servo. Holds only the integrator state and the saturation dwell timer;
@@ -167,6 +221,12 @@ pub struct PhaseSlewServo {
     /// #103 — the last commanded `f_phase` (ppm), so the output slew-rate limiter can bound how fast
     /// the frequency word moves between updates. Reset to 0 with the servo (a re-lock starts idle).
     last_f_phase_ppm: f64,
+    /// #105 — false = fast ACQUISITION (still catching the frequency DC), true = damped TRACKING.
+    /// A fresh servo starts in acquisition; it latches to tracking after `CONVERGENCE_SAMPLES`
+    /// consecutive in-band updates and drops back on a `REACQUIRE_BAND_US` excursion.
+    converged: bool,
+    /// #105 — consecutive in-`CONVERGENCE_BAND_US` updates accumulated toward the convergence latch.
+    converged_run: u32,
     /// Accumulated seconds during which the slew has been saturated AND `|e| > SAT_ALARM_E_US`.
     saturated_dwell_s: f64,
 }
@@ -182,6 +242,8 @@ impl PhaseSlewServo {
         PhaseSlewServo {
             i_ppm: 0.0,
             last_f_phase_ppm: 0.0,
+            converged: false,
+            converged_run: 0,
             saturated_dwell_s: 0.0,
         }
     }
@@ -191,13 +253,23 @@ impl PhaseSlewServo {
         self.i_ppm
     }
 
+    /// #105 — true once the servo has latched from fast ACQUISITION into damped TRACKING.
+    pub fn converged(&self) -> bool {
+        self.converged
+    }
+
     /// #105 — the controller calls this when it STEPS the clock's phase (a large offset the slew
-    /// path cannot take). A step corrects PHASE; the frequency DC the integrator learned is
-    /// UNCHANGED and must be PRESERVED — zeroing it is what caused the high-DC step→reset→runaway
-    /// loop (#105). [RED stub: still zeroes it, mimicking the current `reset_phase_slew` bug — the
-    /// GREEN commit makes it preserve the DC + re-enter acquisition.]
+    /// path cannot take) WHILE LOCKED. A step corrects PHASE; the frequency DC the integrator learned
+    /// is UNCHANGED, so it is PRESERVED — zeroing it is what caused the high-DC step→reset→runaway
+    /// loop (#105). The applied slew stays at the held DC (`last_f_phase_ppm = i_ppm`) so the clock
+    /// keeps the frequency across the step, and the servo re-enters fast acquisition to re-verify the
+    /// (possibly changed) DC. NOT a full reset — that stays for genuine loss of reference (lock loss /
+    /// PTP offline), which `reset_phase_slew` in the controller still does.
     pub fn note_phase_step(&mut self) {
-        self.i_ppm = 0.0;
+        self.last_f_phase_ppm = self.i_ppm;
+        self.converged = false;
+        self.converged_run = 0;
+        self.saturated_dwell_s = 0.0;
     }
 
     /// One servo update for a fresh median-filtered NTP phase error `e_us` (µs, positive = local
@@ -208,22 +280,45 @@ impl PhaseSlewServo {
         let dt = dt_s.max(0.0);
         let e = e_us as f64;
 
-        // #103 — FULL phase deadband: inside it the servo makes no NEW response to the sub-deadband
-        // error — the proportional term is zero and the integrator STATE is frozen, so the NTP-path
-        // noise floor is never chased. NOTE: the integrator's already-absorbed DC frequency still
-        // flows through to `f_phase` below (the `target = p + self.i_ppm` with p = 0 becomes the held
-        // integrator) — that is what keeps the clock on-phase; only the *reaction* to the residual is
-        // suppressed, the applied slew is NOT forced to zero.
+        // #105 — re-acquire hysteresis: a large excursion while TRACKING means the held DC is wrong
+        // (or a disturbance hit), so drop BACK to fast acquisition before the offset reaches the
+        // step threshold. Prevents a bad latch / a real DC shift from getting stuck in slow tracking.
+        if self.converged && e_us.abs() > REACQUIRE_BAND_US {
+            self.converged = false;
+            self.converged_run = 0;
+        }
+        let acquiring = !self.converged;
+
+        // #105 — mode-dependent gains: fast ACQUISITION until the servo first converges, then the
+        // #103 damped TRACKING gains (byte-identical to #103, so the low-DC steady state is unchanged).
+        let (kp, max_gain, i_rate, f_slew) = if acquiring {
+            (
+                K_P_ACQUIRE_PPM_PER_US,
+                MAX_LOOP_GAIN_ACQUIRE,
+                I_RATE_ACQUIRE_PPM_PER_S,
+                F_PHASE_SLEW_RATE_ACQUIRE_PPM_PER_S,
+            )
+        } else {
+            (
+                K_P_PPM_PER_US,
+                MAX_LOOP_GAIN,
+                I_RATE_PPM_PER_S,
+                F_PHASE_SLEW_RATE_PPM_PER_S,
+            )
+        };
+
+        // FULL phase deadband: inside it the servo makes no NEW response to the sub-deadband error —
+        // the proportional term is zero and the integrator STATE is frozen, so the NTP-path noise
+        // floor is never chased. NOTE: the integrator's already-absorbed DC frequency still flows
+        // through to `f_phase` below (`target = 0 + self.i_ppm`) — that keeps the clock on-phase; only
+        // the *reaction* to the residual is suppressed, the applied slew is NOT forced to zero.
         let in_deadband = e_us.abs() <= PHASE_DEADBAND_US;
 
-        // --- Proportional term (frozen inside the deadband), with the damping-capped effective gain
-        // (overdamped at any cadence). Clamped to the composite cap so the reported P contribution
-        // never exceeds what can be applied, and so a huge error inside the slew band cannot
-        // momentarily overflow it.
+        // --- Proportional term (frozen inside the deadband), with the mode's damping-capped gain.
         let p = if in_deadband {
             0.0
         } else {
-            (effective_kp(dt) * e).clamp(-F_PHASE_CAP_PPM, F_PHASE_CAP_PPM)
+            (effective_kp_with(kp, max_gain, dt) * e).clamp(-F_PHASE_CAP_PPM, F_PHASE_CAP_PPM)
         };
 
         // Anti-windup decision uses the tentative composite BEFORE this update's integration.
@@ -231,11 +326,12 @@ impl PhaseSlewServo {
         let would_saturate = tentative.abs() > F_PHASE_CAP_PPM;
 
         // --- Integrator: frozen inside the deadband (so measurement jitter cannot random-walk the
-        // frequency); rate-limited to ≤ I_RATE_PPM_PER_S; anti-windup (never integrate further
-        // INTO saturation); hard-clamped to ±I_CLAMP_PPM.
+        // frequency); rate-limited to ≤ the mode's I-rate; anti-windup (never integrate further INTO
+        // saturation); hard-clamped to ±I_CLAMP_PPM. `K_I` is the SAME in both modes — acquisition
+        // speed comes from the higher rate CAP, not a higher `K_I` (which would overshoot the DC).
         if !in_deadband {
             let unbounded = K_I_PPM_PER_US_S * e * dt;
-            let rate_cap = I_RATE_PPM_PER_S * dt;
+            let rate_cap = i_rate * dt;
             let delta = unbounded.clamp(-rate_cap, rate_cap);
             let deepens_saturation = would_saturate && ((delta > 0.0) == (tentative > 0.0));
             if !deepens_saturation {
@@ -249,14 +345,29 @@ impl PhaseSlewServo {
         let target = (p + self.i_ppm).clamp(-F_PHASE_CAP_PPM, F_PHASE_CAP_PPM);
         let saturated = target.abs() >= F_PHASE_CAP_PPM - 1e-9;
 
-        // --- #103 output slew-rate limiter: the commanded f_phase moves by at most
-        // F_PHASE_SLEW_RATE_PPM_PER_S · dt toward the demand this update, bounding clock acceleration
-        // and smoothing any proportional swing. Re-clamped to the hard cap for safety.
-        let max_step = F_PHASE_SLEW_RATE_PPM_PER_S * dt;
+        // --- Output slew-rate limiter (the mode's cap): the commanded f_phase moves by at most
+        // `f_slew · dt` toward the demand this update, bounding clock acceleration. Re-clamped to the
+        // hard cap for safety.
+        let max_step = f_slew * dt;
         let f_phase = (self.last_f_phase_ppm
             + (target - self.last_f_phase_ppm).clamp(-max_step, max_step))
         .clamp(-F_PHASE_CAP_PPM, F_PHASE_CAP_PPM);
         self.last_f_phase_ppm = f_phase;
+
+        // #105 — convergence latch: after CONVERGENCE_SAMPLES consecutive updates with |e| inside the
+        // convergence band, latch from ACQUISITION into TRACKING (stays latched until a re-acquire
+        // excursion above, a step, or a full reset). A single drift-through-zero sample on a still-
+        // acquiring high-DC box resets the run, so it never latches prematurely.
+        if !self.converged {
+            if e_us.abs() <= CONVERGENCE_BAND_US {
+                self.converged_run = self.converged_run.saturating_add(1);
+            } else {
+                self.converged_run = 0;
+            }
+            if self.converged_run >= CONVERGENCE_SAMPLES {
+                self.converged = true;
+            }
+        }
 
         // --- "Slew saturated" guard: dwell accumulates only while the DEMAND is capped AND the error
         // is genuinely large; any recovery below either threshold resets it.
@@ -273,6 +384,7 @@ impl PhaseSlewServo {
             i_ppm: self.i_ppm,
             saturated,
             alarm,
+            converged: self.converged,
         }
     }
 
@@ -349,19 +461,35 @@ mod tests {
 
     // ---- P term -----------------------------------------------------------
 
-    #[test]
-    fn proportional_term_tracks_error_sign_and_magnitude() {
+    /// A servo latched into TRACKING (fed in-band updates until it converges; the integrator stays 0).
+    fn converged_tracking_servo() -> PhaseSlewServo {
         let mut s = PhaseSlewServo::new();
-        // e = +1000us (1ms behind, outside the 200us deadband), dt=10s ⇒ k_p_eff = 0.02 ⇒ P = +20 ppm.
-        let out = s.update(1000, 10.0);
+        for _ in 0..(CONVERGENCE_SAMPLES + 1) {
+            s.update(0, 10.0); // |e|=0 is inside the convergence band ⇒ latches to tracking; i stays 0
+        }
+        assert!(s.converged(), "helper must reach tracking mode");
+        s
+    }
+
+    #[test]
+    fn proportional_term_uses_the_mode_gain_and_tracks_sign() {
+        // ACQUISITION (a fresh servo): the faster P gain 0.04 ⇒ P = 0.04*1000 = 40ppm.
+        let mut acq = PhaseSlewServo::new();
+        let out = acq.update(1000, 10.0);
         assert!(
-            (out.p_ppm - 20.0).abs() < 1.0,
-            "P should be ~+20ppm for +1ms error, got {}",
+            (out.p_ppm - 40.0).abs() < 1.0,
+            "acquisition P should be ~+40ppm for +1ms error, got {}",
             out.p_ppm
         );
+        assert!(out.f_phase_ppm > 0.0, "positive error ⇒ positive slew");
+        // TRACKING (converged): the damped P gain 0.02 ⇒ P = 0.02*900 = 18ppm. 900us stays below the
+        // 1000us re-acquire band, so the servo does NOT drop back to acquisition.
+        let mut trk = converged_tracking_servo();
+        let out = trk.update(900, 10.0);
         assert!(
-            out.f_phase_ppm > 0.0,
-            "positive error ⇒ speed up (positive slew)"
+            (out.p_ppm - 18.0).abs() < 1.0,
+            "tracking P should be ~+18ppm for +900us error, got {}",
+            out.p_ppm
         );
     }
 
@@ -375,37 +503,71 @@ mod tests {
     // ---- caps / anti-windup ----------------------------------------------
 
     #[test]
-    fn demand_saturates_immediately_but_the_output_ramps_to_the_200ppm_cap() {
+    fn tracking_output_slew_rate_limits_the_f_phase_ramp() {
+        // A converged servo with a 900us error (tracking): the demand is ~18ppm, but the #103 output
+        // limiter moves f_phase by at most 1.5ppm/s = 15ppm/step — so the first step ramps to ≤15, not
+        // straight to the ~18ppm demand.
+        let mut trk = converged_tracking_servo();
+        let out = trk.update(900, 10.0);
+        assert!(
+            out.f_phase_ppm > 0.0 && out.f_phase_ppm <= 15.0 + 1e-6,
+            "tracking f_phase must ramp ≤15ppm/step, got {}",
+            out.f_phase_ppm
+        );
+    }
+
+    #[test]
+    fn demand_saturates_and_the_output_never_exceeds_the_200ppm_cap() {
+        // A huge (but < 50ms step boundary) error saturates the demand; the applied slew must never
+        // exceed the ±200ppm cap. (A fresh servo is in acquisition, whose faster output limiter
+        // reaches the cap quickly — the point here is that the cap HOLDS.)
         let mut s = PhaseSlewServo::new();
-        // e = 40ms (< 50ms step boundary) ⇒ raw P = 0.02*40000 = 800ppm ⇒ demand capped to +200.
-        let out = s.update(40_000, 10.0);
-        assert!(out.saturated, "the demand (P+I) is at the cap immediately");
-        // The #103 output rate limiter ramps the applied slew in (≤15ppm/step at 10s), never slamming
-        // the full 200ppm on in one update.
-        assert!(out.f_phase_ppm > 0.0 && out.f_phase_ppm <= 15.0 + 1e-6);
-        // It reaches — and never exceeds — the +200ppm cap after enough updates.
-        let mut last = out;
+        let first = s.update(40_000, 10.0);
+        assert!(
+            first.saturated,
+            "the demand (P+I) is at the cap immediately"
+        );
+        let mut last = first;
         for _ in 0..40 {
             last = s.update(40_000, 10.0);
-            assert!(last.f_phase_ppm <= 200.0 + 1e-6);
+            assert!(
+                last.f_phase_ppm <= 200.0 + 1e-6,
+                "f_phase exceeded the cap: {}",
+                last.f_phase_ppm
+            );
         }
         assert!(
             (last.f_phase_ppm - 200.0).abs() < 1e-6,
-            "ramps to the cap, got {}",
+            "reaches the cap, got {}",
             last.f_phase_ppm
         );
     }
 
     #[test]
-    fn integrator_change_is_rate_limited_to_0_15ppm_per_second() {
-        let mut s = PhaseSlewServo::new();
-        // A large sustained error would drive I hard, but one 10 s update may move it ≤ 1.5 ppm.
-        let before = s.i_ppm();
-        let out = s.update(5_000, 10.0);
+    fn integrator_rate_limit_is_per_mode() {
+        // TRACKING: I moves ≤ 0.15ppm/s = 1.5ppm/step (a converged servo + a 900us error that stays
+        // below the re-acquire band).
+        let mut trk = converged_tracking_servo();
+        let before = trk.i_ppm();
+        let out = trk.update(900, 10.0);
         assert!(
             (out.i_ppm - before).abs() <= 1.5 + 1e-6,
-            "|ΔI|={} must be ≤ rate·dt = 1.5ppm",
+            "tracking |ΔI|={} must be ≤ 1.5ppm",
             (out.i_ppm - before).abs()
+        );
+        // ACQUISITION: I may move up to the faster cap 5ppm/s = 50ppm/step — and DOES move faster than
+        // the tracking cap (that is the whole point of the mode split).
+        let mut acq = PhaseSlewServo::new();
+        let out = acq.update(5_000, 10.0);
+        assert!(
+            out.i_ppm.abs() <= 50.0 + 1e-6,
+            "acquisition |ΔI|={} must be ≤ the 50ppm/step cap",
+            out.i_ppm
+        );
+        assert!(
+            out.i_ppm.abs() > 1.5,
+            "acquisition must build I faster than the 1.5ppm tracking cap, got {}",
+            out.i_ppm
         );
     }
 
