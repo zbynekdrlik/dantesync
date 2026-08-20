@@ -67,19 +67,29 @@ release with a missing asset). `ci.yml`'s own `test`/`build` jobs already run th
 and a real Linux+Windows compile on every PR. There is no reason to run a local release build or a
 full local test suite — CI is what actually produces and verifies the shipped binaries.
 
-Use `cargo check` and `cargo test`. Do NOT run `cargo build --release` locally — CI builds both
-Linux and Windows. Run locally before every push:
+**UPDATE (airuleset #557, verified 2026-08-20): the global Tier-0 hook (`block-tier0-local-build.sh`)
+now HARD-BLOCKS every *compiling* cargo shape on this box — `cargo build`/`test`/`check`/`clippy`/
+`doc`/`bench`/`run`, scoped or whole-workspace, `--no-run` or not — including in THIS repo (the block
+message mislabels it "the camera-box repo", but it fires here too). The commands below are RETAINED
+as the intent, but `cargo check`/`clippy`/`test --no-run` are no longer runnable locally.** Locally
+you may run only NON-compiling cargo (`cargo fmt` / `metadata` / `tree` / `clean` / `update`). CI
+(`ci.yml`) is the first place code compiles, runs clippy `-D warnings`, and runs the full test suite.
 
 ```bash
-cargo fmt --all --check
-cargo check
-cargo clippy -- -D warnings -A dead_code
-cargo test --no-run
+cargo fmt --all --check     # the ONLY cargo check still runnable locally (rustfmt doesn't compile)
+# cargo check / clippy / test --no-run  --> BLOCKED locally; CI runs them
 ```
 
-If you need to actually EXECUTE a test locally (e.g. to observe RED before GREEN on a bug fix),
-run only that one targeted test binary (`cargo test --test <file>` or `cargo test --lib <module>`),
-never the full suite and never `cargo build --release`.
+**The local verification net under this Tier-0 block** (proven on #103): `cargo fmt --all --check`
+(rustfmt parses every file incl. `#[cfg]` and test modules, so it catches a broken brace / bad
+literal) PLUS a standalone `rustc --edition 2021 --test scratch.rs` replica of the single module
+under test — extract the module's source to a scratch file, stub any tiny external dep (e.g.
+`use log::warn;` → a `macro_rules! warn { ($($t:tt)*) => {{}}; }`), and run the REAL code's tests
+with no crate build. Prove RED→GREEN that way before pushing. **Two lint classes surface ONLY on CI
+now (clippy is CI-only):** e.g. `clippy::doc-lazy-continuation` fires when a wrapped `///` doc line
+starts with a markdown list marker (`+`/`-`/`*` or `N.`) — a sentence that wraps to `/// + foo` reads
+as a bullet and fails `-D warnings`; keep list markers off wrapped-line starts. `rustc --test` does
+NOT run clippy, so budget one CI round for clippy or eyeball the diff for these.
 
 **Why:** cargo's project-local `target/` has no garbage collection (rust-lang/cargo#5026) — every
 incremental/profile/bin combination accumulates and is never auto-removed, so a local release
