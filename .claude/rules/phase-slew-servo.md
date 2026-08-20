@@ -40,12 +40,18 @@ wiring lives in `src/controller.rs` (`slew_phase` / `reset_phase_slew`, the deco
    `damped_servo_does_not_ring_on_a_one_sample_delay_plant`.
 
 3. **The full phase deadband (widened by #103).** `PHASE_DEADBAND_US` (200 µs; was `I_DEADBAND_US`,
-   150 µs) now freezes BOTH the proportional term AND the integrator inside the band — NO phase
-   correction at all — so the NTP-path noise floor is never injected into the clock. 200 µs sits
+   150 µs) now freezes the proportional term AND the integrator STATE inside the band — no NEW
+   response to the sub-deadband error, so the NTP-path noise floor is never chased. **Do NOT read
+   this as "f_phase → 0 in the band":** the integrator's already-absorbed DC frequency KEEPS being
+   applied (`target = 0 + i` = the held integrator), and that held frequency is exactly what holds
+   the clock on-phase against the Dante-vs-UTC drift — zeroing `f_phase` in-band would let the drift
+   repop, which IS the #103 failure. Only the *reaction* to the residual is suppressed. 200 µs sits
    above the measurement noise floor (≈40 µs burst spread + ≈130 µs inter-burst jitter; the healthy
    6-sample spread is 119-135 µs) and below the master's P-equilibrium, so a real sustained DC error
    still pushes `|e|` past it and engages the servo. Above the noise floor, below the P-equilibrium —
-   keep it in that window if you retune.
+   keep it in that window if you retune. (The converged-servo behaviour is locked by the
+   `deadband_holds_the_converged_dc_frequency…` test — a fresh-servo test alone cannot catch a
+   regression to zeroing `f_phase` in-band.)
 
 4. **The output slew-rate limiter (#103).** `F_PHASE_SLEW_RATE_PPM_PER_S` (1.5 ppm/s) bounds how fast
    the commanded `f_phase` (the DEMAND `P + I`) is allowed to move, so a noisy proportional swing

@@ -81,9 +81,12 @@ pub const STEP_BOUNDARY_US: i64 = 50_000;
 /// critically damped, instead of the old unstable-with-delay deadbeat.
 pub const MAX_LOOP_GAIN: f64 = 0.25;
 
-/// FULL phase deadband (µs): inside this band the servo makes NO phase correction at all — BOTH the
-/// proportional term and the integrator are frozen — so the NTP-path noise floor is never injected
-/// into the clock. #103 renamed this from `I_DEADBAND_US` (which froze only the integrator) and
+/// FULL phase deadband (µs): inside this band the servo makes no NEW response to the sub-deadband
+/// error — the proportional term is zero and the integrator STATE is frozen — so the NTP-path noise
+/// floor is never chased. The integrator's already-absorbed DC frequency KEEPS being applied (that
+/// is what holds a stable clock on-phase against the Dante-vs-UTC drift; zeroing `f_phase` in-band
+/// would let that drift repop — the #103 failure); only the *reaction* to the residual is
+/// suppressed. #103 renamed this from `I_DEADBAND_US` (which froze only the integrator) and
 /// raised it `150 → 200`: 200 µs sits safely above the measurement noise floor (≈40 µs burst spread
 /// + ≈130 µs inter-burst jitter; the healthy 6-sample spread was 119-135 µs) and below the master's
 /// proportional equilibrium, so a real sustained DC error still pushes `|e|` past it and engages the
@@ -196,10 +199,12 @@ impl PhaseSlewServo {
         let dt = dt_s.max(0.0);
         let e = e_us as f64;
 
-        // #103 — FULL phase deadband: inside it the servo makes NO phase correction at all. Both the
-        // proportional term AND the integrator are frozen, so the NTP-path noise floor is never
-        // injected into the clock; the held integrator keeps a stable clock on-phase without
-        // micro-chasing the measurement jitter.
+        // #103 — FULL phase deadband: inside it the servo makes no NEW response to the sub-deadband
+        // error — the proportional term is zero and the integrator STATE is frozen, so the NTP-path
+        // noise floor is never chased. NOTE: the integrator's already-absorbed DC frequency still
+        // flows through to `f_phase` below (the `target = p + self.i_ppm` with p = 0 becomes the held
+        // integrator) — that is what keeps the clock on-phase; only the *reaction* to the residual is
+        // suppressed, the applied slew is NOT forced to zero.
         let in_deadband = e_us.abs() <= PHASE_DEADBAND_US;
 
         // --- Proportional term (frozen inside the deadband), with the damping-capped effective gain
@@ -435,8 +440,10 @@ mod tests {
     #[test]
     fn nothing_moves_inside_the_deadband_so_jitter_never_walks_the_frequency() {
         let mut s = PhaseSlewServo::new();
-        // Alternating ±100us jitter, all inside the 200us FULL deadband: the integrator stays 0 AND
-        // no phase correction is applied at all (P is frozen too), so noise is never injected.
+        // Alternating ±100us jitter, all inside the 200us FULL deadband, on a FRESH servo (i starts
+        // 0): the integrator never engages (stays 0) and no proportional kick builds, so a servo that
+        // has only ever seen sub-deadband jitter injects nothing. (Once the integrator HAS absorbed a
+        // DC, that held frequency keeps flowing — see `deadband_holds_the_converged_dc_frequency…`.)
         for k in 0..200 {
             let e = if k % 2 == 0 { 100 } else { -100 };
             let out = s.update(e, 30.0);
@@ -675,18 +682,23 @@ mod tests {
             }
             last_f = out.f_phase_ppm;
         }
+        // Assert BELOW the output rate-limiter's own bound (F_PHASE_SLEW_RATE·dt = 15 ppm/step), so
+        // this genuinely tests DAMPING, not merely that the limiter exists: a badly-damped servo
+        // with the same limiter would ride at ~15 ppm/step, a damped one moves only a few ppm.
         assert!(
-            max_df < 20.0,
-            "steady-state |Δf_phase/step| {}ppm must stay smooth (a deadbeat servo swings 100+ppm)",
+            max_df < 8.0,
+            "steady-state |Δf_phase/step| {}ppm must stay smooth — well under the 15ppm limiter bound (a deadbeat servo swings 100+ppm)",
             max_df
         );
     }
 
     #[test]
-    fn no_phase_correction_at_all_inside_the_deadband() {
-        // A steady 150us error is inside the ≈200us full deadband (the NTP-path noise floor). Once
-        // settled the servo must inject NO clock motion at all — neither P nor the held integrator.
-        // (A deadbeat servo has no P deadband: it applies P = 0.1·150 = 15ppm and keeps nudging.)
+    fn fresh_servo_builds_no_correction_from_sub_deadband_error() {
+        // A steady 150us error is inside the ≈200us full deadband (the NTP-path noise floor). On a
+        // FRESH servo the integrator never engages, so no correction builds at all — no P kick, no
+        // accumulated DC. (A deadbeat servo has no P deadband: it applies P = 0.1·150 = 15ppm and
+        // keeps nudging.) The CONVERGED case — where the integrator has already absorbed the DC and
+        // that held frequency must KEEP being applied inside the band — is the next test.
         let mut s = PhaseSlewServo::new();
         let mut out = s.update(150, 10.0);
         for _ in 0..50 {
@@ -699,7 +711,41 @@ mod tests {
         );
         assert!(
             out.f_phase_ppm.abs() < 1e-9,
-            "no phase correction at all inside the deadband, got {}ppm",
+            "a fresh servo builds no correction inside the deadband, got {}ppm",
+            out.f_phase_ppm
+        );
+    }
+
+    #[test]
+    fn deadband_holds_the_converged_dc_frequency_it_does_not_drop_to_zero() {
+        // #103 review 🟡: inside the deadband P and the integrator STATE freeze, but the integrator's
+        // already-absorbed DC frequency must KEEP being applied — that held frequency is exactly what
+        // holds the clock on-phase. Zeroing f_phase in-band would let the ~23ppm Dante-vs-UTC drift
+        // repop (the #103 failure), and the fresh-servo tests above (i=0) could NOT catch that. So:
+        // drive the servo to convergence first, THEN feed an in-deadband error and prove the held DC
+        // is still commanded.
+        let mut s = PhaseSlewServo::new();
+        // Converge against a 23 ppm DC from a 3 ms error (zero-delay closed loop) ⇒ I ≈ 23 ppm.
+        let mut e = 3000.0_f64;
+        for _ in 0..300 {
+            let out = s.update(e.round() as i64, 10.0);
+            e += (23.0 - out.f_phase_ppm) * 10.0;
+        }
+        assert!(
+            (s.i_ppm() - 23.0).abs() < 6.0,
+            "precondition: integrator must have absorbed the ~23ppm DC, got {}ppm",
+            s.i_ppm()
+        );
+        // Now a small in-deadband error: P is frozen (0), but the held DC frequency is still applied.
+        let out = s.update(120, 10.0);
+        assert!(
+            out.p_ppm.abs() < 1e-9,
+            "P must be frozen inside the deadband, got {}ppm",
+            out.p_ppm
+        );
+        assert!(
+            (out.f_phase_ppm - s.i_ppm()).abs() < 1e-9 && out.f_phase_ppm > 15.0,
+            "the held DC frequency (~23ppm) must KEEP being applied inside the deadband, got {}ppm",
             out.f_phase_ppm
         );
     }
