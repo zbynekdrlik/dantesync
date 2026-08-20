@@ -540,8 +540,8 @@ fn claude_md_local_build_policy_names_the_release_workflow_and_cheap_checks() {
         "Local Build Policy must document the standalone rustc scratch-replica verification net"
     );
     assert!(
-        section.contains("cargo build --release"),
-        "must explicitly say cargo build --release belongs to CI, not local"
+        section.contains("local release build"),
+        "must explicitly say a local release build has no reason to exist -- CI builds the binaries"
     );
 }
 
