@@ -154,6 +154,21 @@ pub struct SyncStatus {
     #[serde(default)]
     pub ntp_step_storm: bool,
 
+    /// dantesync#101: this node's OWN currently-active NTP step threshold (microseconds) — the
+    /// size of UTC offset it tolerates before it steps its own clock. On a SERVER-mode node this
+    /// equals `server_step_threshold_us(is_locked, ptp_offline)` (the same value `ntp_deadband_us`
+    /// already reports); on a CLIENT node it is `calculate_ntp_adaptive_threshold()` — the MAD-based
+    /// adaptive threshold, the SAME quantity the journal logs as `[NTP] offset:+Nus (threshold:Mus,
+    /// adaptive)`. `ntp_deadband_us` (#83) deliberately reports this ONLY in server mode (`None` on
+    /// a client); this field fills that gap so a CLIENT's threshold is machine-readable too. Why it
+    /// matters: camera-box's DanteSync E2E gate makes a client's median AND stability (spread)
+    /// bounds step-aware from this threshold — a Linux cam reads it from journald, but a Windows
+    /// client is HTTP-only, so without this field the gate fell back to a fixed 700us term and a
+    /// healthy step-straddle spread false-UNSTABLE'd the run (camera-box #1129). `None` only on a
+    /// pre-#101 payload (deserialized via `#[serde(default)]`); a live node always reports `Some(..)`.
+    #[serde(default)]
+    pub ntp_step_threshold_us: Option<i64>,
+
     // ========================================================================
     // Phase-slew telemetry (dantesync#97) — all additive, all default to the
     // pre-#97 "feature off" reading so an old JSON blob still deserializes and
@@ -231,6 +246,8 @@ impl Default for SyncStatus {
             // #91: no steps counted / not storming until a server-mode step lands
             ntp_steps_last_hour: None,
             ntp_step_storm: false,
+            // #101: unknown until update_shared_status has computed it
+            ntp_step_threshold_us: None,
             // #97: phase slew off / idle by default
             phase_slew_enabled: false,
             f_phase_ppm: 0.0,
@@ -479,6 +496,53 @@ mod tests {
         assert!((back.f_phase_ppm - 22.5).abs() < f64::EPSILON);
         assert!((back.f_phase_i_ppm - 20.0).abs() < f64::EPSILON);
         assert!((back.f_ptp_ppm - 33.4).abs() < f64::EPSILON);
+    }
+
+    /// dantesync#101: `ntp_step_threshold_us` is additive. A pre-#101 JSON blob (which has the #97
+    /// phase-slew fields but not this one) must still deserialize, defaulting to None; and a node
+    /// carrying a client-mode adaptive threshold round-trips it. This is the field camera-box's
+    /// step-aware DanteSync gate reads for a Windows client that has no journald (camera-box #1129).
+    #[test]
+    fn test_sync_status_ntp_step_threshold_us_is_additive_101() {
+        let pre_101 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1786439763,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "ntp_spread_us":0,"ntp_sample_count":0,"pcap_ntp_active":false,"ntp_updated_ts":0,
+            "ntp_age_s":null,"ntp_deadband_us":null,"ntp_steps_last_hour":null,"ntp_step_storm":false,
+            "phase_slew_enabled":false,"f_phase_ppm":0.0,"f_phase_p_ppm":0.0,"f_phase_i_ppm":0.0,
+            "f_ptp_ppm":0.0,"phase_slew_saturated":false}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(pre_101).expect("pre-#101 JSON must still deserialize");
+        assert_eq!(
+            restored.ntp_step_threshold_us, None,
+            "absent step-threshold field must default to None (a box not yet serving it), never Some(0)"
+        );
+
+        // A client carrying its adaptive threshold round-trips, and serializes as an explicit
+        // (non-null) value so the camera-box gate can read it.
+        let client = SyncStatus {
+            ntp_step_threshold_us: Some(3400),
+            ntp_deadband_us: None, // a client reports no server-mode deadband, but DOES have a step threshold
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&client).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(back.ntp_step_threshold_us, Some(3400));
+        assert!(
+            json.contains("\"ntp_step_threshold_us\":3400"),
+            "a client's step threshold must serialize as an explicit numeric value, got: {}",
+            json
+        );
+
+        // Default (nothing computed yet) serializes as explicit null, never omitted.
+        let fresh = SyncStatus::default();
+        assert_eq!(fresh.ntp_step_threshold_us, None);
+        let json = serde_json::to_string(&fresh).expect("serialize failed");
+        assert!(
+            json.contains("\"ntp_step_threshold_us\":null"),
+            "must serialize as an explicit null, not be omitted, got: {}",
+            json
+        );
     }
 
     #[test]
