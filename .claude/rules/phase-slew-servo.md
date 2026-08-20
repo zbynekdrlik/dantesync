@@ -99,7 +99,12 @@ The servo is DUAL-MODE. A `converged` latch splits two gain sets:
 - **TRACKING** (`converged == true`): the #103 damped gains, byte-identical — so the low-DC steady
   state is UNCHANGED. Latches after `CONVERGENCE_SAMPLES` (3) consecutive updates with |e| ≤
   `CONVERGENCE_BAND_US` (300). `REACQUIRE_BAND_US` (1000) hysteresis drops back to acquisition on a
-  large excursion so a bad latch / a real DC shift never gets stranded in slow tracking.
+  PERSISTENT large excursion (`REACQUIRE_SAMPLES` = 2 consecutive out-of-band samples — a single
+  >1 ms burst outlier must NOT un-latch a healthy box, or it injects an acquisition-sized lurch)
+  so a bad latch / a real DC shift never gets stranded in slow tracking. The controller also BOUNDS
+  the step-preserve: after `PHASE_SLEW_MAX_PRESERVE_STREAK` (5) consecutive non-slew cycles it
+  full-resets, so a persistent not-locked spell (a real reference change) relearns the DC instead of
+  applying a stale one forever.
 
 **Load-bearing invariant: a STEP must NOT discard the learned frequency DC.** A step corrects PHASE;
 the ~50 ppm Dante-vs-UTC FREQUENCY relationship is unchanged. `PhaseSlewServo::note_phase_step()`
