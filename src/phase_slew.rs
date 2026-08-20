@@ -88,7 +88,7 @@ pub const MAX_LOOP_GAIN: f64 = 0.25;
 /// would let that drift repop — the #103 failure); only the *reaction* to the residual is
 /// suppressed. #103 renamed this from `I_DEADBAND_US` (which froze only the integrator) and
 /// raised it `150 → 200`: 200 µs sits safely above the measurement noise floor (≈40 µs burst spread
-/// + ≈130 µs inter-burst jitter; the healthy 6-sample spread was 119-135 µs) and below the master's
+/// and ≈130 µs inter-burst jitter; the healthy 6-sample spread was 119-135 µs) and below the master's
 /// proportional equilibrium, so a real sustained DC error still pushes `|e|` past it and engages the
 /// servo, while a stable clock is held (via the frozen integrator) without micro-chasing the jitter.
 pub const PHASE_DEADBAND_US: i64 = 200;
