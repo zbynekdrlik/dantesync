@@ -78,6 +78,42 @@ replica) by extracting `src/phase_slew.rs` to a scratch file (stub `log::warn` w
 and running `rustc --edition 2021 --test scratch.rs` — the module only depends on `log`, so this runs
 the REAL servo law under Tier-0 with no crate build. Prove RED→GREEN this way before pushing.
 
+**#105 lesson — the sim MUST include a HIGH-DC plant AND the step interaction.** #103's sim used only
+low DC (≤23 ppm) and no step, so it missed that the slow tracking integrator cannot hold a ~50 ppm
+box (cam1), and that a STEP resetting the integrator makes it loop step→reset→runaway. Any gain
+change MUST be simulated at 50-66 ppm inflow WITH the step→reset/preserve interaction modelled (step
+when |e| exceeds the box's small adaptive threshold ~1.6 ms — NOT the 50 ms `STEP_BOUNDARY_US`), and
+across 1- AND 2-sample delay. Assert: 0 steps after acquisition, converges into the deadband in
+~2 min, no oscillation, AND the low-DC / anti-ring cases stay green (no #103 regression).
+
+## The two servo MODES (#105) — do not collapse them, do not let a step reset the DC
+
+The servo is DUAL-MODE. A `converged` latch splits two gain sets:
+- **ACQUISITION** (`converged == false`, a fresh servo or after a step/large excursion): faster gains
+  (`K_P_ACQUIRE` 0.04 = loop gain 0.4, `I_RATE_ACQUIRE` 5 ppm/s, `F_PHASE_SLEW_RATE_ACQUIRE` 20 ppm/s)
+  to catch the frequency DC in ~tens of s before the offset runs away. `K_I` is the SAME in both
+  modes — a higher `K_I` OVERSHOOTS the DC (verified in sim); the acquisition speed is the higher
+  rate CAP, not a higher `K_I`. The acquisition loop gain 0.4 is chosen for DELAY ROBUSTNESS (stable
+  at 1-2 sample delay; 0.6 oscillates at 2 samples — do not raise it without re-running the delay
+  sweep).
+- **TRACKING** (`converged == true`): the #103 damped gains, byte-identical — so the low-DC steady
+  state is UNCHANGED. Latches after `CONVERGENCE_SAMPLES` (3) consecutive updates with |e| ≤
+  `CONVERGENCE_BAND_US` (300). `REACQUIRE_BAND_US` (1000) hysteresis drops back to acquisition on a
+  PERSISTENT large excursion (`REACQUIRE_SAMPLES` = 2 consecutive out-of-band samples — a single
+  >1 ms burst outlier must NOT un-latch a healthy box, or it injects an acquisition-sized lurch)
+  so a bad latch / a real DC shift never gets stranded in slow tracking. The controller also BOUNDS
+  the step-preserve: after `PHASE_SLEW_MAX_PRESERVE_STREAK` (5) consecutive non-slew cycles it
+  full-resets, so a persistent not-locked spell (a real reference change) relearns the DC instead of
+  applying a stale one forever.
+
+**Load-bearing invariant: a STEP must NOT discard the learned frequency DC.** A step corrects PHASE;
+the ~50 ppm Dante-vs-UTC FREQUENCY relationship is unchanged. `PhaseSlewServo::note_phase_step()`
+keeps the integrator (and re-enters acquisition to re-verify it); the controller calls
+`preserve_phase_slew_dc_across_step()` (which keeps `pending_f_phase_ppm = servo.i_ppm()`) on a
+step/flap, and `reset_phase_slew()` (full reset, integrator → 0) ONLY on a genuine loss of reference
+(`ptp_offline`). Zeroing the integrator on every non-slew cycle is EXACTLY what caused the #105
+high-DC runaway loop — never route a step back through `reset_phase_slew`.
+
 ## Canary / re-tighten (the #97 follow-up)
 
 The rollout is per-box (cams → imag → strih LAST). The proof a box is safe: step census 0/24h, |e|
@@ -87,3 +123,9 @@ two servos are NOT fighting, i.e. the decoupling works). Read the phase-servo te
 `phase_slew_saturated`) and the `[PHASE-SLEW]` / `[PHASE-SLEW][SATURATED]` journal lines. Any
 residual copies/gaps AFTER the step storm is removed is a DIFFERENT (emit-side) bug — file it, never
 re-relax a gate.
+
+**#105 canary signal:** the `[PHASE-SLEW]` line carries an `[ACQ]`/`[TRK]` tag — a HEALTHY box shows
+a brief `[ACQ]` on deploy/relock while it catches the DC, then settles into `[TRK]` and STAYS there.
+A box flapping back to `[ACQ]` repeatedly, or still stepping after it first reached `[TRK]`, means the
+acquisition/step-preserve fix is not holding — investigate, do not re-relax. Confirm a high-DC box
+(cam1) reaches `[TRK]` with `f_phase_i_ppm ≈ 50 ppm` held and 0 steps/24h.
