@@ -203,6 +203,10 @@ pub struct SyncStatus {
     /// dantesync#97: true while the phase slew is capped at ±200 ppm — a sustained `true` with a
     /// large `ntp_offset_us` is the "slew saturated" condition the `[PHASE-SLEW][SATURATED]` alarm
     /// keys on (the servo cannot keep up; the step path should probably have taken the correction).
+    /// dantesync#103: this reflects the servo DEMAND (`P + I` at the cap), NOT the rate-limited slew
+    /// actually applied — during the output ramp `f_phase_ppm` can still be small while this is
+    /// `true`. That is deliberate (the alarm must arm on the demand, not wait out the ramp); read it
+    /// as "the servo is asking for max slew", not "±200 ppm is on the clock right now".
     #[serde(default)]
     pub phase_slew_saturated: bool,
 }
