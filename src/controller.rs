@@ -316,6 +316,11 @@ const NTP_STEP_AGREEMENT_TOL_US: i64 = NTP_STEP_THRESHOLD_BASE_US; // Same-sign 
 // ============================================================================
 const NTP_SERVER_STEP_THRESHOLD_US: i64 = 200; // still >>5-32us measured single-query noise (#53); catches genuine drift earlier than the client's 500us floor
 const NTP_SERVER_CHECK_INTERVAL_SECS: u64 = 10; // independent of calculate_adaptive_ntp_interval, which tracks PTP-vs-Dante-GM lock quality -- irrelevant to this node's UTC duty
+                                                // #105 (review 🟡): max consecutive non-slewable cycles that keep applying the held phase-slew DC
+                                                // before the controller gives up and full-resets. Bounds a stale DC during a persistent not-locked
+                                                // spell (e.g. a GM changeover where the true DC may have shifted). 5 checks = ~50-150s (client
+                                                // cadence 10-30s), long enough that a brief flap keeps its DC but a real reference change relearns.
+const PHASE_SLEW_MAX_PRESERVE_STREAK: u32 = 5;
 const NTP_SERVER_AGREEMENT_TOL_US: i64 = 400; // #76: FIXED (non-scaling) tolerance sized to the true ~190-380us/check accrual, not to a possibly-noisy candidate's own magnitude
 const NTP_SERVER_MAX_BURST_SPREAD_US: u64 = 600; // #76: a burst this noisy internally is low-quality evidence and is excluded from the step decision entirely -- 600, not the ~500 first suggested, so it does not also exclude strih's own genuine 588us-spread large-error-recovery reading (dantesync#68's own fixture); still well below the observed WAN noise burst spreads (up to 1356us)
 
@@ -765,6 +770,11 @@ where
     /// true for the whole saturation episode), so this latch makes `log_saturated_alarm` fire ONCE
     /// at the onset instead of every NTP cadence for minutes — honouring that fn's edge contract.
     phase_slew_alarm_active: bool,
+    /// #105 (review 🟡): consecutive non-slewable cycles that PRESERVED the held DC without a slew
+    /// re-engaging. Bounds the stale-DC hold — after `PHASE_SLEW_MAX_PRESERVE_STREAK` such cycles (a
+    /// persistent not-locked spell, e.g. a GM changeover where the true DC may have changed) the
+    /// controller does a FULL reset instead of preserving. Reset to 0 whenever a slew succeeds.
+    phase_slew_preserve_streak: u32,
 }
 
 struct PendingSync {
@@ -923,6 +933,7 @@ where
             last_phase_slew_output: None,
             last_phase_slew_update: None,
             phase_slew_alarm_active: false,
+            phase_slew_preserve_streak: 0,
         }
     }
 
@@ -1501,6 +1512,8 @@ where
     /// time since the last slew update (clamped to a sane range) so the servo's deadbeat gain cap
     /// and integrator are correct across the client's variable NTP cadence.
     fn slew_phase(&mut self, offset_us: i64) {
+        // #105 (review 🟡): a slew re-engaged, so the preserve-streak clock resets.
+        self.phase_slew_preserve_streak = 0;
         let now = Instant::now();
         let dt = self
             .last_phase_slew_update
@@ -1555,6 +1568,7 @@ where
         self.last_phase_slew_update = None;
         // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
         self.phase_slew_alarm_active = false;
+        self.phase_slew_preserve_streak = 0;
     }
 
     /// #105 — disengage the phase SLEW for a step / brief flap WITHOUT discarding the learned
@@ -1565,6 +1579,16 @@ where
     /// re-verifies the (possibly changed) DC. `reset_phase_slew` (full reset) stays for a genuine
     /// loss of reference (PTP offline).
     fn preserve_phase_slew_dc_across_step(&mut self) {
+        // #105 (review 🟡): bound the stale-DC hold. A brief flap keeps its DC (no runaway), but a
+        // PERSISTENT not-locked spell (a real reference change, e.g. GM changeover) must not apply a
+        // stale DC forever — after PHASE_SLEW_MAX_PRESERVE_STREAK consecutive preserves with no slew
+        // re-engaging, fall back to a full reset so the servo relearns the DC from scratch.
+        self.phase_slew_preserve_streak = self.phase_slew_preserve_streak.saturating_add(1);
+        if self.phase_slew_preserve_streak > PHASE_SLEW_MAX_PRESERVE_STREAK {
+            self.phase_slew_preserve_streak = 0;
+            self.reset_phase_slew();
+            return;
+        }
         let held = if let Some(servo) = self.phase_slew.as_mut() {
             servo.note_phase_step();
             servo.i_ppm()
@@ -2710,9 +2734,13 @@ where
                 status.f_phase_i_ppm = out.i_ppm;
                 status.phase_slew_saturated = out.saturated;
             } else {
+                // #105 (review 🔵): after a step PRESERVE, `pending_f_phase_ppm` IS the held
+                // integrator DC still being applied — surface it as `f_phase_i_ppm` so the canary
+                // (which watches the held ~50 ppm) does not read 0 and false-alarm. When genuinely
+                // idle/disabled `pending` is 0, so this reads 0 exactly as before.
                 status.f_phase_ppm = self.pending_f_phase_ppm;
                 status.f_phase_p_ppm = 0.0;
-                status.f_phase_i_ppm = 0.0;
+                status.f_phase_i_ppm = self.pending_f_phase_ppm;
                 status.phase_slew_saturated = false;
             }
         }
@@ -6296,9 +6324,124 @@ mod tests {
         c.last_ntp_check = Instant::now() - Duration::from_secs(60);
         c.check_ntp_utc_tracking();
 
+        // #105: a step now PRESERVES the learned frequency DC; this servo never slewed, so its DC is
+        // 0 and pending stays 0 (the preserve/reset branch keeps applying `i`, which is 0 here). The
+        // nonzero-DC preserve contract is covered by `a_locked_step_preserves_the_learned_phase_slew_dc`.
         assert_eq!(
             c.pending_f_phase_ppm, 0.0,
-            "a stepped error must leave no held slew"
+            "a fresh servo (i=0) has no learned DC to hold across a step"
+        );
+    }
+
+    #[test]
+    fn a_locked_step_preserves_the_learned_phase_slew_dc() {
+        // #105 (review 🟡): prime a nonzero integrator DC, then a >50ms error STEPS while LOCKED. The
+        // step corrects PHASE but the frequency DC must be PRESERVED (pending == i), not zeroed — that
+        // zeroing was the high-DC runaway. The servo also re-enters acquisition.
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times(2)
+            .returning(|| Ok(one_offset(100_000, 1))); // 100ms > the 50ms slew boundary ⇒ step path
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status,
+            slew_config(),
+        );
+        c.is_locked = true;
+        c.ptp_offline = false;
+
+        // Prime the servo's integrator toward a learned DC (several acquisition updates).
+        {
+            let servo = c.phase_slew.as_mut().expect("slew enabled");
+            for _ in 0..6 {
+                servo.update(2_000, 10.0);
+            }
+        }
+        let dc = c.phase_slew.as_ref().unwrap().i_ppm();
+        assert!(
+            dc > 5.0,
+            "precondition: integrator holds a nonzero DC, got {}ppm",
+            dc
+        );
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+
+        assert!(
+            (c.pending_f_phase_ppm - dc).abs() < 1e-6,
+            "a locked step must keep applying the learned DC ({}ppm), got pending={}ppm",
+            dc,
+            c.pending_f_phase_ppm
+        );
+        assert!(
+            !c.phase_slew.as_ref().unwrap().converged(),
+            "the servo must re-enter acquisition after a step"
+        );
+    }
+
+    #[test]
+    fn a_ptp_offline_step_full_resets_the_phase_slew_dc() {
+        // #105 (review 🟡): the ptp_offline branch is a FULL reset, NOT a preserve — with PTP dead
+        // there is no servo to decouple against, so a held DC would be applied blind. Prime a DC, go
+        // ptp_offline, step: pending AND the integrator must both go to 0.
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut mock_ntp = MockNtpSource::new();
+        mock_ntp
+            .expect_get_offset()
+            .times(2)
+            .returning(|| Ok(one_offset(3_000, 1)));
+        let mut mock_clock = MockSystemClock::new();
+        mock_clock
+            .expect_step_clock()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut c = PtpController::new(
+            mock_clock,
+            MockPtpNetwork::new(),
+            mock_ntp,
+            status,
+            slew_config(),
+        );
+        c.is_locked = true;
+        c.ptp_offline = true;
+
+        {
+            let servo = c.phase_slew.as_mut().expect("slew enabled");
+            for _ in 0..6 {
+                servo.update(2_000, 10.0);
+            }
+        }
+        assert!(
+            c.phase_slew.as_ref().unwrap().i_ppm() > 5.0,
+            "precondition: a nonzero DC"
+        );
+
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+
+        assert_eq!(
+            c.pending_f_phase_ppm, 0.0,
+            "ptp_offline ⇒ full reset, no held DC"
+        );
+        assert!(
+            c.phase_slew.as_ref().unwrap().i_ppm().abs() < 1e-9,
+            "ptp_offline ⇒ integrator reset to 0, got {}ppm",
+            c.phase_slew.as_ref().unwrap().i_ppm()
         );
     }
 

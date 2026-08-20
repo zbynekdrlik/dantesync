@@ -111,8 +111,11 @@ pub const SAT_ALARM_DWELL_S: f64 = 60.0;
 // #103 TRACKING gains above. The acquisition gains stay DELAY-ROBUST (loop gain 0.4, stable at 1-2
 // sample delay — verified by closed-loop simulation across dt and delay before this code was written).
 
-/// Acquisition proportional gain (ppm/µs): loop gain `k_p·dt = 0.4` at 10 s — critically damped for
-/// the one-sample-delay plant and still stable at two samples. 2× the tracking `K_P` (0.02), so the
+/// Acquisition proportional gain (ppm/µs): loop gain `k_p·dt = 0.4` at 10 s — WELL-damped for the
+/// one-sample-delay plant (`z²−z+0.4` has complex poles at |z|≈0.63, so a fast lightly-ringing
+/// transient, NOT the critical `k·dt=0.25`), and still stable at two samples (verified by the delay
+/// sweep — 0.6 oscillates at two samples, so 0.4 is the robust operating point; do not raise it or
+/// `MAX_LOOP_GAIN_ACQUIRE` without re-running that sweep). 2× the tracking `K_P` (0.02), so the
 /// acquisition transient is arrested fast without the deadbeat aggressiveness #103 removed.
 pub const K_P_ACQUIRE_PPM_PER_US: f64 = 0.04;
 
@@ -139,11 +142,23 @@ pub const CONVERGENCE_BAND_US: i64 = 300;
 /// on a still-acquiring high-DC box does not prematurely switch to the slow tracking gains).
 pub const CONVERGENCE_SAMPLES: u32 = 3;
 
-/// Re-acquire hysteresis band (µs): a TRACKING servo whose error exceeds this drops BACK to
-/// acquisition — a large excursion means the held DC is wrong or a disturbance hit, and the fast
-/// gains must re-catch it before it reaches the step threshold. Above the tracking steady range,
-/// below the box's small adaptive step threshold, so re-acquisition pre-empts a step.
+/// Re-acquire hysteresis band (µs): a TRACKING servo whose error PERSISTENTLY exceeds this drops
+/// BACK to acquisition — a genuine sustained excursion means the held DC is wrong or a disturbance
+/// hit, and the fast gains must re-catch it. The band ordering is `PHASE_DEADBAND_US` (200) <
+/// `CONVERGENCE_BAND_US` (300) < `REACQUIRE_BAND_US` (1000) < `STEP_BOUNDARY_US` (50 000); a LOCKED
+/// box only ever reaches the step path at `> STEP_BOUNDARY_US` (below it it always slews), so on a
+/// locked box re-acquisition always pre-empts a slew-path step. (The controller's own adaptive NTP
+/// step thresholds — client floor 500 µs, server 200 µs — are reached only when NOT locked, where the
+/// step path preserves the DC anyway.)
 pub const REACQUIRE_BAND_US: i64 = 1000;
+
+/// Consecutive updates with `|e| > REACQUIRE_BAND_US` required to drop TRACKING back to acquisition.
+/// #105 review 🟡: the un-latch MUST be persistent (not a single sample) — a lone >1 ms burst-median
+/// outlier on a healthy low-DC box would otherwise instantly restore the acquisition gains and inject
+/// an acquisition-sized phase lurch (the exact #103 regression). Requiring 2 consecutive samples
+/// keeps a single outlier in the gentle tracking response, and only a genuine sustained excursion
+/// re-acquires (after ~one extra NTP interval — negligible next to the DC it is re-catching).
+pub const REACQUIRE_SAMPLES: u32 = 2;
 
 // ============================================================================
 // PURE HELPERS (feed-forward decoupling + composite word) — no state
@@ -227,6 +242,9 @@ pub struct PhaseSlewServo {
     converged: bool,
     /// #105 — consecutive in-`CONVERGENCE_BAND_US` updates accumulated toward the convergence latch.
     converged_run: u32,
+    /// #105 — consecutive `|e| > REACQUIRE_BAND_US` updates while TRACKING, toward the re-acquire
+    /// hysteresis (persistent so a single outlier does not un-latch).
+    reacquire_run: u32,
     /// Accumulated seconds during which the slew has been saturated AND `|e| > SAT_ALARM_E_US`.
     saturated_dwell_s: f64,
 }
@@ -244,6 +262,7 @@ impl PhaseSlewServo {
             last_f_phase_ppm: 0.0,
             converged: false,
             converged_run: 0,
+            reacquire_run: 0,
             saturated_dwell_s: 0.0,
         }
     }
@@ -269,6 +288,7 @@ impl PhaseSlewServo {
         self.last_f_phase_ppm = self.i_ppm;
         self.converged = false;
         self.converged_run = 0;
+        self.reacquire_run = 0;
         self.saturated_dwell_s = 0.0;
     }
 
@@ -280,12 +300,21 @@ impl PhaseSlewServo {
         let dt = dt_s.max(0.0);
         let e = e_us as f64;
 
-        // #105 — re-acquire hysteresis: a large excursion while TRACKING means the held DC is wrong
-        // (or a disturbance hit), so drop BACK to fast acquisition before the offset reaches the
-        // step threshold. Prevents a bad latch / a real DC shift from getting stuck in slow tracking.
-        if self.converged && e_us.abs() > REACQUIRE_BAND_US {
-            self.converged = false;
-            self.converged_run = 0;
+        // #105 — re-acquire hysteresis: a PERSISTENT large excursion while TRACKING means the held DC
+        // is wrong (or a disturbance hit), so drop BACK to fast acquisition. Requires REACQUIRE_SAMPLES
+        // consecutive out-of-band updates (review 🟡) so a single >1ms burst-median outlier stays in
+        // the gentle tracking response instead of triggering an acquisition-sized lurch.
+        if self.converged {
+            if e_us.abs() > REACQUIRE_BAND_US {
+                self.reacquire_run = self.reacquire_run.saturating_add(1);
+            } else {
+                self.reacquire_run = 0;
+            }
+            if self.reacquire_run >= REACQUIRE_SAMPLES {
+                self.converged = false;
+                self.converged_run = 0;
+                self.reacquire_run = 0;
+            }
         }
         let acquiring = !self.converged;
 
@@ -366,6 +395,7 @@ impl PhaseSlewServo {
             }
             if self.converged_run >= CONVERGENCE_SAMPLES {
                 self.converged = true;
+                self.reacquire_run = 0;
             }
         }
 
@@ -992,6 +1022,35 @@ mod tests {
             "the learned frequency DC must be PRESERVED across a phase step, was {}ppm now {}ppm",
             dc_before,
             s.i_ppm()
+        );
+    }
+
+    #[test]
+    fn a_single_outlier_does_not_un_latch_tracking_but_a_sustained_excursion_does() {
+        // #105 review 🟡: a lone >1ms burst-median outlier on a healthy TRACKING box must NOT restore
+        // the acquisition gains (that would inject an acquisition-sized phase lurch — the #103
+        // regression). It stays in the gentle tracking response; only a SUSTAINED excursion re-acquires.
+        let mut s = converged_tracking_servo();
+        assert!(s.converged());
+        // one outlier at 2000us (> REACQUIRE_BAND 1000): stays TRACKING, gentle output (P 0.02, slew 1.5).
+        let out = s.update(2000, 10.0);
+        assert!(s.converged(), "a single outlier must NOT un-latch tracking");
+        assert!(
+            out.f_phase_ppm.abs() <= 15.0 + 1e-6,
+            "the single-outlier response must be the gentle tracking ramp (≤15ppm/step), got {}",
+            out.f_phase_ppm
+        );
+        // a back-in-band sample forgets the outlier; still tracking.
+        s.update(0, 10.0);
+        assert!(s.converged(), "still tracking after the outlier passes");
+        // a SUSTAINED excursion (REACQUIRE_SAMPLES consecutive out-of-band) DOES drop to acquisition.
+        let mut converged = true;
+        for _ in 0..REACQUIRE_SAMPLES {
+            converged = s.update(2000, 10.0).converged;
+        }
+        assert!(
+            !converged,
+            "a sustained excursion (≥REACQUIRE_SAMPLES) must re-acquire"
         );
     }
 }
