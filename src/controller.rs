@@ -2627,6 +2627,18 @@ where
             } else {
                 None
             };
+            // #101: this node's OWN currently-active step threshold, REGARDLESS of mode. Server
+            // mode reuses the same value as ntp_deadband_us above (server_step_threshold_us); a
+            // CLIENT reports its adaptive MAD-based threshold (calculate_ntp_adaptive_threshold) --
+            // the SAME quantity the journal logs as "threshold:Nus", which ntp_deadband_us
+            // deliberately does NOT publish on a client (#83). Lets a HTTP-only consumer (a Windows
+            // camera-box client with no journald) read its own step envelope for the step-aware
+            // median+spread gate widening instead of falling back to a fixed guess (camera-box #1129).
+            status.ntp_step_threshold_us = Some(if self.ntp_server_mode {
+                server_step_threshold_us(self.is_locked, self.ptp_offline)
+            } else {
+                self.calculate_ntp_adaptive_threshold()
+            });
             // #91: keep the step-storm metric/flag fresh between steps so a
             // watchdog polling /status sees the storm CLEAR (steps aging out of
             // the trailing window) without needing another step to fire. The loud
@@ -2847,6 +2859,58 @@ mod tests {
             None,
             "client mode must never publish a deadband"
         );
+    }
+
+    /// #101: `ntp_step_threshold_us` publishes the node's OWN current step threshold through the
+    /// real `update_shared_status()` wiring, REGARDLESS of mode -- Some(server threshold) in server
+    /// mode (same value as ntp_deadband_us) and Some(adaptive threshold) on a CLIENT (where
+    /// ntp_deadband_us is deliberately None, #83). This is the field camera-box's step-aware gate
+    /// reads for a Windows client with no journald (camera-box #1129).
+    #[test]
+    fn ntp_step_threshold_us_publishes_through_the_real_status_wiring_client_and_server_101() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // SERVER mode: same value as ntp_deadband_us (server_step_threshold_us).
+        let (mut c, status) = create_nano_test_controller();
+        c.configure_ntp_server_mode(100_000);
+        c.update_shared_status();
+        {
+            let s = status.read().expect("status lock");
+            assert_eq!(
+                s.ntp_step_threshold_us,
+                Some(NTP_SERVER_STEP_THRESHOLD_US),
+                "server mode not yet locked -- Some(tight threshold), matching ntp_deadband_us"
+            );
+            assert_eq!(
+                s.ntp_step_threshold_us, s.ntp_deadband_us,
+                "in server mode the step threshold equals the deadband"
+            );
+        }
+        c.is_locked = true;
+        c.ptp_offline = false;
+        c.update_shared_status();
+        assert_eq!(
+            status.read().expect("status lock").ntp_step_threshold_us,
+            Some(NTP_SERVER_LOCKED_DEADBAND_US),
+            "server mode locked -- Some(large deadband)"
+        );
+
+        // CLIENT mode: ntp_deadband_us is None, but ntp_step_threshold_us reports the adaptive
+        // threshold (base with <3 samples) -- the whole point of #101.
+        let (client_c, client_status) = create_nano_test_controller();
+        client_c.update_shared_status();
+        {
+            let s = client_status.read().expect("status lock");
+            assert_eq!(
+                s.ntp_deadband_us, None,
+                "client still publishes no server-mode deadband"
+            );
+            assert_eq!(
+                s.ntp_step_threshold_us,
+                Some(NTP_STEP_THRESHOLD_BASE_US),
+                "a client MUST publish its own adaptive step threshold (base with <3 samples), not None"
+            );
+        }
     }
 
     /// Adversarial-review fix (#53 continuation): `pcap_ntp_active` must NOT
