@@ -523,17 +523,22 @@ fn claude_md_local_build_policy_names_the_release_workflow_and_cheap_checks() {
             && section.contains("dantesync-windows-amd64.exe"),
         "must name the actual published release assets"
     );
-    for cheap_check in [
-        "cargo fmt",
-        "cargo check",
-        "cargo clippy",
-        "cargo test --no-run",
-    ] {
-        assert!(
-            section.contains(cheap_check),
-            "Local Build Policy must list '{cheap_check}' as an allowed cheap check"
-        );
-    }
+    // airuleset #557 (2026-08-20): the global Tier-0 hook blocks every COMPILING cargo shape
+    // locally — the policy now names `cargo fmt` as the only runnable cargo check, explicitly
+    // marks check/clippy/test --no-run as BLOCKED (CI runs them), and documents the standalone
+    // `rustc --test` scratch-replica net.
+    assert!(
+        section.contains("cargo fmt"),
+        "Local Build Policy must keep `cargo fmt` as the one runnable local cargo check"
+    );
+    assert!(
+        section.contains("BLOCKED locally"),
+        "Local Build Policy must mark compiling cargo shapes as BLOCKED locally (airuleset #557)"
+    );
+    assert!(
+        section.contains("rustc --edition 2021 --test"),
+        "Local Build Policy must document the standalone rustc scratch-replica verification net"
+    );
     assert!(
         section.contains("cargo build --release"),
         "must explicitly say cargo build --release belongs to CI, not local"
