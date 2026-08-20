@@ -191,6 +191,15 @@ impl PhaseSlewServo {
         self.i_ppm
     }
 
+    /// #105 — the controller calls this when it STEPS the clock's phase (a large offset the slew
+    /// path cannot take). A step corrects PHASE; the frequency DC the integrator learned is
+    /// UNCHANGED and must be PRESERVED — zeroing it is what caused the high-DC step→reset→runaway
+    /// loop (#105). [RED stub: still zeroes it, mimicking the current `reset_phase_slew` bug — the
+    /// GREEN commit makes it preserve the DC + re-enter acquisition.]
+    pub fn note_phase_step(&mut self) {
+        self.i_ppm = 0.0;
+    }
+
     /// One servo update for a fresh median-filtered NTP phase error `e_us` (µs, positive = local
     /// behind UTC) measured `dt_s` seconds after the previous update. Returns the composite
     /// `f_phase` to add to `f_ptp`. Callers MUST only reach this for `|e| ≤ STEP_BOUNDARY_US`
@@ -747,6 +756,80 @@ mod tests {
             (out.f_phase_ppm - s.i_ppm()).abs() < 1e-9 && out.f_phase_ppm > 15.0,
             "the held DC frequency (~23ppm) must KEEP being applied inside the deadband, got {}ppm",
             out.f_phase_ppm
+        );
+    }
+
+    // ---- #105: dual-mode acquisition + step preserves the DC ----------------
+    //
+    // v1.8.50 (the #103 damping) holds a low-DC box but on a high-DC box (~50 ppm, e.g. cam1) the
+    // slow integrator (I_RATE 0.15 ppm/s) cannot build the holding frequency, and a step zeroes it —
+    // the offset runs away and the box loops step→reset→step. These tests add a high-DC plant and the
+    // step interaction; they FAIL on 1.8.50 and pass on the 1.8.51 dual-mode servo.
+
+    /// Fresh servo on a constant `inflow` ppm DC, one-sample loop delay, NO steps. Returns the peak
+    /// |e| reached and the time |e| first settled within the deadband (or None). A high-DC box must
+    /// converge FAST and keep the peak below the box's small adaptive step threshold, or a step fires
+    /// and (pre-#105) resets the servo into a runaway loop.
+    fn acquisition_peak_and_settle(inflow_ppm: f64, dt_s: f64, steps: usize) -> (f64, Option<f64>) {
+        let mut s = PhaseSlewServo::new();
+        let mut e = 0.0_f64;
+        let mut f_delayed = 0.0_f64;
+        let mut peak = 0.0_f64;
+        let mut settled: Option<f64> = None;
+        for n in 0..steps {
+            let out = s.update(e.round() as i64, dt_s);
+            e += (inflow_ppm - f_delayed) * dt_s;
+            f_delayed = out.f_phase_ppm;
+            peak = peak.max(e.abs());
+            if settled.is_none() && n > 3 && e.abs() <= PHASE_DEADBAND_US as f64 {
+                settled = Some((n as f64 + 1.0) * dt_s);
+            }
+        }
+        (peak, settled)
+    }
+
+    #[test]
+    fn high_dc_50ppm_acquisition_stays_below_the_step_threshold_and_settles_fast() {
+        // 50 ppm Dante-vs-UTC DC (cam1 class). The acquisition transient must stay well below the box's
+        // small adaptive step threshold (~1.6 ms per the #105 journal) so no step ever fires, and settle
+        // into the deadband within ~2 min. v1.8.50's slow integrator parks e ~2.5 ms (> threshold → the
+        // runaway loop) and takes many minutes.
+        let (peak, settled) = acquisition_peak_and_settle(50.0, 10.0, 400);
+        assert!(
+            peak < 1600.0,
+            "acquisition peak |e|={}us must stay below the ~1.6ms step threshold (no step fires)",
+            peak
+        );
+        let t = settled.expect("must settle into the deadband");
+        assert!(t <= 150.0, "must settle within ~2min, took {}s", t);
+    }
+
+    #[test]
+    fn note_phase_step_preserves_the_learned_frequency_dc() {
+        // Converge against a 50 ppm DC so the integrator holds ~50 ppm, then a STEP happens (a large
+        // phase error the slew path cannot take). The step corrects PHASE; the learned FREQUENCY DC
+        // must SURVIVE — zeroing it re-starts the runaway (the #105 loop). v1.8.50 / the RED stub
+        // zero the integrator here.
+        let mut s = PhaseSlewServo::new();
+        let mut e = 0.0_f64;
+        let mut f_delayed = 0.0_f64;
+        for _ in 0..200 {
+            let out = s.update(e.round() as i64, 10.0);
+            e += (50.0 - f_delayed) * 10.0;
+            f_delayed = out.f_phase_ppm;
+        }
+        let dc_before = s.i_ppm();
+        assert!(
+            dc_before > 40.0,
+            "precondition: integrator must hold ~50ppm before the step, got {}ppm",
+            dc_before
+        );
+        s.note_phase_step();
+        assert!(
+            (s.i_ppm() - dc_before).abs() < 1.0,
+            "the learned frequency DC must be PRESERVED across a phase step, was {}ppm now {}ppm",
+            dc_before,
+            s.i_ppm()
         );
     }
 }
