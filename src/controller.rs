@@ -1225,17 +1225,25 @@ where
                         self.slew_phase(offset_us);
                         return; // slewed, not stepped — skip the entire step-decision block
                     }
-                    // Not slewable (large error / acquiring / PTP offline): drop any held slew so
-                    // the decoupling decays to a no-op, then fall through to the STEP path.
+                    // #105 — not slewable (a large error to STEP, or a brief not-locked flap). The
+                    // step corrects PHASE; it must NOT discard the learned FREQUENCY DC — zeroing the
+                    // integrator on every such cycle is exactly what let a high-DC box (~50 ppm, cam1)
+                    // run away and loop step→reset→step. So keep the DC applied and re-enter fast
+                    // acquisition, EXCEPT on a genuine PTP outage (ptp_offline), where the phase
+                    // servo's decoupling assumptions don't hold and a full reset is correct.
                     if phase_slew::should_step(offset_us) {
                         info!(
-                            "[PHASE-SLEW] |e|={}us exceeds the {}us slew boundary — STEPPING \
-                             (cold boot / large offset the servo must not slow-walk)",
+                            "[PHASE-SLEW] |e|={}us exceeds the {}us slew boundary — STEPPING (phase); \
+                             keeping the learned f_phase DC across the step (#105)",
                             offset_us,
                             phase_slew::STEP_BOUNDARY_US
                         );
                     }
-                    self.reset_phase_slew();
+                    if self.ptp_offline {
+                        self.reset_phase_slew();
+                    } else {
+                        self.preserve_phase_slew_dc_across_step();
+                    }
                 }
 
                 // (offset + quality (#53) + freshness (#68) were published to
@@ -1523,12 +1531,13 @@ where
         }
         self.phase_slew_alarm_active = out.alarm;
         info!(
-            "[PHASE-SLEW] e={:+}us f_phase={:+.2}ppm (P={:+.2} I={:+.2}) f_ptp={:+.2}ppm{}",
+            "[PHASE-SLEW] e={:+}us f_phase={:+.2}ppm (P={:+.2} I={:+.2}) f_ptp={:+.2}ppm [{}]{}",
             offset_us,
             out.f_phase_ppm,
             out.p_ppm,
             out.i_ppm,
             self.last_adj_ppm,
+            if out.converged { "TRK" } else { "ACQ" }, // #105 acquisition vs tracking mode
             if out.saturated { " SATURATED" } else { "" }
         );
         self.update_shared_status();
@@ -1544,6 +1553,29 @@ where
         self.pending_f_phase_ppm = 0.0;
         self.last_phase_slew_output = None;
         self.last_phase_slew_update = None;
+        // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
+        self.phase_slew_alarm_active = false;
+    }
+
+    /// #105 — disengage the phase SLEW for a step / brief flap WITHOUT discarding the learned
+    /// frequency DC. A step corrects PHASE; the ~50 ppm Dante-vs-UTC frequency relationship the
+    /// integrator holds is unchanged by a phase jump, so it is KEPT and continues to be applied
+    /// (`pending_f_phase_ppm = i`) — zeroing it on every non-slew cycle is what let a high-DC box run
+    /// away and loop step→reset→step. `note_phase_step` re-enters fast acquisition so the servo
+    /// re-verifies the (possibly changed) DC. `reset_phase_slew` (full reset) stays for a genuine
+    /// loss of reference (PTP offline).
+    fn preserve_phase_slew_dc_across_step(&mut self) {
+        let held = if let Some(servo) = self.phase_slew.as_mut() {
+            servo.note_phase_step();
+            servo.i_ppm()
+        } else {
+            0.0
+        };
+        // Keep applying the learned DC frequency across the step so the clock does not free-run.
+        self.pending_f_phase_ppm = held;
+        self.last_phase_slew_output = None;
+        // `last_phase_slew_update` is intentionally KEPT — a step is not a re-lock, so the next slew's
+        // dt stays the real elapsed time.
         // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
         self.phase_slew_alarm_active = false;
     }
