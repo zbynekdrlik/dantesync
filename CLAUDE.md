@@ -121,6 +121,9 @@ is running.
 - Multi-homed PTP receive interface selection (net.rs/net_pcap.rs/gm_filter.rs — pick the NIC on the
   trusted GM subnet, reuse the #53 selector, pure-logic-in-gm_filter vs Windows-glue split, overlap
   semantics + ambiguity guard) → `.claude/rules/multi-homed-interface-selection.md`
+- DSCP marking of timesync sockets (#52 — which sockets are markable per platform: Linux ntp_server
+  reply YES, Linux rsntp client NO handle, Windows filters IP_TOS; the `dscp<<2` TOS-byte math;
+  fail-open; socket2 0.5.10 set_tos) → `.claude/rules/dscp-marking.md` (auto-loads on its `paths:`)
 
 ## GOTCHA — `gh pr edit --body-file`/`--body` fails with a GraphQL "Projects (classic)" error
 
