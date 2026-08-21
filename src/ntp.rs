@@ -150,10 +150,10 @@ impl NtpClient {
     /// capture interface (which fails outright on a dual-homed host where
     /// PTP and NTP live on different subnets — confirmed live on the stream
     /// box). See `net_pcap::find_device_for_ntp_server`.
-    pub fn new(server: &str) -> Self {
+    pub fn new(server: &str, dscp: &crate::dscp::DscpConfig) -> Self {
         #[cfg(windows)]
         {
-            let pcap_transport = match Self::init_pcap_transport(server) {
+            let pcap_transport = match Self::init_pcap_transport(server, dscp) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     log::warn!(
@@ -172,6 +172,11 @@ impl NtpClient {
         }
         #[cfg(not(windows))]
         {
+            // dantesync#52: the Linux NTP client is rsntp, whose socket is created
+            // internally (no setsockopt handle) — nothing to mark here; the request
+            // direction is covered by an nftables mangle rule at provisioning. See
+            // `crate::dscp` for the coverage split.
+            let _ = dscp;
             NtpClient {
                 server: server.to_string(),
             }
@@ -179,9 +184,12 @@ impl NtpClient {
     }
 
     #[cfg(windows)]
-    fn init_pcap_transport(server: &str) -> Result<crate::net_pcap::PcapNtpTransport> {
+    fn init_pcap_transport(
+        server: &str,
+        dscp: &crate::dscp::DscpConfig,
+    ) -> Result<crate::net_pcap::PcapNtpTransport> {
         let server_ip = Self::resolve_ipv4(server)?;
-        crate::net_pcap::PcapNtpTransport::new(server_ip)
+        crate::net_pcap::PcapNtpTransport::new(server_ip, dscp)
     }
 
     #[cfg(windows)]
@@ -337,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_ntp_client_new() {
-        let client = NtpClient::new("pool.ntp.org");
+        let client = NtpClient::new("pool.ntp.org", &crate::dscp::DscpConfig::default());
         assert_eq!(client.server, "pool.ntp.org");
     }
 

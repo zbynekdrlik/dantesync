@@ -146,7 +146,7 @@ fn disable_udp_conn_reset(socket: &UdpSocket) {
 ///
 /// # Usage
 /// ```ignore
-/// let server = NtpServer::new(123, 3)?;
+/// let server = NtpServer::new(123, 3, Default::default())?;
 /// server.run(running_flag)?;
 /// ```
 pub struct NtpServer {
@@ -165,6 +165,9 @@ pub struct NtpServer {
     /// last actually re-read its own upstream reference. `None` (or a status
     /// with nothing measured yet) falls back to `reference_time`.
     status: Option<Arc<std::sync::RwLock<crate::status::SyncStatus>>>,
+    /// dantesync#52 — DSCP marking config, carried so `run_supervised`'s rebind
+    /// re-applies the mark on a fresh socket after an unexpected exit.
+    dscp: crate::dscp::DscpConfig,
 }
 
 impl NtpServer {
@@ -173,7 +176,7 @@ impl NtpServer {
     /// # Arguments
     /// * `port` - UDP port to listen on (usually 123, requires elevated privileges)
     /// * `stratum` - Stratum level to report (typically 2-4 for LAN servers)
-    pub fn new(port: u16, stratum: u8) -> Result<Self> {
+    pub fn new(port: u16, stratum: u8, dscp: crate::dscp::DscpConfig) -> Result<Self> {
         let bind_addr = format!("0.0.0.0:{}", port);
         let socket = UdpSocket::bind(&bind_addr).map_err(|e| {
             anyhow!(
@@ -195,6 +198,12 @@ impl NtpServer {
         #[cfg(windows)]
         disable_udp_conn_reset(&socket);
 
+        // dantesync#52: mark this reply socket's egress with DSCP so loaded venue
+        // switches prioritise timesync. Linux-effective; a logged no-op on Windows
+        // (IP_TOS is filtered there — see crate::dscp). Best-effort: a failure
+        // leaves the socket unmarked, exactly the pre-#52 behaviour.
+        crate::dscp::apply(&socket, &dscp, "ntp-server reply");
+
         info!(
             "[NTP-Server] Listening on {} (stratum {})",
             bind_addr, stratum
@@ -206,6 +215,7 @@ impl NtpServer {
             port,
             reference_time: SystemTime::now(),
             status: None,
+            dscp,
         })
     }
 
@@ -424,6 +434,8 @@ where
     // Carried across restarts: `NtpServer::new()` would otherwise hand back a
     // server with `status: None`, silently reverting the reference-timestamp fix.
     let status_source = server.status.clone();
+    // dantesync#52: carry the DSCP config so the rebind re-marks the fresh socket.
+    let dscp = server.dscp.clone();
     let mut current = server;
 
     while running.load(Ordering::SeqCst) {
@@ -458,7 +470,7 @@ where
             if !running.load(Ordering::SeqCst) {
                 return;
             }
-            match NtpServer::new(port, stratum) {
+            match NtpServer::new(port, stratum, dscp.clone()) {
                 Ok(mut fresh) => {
                     fresh.status = status_source.clone();
                     warn!("[NTP-Server] Restarted after an unexpected loop exit");
@@ -527,7 +539,8 @@ mod tests {
         // recv_from blocks in the kernel until the timeout, so the loop wakes ~10x/sec (graceful
         // shutdown still <=100ms) and consumes ~0% idle. This test pins that: an idle recv_from with
         // no inbound packet must take ~the read timeout, not return immediately.
-        let server = NtpServer::new(0, 3).expect("bind ephemeral NTP server for the test");
+        let server = NtpServer::new(0, 3, Default::default())
+            .expect("bind ephemeral NTP server for the test");
         let mut buf = [0u8; NTP_PACKET_SIZE];
         let t0 = std::time::Instant::now();
         let _ = server.socket.recv_from(&mut buf); // nothing inbound -> blocks until the read timeout
@@ -617,7 +630,7 @@ mod tests {
     fn run_supervised_serves_consecutive_requests_and_shuts_down_68() {
         use std::net::UdpSocket as StdUdpSocket;
 
-        let server = NtpServer::new(0, 3).expect("bind ephemeral NTP server");
+        let server = NtpServer::new(0, 3, Default::default()).expect("bind ephemeral NTP server");
         let addr = server
             .local_addr()
             .expect("server must expose its bound addr");
@@ -683,7 +696,8 @@ mod tests {
     /// forever after.
     #[test]
     fn an_early_return_while_still_running_restarts_with_the_status_source_68() {
-        let mut server = NtpServer::new(0, 3).expect("bind ephemeral NTP server");
+        let mut server =
+            NtpServer::new(0, 3, Default::default()).expect("bind ephemeral NTP server");
         server.set_status_source(Arc::new(std::sync::RwLock::new(
             crate::status::SyncStatus::default(),
         )));
@@ -739,6 +753,7 @@ mod tests {
             port: 0,
             reference_time: UNIX_EPOCH + Duration::from_secs(1_000_000),
             status: None,
+            dscp: crate::dscp::DscpConfig::default(),
         };
 
         let status = Arc::new(std::sync::RwLock::new(crate::status::SyncStatus::default()));
@@ -763,6 +778,7 @@ mod tests {
             port: 0,
             reference_time: created,
             status: None,
+            dscp: crate::dscp::DscpConfig::default(),
         };
         // Status present, but nothing measured yet (ntp_updated_ts == 0).
         server.set_status_source(Arc::new(std::sync::RwLock::new(
@@ -851,6 +867,7 @@ mod tests {
             port: 0,
             reference_time: SystemTime::now(),
             status: None,
+            dscp: crate::dscp::DscpConfig::default(),
         };
 
         let originate_ts = [0u8; 8];
@@ -881,6 +898,7 @@ mod tests {
             port: 0,
             reference_time: SystemTime::now(),
             status: None,
+            dscp: crate::dscp::DscpConfig::default(),
         };
 
         let originate_ts = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -898,6 +916,7 @@ mod tests {
             port: 0,
             reference_time: SystemTime::now(),
             status: None,
+            dscp: crate::dscp::DscpConfig::default(),
         };
 
         let recv_secs: u32 = 0x12345678;
@@ -924,6 +943,7 @@ mod tests {
             port: 0,
             reference_time: SystemTime::now(),
             status: None,
+            dscp: crate::dscp::DscpConfig::default(),
         };
 
         let response = server.build_response(3, &[0; 8], 100, 200).unwrap();

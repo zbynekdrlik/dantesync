@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::dscp::DscpConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
     // #47/#68 lesson (see the partial-object tests below): each optional sub-object
@@ -49,6 +51,15 @@ pub struct SystemConfig {
     /// `crate::phase_slew`.
     #[serde(default)]
     pub phase_slew: PhaseSlewConfig,
+
+    /// dantesync#52 — DSCP marking of timesync UDP sockets (default: ON, EF/46).
+    ///
+    /// Its own `#[serde(default)]` (plus the sub-object's per-field default) means every
+    /// pre-#52 config that lacks the key still parses and defaults to marking enabled. See
+    /// `crate::dscp` for the coverage split (Linux server-reply effective; Linux rsntp client
+    /// and Windows need provisioning-level nftables / QoS policy).
+    #[serde(default)]
+    pub dscp: DscpConfig,
 }
 
 fn default_ntp_stale_secs() -> u64 {
@@ -276,6 +287,10 @@ impl Default for SystemConfig {
             // dantesync#97: phase slew is OFF by default — merging it changes nothing on the
             // fleet until a box opts in during the canary rollout.
             phase_slew: PhaseSlewConfig::default(),
+
+            // dantesync#52: DSCP marking ON by default (EF/46). Harmless when a
+            // switch ignores DSCP; a bad value fails open to unmarked.
+            dscp: DscpConfig::default(),
         }
     }
 }
@@ -613,6 +628,51 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize failed");
         let restored: SystemConfig = serde_json::from_str(&json).expect("deserialize failed");
         assert_eq!(restored.gm_allowlist, config.gm_allowlist);
+    }
+
+    // ========================================================================
+    // DSCP CONFIG TESTS (dantesync#52)
+    // ========================================================================
+
+    #[test]
+    fn system_config_without_dscp_field_defaults_to_enabled_ef() {
+        // Every pre-#52 config predates system.dscp: a system object without it
+        // must parse and default marking ON at EF/46 (backward compatible).
+        let json = r#"{"gm_allowlist": ["10.77.9.184"]}"#;
+        let config: SystemConfig =
+            serde_json::from_str(json).expect("a pre-#52 system object must still parse");
+        assert!(config.dscp.enabled);
+        assert_eq!(config.dscp.dscp, 46);
+    }
+
+    #[test]
+    fn system_config_with_partial_dscp_object_parses() {
+        // A box overriding only the code point (CS7) leaves `enabled` defaulting true.
+        let json = r#"{"dscp": {"dscp": 56}}"#;
+        let config: SystemConfig =
+            serde_json::from_str(json).expect("a partial dscp object must still parse");
+        assert!(config.dscp.enabled);
+        assert_eq!(config.dscp.dscp, 56);
+    }
+
+    #[test]
+    fn system_config_can_disable_dscp() {
+        let json = r#"{"dscp": {"enabled": false}}"#;
+        let config: SystemConfig = serde_json::from_str(json).expect("dscp disable must parse");
+        assert!(!config.dscp.enabled);
+        assert_eq!(config.dscp.dscp, 46); // value defaulted, marking off
+    }
+
+    #[test]
+    fn dscp_serde_roundtrip_preserves_values() {
+        let mut config = SystemConfig::default();
+        config.dscp = DscpConfig {
+            enabled: true,
+            dscp: 56,
+        };
+        let json = serde_json::to_string(&config).expect("serialize failed");
+        let restored: SystemConfig = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(restored.dscp, config.dscp);
     }
 
     // ========================================================================
