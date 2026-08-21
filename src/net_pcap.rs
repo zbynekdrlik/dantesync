@@ -512,7 +512,7 @@ impl PcapNtpTransport {
     /// (`find_device_for_ntp_server`, dantesync#53 continuation) — NOT by
     /// inheriting the PTP capture interface, which fails outright on a
     /// dual-homed host where PTP and NTP live on different subnets.
-    pub fn new(server_ip: Ipv4Addr) -> Result<Self> {
+    pub fn new(server_ip: Ipv4Addr, dscp: &crate::dscp::DscpConfig) -> Result<Self> {
         let device = find_device_for_ntp_server(server_ip)?;
         let local_ip = device_ipv4(&device)?;
 
@@ -525,6 +525,12 @@ impl PcapNtpTransport {
         // defect this transport exists to route around).
         let socket = UdpSocket::bind((local_ip, 0))?;
         socket.connect((server_ip, NTP_PORT))?;
+
+        // dantesync#52: mark the NTP client request egress with DSCP. On Windows
+        // the OS filters a socket-set IP_TOS (needs a QoS policy at provisioning),
+        // so `crate::dscp::apply` is a logged no-op here — wired for completeness
+        // and to surface the QoS guidance in the log. See `crate::dscp`.
+        crate::dscp::apply(&socket, dscp, "ntp-client request (pcap)");
 
         info!(
             "[NTP][Npcap] kernel-timestamped NTP transport ready: {} ({}) -> {}",
@@ -835,7 +841,10 @@ mod tests {
             );
             return;
         }
-        let result = PcapNtpTransport::new(Ipv4Addr::new(127, 0, 0, 1));
+        let result = PcapNtpTransport::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            &crate::dscp::DscpConfig::default(),
+        );
         assert!(
             result.is_err(),
             "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
