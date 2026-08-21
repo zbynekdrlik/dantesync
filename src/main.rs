@@ -744,8 +744,11 @@ fn run_sync_loop(
         .ntp_server
         .as_deref()
         .expect("ntp_server must be resolved before run_sync_loop");
+    // dantesync#52: capture the DSCP config before `system_config` is moved into
+    // the controller below, so both the client and the server socket can be marked.
+    let dscp_config = system_config.dscp.clone();
     let ntp_source = RealNtpSource {
-        client: ntp::NtpClient::new(ntp_server),
+        client: ntp::NtpClient::new(ntp_server, &dscp_config),
     };
 
     let mut controller =
@@ -764,7 +767,11 @@ fn run_sync_loop(
         );
 
         // Create NTP server
-        match ntp_server::NtpServer::new(ntp_server_config.port, ntp_server_config.stratum) {
+        match ntp_server::NtpServer::new(
+            ntp_server_config.port,
+            ntp_server_config.stratum,
+            dscp_config.clone(),
+        ) {
             Ok(mut ntp_srv) => {
                 // #68: KEEP querying upstream. This host is the fleet's time
                 // source, not UTC's — with the periodic queries off it free-ran
