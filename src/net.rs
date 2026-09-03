@@ -95,10 +95,10 @@ pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpS
 /// binds second loses the port and its PTP follower is starved of
 /// Follow_Up/Delay_Resp on 320).
 pub fn igmp_join_bind_addr() -> SocketAddrV4 {
-    // dantesync#109 RED baseline: today the join socket binds a PTP port
-    // (net_pcap.rs::join_multicast is called for 319 and 320). The fix (next
-    // commit) returns an ephemeral port 0 so 319/320 stay free for DVS.
-    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 319)
+    // dantesync#109: bind an EPHEMERAL port (0). The kernel picks a free source
+    // port for the join socket; 319/320 stay free for a DVS ptp.exe on the same
+    // host. The port is irrelevant to the IGMP membership and to pcap's capture.
+    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
 }
 
 #[cfg(unix)]

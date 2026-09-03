@@ -17,15 +17,24 @@ const PTP_EVENT_PORT: u16 = 319;
 const PTP_GENERAL_PORT: u16 = 320;
 const PTP_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
 
-/// Create a socket and join PTP multicast group (for IGMP membership)
-fn join_multicast(port: u16, iface_ip: Ipv4Addr) -> Result<UdpSocket> {
+/// Create ONE socket that joins the PTP multicast group `224.0.1.129` on
+/// `iface_ip`, purely to hold the IGMP membership for the process lifetime
+/// (membership is released when the socket is closed).
+///
+/// dantesync#109: this socket binds an EPHEMERAL port (`net::igmp_join_bind_addr`),
+/// NOT the PTP ports 319/320. IGMP membership is per interface+group, not per
+/// port, and pcap's own BPF filter (not this socket) selects the captured PTP
+/// traffic — so binding 319/320 was a pointless exclusive claim that collided
+/// with a Dante Virtual Soundcard `ptp.exe` on the same host (no shared
+/// `SO_REUSEADDR`, so whoever binds second loses the port). One socket for the
+/// group is sufficient; the old per-port pair (319 AND 320) and the now-pointless
+/// `SO_REUSEADDR` (it existed only to re-bind the fixed PTP ports) are both gone.
+fn join_multicast(iface_ip: Ipv4Addr) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::net::SocketAddrV4;
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
 
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    let addr = crate::net::igmp_join_bind_addr();
     socket.bind(&addr.into())?;
 
     socket.join_multicast_v4(&PTP_MULTICAST, &iface_ip)?;
@@ -343,9 +352,9 @@ pub(crate) fn pcap_ts_to_systemtime(ts_sec: i64, ts_usec: i64) -> SystemTime {
 /// PTP network using Npcap with HostHighPrec timestamps
 pub struct NpcapPtpNetwork {
     capture: Capture<Active>,
-    // Keep sockets alive for IGMP multicast membership
-    _igmp_sock_319: UdpSocket,
-    _igmp_sock_320: UdpSocket,
+    // Keep the socket alive for IGMP multicast membership (dropped on close);
+    // ONE ephemeral-port socket holds the 224.0.1.129 membership (dantesync#109).
+    _igmp_sock: UdpSocket,
     using_hiprec: bool,
 }
 
@@ -373,12 +382,20 @@ impl NpcapPtpNetwork {
         };
         info!("Using interface IP {} for multicast join", iface_ip);
 
-        // CRITICAL: Join multicast group via sockets to trigger IGMP
-        let igmp_sock_319 = join_multicast(PTP_EVENT_PORT, iface_ip)?;
-        let igmp_sock_320 = join_multicast(PTP_GENERAL_PORT, iface_ip)?;
-        info!("Joined PTP multicast group 224.0.1.129 on ports 319 and 320");
+        // CRITICAL: Join the multicast group via ONE ephemeral-port socket to
+        // trigger IGMP membership (dantesync#109: NOT bound to 319/320, so a
+        // Dante Virtual Soundcard ptp.exe on the same host keeps both PTP ports).
+        let igmp_sock = join_multicast(iface_ip)?;
+        info!(
+            "Joined PTP multicast group 224.0.1.129 on {} via an ephemeral-port IGMP socket \
+             (ports 319/320 left free for a DVS ptp.exe on the same host — dantesync#109)",
+            iface_ip
+        );
 
-        // Apply BPF filter to only capture PTP multicast - reduces conflict with DVS
+        // Apply BPF filter to only capture PTP multicast. The IGMP-join socket
+        // above binds an ephemeral port, not 319/320, so DVS keeps exclusive
+        // ownership of both PTP ports (dantesync#109); this filter only scopes
+        // which packets pcap decodes and never claims a port.
         let ptp_filter = "udp and dst host 224.0.1.129 and (dst port 319 or dst port 320)";
         let capture = open_hiprec_capture(&device, ptp_filter)?;
 
@@ -393,8 +410,7 @@ impl NpcapPtpNetwork {
 
         Ok(NpcapPtpNetwork {
             capture,
-            _igmp_sock_319: igmp_sock_319,
-            _igmp_sock_320: igmp_sock_320,
+            _igmp_sock: igmp_sock,
             using_hiprec,
         })
     }
@@ -432,7 +448,7 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                 };
 
                 // Check destination port for PTP (319 or 320)
-                if dst_port != 319 && dst_port != 320 {
+                if dst_port != PTP_EVENT_PORT && dst_port != PTP_GENERAL_PORT {
                     return Ok(None);
                 }
 
