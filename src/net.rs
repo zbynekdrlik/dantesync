@@ -90,10 +90,11 @@ pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpS
 /// interface+group, NOT per port, so the socket's bound source port is
 /// irrelevant to the join (and pcap's own BPF filter, not this socket, selects
 /// the captured traffic). It must therefore bind an EPHEMERAL port — never a
-/// PTP port (319/320), which on a Dante Virtual Soundcard host are owned
-/// exclusively by DVS's own `ptp.exe` (no shared `SO_REUSEADDR`, so whoever
-/// binds second loses the port and its PTP follower is starved of
-/// Follow_Up/Delay_Resp on 320).
+/// PTP port (319/320), which on a Dante Virtual Soundcard host belong to DVS's
+/// own `ptp.exe`: dantesync (a boot-time service) bound them first, so
+/// `ptp.exe` (started later, without `SO_REUSEADDR`) failed its bind with
+/// WSAEADDRINUSE and its PTP follower was starved of Follow_Up/Delay_Resp on
+/// 320.
 pub fn igmp_join_bind_addr() -> SocketAddrV4 {
     // dantesync#109: bind an EPHEMERAL port (0). The kernel picks a free source
     // port for the join socket; 319/320 stay free for a DVS ptp.exe on the same

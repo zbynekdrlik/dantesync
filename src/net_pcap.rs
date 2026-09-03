@@ -25,8 +25,9 @@ const PTP_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
 /// NOT the PTP ports 319/320. IGMP membership is per interface+group, not per
 /// port, and pcap's own BPF filter (not this socket) selects the captured PTP
 /// traffic — so binding 319/320 was a pointless exclusive claim that collided
-/// with a Dante Virtual Soundcard `ptp.exe` on the same host (no shared
-/// `SO_REUSEADDR`, so whoever binds second loses the port). One socket for the
+/// with a Dante Virtual Soundcard `ptp.exe` on the same host (dantesync, a
+/// boot-time service, bound first; `ptp.exe`, started later without
+/// `SO_REUSEADDR`, lost both ports with WSAEADDRINUSE). One socket for the
 /// group is sufficient; the old per-port pair (319 AND 320) and the now-pointless
 /// `SO_REUSEADDR` (it existed only to re-bind the fixed PTP ports) are both gone.
 fn join_multicast(iface_ip: Ipv4Addr) -> Result<UdpSocket> {

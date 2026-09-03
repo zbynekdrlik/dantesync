@@ -2,6 +2,7 @@
 paths:
   - "src/net.rs"
   - "src/net_pcap.rs"
+  - "src/net_winsock.rs"
   - "src/gm_filter.rs"
 ---
 
@@ -71,10 +72,12 @@ needs UDP 319/320 exclusively for its PTP follower. The pcap path's IGMP-members
 `0.0.0.0:0`)**, never a PTP port — IGMP group membership is per interface+group, NOT per port, and
 pcap's own BPF filter (`dst port 319 or dst port 320`) selects the captured traffic, so the join
 socket's bound port is irrelevant. It used to bind 319 AND 320 (one socket each, plus a pointless
-`SO_REUSEADDR`); with no shared reuse flag, dantesync and `ptp.exe` raced for the ports and whoever
-bound second lost — starving DVS's follower of the PTP *general* messages (Follow_Up/Delay_Resp) on
-320, so its media clock free-ran on the host crystal (≈−17 ppm off the grandmaster, hidden only by
-the camera-box ASRC servo). **Never re-add a fixed-PTP-port bind to any pcap/socket join path.**
+`SO_REUSEADDR`); dantesync is a boot-time service and bound first, DVS's `ptp.exe` (a login-time app
+without `SO_REUSEADDR`) then failed its own bind with `WSAEADDRINUSE` — live on `stream` 2026-09-03
+dantesync held BOTH 319 and 320 and `ptp.exe` held neither — starving DVS's follower of the PTP
+*general* messages (Follow_Up/Delay_Resp) on 320, so its media clock free-ran on the host crystal
+(≈−17 ppm off the grandmaster, hidden only by the camera-box ASRC servo). **Never re-add a
+fixed-PTP-port bind to any pcap/socket join path.**
 
 - The bind decision is the pure, non-cfg-gated seam `net::igmp_join_bind_addr()` (Linux-CI unit
   tested — port must be 0, never 319/320); `net_pcap.rs` glue only calls it. Follow the same
@@ -86,4 +89,8 @@ the camera-box ASRC servo). **Never re-add a fixed-PTP-port bind to any pcap/soc
   shows ONLY `ptp.exe` on both ports (dantesync no longer appears), and the OBS log's
   `asrc: source 'mbc' estimated=` residual collapses from ≈−17 ppm toward 0 (DVS is now disciplined
   by the grandmaster). Read live state via the win-stream MCP (session-agnostic `Get-NetUDPEndpoint`
-  / process list / OBS log read).
+  / process list / OBS log read). **`ptp.exe` binds its ports only at ITS start** — after the
+  dantesync restart the ports may sit UNOWNED (nobody on 319/320) until DVS is restarted; that is
+  NOT "still broken", it is the DVS side not having retried yet. If `ptp.exe` has not re-bound within
+  ~1 min, restart Dante Virtual Soundcard (it briefly drops the ASIO device stream OBS reads `mbc`
+  from — do it off-air and verify OBS audio resumes), THEN re-read the endpoints.
