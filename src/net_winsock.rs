@@ -10,7 +10,7 @@
 //! - SO_TIMESTAMP control message contains QPC timestamp
 
 use anyhow::{anyhow, Result};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::mem;
 use std::net::Ipv4Addr;
 use std::ptr;
@@ -169,12 +169,26 @@ impl WinsockPtpNetwork {
                 mem::size_of::<SOCKADDR_IN>() as i32,
             ) == SOCKET_ERROR
             {
+                // Capture the error BEFORE closesocket (which can reset it).
+                let err = WSAGetLastError().0;
                 closesocket(sock);
-                return Err(anyhow!(
-                    "Failed to bind port {}: {}",
-                    port,
-                    WSAGetLastError().0
-                ));
+                // dantesync#109: on a Dante Virtual Soundcard host, DVS's own
+                // ptp.exe already owns 319/320 exclusively (WSAEADDRINUSE =
+                // 10048), so this bind loses the port. Today this failure was
+                // silent (a bare Err propagated up); log it LOUDLY so the
+                // collision is diagnosable from dantesync's log alone.
+                let inuse_hint = if err == 10048 {
+                    " = WSAEADDRINUSE (port already owned exclusively, e.g. by DVS ptp.exe)"
+                } else {
+                    ""
+                };
+                error!(
+                    "Failed to bind PTP UDP port {} (WSA error {}{}). Another PTP daemon \
+                     (e.g. Dante Virtual Soundcard's ptp.exe) likely owns this port -- \
+                     dantesync's Winsock PTP receive on port {} cannot start.",
+                    port, err, inuse_hint, port
+                );
+                return Err(anyhow!("Failed to bind port {}: {}", port, err));
             }
 
             // Join PTP multicast group

@@ -83,6 +83,25 @@ pub fn create_multicast_socket(port: u16, interface_ip: Ipv4Addr) -> Result<UdpS
     Ok(udp_socket)
 }
 
+/// The bind address for the pcap IGMP-join socket (dantesync#109).
+///
+/// The Windows pcap path opens a UDP socket purely to trigger the kernel IGMP
+/// membership report for the PTP group `224.0.1.129`. IGMP membership is per
+/// interface+group, NOT per port, so the socket's bound source port is
+/// irrelevant to the join (and pcap's own BPF filter, not this socket, selects
+/// the captured traffic). It must therefore bind an EPHEMERAL port — never a
+/// PTP port (319/320), which on a Dante Virtual Soundcard host belong to DVS's
+/// own `ptp.exe`: dantesync (a boot-time service) bound them first, so
+/// `ptp.exe` (started later, without `SO_REUSEADDR`) failed its bind with
+/// WSAEADDRINUSE and its PTP follower was starved of Follow_Up/Delay_Resp on
+/// 320.
+pub fn igmp_join_bind_addr() -> SocketAddrV4 {
+    // dantesync#109: bind an EPHEMERAL port (0). The kernel picks a free source
+    // port for the join socket; 319/320 stay free for a DVS ptp.exe on the same
+    // host. The port is irrelevant to the IGMP membership and to pcap's capture.
+    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
+}
+
 #[cfg(unix)]
 pub fn recv_with_timestamp(
     sock: &UdpSocket,
@@ -192,6 +211,52 @@ mod tests {
         let multi_addr: Ipv4Addr = "224.0.1.129".parse().unwrap();
         assert!(multi_addr.is_multicast(), "PTP address should be multicast");
         assert_eq!(multi_addr.octets(), [224, 0, 1, 129]);
+    }
+
+    /// dantesync#109: the pcap IGMP-join socket must bind an EPHEMERAL port,
+    /// never a PTP port. Binding 319/320 collides with a Dante Virtual
+    /// Soundcard `ptp.exe` on the same host and starves its PTP follower of the
+    /// PTP general messages (Follow_Up/Delay_Resp) on 320 — the DVS media clock
+    /// then free-runs on the host crystal instead of the grandmaster.
+    #[test]
+    fn igmp_join_bind_addr_never_uses_a_ptp_port() {
+        let addr = igmp_join_bind_addr();
+        assert_eq!(
+            addr.port(),
+            0,
+            "IGMP-join socket must bind an ephemeral port (0), not a PTP port"
+        );
+        assert_ne!(
+            addr.port(),
+            319,
+            "must not bind PTP event port 319 (DVS ptp.exe needs it)"
+        );
+        assert_ne!(
+            addr.port(),
+            320,
+            "must not bind PTP general port 320 (DVS ptp.exe needs it)"
+        );
+        assert_eq!(
+            *addr.ip(),
+            Ipv4Addr::UNSPECIFIED,
+            "IGMP-join socket binds the unspecified address"
+        );
+    }
+
+    /// dantesync#109: a real UDP socket bound the way the IGMP join binds lands
+    /// on a concrete NON-zero ephemeral port and never on 319/320 — so it can
+    /// never collide with an exclusive PTP-port listener (e.g. DVS `ptp.exe`).
+    #[test]
+    fn igmp_join_socket_binds_a_nonzero_ephemeral_port() {
+        let sock =
+            UdpSocket::bind(igmp_join_bind_addr()).expect("bind the ephemeral IGMP-join socket");
+        let port = sock
+            .local_addr()
+            .expect("read local_addr of the join socket")
+            .port();
+        assert_ne!(port, 0, "kernel must assign a concrete ephemeral port");
+        assert_ne!(port, 319, "the join socket must never land on PTP port 319");
+        assert_ne!(port, 320, "the join socket must never land on PTP port 320");
     }
 
     /// Test recv_with_timestamp returns None for non-blocking socket with no data

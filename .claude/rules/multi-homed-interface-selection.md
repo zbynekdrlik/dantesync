@@ -2,6 +2,7 @@
 paths:
   - "src/net.rs"
   - "src/net_pcap.rs"
+  - "src/net_winsock.rs"
   - "src/gm_filter.rs"
 ---
 
@@ -62,3 +63,34 @@ returns None/empty → `find_device(fallback_name)` = the historical default-int
 BYTE-IDENTICAL. Only a multi-homed box WITH a restricting allowlist whose default NIC is off the GM
 subnet changes behavior. The Linux socket path (`RealPtpNetwork`) is intentionally NOT changed (the
 fleet's only multi-homed box is Windows).
+
+## The IGMP-join socket must bind an EPHEMERAL port, NEVER 319/320 (dantesync#109 — DVS coexistence)
+
+On a box that ALSO runs Dante Virtual Soundcard (the `stream` box, 10.77.9.204), DVS's own `ptp.exe`
+needs UDP 319/320 exclusively for its PTP follower. The pcap path's IGMP-membership socket
+(`net_pcap::join_multicast`) must therefore bind an **ephemeral port (`net::igmp_join_bind_addr()` →
+`0.0.0.0:0`)**, never a PTP port — IGMP group membership is per interface+group, NOT per port, and
+pcap's own BPF filter (`dst port 319 or dst port 320`) selects the captured traffic, so the join
+socket's bound port is irrelevant. It used to bind 319 AND 320 (one socket each, plus a pointless
+`SO_REUSEADDR`); dantesync is a boot-time service and bound first, DVS's `ptp.exe` (a login-time app
+without `SO_REUSEADDR`) then failed its own bind with `WSAEADDRINUSE` — live on `stream` 2026-09-03
+dantesync held BOTH 319 and 320 and `ptp.exe` held neither — starving DVS's follower of the PTP
+*general* messages (Follow_Up/Delay_Resp) on 320, so its media clock free-ran on the host crystal
+(≈−17 ppm off the grandmaster, hidden only by the camera-box ASRC servo). **Never re-add a
+fixed-PTP-port bind to any pcap/socket join path.**
+
+- The bind decision is the pure, non-cfg-gated seam `net::igmp_join_bind_addr()` (Linux-CI unit
+  tested — port must be 0, never 319/320); `net_pcap.rs` glue only calls it. Follow the same
+  split for any new socket that joins a PTP group.
+- `net_winsock.rs` (the non-pcap fallback, not currently wired into `main`) genuinely receives on
+  319/320, so it MUST bind them — but it now logs a loud `error!` (with the WSA error, incl.
+  `WSAEADDRINUSE=10048`, and the likely DVS cause) when a bind fails, instead of a silent Err.
+- Acceptance on the `stream` box after deploying the fix: `Get-NetUDPEndpoint -LocalPort 319,320`
+  shows ONLY `ptp.exe` on both ports (dantesync no longer appears), and the OBS log's
+  `asrc: source 'mbc' estimated=` residual collapses from ≈−17 ppm toward 0 (DVS is now disciplined
+  by the grandmaster). Read live state via the win-stream MCP (session-agnostic `Get-NetUDPEndpoint`
+  / process list / OBS log read). **`ptp.exe` binds its ports only at ITS start** — after the
+  dantesync restart the ports may sit UNOWNED (nobody on 319/320) until DVS is restarted; that is
+  NOT "still broken", it is the DVS side not having retried yet. If `ptp.exe` has not re-bound within
+  ~1 min, restart Dante Virtual Soundcard (it briefly drops the ASIO device stream OBS reads `mbc`
+  from — do it off-air and verify OBS audio resumes), THEN re-read the endpoints.
