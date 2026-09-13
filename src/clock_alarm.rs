@@ -61,8 +61,20 @@ impl ClockHealth {
     /// hostname (#113), then PTP staleness (no allowed announce), then a
     /// present-but-disallowed source, then a plain not-locked state.
     pub fn lost_reason(&self) -> Option<String> {
-        // [red] not yet implemented — the decision tests must fail against this stub.
-        None
+        if let Some(name) = &self.allowlist_unresolvable {
+            return Some(format!("grandmaster hostname {name} unresolvable"));
+        }
+        // Genuinely healthy: locked, in a locked mode, on an allowed GM, not stale.
+        if self.is_locked && self.mode_locked && self.gm_allowed && !self.ptp_stale {
+            return None;
+        }
+        if self.ptp_stale {
+            return Some("no PTP announce from an allowed grandmaster".to_string());
+        }
+        if !self.gm_allowed {
+            return Some("PTP source not in the grandmaster allowlist".to_string());
+        }
+        Some("not PTP-locked to the grandmaster".to_string())
     }
 }
 
