@@ -58,8 +58,15 @@ impl ClockHealth {
     /// `None` when the node is genuinely PTP-locked to an allowed grandmaster.
     ///
     /// Precedence, most specific / actionable first: an unresolvable allowlist
-    /// hostname (#113), then PTP staleness (no allowed announce), then a
-    /// present-but-disallowed source, then a plain not-locked state.
+    /// hostname (#113), then PTP staleness (no allowed announce), then a plain
+    /// not-locked / acquiring state, then a present-but-disallowed source.
+    ///
+    /// Note on ordering: the allowlist DROPS disallowed packets before adoption
+    /// (`process_loop_iteration`), so `gm_allowed` is really "an allowed source is
+    /// adopted"; when it is false there is simply no source yet (cold start /
+    /// loss), which is best reported as "not PTP-locked". The `gm_allowed`
+    /// catch-all below therefore only fires in the near-impossible locked-but-no-
+    /// allowed-source case, and is kept for completeness.
     pub fn lost_reason(&self) -> Option<String> {
         if let Some(name) = &self.allowlist_unresolvable {
             return Some(format!("grandmaster hostname {name} unresolvable"));
@@ -71,10 +78,10 @@ impl ClockHealth {
         if self.ptp_stale {
             return Some("no PTP announce from an allowed grandmaster".to_string());
         }
-        if !self.gm_allowed {
-            return Some("PTP source not in the grandmaster allowlist".to_string());
+        if !self.is_locked || !self.mode_locked {
+            return Some("not PTP-locked to the grandmaster".to_string());
         }
-        Some("not PTP-locked to the grandmaster".to_string())
+        Some("PTP source not in the grandmaster allowlist".to_string())
     }
 }
 

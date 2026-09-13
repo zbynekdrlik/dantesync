@@ -10,6 +10,7 @@
 //! - Soft dead zones tuned for 96kHz audio (1 sample = 10.4µs)
 
 use crate::clock::SystemClock;
+use crate::clock_alarm::{self, ClockAlarm, ClockAlarmNotifier, ClockHealth, DesktopNotifier};
 use crate::config::SystemConfig;
 use crate::gm_filter::GmAllowlist;
 use crate::phase_slew::{self, PhaseSlewOutput, PhaseSlewServo};
@@ -589,6 +590,19 @@ where
     /// as-if it never arrived, so a foreign-subnet grandmaster cannot be adopted.
     /// Empty = unrestricted (historical last-writer-wins). See `crate::gm_filter`.
     gm_allowlist: GmAllowlist,
+    /// dantesync#114 — the loud NO-DANTE-CLOCK alarm state machine, evaluated on
+    /// every 10 s `tick_status()` (so it fires even when NO PTP packets arrive —
+    /// the whole point, since a lost clock means no packets). Silent while
+    /// PTP-locked to an allowed grandmaster; otherwise one notification per
+    /// `clock_alarm_interval_s`. See `crate::clock_alarm`.
+    clock_alarm: ClockAlarm,
+    /// dantesync#114 — the platform desktop notifier the alarm drives (Linux
+    /// `notify-send`; no-op on a headless box or on Windows, where the tray shows
+    /// the balloon from `/status.clock_alarm`). Boxed for test injection.
+    clock_alarm_notifier: Box<dyn ClockAlarmNotifier>,
+    /// dantesync#114 — the effective (floored) alarm cadence in seconds, published
+    /// in `/status.clock_alarm_interval_s` so every surface shares one cadence.
+    clock_alarm_interval_s: u64,
     /// camera-box issue 1073 — observability for the source filter. Counts PTP
     /// packets dropped by the allowlist since the last ALLOWED grandmaster packet
     /// (reset to 0 on any accepted packet), so `check_ptp_status` can tell
@@ -805,6 +819,13 @@ where
         // #97: read the flag before `config` is moved into the struct below.
         let config_phase_slew_enabled = config.phase_slew.enabled;
 
+        // #114: read the alarm cadence before `config` is moved. The effective
+        // (floored) value is published in /status; the raw value is floored again
+        // inside `ClockAlarm::from_interval_secs` so a `0` can never spam.
+        let clock_alarm_interval_cfg = config.clock_alarm_interval_s;
+        let clock_alarm_interval_s =
+            clock_alarm_interval_cfg.max(clock_alarm::CLOCK_ALARM_INTERVAL_FLOOR_S);
+
         // camera-box issue 1073: parse the grandmaster-source allowlist once.
         let gm_allowlist = GmAllowlist::parse(&config.gm_allowlist);
         for bad in gm_allowlist.invalid_entries() {
@@ -859,6 +880,9 @@ where
             current_sync_source: None,
             current_sync_source_ip: None,
             gm_allowlist,
+            clock_alarm: ClockAlarm::from_interval_secs(clock_alarm_interval_cfg),
+            clock_alarm_notifier: Box::new(DesktopNotifier),
+            clock_alarm_interval_s,
             gm_dropped_since_accepted: 0,
             last_gm_drop_warn: None,
             sample_window: Vec::with_capacity(window_size),
@@ -1855,8 +1879,55 @@ where
         // #68: the staleness check lives on this tick, not in the query path —
         // the failure it detects is "the query path is not running at all".
         self.check_ntp_freshness();
+        // #114: evaluate + emit the loud NO-DANTE-CLOCK alarm. Runs on the 10 s
+        // tick regardless of packet arrival, so a lost clock (which means NO PTP
+        // packets, hence no servo update) still fires the per-minute alarm.
+        self.evaluate_clock_alarm();
         // Publish the current snapshot for IPC / HTTP status consumers
         self.update_shared_status();
+    }
+
+    /// #114: sample the current Dante-clock health for the alarm decision.
+    fn sample_clock_health(&self) -> ClockHealth {
+        let ptp_stale = self.last_ptp_packet.elapsed() > Duration::from_secs(PTP_TIMEOUT_SECS);
+        // mode ∈ {LOCK, NANO} — the genuinely PTP-locked modes.
+        let mode_locked = self.in_nano_mode || self.is_locked;
+        // A grandmaster source is present AND permitted by the (resolved) allowlist.
+        let gm_allowed = match self.current_sync_source_ip {
+            Some(ip) => self.gm_allowlist.allows(ip),
+            None => false,
+        };
+        ClockHealth {
+            is_locked: self.is_locked,
+            mode_locked,
+            gm_allowed,
+            ptp_stale,
+            // #113 wires the unresolvable-hostname reason here; None until then.
+            allowlist_unresolvable: None,
+        }
+    }
+
+    /// #114: advance the clock alarm and perform its emissions (LOST/REGAINED
+    /// INFO edges, the per-cadence WARN log on every platform, and the desktop
+    /// notification through the platform notifier), then publish the snapshot.
+    fn evaluate_clock_alarm(&mut self) {
+        let health = self.sample_clock_health();
+        let now = Instant::now();
+        let now_epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tick = clock_alarm::drive(
+            &mut self.clock_alarm,
+            &health,
+            now,
+            now_epoch,
+            &*self.clock_alarm_notifier,
+        );
+        if let Ok(mut status) = self.status_shared.write() {
+            status.clock_alarm = tick.snapshot;
+            status.clock_alarm_interval_s = self.clock_alarm_interval_s;
+        }
     }
 
     pub fn process_loop_iteration(&mut self) -> Result<()> {
@@ -3124,6 +3195,86 @@ mod tests {
         w.write_u16::<BigEndian>(seq).unwrap();
         buf[49..55].copy_from_slice(&uuid); // grandmaster clock UUID
         buf
+    }
+
+    struct NoopAlarmNotifier;
+    impl ClockAlarmNotifier for NoopAlarmNotifier {
+        fn notify(&self, _title: &str, _message: &str) {}
+    }
+
+    /// dantesync#114: the controller raises the clock alarm in `/status` when the
+    /// node is NOT PTP-locked to an allowed grandmaster, and clears it once
+    /// genuinely locked — driven from the 10 s tick even with no packets.
+    #[test]
+    fn clock_alarm_wires_status_active_when_unlocked_and_clears_when_locked_114() {
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.clock_alarm_interval_s = 30; // > floor, kept verbatim
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            status.clone(),
+            config,
+        );
+        // Never touch a real desktop bus from a unit test.
+        controller.clock_alarm_notifier = Box::new(NoopAlarmNotifier);
+
+        // Force the lost condition: not locked, no adopted source, PTP stale.
+        controller.is_locked = false;
+        controller.in_nano_mode = false;
+        controller.current_sync_source_ip = None;
+        controller.last_ptp_packet = Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 5);
+
+        controller.evaluate_clock_alarm();
+        {
+            let s = status.read().unwrap();
+            assert!(s.clock_alarm.active, "alarm must be active while unlocked");
+            assert!(s.clock_alarm.since.is_some(), "since must be stamped");
+            assert!(!s.clock_alarm.reason.is_empty(), "reason must be set");
+            assert_eq!(
+                s.clock_alarm_interval_s, 30,
+                "the configured cadence must be published"
+            );
+        }
+        assert!(controller.clock_alarm.is_active());
+
+        // Now genuinely locked to an allowed grandmaster (default allowlist is
+        // unrestricted, so any adopted source is allowed).
+        controller.is_locked = true;
+        controller.current_sync_source_ip = Some("10.77.9.184".parse().unwrap());
+        controller.last_ptp_packet = Instant::now();
+
+        controller.evaluate_clock_alarm();
+        {
+            let s = status.read().unwrap();
+            assert!(!s.clock_alarm.active, "alarm must clear once locked");
+            assert_eq!(s.clock_alarm.since, None);
+            assert_eq!(s.clock_alarm.reason, "");
+        }
+        assert!(!controller.clock_alarm.is_active());
+    }
+
+    /// dantesync#114: a nonsense cadence (0) is floored, not published as 0.
+    #[test]
+    fn clock_alarm_interval_is_floored_114() {
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.clock_alarm_interval_s = 0;
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            status.clone(),
+            config,
+        );
+        controller.clock_alarm_notifier = Box::new(NoopAlarmNotifier);
+        controller.evaluate_clock_alarm();
+        assert_eq!(
+            status.read().unwrap().clock_alarm_interval_s,
+            clock_alarm::CLOCK_ALARM_INTERVAL_FLOOR_S,
+            "a 0 cadence must be floored, never published as 0"
+        );
     }
 
     /// RED (camera-box issue 1073): reproduces the live incident. The stream box,

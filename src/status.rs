@@ -1,3 +1,4 @@
+use crate::clock_alarm::ClockAlarmStatus;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
@@ -209,6 +210,30 @@ pub struct SyncStatus {
     /// as "the servo is asking for max slew", not "±200 ppm is on the clock right now".
     #[serde(default)]
     pub phase_slew_saturated: bool,
+
+    // ========================================================================
+    // Clock alarm (dantesync#114) — all additive, all default to the pre-#114
+    // "no alarm / 60 s cadence" reading so an old JSON blob still deserializes
+    // and camera-box's DanteSync gate is unaffected.
+    // ========================================================================
+    /// dantesync#114: the loud "NO DANTE CLOCK" alarm snapshot — `{active, since,
+    /// reason}`. `active` is true while this node is NOT PTP-locked to an allowed
+    /// grandmaster; `since` is the unix epoch second the current episode began
+    /// (`null` when inactive); `reason` is a human string (empty when inactive).
+    /// External gates/watchdogs read this to detect a silent fall to NTP-only.
+    #[serde(default)]
+    pub clock_alarm: ClockAlarmStatus,
+
+    /// dantesync#114: the EFFECTIVE (floored) cadence in seconds at which the
+    /// alarm re-notifies while active — so every surface (the daemon WARN log,
+    /// the Linux notify-send, the Windows tray balloon) shares one configured
+    /// cadence. Default 60.
+    #[serde(default = "default_clock_alarm_interval_s")]
+    pub clock_alarm_interval_s: u64,
+}
+
+fn default_clock_alarm_interval_s() -> u64 {
+    60
 }
 
 impl SyncStatus {
@@ -259,6 +284,9 @@ impl Default for SyncStatus {
             f_phase_i_ppm: 0.0,
             f_ptp_ppm: 0.0,
             phase_slew_saturated: false,
+            // #114: no alarm, 60 s cadence by default
+            clock_alarm: ClockAlarmStatus::default(),
+            clock_alarm_interval_s: default_clock_alarm_interval_s(),
         }
     }
 }
@@ -546,6 +574,54 @@ mod tests {
             json.contains("\"ntp_step_threshold_us\":null"),
             "must serialize as an explicit null, not be omitted, got: {}",
             json
+        );
+    }
+
+    /// dantesync#114: the clock-alarm fields are additive. A pre-#114 JSON blob
+    /// (which has the #101 step-threshold field but neither clock-alarm field)
+    /// must still deserialize, defaulting to "no alarm / 60 s cadence"; and a
+    /// node in alarm round-trips the snapshot + cadence.
+    #[test]
+    fn test_sync_status_clock_alarm_fields_are_additive_114() {
+        let pre_114 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1786439763,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "ntp_spread_us":0,"ntp_sample_count":0,"pcap_ntp_active":false,"ntp_updated_ts":0,
+            "ntp_age_s":null,"ntp_deadband_us":null,"ntp_steps_last_hour":null,"ntp_step_storm":false,
+            "phase_slew_enabled":false,"f_phase_ppm":0.0,"f_phase_p_ppm":0.0,"f_phase_i_ppm":0.0,
+            "f_ptp_ppm":0.0,"phase_slew_saturated":false,"ntp_step_threshold_us":null}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(pre_114).expect("pre-#114 JSON must still deserialize");
+        assert!(
+            !restored.clock_alarm.active,
+            "absent clock_alarm must default to inactive, never a spurious alarm"
+        );
+        assert_eq!(restored.clock_alarm.since, None);
+        assert_eq!(restored.clock_alarm.reason, "");
+        assert_eq!(
+            restored.clock_alarm_interval_s, 60,
+            "absent cadence must default to 60 s, not 0"
+        );
+
+        // A node in alarm round-trips the snapshot + cadence.
+        let alarmed = SyncStatus {
+            clock_alarm: ClockAlarmStatus {
+                active: true,
+                since: Some(1_786_400_000),
+                reason: "not PTP-locked to the grandmaster".to_string(),
+            },
+            clock_alarm_interval_s: 60,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&alarmed).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert!(back.clock_alarm.active);
+        assert_eq!(back.clock_alarm.since, Some(1_786_400_000));
+        assert_eq!(back.clock_alarm.reason, "not PTP-locked to the grandmaster");
+        // The `/status.clock_alarm` object carries exactly {active, since, reason}.
+        assert!(
+            json.contains("\"clock_alarm\":{\"active\":true,\"since\":1786400000,\"reason\":"),
+            "clock_alarm must serialize as {{active,since,reason}}, got: {json}"
         );
     }
 
