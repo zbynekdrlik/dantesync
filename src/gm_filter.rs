@@ -73,7 +73,6 @@ pub struct ResolveOutcome {
 /// rather than silently dropping it as garbage. Requires at least one ASCII
 /// letter, so a malformed numeric entry (e.g. `999.999.999.999`, which fails IP
 /// parsing) is NOT mistaken for a hostname.
-#[allow(dead_code)]
 fn is_valid_hostname(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 {
         return false;
@@ -204,7 +203,7 @@ impl GmAllowlist {
                 // hostname (e.g. `video-clock.lan`) is a hostname to resolve — not
                 // "invalid". A slash-bearing entry that failed IP/CIDR parsing
                 // (e.g. `10.77.9.0/33`) is a malformed CIDR, never a hostname.
-                // [red] hostname classification not implemented yet.
+                Err(_) if !t.contains('/') && is_valid_hostname(t) => hostnames.push(t.to_string()),
                 Err(_) => invalid.push(e.clone()),
             }
         }
@@ -293,9 +292,49 @@ impl GmAllowlist {
     /// resolution exists, it is KEPT (a transient DNS blip must never drop the
     /// rig's clock lock). A no-hostname allowlist is a no-op. Returns a
     /// [`ResolveOutcome`] describing any change for the caller to log.
-    pub fn resolve(&mut self, _resolver: &dyn Resolver) -> ResolveOutcome {
-        // [red] resolution not implemented yet.
-        ResolveOutcome::default()
+    pub fn resolve(&mut self, resolver: &dyn Resolver) -> ResolveOutcome {
+        if self.hostnames.is_empty() {
+            return ResolveOutcome::default();
+        }
+        let mut new_set: Vec<Ipv4Addr> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        for h in &self.hostnames {
+            match resolver.resolve(h) {
+                Ok(ips) if !ips.is_empty() => {
+                    for ip in ips {
+                        if !new_set.contains(&ip) {
+                            new_set.push(ip);
+                        }
+                    }
+                }
+                _ => unresolved.push(h.clone()),
+            }
+        }
+        new_set.sort();
+        let old = self.resolved.clone();
+
+        // Keep-previous-on-total-failure: nothing resolved this pass but we had a
+        // prior resolution — hold it, only the unresolved list changes.
+        if new_set.is_empty() && !old.is_empty() {
+            let changed = self.unresolved != unresolved;
+            self.unresolved = unresolved.clone();
+            return ResolveOutcome {
+                changed,
+                newly_unresolved: unresolved,
+                old_resolved: old.clone(),
+                new_resolved: old,
+            };
+        }
+
+        let changed = new_set != old || self.unresolved != unresolved;
+        self.resolved = new_set.clone();
+        self.unresolved = unresolved.clone();
+        ResolveOutcome {
+            changed,
+            newly_unresolved: unresolved,
+            old_resolved: old,
+            new_resolved: new_set,
+        }
     }
 
     /// The literal prefixes plus each resolved hostname IP as a `/32`, for
@@ -812,16 +851,16 @@ mod tests {
         let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
         let resolver = FakeResolver::new(&[]); // nothing resolves
         let outcome = a.resolve(&resolver);
-        assert_eq!(outcome.newly_unresolved, vec!["video-clock.lan".to_string()]);
+        assert_eq!(
+            outcome.newly_unresolved,
+            vec!["video-clock.lan".to_string()]
+        );
         assert!(a.resolved_ips().is_empty());
         assert_eq!(a.unresolved_hostnames(), &["video-clock.lan".to_string()]);
         // Never silently accept any GM — nothing is allowed…
         assert!(!a.allows(ip("10.77.9.230")));
         // …and the loud clock-alarm reason is surfaced.
-        assert_eq!(
-            a.unresolvable_reason().as_deref(),
-            Some("video-clock.lan")
-        );
+        assert_eq!(a.unresolvable_reason().as_deref(), Some("video-clock.lan"));
     }
 
     #[test]
@@ -837,7 +876,10 @@ mod tests {
             &[ip("10.77.9.230")],
             "a transient DNS blip must never drop the lock"
         );
-        assert_eq!(outcome.newly_unresolved, vec!["video-clock.lan".to_string()]);
+        assert_eq!(
+            outcome.newly_unresolved,
+            vec!["video-clock.lan".to_string()]
+        );
         // Still allowed via the kept IPs, so this is NOT a clock-loss reason.
         assert!(a.allows(ip("10.77.9.230")));
         assert!(
@@ -858,15 +900,16 @@ mod tests {
         assert_eq!(outcome.old_resolved, vec![ip("10.77.9.184")]);
         assert_eq!(outcome.new_resolved, vec![ip("10.77.9.230")]);
         assert!(a.allows(ip("10.77.9.230")));
-        assert!(!a.allows(ip("10.77.9.184")), "the old lease is no longer allowed");
+        assert!(
+            !a.allows(ip("10.77.9.184")),
+            "the old lease is no longer allowed"
+        );
     }
 
     #[test]
     fn literal_and_hostname_entries_coexist() {
-        let mut a = GmAllowlist::parse(&[
-            "10.77.10.0/24".to_string(),
-            "video-clock.lan".to_string(),
-        ]);
+        let mut a =
+            GmAllowlist::parse(&["10.77.10.0/24".to_string(), "video-clock.lan".to_string()]);
         a.resolve(&FakeResolver::new(&[("video-clock.lan", &["10.77.9.230"])]));
         assert!(a.allows(ip("10.77.9.230")), "resolved hostname IP allowed");
         assert!(a.allows(ip("10.77.10.5")), "literal CIDR still allowed");
