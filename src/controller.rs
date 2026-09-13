@@ -613,8 +613,6 @@ where
     /// dantesync#113 — last time the hostname allowlist was re-resolved
     /// (`Instant`, monotonic — this daemon steps its own wall clock).
     last_gm_resolve: Instant,
-    /// dantesync#114 review — process start (`Instant`), for the acquisition grace.
-    started_at: Instant,
     /// dantesync#114 review — has this node achieved PTP lock at least once? Until
     /// it has (and within `ACQUISITION_GRACE`), a not-yet-locked clock is normal
     /// boot acquisition, not a loss (no spurious reboot alarm).
@@ -923,7 +921,6 @@ where
             gm_allowlist,
             gm_resolver,
             last_gm_resolve: now,
-            started_at: now,
             ever_locked: false,
             clock_alarm: ClockAlarm::from_interval_secs(clock_alarm_interval_cfg),
             clock_alarm_notifier: Box::new(DesktopNotifier),
