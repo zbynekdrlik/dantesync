@@ -12,7 +12,7 @@
 use crate::clock::SystemClock;
 use crate::clock_alarm::{self, ClockAlarm, ClockAlarmNotifier, ClockHealth, DesktopNotifier};
 use crate::config::SystemConfig;
-use crate::gm_filter::GmAllowlist;
+use crate::gm_filter::{GmAllowlist, ResolveOutcome, Resolver, StdResolver};
 use crate::phase_slew::{self, PhaseSlewOutput, PhaseSlewServo};
 use crate::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header, PtpV1SyncMessageBody};
 use crate::spike_filter::{FilterMode, JitterEstimator, SpikeFilter};
@@ -554,6 +554,15 @@ const NTP_STEP_STORM_WARN_INTERVAL: Duration = Duration::from_secs(300);
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
 
+/// dantesync#113 — periodic re-resolution cadence for `gm_allowlist` hostname
+/// entries, so a DNS/lease change propagates without a service restart.
+const GM_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// dantesync#113 — minimum spacing between the extra "announce from an unknown
+/// source" re-resolutions, so a foreign-PTP flood can never turn into a DNS
+/// query storm. The grandmaster moving to a new IP is caught within this window.
+const GM_RESOLVE_ON_DROP_COOLDOWN: Duration = Duration::from_secs(5);
+
 // NTP failure detection
 const NTP_FAILURE_THRESHOLD: usize = 3; // Consider NTP failed after 3 consecutive failures
 
@@ -590,6 +599,12 @@ where
     /// as-if it never arrived, so a foreign-subnet grandmaster cannot be adopted.
     /// Empty = unrestricted (historical last-writer-wins). See `crate::gm_filter`.
     gm_allowlist: GmAllowlist,
+    /// dantesync#113 — resolver for `gm_allowlist` hostname entries. Boxed so a
+    /// test can inject a fake (no real DNS). Real builds use `StdResolver`.
+    gm_resolver: Box<dyn Resolver>,
+    /// dantesync#113 — last time the hostname allowlist was re-resolved
+    /// (`Instant`, monotonic — this daemon steps its own wall clock).
+    last_gm_resolve: Instant,
     /// dantesync#114 — the loud NO-DANTE-CLOCK alarm state machine, evaluated on
     /// every 10 s `tick_status()` (so it fires even when NO PTP packets arrive —
     /// the whole point, since a lost clock means no packets). Silent while
@@ -827,13 +842,25 @@ where
             clock_alarm_interval_cfg.max(clock_alarm::CLOCK_ALARM_INTERVAL_FLOOR_S);
 
         // camera-box issue 1073: parse the grandmaster-source allowlist once.
-        let gm_allowlist = GmAllowlist::parse(&config.gm_allowlist);
+        let mut gm_allowlist = GmAllowlist::parse(&config.gm_allowlist);
         for bad in gm_allowlist.invalid_entries() {
             warn!(
-                "gm_allowlist: ignoring unparseable entry {:?} (expected an IPv4 or CIDR like \
-                 10.77.9.184 or 10.77.9.0/24)",
+                "gm_allowlist: ignoring unparseable entry {:?} (expected an IPv4, a CIDR like \
+                 10.77.9.0/24, or a hostname like video-clock.lan)",
                 bad
             );
+        }
+        // dantesync#113: resolve hostname entries at startup so the allowlist is
+        // effective before the first packet (a hostname-only allowlist permits
+        // nothing until resolved). The resolver is boxed for test injection.
+        let gm_resolver: Box<dyn Resolver> = Box::new(StdResolver);
+        if gm_allowlist.has_hostnames() {
+            info!(
+                "gm_allowlist: resolving hostname entries {:?} at startup",
+                gm_allowlist.hostnames()
+            );
+            let outcome = gm_allowlist.resolve(&*gm_resolver);
+            Self::log_gm_resolve_outcome(&outcome, &gm_allowlist);
         }
         if gm_allowlist.is_unrestricted() {
             info!("GM source policy: UNRESTRICTED (accept any grandmaster source IP)");
@@ -880,6 +907,8 @@ where
             current_sync_source: None,
             current_sync_source_ip: None,
             gm_allowlist,
+            gm_resolver,
+            last_gm_resolve: now,
             clock_alarm: ClockAlarm::from_interval_secs(clock_alarm_interval_cfg),
             clock_alarm_notifier: Box::new(DesktopNotifier),
             clock_alarm_interval_s,
@@ -1879,12 +1908,50 @@ where
         // #68: the staleness check lives on this tick, not in the query path —
         // the failure it detects is "the query path is not running at all".
         self.check_ntp_freshness();
+        // #113: re-resolve hostname allowlist entries periodically so a DNS/lease
+        // change propagates without a restart (before the alarm samples health).
+        self.maybe_reresolve_gm();
         // #114: evaluate + emit the loud NO-DANTE-CLOCK alarm. Runs on the 10 s
         // tick regardless of packet arrival, so a lost clock (which means NO PTP
         // packets, hence no servo update) still fires the per-minute alarm.
         self.evaluate_clock_alarm();
         // Publish the current snapshot for IPC / HTTP status consumers
         self.update_shared_status();
+    }
+
+    /// dantesync#113: log a hostname-resolution outcome — INFO on a change (an A
+    /// record moved), ERROR (loud, and repeated every re-resolve) for each
+    /// hostname currently unresolvable, per the ticket's fail-loud requirement.
+    fn log_gm_resolve_outcome(outcome: &ResolveOutcome, allowlist: &GmAllowlist) {
+        if outcome.changed && outcome.old_resolved != outcome.new_resolved {
+            info!(
+                "gm_allowlist: hostname resolution changed {:?} -> {:?}",
+                outcome.old_resolved, outcome.new_resolved
+            );
+        }
+        for name in &outcome.newly_unresolved {
+            error!(
+                "gm_allowlist: hostname {:?} is UNRESOLVABLE — keeping the previous resolution \
+                 {:?} (an empty set means NO grandmaster is accepted until DNS recovers; the \
+                 service keeps running on NTP fallback and raises the clock alarm)",
+                name,
+                allowlist.resolved_ips()
+            );
+        }
+    }
+
+    /// dantesync#113: re-resolve the hostname allowlist if the cadence has elapsed
+    /// (called from the 10 s tick). A no-hostname allowlist is a no-op.
+    fn maybe_reresolve_gm(&mut self) {
+        if !self.gm_allowlist.has_hostnames() {
+            return;
+        }
+        if self.last_gm_resolve.elapsed() < GM_RESOLVE_INTERVAL {
+            return;
+        }
+        let outcome = self.gm_allowlist.resolve(&*self.gm_resolver);
+        self.last_gm_resolve = Instant::now();
+        Self::log_gm_resolve_outcome(&outcome, &self.gm_allowlist);
     }
 
     /// #114: sample the current Dante-clock health for the alarm decision.
@@ -1902,8 +1969,9 @@ where
             mode_locked,
             gm_allowed,
             ptp_stale,
-            // #113 wires the unresolvable-hostname reason here; None until then.
-            allowlist_unresolvable: None,
+            // #113: a hostname allowlist with no working resolution is a specific,
+            // loud clock-loss reason (None when a resolution is held).
+            allowlist_unresolvable: self.gm_allowlist.unresolvable_reason(),
         }
     }
 
@@ -1978,6 +2046,17 @@ where
                     self.last_gm_drop_warn = Some(now);
                 } else {
                     debug!("Dropping PTP packet from non-allowlisted grandmaster source {ip}");
+                }
+                // #113: a dropped source while we carry hostname entries is a hint
+                // the grandmaster may have moved (DHCP/DNS change) — re-resolve NOW
+                // so a new lease is picked up within seconds, bounded by a cooldown
+                // so a foreign PTP flood can never storm DNS.
+                if self.gm_allowlist.has_hostnames()
+                    && self.last_gm_resolve.elapsed() >= GM_RESOLVE_ON_DROP_COOLDOWN
+                {
+                    let outcome = self.gm_allowlist.resolve(&*self.gm_resolver);
+                    self.last_gm_resolve = Instant::now();
+                    Self::log_gm_resolve_outcome(&outcome, &self.gm_allowlist);
                 }
                 // Keep NTP discipline alive even under a foreign PTP flood — mirror
                 // the no-packet branch, so a dropped packet never starves the only
@@ -2720,6 +2799,10 @@ where
             status.drift_ppm = self.last_adj_ppm;
             status.gm_uuid = self.current_gm_uuid;
             status.gm_source_ip = self.current_sync_source_ip;
+            // #113: publish the live hostname resolution so external gates can
+            // compare gm_source_ip against the resolved set (and see loud failures).
+            status.gm_allowlist_resolved = self.gm_allowlist.resolved_ips().to_vec();
+            status.gm_allowlist_unresolved = self.gm_allowlist.unresolved_hostnames().to_vec();
             status.settled = self.clock_settled;
             status.updated_ts = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3275,6 +3358,91 @@ mod tests {
             clock_alarm::CLOCK_ALARM_INTERVAL_FLOOR_S,
             "a 0 cadence must be floored, never published as 0"
         );
+    }
+
+    struct MapResolver(std::collections::HashMap<String, Vec<std::net::Ipv4Addr>>);
+    impl crate::gm_filter::Resolver for MapResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<std::net::Ipv4Addr>> {
+            self.0
+                .get(host)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such host"))
+        }
+    }
+
+    /// dantesync#113: a resolved hostname allowlist publishes the resolved IP in
+    /// /status and accepts that grandmaster; an unresolvable one publishes the
+    /// unresolved name AND drives the #114 clock alarm with the specific reason.
+    #[test]
+    fn gm_allowlist_hostname_resolution_wires_status_and_alarm_113() {
+        // --- resolved case ---
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config = SystemConfig::default();
+        config.gm_allowlist = vec!["video-clock.lan".to_string()];
+        let mut controller = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            status.clone(),
+            config,
+        );
+        controller.clock_alarm_notifier = Box::new(NoopAlarmNotifier);
+        // Inject a resolver that maps the name, then force a re-resolve.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "video-clock.lan".to_string(),
+            vec!["10.77.9.230".parse().unwrap()],
+        );
+        controller.gm_resolver = Box::new(MapResolver(map));
+        controller.last_gm_resolve = Instant::now() - GM_RESOLVE_INTERVAL - Duration::from_secs(1);
+        controller.tick_status();
+        {
+            let s = status.read().unwrap();
+            assert_eq!(
+                s.gm_allowlist_resolved,
+                vec!["10.77.9.230".parse::<std::net::Ipv4Addr>().unwrap()],
+                "resolved GM IP must be published"
+            );
+            assert!(s.gm_allowlist_unresolved.is_empty());
+        }
+        assert!(
+            controller
+                .gm_allowlist
+                .allows("10.77.9.230".parse().unwrap()),
+            "the resolved grandmaster is accepted"
+        );
+
+        // --- unresolvable case ---
+        let status2 = Arc::new(RwLock::new(SyncStatus::default()));
+        let mut config2 = SystemConfig::default();
+        config2.gm_allowlist = vec!["video-clock.lan".to_string()];
+        let mut controller2 = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            status2.clone(),
+            config2,
+        );
+        controller2.clock_alarm_notifier = Box::new(NoopAlarmNotifier);
+        controller2.gm_resolver = Box::new(MapResolver(std::collections::HashMap::new())); // nothing resolves
+        controller2.last_gm_resolve = Instant::now() - GM_RESOLVE_INTERVAL - Duration::from_secs(1);
+        controller2.tick_status();
+        {
+            let s = status2.read().unwrap();
+            assert_eq!(
+                s.gm_allowlist_unresolved,
+                vec!["video-clock.lan".to_string()],
+                "an unresolvable hostname must be published loudly"
+            );
+            assert!(s.gm_allowlist_resolved.is_empty());
+            assert!(s.clock_alarm.active, "an unresolvable GM raises the alarm");
+            assert!(
+                s.clock_alarm.reason.contains("video-clock.lan")
+                    && s.clock_alarm.reason.contains("unresolvable"),
+                "the alarm reason must name the unresolvable hostname, got: {}",
+                s.clock_alarm.reason
+            );
+        }
     }
 
     /// RED (camera-box issue 1073): reproduces the live incident. The stream box,

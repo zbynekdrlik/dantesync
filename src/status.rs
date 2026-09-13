@@ -230,6 +230,22 @@ pub struct SyncStatus {
     /// cadence. Default 60.
     #[serde(default = "default_clock_alarm_interval_s")]
     pub clock_alarm_interval_s: u64,
+
+    // ========================================================================
+    // Hostname allowlist (dantesync#113) — additive; both default to empty so an
+    // old JSON blob still deserializes.
+    // ========================================================================
+    /// dantesync#113: the CURRENTLY-resolved IPv4 set of every `gm_allowlist`
+    /// hostname entry, so an external gate can compare `gm_source_ip` against the
+    /// live resolution (empty on a literal-only or not-yet-resolved allowlist).
+    #[serde(default)]
+    pub gm_allowlist_resolved: Vec<Ipv4Addr>,
+
+    /// dantesync#113: `gm_allowlist` hostname entries that currently FAIL to
+    /// resolve (empty when all resolve or there are no hostnames). A non-empty
+    /// list is the loud, machine-readable "grandmaster name unresolvable" signal.
+    #[serde(default)]
+    pub gm_allowlist_unresolved: Vec<String>,
 }
 
 fn default_clock_alarm_interval_s() -> u64 {
@@ -287,6 +303,9 @@ impl Default for SyncStatus {
             // #114: no alarm, 60 s cadence by default
             clock_alarm: ClockAlarmStatus::default(),
             clock_alarm_interval_s: default_clock_alarm_interval_s(),
+            // #113: no resolved / unresolved hostnames by default
+            gm_allowlist_resolved: Vec::new(),
+            gm_allowlist_unresolved: Vec::new(),
         }
     }
 }
@@ -622,6 +641,42 @@ mod tests {
         assert!(
             json.contains("\"clock_alarm\":{\"active\":true,\"since\":1786400000,\"reason\":"),
             "clock_alarm must serialize as {{active,since,reason}}, got: {json}"
+        );
+    }
+
+    /// dantesync#113: the hostname-allowlist resolution fields are additive. A
+    /// pre-#113 JSON blob (with the #114 clock-alarm fields but neither resolution
+    /// field) must still deserialize, defaulting both to empty; and a node with a
+    /// resolved + an unresolved hostname round-trips them.
+    #[test]
+    fn test_sync_status_gm_allowlist_resolution_fields_are_additive_113() {
+        let pre_113 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1786439763,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "ntp_spread_us":0,"ntp_sample_count":0,"pcap_ntp_active":false,"ntp_updated_ts":0,
+            "ntp_age_s":null,"ntp_deadband_us":null,"ntp_steps_last_hour":null,"ntp_step_storm":false,
+            "phase_slew_enabled":false,"f_phase_ppm":0.0,"f_phase_p_ppm":0.0,"f_phase_i_ppm":0.0,
+            "f_ptp_ppm":0.0,"phase_slew_saturated":false,"ntp_step_threshold_us":null,
+            "clock_alarm":{"active":false,"since":null,"reason":""},"clock_alarm_interval_s":60}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(pre_113).expect("pre-#113 JSON must still deserialize");
+        assert!(restored.gm_allowlist_resolved.is_empty());
+        assert!(restored.gm_allowlist_unresolved.is_empty());
+
+        let s = SyncStatus {
+            gm_allowlist_resolved: vec!["10.77.9.230".parse().unwrap()],
+            gm_allowlist_unresolved: vec!["video-clock.lan".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(
+            back.gm_allowlist_resolved,
+            vec!["10.77.9.230".parse::<Ipv4Addr>().unwrap()]
+        );
+        assert_eq!(
+            back.gm_allowlist_unresolved,
+            vec!["video-clock.lan".to_string()]
         );
     }
 
