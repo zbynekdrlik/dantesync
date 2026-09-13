@@ -51,6 +51,14 @@ pub struct ClockHealth {
     /// `Some(name)` names the first unresolvable hostname; drives the alarm ACTIVE
     /// with a specific reason even before any PTP packet is seen.
     pub allowlist_unresolvable: Option<String>,
+    /// dantesync#114 review: the node is still in its INITIAL acquisition window
+    /// (never locked yet, within a grace period from start) AND packets are
+    /// arriving. A not-yet-locked clock during normal boot acquisition is NOT a
+    /// loss — this suppresses the "not-locked" reason so a service restart / rig
+    /// reboot does not emit a spurious critical alarm. A genuine HARD failure
+    /// (PTP stale = no packets at all, or an unresolvable hostname) still fires
+    /// immediately, even during the grace, because those are real clock loss.
+    pub in_acquisition: bool,
 }
 
 impl ClockHealth {
@@ -77,6 +85,12 @@ impl ClockHealth {
         }
         if self.ptp_stale {
             return Some("no PTP announce from an allowed grandmaster".to_string());
+        }
+        // Initial acquisition (never locked yet, packets flowing, within the grace
+        // window): a not-yet-locked clock is normal boot behaviour, not a loss.
+        // Hard failures above (stale / unresolvable) already returned.
+        if self.in_acquisition {
+            return None;
         }
         if !self.is_locked || !self.mode_locked {
             return Some("not PTP-locked to the grandmaster".to_string());
@@ -307,6 +321,7 @@ mod tests {
             gm_allowed: true,
             ptp_stale: false,
             allowlist_unresolvable: None,
+            in_acquisition: false,
         }
     }
 
@@ -317,6 +332,7 @@ mod tests {
             gm_allowed: true,
             ptp_stale: false,
             allowlist_unresolvable: None,
+            in_acquisition: false,
         }
     }
 
@@ -416,6 +432,7 @@ mod tests {
             gm_allowed: false,
             ptp_stale: true,
             allowlist_unresolvable: Some("video-clock.lan".to_string()),
+            in_acquisition: false,
         };
         assert_eq!(
             h.lost_reason().as_deref(),
@@ -429,6 +446,7 @@ mod tests {
             gm_allowed: false,
             ptp_stale: true,
             allowlist_unresolvable: None,
+            in_acquisition: false,
         };
         assert_eq!(
             stale.lost_reason().as_deref(),
@@ -442,6 +460,7 @@ mod tests {
             gm_allowed: false,
             ptp_stale: false,
             allowlist_unresolvable: None,
+            in_acquisition: false,
         };
         assert_eq!(
             disallowed.lost_reason().as_deref(),
@@ -461,8 +480,63 @@ mod tests {
             gm_allowed: true,
             ptp_stale: false,
             allowlist_unresolvable: None,
+            in_acquisition: false,
         };
         assert!(half.lost_reason().is_some());
+    }
+
+    #[test]
+    fn in_acquisition_suppresses_not_locked_but_never_hard_failures() {
+        // Boot acquisition, packets flowing, not yet locked → suppressed (no
+        // spurious reboot alarm).
+        let acquiring = ClockHealth {
+            is_locked: false,
+            mode_locked: false,
+            gm_allowed: false,
+            ptp_stale: false,
+            allowlist_unresolvable: None,
+            in_acquisition: true,
+        };
+        assert_eq!(
+            acquiring.lost_reason(),
+            None,
+            "a not-yet-locked clock during boot acquisition must not alarm"
+        );
+
+        // But a HARD failure during acquisition still fires: no packets at all…
+        let stale_at_boot = ClockHealth {
+            ptp_stale: true,
+            in_acquisition: true,
+            ..acquiring.clone()
+        };
+        assert_eq!(
+            stale_at_boot.lost_reason().as_deref(),
+            Some("no PTP announce from an allowed grandmaster"),
+            "no PTP packets at all is a real loss even during acquisition"
+        );
+
+        // …and an unresolvable hostname at boot.
+        let unresolvable_at_boot = ClockHealth {
+            allowlist_unresolvable: Some("video-clock.lan".to_string()),
+            in_acquisition: true,
+            ..acquiring.clone()
+        };
+        assert_eq!(
+            unresolvable_at_boot.lost_reason().as_deref(),
+            Some("grandmaster hostname video-clock.lan unresolvable"),
+            "an unresolvable hostname is a real failure even during acquisition"
+        );
+
+        // Once the grace is over (in_acquisition=false), a still-not-locked clock
+        // DOES alarm — the real "never locked" problem is not hidden forever.
+        let past_grace = ClockHealth {
+            in_acquisition: false,
+            ..acquiring
+        };
+        assert_eq!(
+            past_grace.lost_reason().as_deref(),
+            Some("not PTP-locked to the grandmaster")
+        );
     }
 
     #[test]

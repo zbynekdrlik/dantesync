@@ -563,6 +563,14 @@ const GM_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 /// query storm. The grandmaster moving to a new IP is caught within this window.
 const GM_RESOLVE_ON_DROP_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// dantesync#114 review — initial acquisition grace. Until the node has locked
+/// ONCE, a still-acquiring (not-yet-locked) clock within this window from start
+/// is NOT treated as a lost clock, so a normal service restart / rig reboot does
+/// not emit a spurious "NO DANTE CLOCK" alarm during convergence. A genuine hard
+/// failure (no PTP packets at all → stale, or an unresolvable hostname) still
+/// fires immediately. 120 s comfortably covers LOCK/NANO convergence.
+const ACQUISITION_GRACE: Duration = Duration::from_secs(120);
+
 // NTP failure detection
 const NTP_FAILURE_THRESHOLD: usize = 3; // Consider NTP failed after 3 consecutive failures
 
@@ -605,6 +613,12 @@ where
     /// dantesync#113 — last time the hostname allowlist was re-resolved
     /// (`Instant`, monotonic — this daemon steps its own wall clock).
     last_gm_resolve: Instant,
+    /// dantesync#114 review — process start (`Instant`), for the acquisition grace.
+    started_at: Instant,
+    /// dantesync#114 review — has this node achieved PTP lock at least once? Until
+    /// it has (and within `ACQUISITION_GRACE`), a not-yet-locked clock is normal
+    /// boot acquisition, not a loss (no spurious reboot alarm).
+    ever_locked: bool,
     /// dantesync#114 — the loud NO-DANTE-CLOCK alarm state machine, evaluated on
     /// every 10 s `tick_status()` (so it fires even when NO PTP packets arrive —
     /// the whole point, since a lost clock means no packets). Silent while
@@ -909,6 +923,8 @@ where
             gm_allowlist,
             gm_resolver,
             last_gm_resolve: now,
+            started_at: now,
+            ever_locked: false,
             clock_alarm: ClockAlarm::from_interval_secs(clock_alarm_interval_cfg),
             clock_alarm_notifier: Box::new(DesktopNotifier),
             clock_alarm_interval_s,
@@ -1929,7 +1945,7 @@ where
                 outcome.old_resolved, outcome.new_resolved
             );
         }
-        for name in &outcome.newly_unresolved {
+        for name in &outcome.unresolved {
             error!(
                 "gm_allowlist: hostname {:?} is UNRESOLVABLE — keeping the previous resolution \
                  {:?} (an empty set means NO grandmaster is accepted until DNS recovers; the \
@@ -1972,6 +1988,9 @@ where
             // #113: a hostname allowlist with no working resolution is a specific,
             // loud clock-loss reason (None when a resolution is held).
             allowlist_unresolvable: self.gm_allowlist.unresolvable_reason(),
+            // #114 review: suppress the transient not-locked reason during the
+            // initial boot acquisition window (never locked yet + within grace).
+            in_acquisition: !self.ever_locked && self.started_at.elapsed() < ACQUISITION_GRACE,
         }
     }
 
@@ -1979,6 +1998,11 @@ where
     /// INFO edges, the per-cadence WARN log on every platform, and the desktop
     /// notification through the platform notifier), then publish the snapshot.
     fn evaluate_clock_alarm(&mut self) {
+        // #114 review: once locked, the acquisition grace no longer applies (a
+        // later unlock is a real loss and alarms immediately).
+        if self.is_locked {
+            self.ever_locked = true;
+        }
         let health = self.sample_clock_health();
         let now = Instant::now();
         let now_epoch = SystemTime::now()

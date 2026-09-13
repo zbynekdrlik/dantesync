@@ -25,6 +25,7 @@
 //! config typo must never take the whole rig's clock offline.
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 /// dantesync#113 — resolves a grandmaster HOSTNAME to its IPv4 set. Behind a
 /// trait so the periodic-resolution decision logic is unit-testable with a fake
@@ -36,22 +37,55 @@ pub trait Resolver {
     fn resolve(&self, host: &str) -> std::io::Result<Vec<Ipv4Addr>>;
 }
 
+/// dantesync#113 review — hard upper bound on a single OS lookup. `resolve()` is
+/// called from the sync-loop thread (via `tick_status` and the on-drop path), and
+/// `to_socket_addrs` blocks for the FULL OS resolver timeout (many seconds) when
+/// the DNS server is unreachable — which would stall PTP packet processing and
+/// perturb the servo. A LAN lookup answers in well under a millisecond, so
+/// capping at 2 s never affects a healthy resolve but bounds the worst-case
+/// servo stall (an over-run is treated as "currently unresolvable", so the
+/// keep-previous path holds the lock). This mirrors that the NTP path already
+/// does bounded blocking network I/O on this same thread.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The real resolver — the OS resolver via `std`'s `ToSocketAddrs` (no new
-/// dependency). IPv6 results are filtered out (this is an IPv4-only PTP fleet).
+/// dependency), each lookup bounded by [`RESOLVE_TIMEOUT`] on a short-lived
+/// thread so a dead DNS server can never stall the sync loop. IPv6 results are
+/// filtered out (this is an IPv4-only PTP fleet).
 pub struct StdResolver;
 
 impl Resolver for StdResolver {
     fn resolve(&self, host: &str) -> std::io::Result<Vec<Ipv4Addr>> {
-        use std::net::ToSocketAddrs;
-        // Port 0 — we only want name resolution, never a connection.
-        let addrs = (host, 0u16).to_socket_addrs()?;
-        Ok(addrs
-            .filter_map(|sa| match sa.ip() {
-                std::net::IpAddr::V4(v4) => Some(v4),
-                std::net::IpAddr::V6(_) => None,
-            })
-            .collect())
+        use std::sync::mpsc;
+        let host = host.to_string();
+        let (tx, rx) = mpsc::channel();
+        // The lookup runs on its own thread; if it over-runs the bound we abandon
+        // it (the receiver drops, the send becomes a no-op) and the thread exits
+        // on its own once the OS resolver finally returns — no thread accumulates.
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_ipv4_blocking(&host));
+        });
+        match rx.recv_timeout(RESOLVE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "DNS resolution exceeded the bound",
+            )),
+        }
     }
+}
+
+/// The raw blocking IPv4 lookup — factored out so [`StdResolver`] can bound it.
+fn resolve_ipv4_blocking(host: &str) -> std::io::Result<Vec<Ipv4Addr>> {
+    use std::net::ToSocketAddrs;
+    // Port 0 — we only want name resolution, never a connection.
+    let addrs = (host, 0u16).to_socket_addrs()?;
+    Ok(addrs
+        .filter_map(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect())
 }
 
 /// The observable result of one [`GmAllowlist::resolve`] pass, so the caller can
@@ -61,7 +95,7 @@ pub struct ResolveOutcome {
     /// The resolved set or the unresolved list changed since the previous pass.
     pub changed: bool,
     /// Hostnames that failed to resolve this pass.
-    pub newly_unresolved: Vec<String>,
+    pub unresolved: Vec<String>,
     /// The resolved IPv4 set BEFORE this pass.
     pub old_resolved: Vec<Ipv4Addr>,
     /// The resolved IPv4 set AFTER this pass (== old on a kept-previous outcome).
@@ -320,7 +354,7 @@ impl GmAllowlist {
             self.unresolved = unresolved.clone();
             return ResolveOutcome {
                 changed,
-                newly_unresolved: unresolved,
+                unresolved,
                 old_resolved: old.clone(),
                 new_resolved: old,
             };
@@ -331,7 +365,7 @@ impl GmAllowlist {
         self.unresolved = unresolved.clone();
         ResolveOutcome {
             changed,
-            newly_unresolved: unresolved,
+            unresolved,
             old_resolved: old,
             new_resolved: new_set,
         }
@@ -851,10 +885,7 @@ mod tests {
         let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
         let resolver = FakeResolver::new(&[]); // nothing resolves
         let outcome = a.resolve(&resolver);
-        assert_eq!(
-            outcome.newly_unresolved,
-            vec!["video-clock.lan".to_string()]
-        );
+        assert_eq!(outcome.unresolved, vec!["video-clock.lan".to_string()]);
         assert!(a.resolved_ips().is_empty());
         assert_eq!(a.unresolved_hostnames(), &["video-clock.lan".to_string()]);
         // Never silently accept any GM — nothing is allowed…
@@ -876,10 +907,7 @@ mod tests {
             &[ip("10.77.9.230")],
             "a transient DNS blip must never drop the lock"
         );
-        assert_eq!(
-            outcome.newly_unresolved,
-            vec!["video-clock.lan".to_string()]
-        );
+        assert_eq!(outcome.unresolved, vec!["video-clock.lan".to_string()]);
         // Still allowed via the kept IPs, so this is NOT a clock-loss reason.
         assert!(a.allows(ip("10.77.9.230")));
         assert!(
