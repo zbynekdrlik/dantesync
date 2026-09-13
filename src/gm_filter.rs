@@ -25,6 +25,105 @@
 //! config typo must never take the whole rig's clock offline.
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
+
+/// dantesync#113 — resolves a grandmaster HOSTNAME to its IPv4 set. Behind a
+/// trait so the periodic-resolution decision logic is unit-testable with a fake
+/// (no real DNS in tests), mirroring the `NtpSource`/`PtpNetwork` seams.
+pub trait Resolver {
+    /// Resolve `host` to zero or more IPv4 addresses. An `Err` (or an empty
+    /// `Ok`) means "currently unresolvable"; the caller keeps any previous
+    /// resolution and surfaces the hostname loudly.
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<Ipv4Addr>>;
+}
+
+/// dantesync#113 review — hard upper bound on a single OS lookup. `resolve()` is
+/// called from the sync-loop thread (via `tick_status` and the on-drop path), and
+/// `to_socket_addrs` blocks for the FULL OS resolver timeout (many seconds) when
+/// the DNS server is unreachable — which would stall PTP packet processing and
+/// perturb the servo. A LAN lookup answers in well under a millisecond, so
+/// capping at 2 s never affects a healthy resolve but bounds the worst-case
+/// servo stall (an over-run is treated as "currently unresolvable", so the
+/// keep-previous path holds the lock). This mirrors that the NTP path already
+/// does bounded blocking network I/O on this same thread.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The real resolver — the OS resolver via `std`'s `ToSocketAddrs` (no new
+/// dependency), each lookup bounded by [`RESOLVE_TIMEOUT`] on a short-lived
+/// thread so a dead DNS server can never stall the sync loop. IPv6 results are
+/// filtered out (this is an IPv4-only PTP fleet).
+pub struct StdResolver;
+
+impl Resolver for StdResolver {
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<Ipv4Addr>> {
+        use std::sync::mpsc;
+        let host = host.to_string();
+        let (tx, rx) = mpsc::channel();
+        // The lookup runs on its own thread; if it over-runs the bound we abandon
+        // it (the receiver drops, the send becomes a no-op) and the thread exits
+        // on its own once the OS resolver finally returns — no thread accumulates.
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_ipv4_blocking(&host));
+        });
+        match rx.recv_timeout(RESOLVE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "DNS resolution exceeded the bound",
+            )),
+        }
+    }
+}
+
+/// The raw blocking IPv4 lookup — factored out so [`StdResolver`] can bound it.
+fn resolve_ipv4_blocking(host: &str) -> std::io::Result<Vec<Ipv4Addr>> {
+    use std::net::ToSocketAddrs;
+    // Port 0 — we only want name resolution, never a connection.
+    let addrs = (host, 0u16).to_socket_addrs()?;
+    Ok(addrs
+        .filter_map(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect())
+}
+
+/// The observable result of one [`GmAllowlist::resolve`] pass, so the caller can
+/// log a change (INFO) or an unresolvable hostname (ERROR) without re-deriving it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveOutcome {
+    /// The resolved set or the unresolved list changed since the previous pass.
+    pub changed: bool,
+    /// Hostnames that failed to resolve this pass.
+    pub unresolved: Vec<String>,
+    /// The resolved IPv4 set BEFORE this pass.
+    pub old_resolved: Vec<Ipv4Addr>,
+    /// The resolved IPv4 set AFTER this pass (== old on a kept-previous outcome).
+    pub new_resolved: Vec<Ipv4Addr>,
+}
+
+/// dantesync#113 — RFC-1123-lite hostname syntax check, used to classify a
+/// non-IP/CIDR allowlist entry as a resolvable hostname (`video-clock.lan`)
+/// rather than silently dropping it as garbage. Requires at least one ASCII
+/// letter, so a malformed numeric entry (e.g. `999.999.999.999`, which fails IP
+/// parsing) is NOT mistaken for a hostname.
+fn is_valid_hostname(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    if !s.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
 
 /// An IPv4 prefix (network base + prefix length) for source matching.
 ///
@@ -107,6 +206,14 @@ impl Ipv4Prefix {
 #[derive(Debug, Clone, Default)]
 pub struct GmAllowlist {
     prefixes: Vec<Ipv4Prefix>,
+    /// dantesync#113 — hostname entries (e.g. `video-clock.lan`) to resolve at
+    /// start and periodically. Kept verbatim; resolution fills `resolved`.
+    hostnames: Vec<String>,
+    /// dantesync#113 — the last successful resolution of `hostnames` (union), used
+    /// alongside `prefixes` by `allows`. Kept across a transient failure.
+    resolved: Vec<Ipv4Addr>,
+    /// dantesync#113 — hostnames that failed to resolve on the last pass (loud).
+    unresolved: Vec<String>,
     /// Entries that failed to parse, kept verbatim for a loud startup warning.
     invalid: Vec<String>,
 }
@@ -117,23 +224,39 @@ impl GmAllowlist {
     /// and otherwise skipped (fail-open — see the module docs).
     pub fn parse(entries: &[String]) -> GmAllowlist {
         let mut prefixes = Vec::new();
+        let mut hostnames = Vec::new();
         let mut invalid = Vec::new();
         for e in entries {
-            if e.trim().is_empty() {
+            let t = e.trim();
+            if t.is_empty() {
                 continue;
             }
-            match Ipv4Prefix::parse(e) {
+            match Ipv4Prefix::parse(t) {
                 Ok(p) => prefixes.push(p),
+                // dantesync#113: a non-IP/CIDR entry with NO slash that is a valid
+                // hostname (e.g. `video-clock.lan`) is a hostname to resolve — not
+                // "invalid". A slash-bearing entry that failed IP/CIDR parsing
+                // (e.g. `10.77.9.0/33`) is a malformed CIDR, never a hostname.
+                Err(_) if !t.contains('/') && is_valid_hostname(t) => hostnames.push(t.to_string()),
                 Err(_) => invalid.push(e.clone()),
             }
         }
-        GmAllowlist { prefixes, invalid }
+        GmAllowlist {
+            prefixes,
+            hostnames,
+            resolved: Vec::new(),
+            unresolved: Vec::new(),
+            invalid,
+        }
     }
 
-    /// True when NO restriction is in effect (no parseable prefixes) — every
-    /// source is accepted, the historical last-writer-wins behavior.
+    /// True when NO restriction is in effect (no parseable prefixes AND no
+    /// hostname entries) — every source is accepted, the historical
+    /// last-writer-wins behavior. dantesync#113: a hostname-only allowlist is
+    /// RESTRICTING even before its first resolution (it must never fail open to
+    /// "accept any GM" just because DNS has not answered yet).
     pub fn is_unrestricted(&self) -> bool {
-        self.prefixes.is_empty()
+        self.prefixes.is_empty() && self.hostnames.is_empty()
     }
 
     /// Number of ACTIVE (successfully parsed) prefixes — for a startup log that
@@ -143,14 +266,123 @@ impl GmAllowlist {
     }
 
     /// True if `ip` is permitted as a grandmaster source. An unrestricted
-    /// allowlist (empty, or all-entries-invalid) accepts everything.
+    /// allowlist (empty, or all-entries-invalid) accepts everything; otherwise a
+    /// source is permitted iff it matches a literal prefix OR a currently-resolved
+    /// hostname IP (dantesync#113). A hostname-only allowlist whose names have NOT
+    /// resolved yet (or all currently fail) permits NOTHING — the loud, correct
+    /// failure (the box drops all PTP → NTP fallback + the #114 alarm) rather than
+    /// silently accepting any grandmaster.
     pub fn allows(&self, ip: Ipv4Addr) -> bool {
-        self.prefixes.is_empty() || self.prefixes.iter().any(|p| p.contains(ip))
+        if self.is_unrestricted() {
+            return true;
+        }
+        self.prefixes.iter().any(|p| p.contains(ip)) || self.resolved.contains(&ip)
     }
 
     /// Entries that failed to parse, so the caller can warn loudly at startup.
     pub fn invalid_entries(&self) -> &[String] {
         &self.invalid
+    }
+
+    /// dantesync#113 — hostname entries configured (verbatim).
+    pub fn hostnames(&self) -> &[String] {
+        &self.hostnames
+    }
+
+    /// dantesync#113 — true when at least one hostname entry is present.
+    pub fn has_hostnames(&self) -> bool {
+        !self.hostnames.is_empty()
+    }
+
+    /// dantesync#113 — the last successfully-resolved hostname IPs (published in
+    /// `/status.gm_allowlist_resolved` so external gates can compare `gm_source_ip`).
+    pub fn resolved_ips(&self) -> &[Ipv4Addr] {
+        &self.resolved
+    }
+
+    /// dantesync#113 — hostnames that currently fail to resolve (published in
+    /// `/status.gm_allowlist_unresolved`).
+    pub fn unresolved_hostnames(&self) -> &[String] {
+        &self.unresolved
+    }
+
+    /// dantesync#113 — the clock-alarm reason (#114) for a hostname allowlist with
+    /// NO working resolution: `Some(names)` only when there is no resolved
+    /// fallback AND a hostname is currently unresolvable. When a previous
+    /// resolution is still held (a transient DNS blip), returns `None` — the clock
+    /// is not lost, we are still matching via the kept IPs.
+    pub fn unresolvable_reason(&self) -> Option<String> {
+        if self.resolved.is_empty() && !self.unresolved.is_empty() {
+            Some(self.unresolved.join(", "))
+        } else {
+            None
+        }
+    }
+
+    /// dantesync#113 — resolve every hostname entry to IPv4 via `resolver`, union
+    /// the results into `resolved`, and record which hostnames currently fail.
+    ///
+    /// Keep-previous-on-failure: if NOTHING resolves this pass but a previous
+    /// resolution exists, it is KEPT (a transient DNS blip must never drop the
+    /// rig's clock lock). A no-hostname allowlist is a no-op. Returns a
+    /// [`ResolveOutcome`] describing any change for the caller to log.
+    pub fn resolve(&mut self, resolver: &dyn Resolver) -> ResolveOutcome {
+        if self.hostnames.is_empty() {
+            return ResolveOutcome::default();
+        }
+        let mut new_set: Vec<Ipv4Addr> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        for h in &self.hostnames {
+            match resolver.resolve(h) {
+                Ok(ips) if !ips.is_empty() => {
+                    for ip in ips {
+                        if !new_set.contains(&ip) {
+                            new_set.push(ip);
+                        }
+                    }
+                }
+                _ => unresolved.push(h.clone()),
+            }
+        }
+        new_set.sort();
+        let old = self.resolved.clone();
+
+        // Keep-previous-on-total-failure: nothing resolved this pass but we had a
+        // prior resolution — hold it, only the unresolved list changes.
+        if new_set.is_empty() && !old.is_empty() {
+            let changed = self.unresolved != unresolved;
+            self.unresolved = unresolved.clone();
+            return ResolveOutcome {
+                changed,
+                unresolved,
+                old_resolved: old.clone(),
+                new_resolved: old,
+            };
+        }
+
+        let changed = new_set != old || self.unresolved != unresolved;
+        self.resolved = new_set.clone();
+        self.unresolved = unresolved.clone();
+        ResolveOutcome {
+            changed,
+            unresolved,
+            old_resolved: old,
+            new_resolved: new_set,
+        }
+    }
+
+    /// The literal prefixes plus each resolved hostname IP as a `/32`, for
+    /// interface selection (dantesync#113: a hostname-addressed GM still drives
+    /// dual-homed capture-interface selection once resolved).
+    fn effective_prefixes(&self) -> Vec<Ipv4Prefix> {
+        let mut all = self.prefixes.clone();
+        for ip in &self.resolved {
+            all.push(Ipv4Prefix {
+                base: u32::from(*ip),
+                prefix_len: 32,
+            });
+        }
+        all
     }
 
     /// camera-box issue 1073 (interface-selection half): pick which local
@@ -188,6 +420,9 @@ impl GmAllowlist {
         &self,
         candidates: &[(Ipv4Addr, Option<Ipv4Addr>)],
     ) -> Vec<usize> {
+        // dantesync#113: literal prefixes PLUS resolved hostname IPs (as /32s), so
+        // a hostname-addressed GM drives dual-homed interface selection too.
+        let effective = self.effective_prefixes();
         // (index, matched trusted-prefix len, interface prefix len) per match.
         let mut scored: Vec<(usize, u8, u8)> = Vec::new();
         for (i, (ip, netmask)) in candidates.iter().enumerate() {
@@ -213,8 +448,7 @@ impl GmAllowlist {
             // ("trust everything") gives no discriminating signal for interface
             // selection, so it is ignored here (unlike source filtering, where a
             // `/0` is a real, if permissive, restriction).
-            let matched: Option<u8> = self
-                .prefixes
+            let matched: Option<u8> = effective
                 .iter()
                 .filter(|p| p.prefix_len > 0 && p.overlaps(&iface))
                 .map(|p| p.prefix_len)
@@ -335,8 +569,12 @@ mod tests {
 
     #[test]
     fn invalid_entries_are_recorded_but_valid_ones_still_restrict() {
-        let a = GmAllowlist::parse(&["not-an-ip".to_string(), "10.77.9.0/24".to_string()]);
-        assert_eq!(a.invalid_entries(), &["not-an-ip".to_string()]);
+        // dantesync#113 changed the contract: a bare non-IP token like "not-an-ip"
+        // is now a valid HOSTNAME (to resolve), not an invalid entry. A genuinely
+        // invalid entry is a malformed CIDR (a slash it cannot parse), which is
+        // never treated as a hostname.
+        let a = GmAllowlist::parse(&["10.77.9.0/33".to_string(), "10.77.9.0/24".to_string()]);
+        assert_eq!(a.invalid_entries(), &["10.77.9.0/33".to_string()]);
         assert!(!a.is_unrestricted());
         assert!(a.allows(ip("10.77.9.184")));
         assert!(!a.allows(ip("10.77.7.109")));
@@ -345,8 +583,11 @@ mod tests {
     #[test]
     fn all_entries_invalid_fails_open_to_unrestricted() {
         // A fully typo'd allowlist must never brick the clock: it degrades to
-        // accept-any (with the bad entries surfaced for a warning).
-        let a = GmAllowlist::parse(&["garbage".to_string(), "10.77.9.0/33".to_string()]);
+        // accept-any (with the bad entries surfaced for a warning). dantesync#113:
+        // "all invalid" now means all-malformed-CIDR (a bare word is a hostname),
+        // so use two malformed CIDRs — with no prefixes AND no hostnames the list
+        // is unrestricted.
+        let a = GmAllowlist::parse(&["10.1.2.3/33".to_string(), "10.0.0.0/99".to_string()]);
         assert!(a.is_unrestricted(), "all-invalid must fail open");
         assert!(a.allows(ip("10.77.7.109")));
         assert_eq!(a.invalid_entries().len(), 2);
@@ -378,9 +619,11 @@ mod tests {
 
     #[test]
     fn prefix_count_reports_only_active_parsed_prefixes() {
+        // dantesync#113: a genuinely-invalid entry is a malformed CIDR (a bare
+        // word would now be a hostname, not invalid).
         let a = GmAllowlist::parse(&[
             "10.77.9.0/24".to_string(),
-            "garbage".to_string(),
+            "10.77.9.0/40".to_string(),
             "10.77.10.5".to_string(),
         ]);
         assert_eq!(a.prefix_count(), 2, "only the two valid entries are active");
@@ -568,5 +811,170 @@ mod tests {
             2,
             "an ambiguous broad allowlist reports both"
         );
+    }
+
+    // ========================================================================
+    // dantesync#113 — hostname allowlist entries
+    // ========================================================================
+
+    use std::collections::HashMap;
+
+    /// A resolver seam for tests — no real DNS. Maps hostname → IPv4s; an absent
+    /// name resolves to an error (unresolvable).
+    struct FakeResolver {
+        map: HashMap<String, Vec<Ipv4Addr>>,
+    }
+    impl FakeResolver {
+        fn new(pairs: &[(&str, &[&str])]) -> Self {
+            let mut map = HashMap::new();
+            for (host, ips) in pairs {
+                map.insert(
+                    host.to_string(),
+                    ips.iter().map(|s| ip(s)).collect::<Vec<_>>(),
+                );
+            }
+            FakeResolver { map }
+        }
+    }
+    impl Resolver for FakeResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<Ipv4Addr>> {
+            match self.map.get(host) {
+                Some(v) => Ok(v.clone()),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn hostname_entry_is_classified_as_hostname_not_invalid() {
+        let a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        assert!(a.invalid_entries().is_empty(), "a hostname is not invalid");
+        assert_eq!(a.hostnames(), &["video-clock.lan".to_string()]);
+        assert!(a.has_hostnames());
+        // Restricting even before resolution — must NOT fail open to accept-any.
+        assert!(
+            !a.is_unrestricted(),
+            "a hostname-only allowlist restricts before it resolves"
+        );
+        assert!(
+            !a.allows(ip("10.77.9.230")),
+            "nothing is allowed until the hostname resolves"
+        );
+    }
+
+    #[test]
+    fn hostname_resolves_and_then_allows_only_the_resolved_ip() {
+        let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        let resolver = FakeResolver::new(&[("video-clock.lan", &["10.77.9.230"])]);
+        let outcome = a.resolve(&resolver);
+        assert!(outcome.changed);
+        assert_eq!(outcome.new_resolved, vec![ip("10.77.9.230")]);
+        assert_eq!(a.resolved_ips(), &[ip("10.77.9.230")]);
+        assert!(a.unresolved_hostnames().is_empty());
+        assert!(a.unresolvable_reason().is_none());
+        // The resolved GM is allowed; a foreign source is not.
+        assert!(a.allows(ip("10.77.9.230")));
+        assert!(!a.allows(ip("10.77.7.109")));
+    }
+
+    #[test]
+    fn unresolvable_hostname_restricts_and_is_loud() {
+        let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        let resolver = FakeResolver::new(&[]); // nothing resolves
+        let outcome = a.resolve(&resolver);
+        assert_eq!(outcome.unresolved, vec!["video-clock.lan".to_string()]);
+        assert!(a.resolved_ips().is_empty());
+        assert_eq!(a.unresolved_hostnames(), &["video-clock.lan".to_string()]);
+        // Never silently accept any GM — nothing is allowed…
+        assert!(!a.allows(ip("10.77.9.230")));
+        // …and the loud clock-alarm reason is surfaced.
+        assert_eq!(a.unresolvable_reason().as_deref(), Some("video-clock.lan"));
+    }
+
+    #[test]
+    fn keeps_previous_resolution_on_a_transient_failure() {
+        let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        a.resolve(&FakeResolver::new(&[("video-clock.lan", &["10.77.9.230"])]));
+        assert_eq!(a.resolved_ips(), &[ip("10.77.9.230")]);
+
+        // A pass where DNS answers nothing must KEEP the previous resolution.
+        let outcome = a.resolve(&FakeResolver::new(&[]));
+        assert_eq!(
+            a.resolved_ips(),
+            &[ip("10.77.9.230")],
+            "a transient DNS blip must never drop the lock"
+        );
+        assert_eq!(outcome.unresolved, vec!["video-clock.lan".to_string()]);
+        // Still allowed via the kept IPs, so this is NOT a clock-loss reason.
+        assert!(a.allows(ip("10.77.9.230")));
+        assert!(
+            a.unresolvable_reason().is_none(),
+            "a kept resolution is not a clock-lost reason"
+        );
+    }
+
+    #[test]
+    fn reresolve_picks_up_a_changed_a_record() {
+        let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        a.resolve(&FakeResolver::new(&[("video-clock.lan", &["10.77.9.184"])]));
+        assert!(a.allows(ip("10.77.9.184")));
+
+        // The A record moves to a new lease.
+        let outcome = a.resolve(&FakeResolver::new(&[("video-clock.lan", &["10.77.9.230"])]));
+        assert!(outcome.changed, "a changed A record must report changed");
+        assert_eq!(outcome.old_resolved, vec![ip("10.77.9.184")]);
+        assert_eq!(outcome.new_resolved, vec![ip("10.77.9.230")]);
+        assert!(a.allows(ip("10.77.9.230")));
+        assert!(
+            !a.allows(ip("10.77.9.184")),
+            "the old lease is no longer allowed"
+        );
+    }
+
+    #[test]
+    fn literal_and_hostname_entries_coexist() {
+        let mut a =
+            GmAllowlist::parse(&["10.77.10.0/24".to_string(), "video-clock.lan".to_string()]);
+        a.resolve(&FakeResolver::new(&[("video-clock.lan", &["10.77.9.230"])]));
+        assert!(a.allows(ip("10.77.9.230")), "resolved hostname IP allowed");
+        assert!(a.allows(ip("10.77.10.5")), "literal CIDR still allowed");
+        assert!(!a.allows(ip("10.77.7.109")), "foreign still rejected");
+    }
+
+    #[test]
+    fn resolve_is_a_noop_for_a_literal_only_allowlist() {
+        let mut a = GmAllowlist::parse(&["10.77.9.0/24".to_string()]);
+        let outcome = a.resolve(&FakeResolver::new(&[]));
+        assert!(!outcome.changed);
+        assert!(a.resolved_ips().is_empty());
+        assert!(a.allows(ip("10.77.9.184")));
+    }
+
+    #[test]
+    fn resolved_hostname_ip_drives_interface_selection() {
+        // A hostname-addressed GM (resolved to 10.77.9.230) must select the rig
+        // interface on 10.77.9.0/24, exactly like a literal entry would.
+        let mut a = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        a.resolve(&FakeResolver::new(&[("video-clock.lan", &["10.77.9.230"])]));
+        let candidates = [
+            (ip("10.77.9.204"), nm("255.255.255.0")), // rig NIC
+            (ip("10.77.7.204"), nm("255.255.255.0")), // mbc NIC
+        ];
+        assert_eq!(a.select_interface(&candidates), Some(0));
+        // Before resolution, a hostname gives no interface signal.
+        let unresolved = GmAllowlist::parse(&["video-clock.lan".to_string()]);
+        assert_eq!(unresolved.select_interface(&candidates), None);
+    }
+
+    #[test]
+    fn numeric_garbage_is_invalid_not_a_hostname() {
+        // Something that looks like a broken IP (no letters) must stay INVALID,
+        // never be mistaken for a resolvable hostname.
+        let a = GmAllowlist::parse(&["999.999.999.999".to_string()]);
+        assert!(a.hostnames().is_empty());
+        assert_eq!(a.invalid_entries(), &["999.999.999.999".to_string()]);
     }
 }

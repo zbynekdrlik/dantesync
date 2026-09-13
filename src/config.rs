@@ -60,10 +60,26 @@ pub struct SystemConfig {
     /// and Windows need provisioning-level nftables / QoS policy).
     #[serde(default)]
     pub dscp: DscpConfig,
+
+    /// dantesync#114 — cadence (seconds) of the loud "NO DANTE CLOCK" alarm while
+    /// the node is NOT PTP-locked to an allowed grandmaster. Default 60 s (the
+    /// owner's "every minute"). Floored at `CLOCK_ALARM_INTERVAL_FLOOR_S` (10 s)
+    /// at read time so a `0` can never turn the alarm into per-tick spam.
+    ///
+    /// This is the ONLY knob — the alarm itself is ALWAYS ON (features-default-on;
+    /// no forgettable off switch). Its own `#[serde(default)]` means every pre-#114
+    /// config that lacks the key still parses and defaults to 60 s. See
+    /// `crate::clock_alarm`.
+    #[serde(default = "default_clock_alarm_interval_s")]
+    pub clock_alarm_interval_s: u64,
 }
 
 fn default_ntp_stale_secs() -> u64 {
     180
+}
+
+fn default_clock_alarm_interval_s() -> u64 {
+    60
 }
 
 /// dantesync#97 — phase-slew servo switch. Only the on/off flag is configurable; the servo's
@@ -291,6 +307,9 @@ impl Default for SystemConfig {
             // dantesync#52: DSCP marking ON by default (EF/46). Harmless when a
             // switch ignores DSCP; a bad value fails open to unmarked.
             dscp: DscpConfig::default(),
+
+            // dantesync#114: loud NO-DANTE-CLOCK alarm every 60 s while unlocked.
+            clock_alarm_interval_s: default_clock_alarm_interval_s(),
         }
     }
 }
@@ -579,6 +598,25 @@ mod tests {
     // ========================================================================
     // GM ALLOWLIST CONFIG TESTS (camera-box issue 1073)
     // ========================================================================
+
+    #[test]
+    fn clock_alarm_interval_defaults_to_60_and_a_pre_114_config_parses() {
+        // Default is the owner's "every minute".
+        assert_eq!(SystemConfig::default().clock_alarm_interval_s, 60);
+
+        // A pre-#114 config that lacks the key must still parse and default to 60.
+        let json = r#"{"gm_allowlist": ["video-clock.lan"]}"#;
+        let config: SystemConfig =
+            serde_json::from_str(json).expect("a pre-#114 system object must still parse");
+        assert_eq!(config.clock_alarm_interval_s, 60);
+
+        // An explicit value round-trips.
+        let mut c = SystemConfig::default();
+        c.clock_alarm_interval_s = 30;
+        let restored: SystemConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(restored.clock_alarm_interval_s, 30);
+    }
 
     #[test]
     fn gm_allowlist_defaults_to_empty_and_unrestricted() {

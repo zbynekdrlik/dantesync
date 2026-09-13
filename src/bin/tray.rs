@@ -11,7 +11,10 @@ mod app {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    // dantesync#114: reuse the lib's alarm shape + message composer so the tray
+    // balloon and the daemon log/notify-send stay byte-for-byte the same text.
+    use dantesync::clock_alarm::{compose_message, ClockAlarmStatus, CLOCK_ALARM_TITLE};
     use tokio::io::AsyncReadExt;
     use tokio::net::windows::named_pipe::ClientOptions;
     use tray_icon::{
@@ -97,6 +100,18 @@ mod app {
         pub ntp_failed: bool,
         #[serde(default)]
         pub accumulated_phase_us: f64,
+
+        /// dantesync#114: the loud "NO DANTE CLOCK" alarm snapshot. The tray shows
+        /// a balloon per `clock_alarm_interval_s` while `active` (Windows can't
+        /// toast from the session-0 service, so the tray does it here).
+        #[serde(default)]
+        pub clock_alarm: ClockAlarmStatus,
+        #[serde(default = "default_clock_alarm_interval_s")]
+        pub clock_alarm_interval_s: u64,
+    }
+
+    fn default_clock_alarm_interval_s() -> u64 {
+        60
     }
 
     // ========================================================================
@@ -179,6 +194,9 @@ mod app {
         was_ptp_offline: bool,
         was_ntp_failed: bool,
         first_update: bool,
+        // dantesync#114: per-cadence clock-alarm balloon tracking.
+        last_clock_alarm_toast: Option<Instant>,
+        clock_alarm_since: Option<u64>,
     }
 
     // ========================================================================
@@ -460,6 +478,8 @@ mod app {
             was_ptp_offline: false,
             was_ntp_failed: false,
             first_update: true,
+            last_clock_alarm_toast: None,
+            clock_alarm_since: None,
         });
 
         event_loop.run(move |event, elwt| {
@@ -528,6 +548,48 @@ mod app {
                                 state.was_ntp_failed = status.ntp_failed;
                                 state.was_online = true;
                                 state.first_update = false;
+                            }
+
+                            // ================================================
+                            // #114: loud, repeating NO-DANTE-CLOCK balloon.
+                            // Windows can't toast from the session-0 service, so
+                            // the tray raises the per-cadence balloon here from
+                            // the /status.clock_alarm field.
+                            // ================================================
+                            {
+                                let mut state = notification_state.borrow_mut();
+                                if status.clock_alarm.active {
+                                    let now = Instant::now();
+                                    let interval =
+                                        Duration::from_secs(status.clock_alarm_interval_s.max(10));
+                                    let episode_changed =
+                                        state.clock_alarm_since != status.clock_alarm.since;
+                                    let due = match state.last_clock_alarm_toast {
+                                        None => true,
+                                        Some(t) => now.duration_since(t) >= interval,
+                                    };
+                                    if episode_changed || due {
+                                        show_notification(
+                                            CLOCK_ALARM_TITLE,
+                                            &compose_message(
+                                                &status.clock_alarm.reason,
+                                                status.clock_alarm.since,
+                                            ),
+                                        );
+                                        state.last_clock_alarm_toast = Some(now);
+                                        state.clock_alarm_since = status.clock_alarm.since;
+                                    }
+                                } else if state.clock_alarm_since.is_some()
+                                    || state.last_clock_alarm_toast.is_some()
+                                {
+                                    // Alarm just cleared — one reassuring toast, then reset.
+                                    show_notification(
+                                        "DanteSync",
+                                        "Dante clock restored — PTP re-locked",
+                                    );
+                                    state.last_clock_alarm_toast = None;
+                                    state.clock_alarm_since = None;
+                                }
                             }
 
                             // ================================================

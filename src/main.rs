@@ -721,7 +721,20 @@ fn run_sync_loop(
         // it picks the capture/IGMP-join interface on the grandmaster's subnet
         // when the allowlist can disambiguate, and otherwise falls back to the
         // default interface (single-homed / no-allowlist boxes are unchanged).
-        let gm_allowlist = dantesync::gm_filter::GmAllowlist::parse(&system_config.gm_allowlist);
+        let mut gm_allowlist =
+            dantesync::gm_filter::GmAllowlist::parse(&system_config.gm_allowlist);
+        // dantesync#113: resolve hostname entries BEFORE interface selection so a
+        // hostname-addressed grandmaster (e.g. video-clock.lan) can pick the
+        // capture NIC on the GM's subnet on a multi-homed box, exactly like a
+        // literal entry. The controller re-resolves periodically after this.
+        if gm_allowlist.has_hostnames() {
+            let outcome = gm_allowlist.resolve(&dantesync::gm_filter::StdResolver);
+            info!(
+                "gm_allowlist: startup hostname resolution {:?} (unresolved: {:?})",
+                outcome.new_resolved,
+                gm_allowlist.unresolved_hostnames()
+            );
+        }
         match net_pcap::NpcapPtpNetwork::new(&iface_name, &gm_allowlist) {
             Ok(npcap_net) => {
                 info!(
