@@ -1410,4 +1410,91 @@ mod tests {
             "the fleet line moved by the base shift, not onto the master's own anchor"
         );
     }
+
+    #[test]
+    fn an_off_line_masters_announce_is_published_at_once_not_at_the_next_tick_88() {
+        // The 31900 time server reads the status snapshot: an announce the off-line master makes
+        // must be in it immediately, or followers hear it after its 5 s lead (a late step).
+        let mut ntp = MockNtpSource::new();
+        ntp.expect_get_offset()
+            .returning(|| Ok(one_offset(60_000, 1)));
+        let mut clock = MockSystemClock::new();
+        clock.expect_step_clock().returning(|_, _| Ok(()));
+        let (mut c, _d) = anchored_controller(clock, ntp, true);
+        c.ptp_offline = true;
+        for _ in 0..2 {
+            c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+            c.check_ntp_utc_tracking();
+        }
+        let ann = c.date_sync.authority.as_ref().unwrap().announce();
+        assert_eq!(ann.seq, 2, "the fleet step was announced");
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(
+            st.date_offset_seq,
+            Some(2),
+            "published without waiting for tick_status"
+        );
+        assert_eq!(st.date_offset_effective_ptp_ns, Some(ann.effective_ptp_ns));
+    }
+
+    #[test]
+    fn samples_from_before_a_ptp_outage_never_mix_into_the_first_window_after_it_117() {
+        // Driven through the real sample path. The window is 4 samples; 3 are collected, then
+        // PTP drops out, the wall free-runs 3 ms, and PTP returns. The first window after the
+        // outage must hold only post-outage samples, so the 3 ms re-anchors (Realigned) instead
+        // of hiding behind a pre-outage median (e = 0) and being slewed for minutes.
+        let mut clock = MockSystemClock::new();
+        clock.expect_adjust_frequency().returning(|_| Ok(()));
+        let mut c = PtpController::new(
+            clock,
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            phase_lock_config(),
+        );
+        c.current_gm_uuid = Some(PL_GM);
+        c.is_locked = true;
+        let d: i64 = 1_790_000_000 * 1_000_000_000 - 5_000 * 1_000_000_000;
+        let mut t1: i64 = 5_000 * 1_000_000_000;
+        let feed = |c: &mut PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
+                    t1: i64,
+                    offset: i64| {
+            let t2 = t1 + offset;
+            let phase = c.calculate_phase_offset(t1, t2);
+            c.process_settled_sync(t1, t2, phase);
+        };
+        for _ in 0..4 {
+            t1 += 125_000_000;
+            feed(&mut c, t1, d);
+        }
+        assert_eq!(
+            c.date_sync.core.anchor_ns(),
+            Some(d),
+            "anchored on the first window"
+        );
+        for _ in 0..3 {
+            t1 += 125_000_000;
+            feed(&mut c, t1, d);
+        }
+        // PTP drops out …
+        c.last_ptp_packet = Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 5);
+        c.check_ptp_status();
+        assert!(c.ptp_offline);
+        c.service_date_offset();
+        // … and comes back 30 s later with the wall 3 ms ahead of the D line.
+        c.last_ptp_packet = Instant::now();
+        c.check_ptp_status();
+        assert!(!c.ptp_offline);
+        t1 += 30_000_000_000;
+        for _ in 0..4 {
+            t1 += 125_000_000;
+            feed(&mut c, t1, d + 3_000_000);
+        }
+        assert_eq!(
+            c.date_sync.core.anchor_ns(),
+            Some(d + 3_000_000),
+            "re-aligned on a window of post-outage samples only"
+        );
+    }
 }

@@ -99,37 +99,46 @@ impl Scenario {
 // functions so a change to the controller's glue has exactly one place to be mirrored.
 // ----------------------------------------------------------------------------------------------
 
-/// What the master's 31900 extension carries (`publish_date_status` + the time server): the
-/// FLEET D (its authority's announce, even while its own wall is off the fleet line) and its PTP
-/// "now" taken from its own D in effect.
+/// The master's published STATUS snapshot (`publish_date_status`): the FLEET D (its authority's
+/// announce, even while its own wall is off the fleet line), and its own D in effect. It is only
+/// refreshed at the controller's publish points (a PTP window, an NTP cycle, a step, the 10 s
+/// tick), and the time server reads it at REPLY time — so a stale snapshot is visible here.
+#[derive(Clone, Copy)]
 struct Published {
     date_offset_ns: i64,
     effective_ptp_ns: i64,
     seq: u32,
     gm: u8,
-    now_ptp_ns: i64,
+    master_anchor_ns: i64,
 }
 
 fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
-    let anchor = m.core.anchor_ns().expect("anchored");
     let ann = a.announce();
     Published {
         date_offset_ns: ann.date_offset_ns,
         effective_ptp_ns: ann.effective_ptp_ns,
         seq: ann.seq,
         gm: m.core_gm,
-        now_ptp_ns: m.wall_ns() - anchor,
+        master_anchor_ns: m.core.anchor_ns().expect("anchored"),
     }
 }
 
-/// A follower's applicability checks (`service_date_offset`).
-fn follower_accepts(b: &Box_, p: &Published) -> bool {
+/// Whether an NTP cycle refreshes the master's published status (`ntp_under_date_authority`).
+fn master_publishes_after_ntp(ptp_offline: bool) -> bool {
+    !ptp_offline
+}
+
+/// Whether the master's local NTP step refreshes it (`note_local_date_step`).
+const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = false;
+
+/// A follower's applicability checks (`service_date_offset`); the time server computes the
+/// replier's PTP now from the SNAPSHOT's D in effect and the live wall.
+fn follower_accepts(b: &Box_, p: &Published, master_wall_now: i64) -> bool {
     let Some(anchor) = b.core.anchor_ns() else {
         return false;
     };
-    !b.core.rebase_pending()
-        && b.core_gm == p.gm
-        && same_time_base(p.now_ptp_ns, b.wall_ns(), anchor)
+    let now_ptp = master_wall_now - p.master_anchor_ns;
+    !b.core.rebase_pending() && b.core_gm == p.gm && same_time_base(now_ptp, b.wall_ns(), anchor)
 }
 
 /// The master's local NTP step while it has no PTP (`note_local_date_step`): its own wall and D
@@ -370,6 +379,7 @@ fn run(sc: &Scenario) -> RunResult {
         .collect();
 
     let mut authority: Option<DateAuthority> = None;
+    let mut snapshot: Option<Published> = None;
     let mut master_local_candidate: Option<i64> = None;
     // Every coordinated step the authority announced: (seq, size).
     let mut announced: Vec<(u32, i64)> = Vec::new();
@@ -401,6 +411,7 @@ fn run(sc: &Scenario) -> RunResult {
         //    crossing (the controller polls `due` every loop iteration, 1 ms / 50 µs), so the
         //    landing instant is resolved below the window.
         let t0_ns = w as f64 * true_dt_ns;
+        let master_steps_at_start = boxes[0].steps.len();
         utc.advance(true_dt_ns, utc_vs_gm_ppm);
         gm_a.advance(true_dt_ns, gm_a_ppm);
         gm_b_pre.advance(true_dt_ns, gm_b_ppm);
@@ -444,10 +455,17 @@ fn run(sc: &Scenario) -> RunResult {
             }
         }
 
+        if boxes[0].steps.len() != master_steps_at_start {
+            if let Some(a) = authority.as_ref() {
+                snapshot = Some(master_publishes(&boxes[0], a)); // `apply_date_step`
+            }
+        }
+
         // 3. one PTP window per box: median of noisy (t2 − t1) against the grandmaster it hears.
         //    With `grace` the controller's 2 s post-step grace is modelled: those windows are
         //    dropped and the word is held.
         let mut master_rebase: Option<(i64, i64)> = None;
+        let mut master_window_ran = false;
         for (i, b) in boxes.iter_mut().enumerate() {
             let (gm_id, gm) = gm_view(w, b.lag, &gm_a, &gm_b_pre, &gm_b_post);
             let mut samples: Vec<i64> = (0..SAMPLES_PER_WINDOW)
@@ -476,6 +494,9 @@ fn run(sc: &Scenario) -> RunResult {
             }
             let out = b.core.on_window(median, true, b.word_ppm, WINDOW_S);
             b.fresh = true;
+            if i == 0 {
+                master_window_ran = true;
+            }
             if let AnchorEvent::Rebased { old_ns, new_ns } = out.event {
                 b.rebases += 1;
                 if i == 0 {
@@ -507,13 +528,21 @@ fn run(sc: &Scenario) -> RunResult {
                 // The master's re-anchor on a new time base rebases the fleet offset (no step).
                 master_rebases_fleet(a, m.wall_ns(), old_ns, new_ns);
             }
+            if master_window_ran {
+                snapshot = Some(master_publishes(m, a)); // the status write ending the window
+            }
             let offline = sc.master_offline_at(w);
             if !offline {
+                let before = m.steps.len();
                 master_reconcile(m, a, t0_ns + true_dt_ns, w, grace);
+                if m.steps.len() != before {
+                    snapshot = Some(master_publishes(m, a)); // `apply_date_step`
+                }
             }
             if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 {
                 let err = utc.ns - m.wall_ns() + (ntp_rng.gauss() * NTP_NOISE_NS).round() as i64;
-                if let Some((ann, own, before)) = master_feed_authority(m, a, err, offline) {
+                let fed = master_feed_authority(m, a, err, offline);
+                if let Some((ann, own, before)) = fed {
                     announced.push((ann.seq, ann.date_offset_ns - before));
                     if own {
                         let anchor = m.core.anchor_ns().unwrap();
@@ -524,6 +553,9 @@ fn run(sc: &Scenario) -> RunResult {
                         );
                     }
                 }
+                if master_publishes_after_ntp(offline) {
+                    snapshot = Some(master_publishes(m, a));
+                }
                 if offline {
                     // Its OWN wall: the local NTP date path (the legacy step gate, two agreeing
                     // over-threshold readings).
@@ -532,11 +564,19 @@ fn run(sc: &Scenario) -> RunResult {
                         && master_local_candidate.is_some_and(|c: i64| c.signum() == err.signum())
                     {
                         master_local_step(m, a, err);
+                        if MASTER_PUBLISHES_AFTER_LOCAL_STEP {
+                            snapshot = Some(master_publishes(m, a));
+                        }
                         master_local_candidate = None;
                     } else {
                         master_local_candidate = over.then_some(err);
                     }
                 }
+            }
+            // The 10 s `tick_status`, on its own timer: not in phase with the NTP cadence (here
+            // 6.5 s after it, i.e. later than the 5 s announce lead).
+            if w % 20 == 13 {
+                snapshot = Some(master_publishes(m, a));
             }
             if w > 240 {
                 max_utc = max_utc.max((utc.ns - m.wall_ns()).abs());
@@ -547,7 +587,8 @@ fn run(sc: &Scenario) -> RunResult {
         //    carries the master's wall, its published D and the D's grandmaster (the extension);
         //    a follower adopts it only in its own time base — the controller's exact checks.
         if w % POLL_INTERVAL_WINDOWS == 0 {
-            let published = master_publishes(&boxes[0], authority.as_ref().unwrap());
+            let published = snapshot.expect("published since the first window");
+            let master_wall_now = boxes[0].wall_ns();
             let ann = DateAnnounce {
                 date_offset_ns: published.date_offset_ns,
                 effective_ptp_ns: published.effective_ptp_ns,
@@ -557,7 +598,7 @@ fn run(sc: &Scenario) -> RunResult {
                 if net_rng.uniform() < POLL_LOSS {
                     continue;
                 }
-                if !follower_accepts(b, &published) {
+                if !follower_accepts(b, &published, master_wall_now) {
                     refused += 1;
                     continue;
                 }
