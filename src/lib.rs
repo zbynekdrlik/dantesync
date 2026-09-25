@@ -12,6 +12,7 @@ pub mod ntp_packet;
 pub mod ntp_server;
 pub mod phase_slew;
 pub mod ptp;
+pub mod ptp_phase_lock;
 pub mod spike_filter;
 pub mod status;
 pub mod time_server;
