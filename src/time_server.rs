@@ -46,8 +46,8 @@
 //!   authority and keeps its local date fallback. On Linux the old server reads the first 8
 //!   bytes and ignores the unknown magic (debug-logged). On WINDOWS its 8-byte receive buffer is
 //!   smaller than the padded request, so the read fails (`WSAEMSGSIZE`) and it logs a socket
-//!   error per poll: 60 in the poller's first minute, then 2 a minute. Upgrade a master before
-//!   its followers (the canary-first fleet order does).
+//!   error per poll: 60 in the poller's first minute, then 2 a minute. So upgrade the fleet's
+//!   NTP master right after the canary (`.claude/skills/dantesync-deployment.md`, step 4).
 //!
 //! A new client reads the extension with [`parse_reply`]; [`UdpAuthorityPoller`] polls the NTP
 //! master once per second on a background thread so the sync loop never blocks on DNS or I/O.

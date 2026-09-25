@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shorter `"DSYX"` is ignored). A `"DSYN"` request still gets the byte-identical 64-byte reply, and
   an older server never answers `"DSYX"`, so a new box on an old master keeps its local NTP date
   path. An older WINDOWS master logs a socket error per such poll (its 8-byte read buffer fails
-  the padded request): upgrade masters before their followers. Followers poll their NTP server's
+  the padded request), so the NTP master is upgraded right after the canary
+  (`.claude/skills/dantesync-deployment.md`, step 4). Followers poll their NTP server's
   31900 once per second on a background thread; a host that has never answered is polled every
   30 s after a minute. Tuning: `system.date_offset.{step_bound_ms, step_lead_ms}`.
 - `/status` (additive): `clock_discipline`, `rate_source`, `ptp_phase_locked`,

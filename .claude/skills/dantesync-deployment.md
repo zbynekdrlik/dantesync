@@ -61,6 +61,16 @@ own user login password). Windows boxes are reached via MCP only in this procedu
    a regression). Only proceed to the rest of the fleet once the canary is LOCKED.
 4. **Roll to the remaining Linux fleet** (cam1-3, cam5-6, imag-nb), then the Windows
    boxes (strih, stream) LAST.
+   - **From v1.9.0 (issues #88/#117): the fleet's NTP MASTER goes right after the canary**, before
+     every other box. The master is the box every other box's `ntp_server` points at, i.e. the
+     one running NTP server mode. Two reasons. Only an upgraded master publishes the fleet date
+     offset, so until then every upgraded follower runs its local NTP date path. And an OLDER
+     WINDOWS master cannot read the padded `"DSYX"` request (its 8-byte read buffer fails with
+     `WSAEMSGSIZE`), so it logs a socket error per follower poll: 60 in each follower's first
+     minute, then 2 a minute.
+   - Verify the master: `curl http://<master>:8898/status` shows `date_authority: "master"` and
+     a `date_offset_ns`. Verify a follower after it: `date_authority: "follower"` with the same
+     `date_offset_seq`.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

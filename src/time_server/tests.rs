@@ -271,7 +271,7 @@ fn the_poller_backs_off_after_a_minute_of_silence_and_recovers_on_a_reply_88() {
     assert_eq!(
         b.interval(),
         AUTHORITY_POLL_INTERVAL,
-        "any reply restores 1 s"
+        "the first reply restores 1 s for good"
     );
 }
 

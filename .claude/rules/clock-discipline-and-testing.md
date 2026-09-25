@@ -220,7 +220,8 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   a request the size of the base reply keeps the ratio at ~1.6. `"DSYN"` is unchanged (8 bytes,
   64-byte reply, the pre-existing 8x). The cost (round 6): an OLD Windows server reads into an
   8-byte buffer, so the padded datagram fails its `recv_from` with `WSAEMSGSIZE` and it logs a
-  socket error per poll. Upgrade a master before its followers.
+  socket error per poll. The rollout upgrades the NTP master right after the canary
+  (`.claude/skills/dantesync-deployment.md`, step 4).
 - **The authority poller backs off only for a host that NEVER answered (rounds 5-6).** After 60
   unanswered polls such a host (a public NTP server, an older master, a firewall) is polled every
   30 s; its first reply restores 1 s for good. A host that answered once is never slowed: after a
