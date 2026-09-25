@@ -26,17 +26,21 @@ use std::time::{Duration, SystemTime};
 /// Fixed seed of the simulated PTP jitter. Every test thread starts from it, so a test's noise
 /// sequence does not depend on test order or on the run.
 ///
-/// Why not `rand::random()`: the servo metrics these tests assert (e.g. the steady-state average
-/// drift rate under 1 ms jitter) are statistics of the noise, and an unseeded run draws a fresh
-/// sample every CI run. Measured over 60 seeds on a replica of this harness, the high-jitter
-/// average rate has an RMS of ~50 us/s against its 150 us/s bound, identical on master and with the
-/// PTP phase lock (it never engages there: that servo never reports locked under 1 ms jitter), so
-/// roughly one run in a few hundred went red for no code change (seen on CI run 36182967772).
-/// A fixed seed keeps every bound as strict as before and makes a red run reproducible.
+/// Why not an unseeded random source: the servo metrics these tests assert (e.g. the steady-state
+/// average drift rate under 1 ms jitter) are statistics of the noise. An unseeded run draws a new
+/// sample every CI run, so a bound that sits in the tail of that distribution fails at random, for
+/// no code change. Fixed seeds keep every bound as strict as before and make a red run
+/// reproducible; a test that wants the spread runs several seeds (see `reseed_sim_noise`).
 const SIM_NOISE_SEED: u64 = 0x5EED_0117_0088_2026;
 
 thread_local! {
     static SIM_NOISE_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(SIM_NOISE_SEED) };
+}
+
+/// Restart this thread's noise from another fixed seed (never 0: xorshift64* would stay at 0).
+fn reseed_sim_noise(seed: u64) {
+    assert_ne!(seed, 0, "xorshift64* needs a non-zero seed");
+    SIM_NOISE_STATE.with(|state| state.set(seed));
 }
 
 /// Uniform sample in [0, 1) from a xorshift64* generator (53-bit mantissa).
@@ -361,7 +365,11 @@ fn test_linux_stability_low_jitter() {
     );
 }
 
-/// Test rate-based servo stability with high jitter (Windows-like conditions)
+/// Test rate-based servo stability with high jitter (Windows-like conditions).
+///
+/// The average rate under 1 ms jitter is a statistic of the noise, so one fixed seed would prove
+/// the bound for one noise sample only. Eight fixed seeds (run in parallel: each run sleeps ~36 s)
+/// keep the check deterministic AND sample the spread; the WORST one must stay in the bound.
 #[test]
 fn test_windows_stability_high_jitter() {
     let mut config = SystemConfig::default();
@@ -372,25 +380,46 @@ fn test_windows_stability_high_jitter() {
     config.filters.sample_window_size = 4;
     config.filters.warmup_secs = 0.0;
 
-    // 1ms jitter, 50ppm drift - high but manageable conditions
-    // Reduced from 2ms/100ppm to be more reliable in CI environments
-    let result = run_simulation(config, 1_000_000.0, 50.0, 150);
+    let runs: Vec<(u64, SimulationResult)> = (1..=8u64)
+        .map(|k| {
+            let seed = SIM_NOISE_SEED ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let config = config.clone();
+            std::thread::spawn(move || {
+                reseed_sim_noise(seed);
+                // 1ms jitter, 50ppm drift - high but manageable conditions
+                (seed, run_simulation(config, 1_000_000.0, 50.0, 150))
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().expect("simulation thread"))
+        .collect();
 
-    println!(
-        "Windows Stable: AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
-        result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked
-    );
-    println!(
-        "  (Offset: Final={:.1}ms Max={:.1}ms - may drift, NTP handles UTC)",
-        result.final_offset_ns / 1_000_000.0,
-        result.max_offset_steady_ns / 1_000_000.0
-    );
+    for (seed, result) in &runs {
+        println!(
+            "Windows Stable (seed {:#018x}): AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
+            seed, result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked
+        );
+        println!(
+            "  (Offset: Final={:.1}ms Max={:.1}ms - may drift, NTP handles UTC)",
+            result.final_offset_ns / 1_000_000.0,
+            result.max_offset_steady_ns / 1_000_000.0
+        );
+    }
+    let (worst_seed, worst) = runs
+        .iter()
+        .map(|(seed, r)| (*seed, r.avg_rate_us_per_s))
+        .fold(
+            (0, 0.0f64),
+            |acc, x| if x.1.abs() > acc.1.abs() { x } else { acc },
+        );
 
     // Relaxed threshold for high-jitter environment (CI VMs can have timing variance)
     assert!(
-        result.avg_rate_us_per_s.abs() < 150.0,
-        "Average drift rate {:.2}us/s too high - servo unstable!",
-        result.avg_rate_us_per_s
+        worst.abs() < 150.0,
+        "Average drift rate {:.2}us/s (seed {:#018x}) too high - servo unstable!",
+        worst,
+        worst_seed
     );
 }
 

@@ -761,3 +761,78 @@ fn samples_from_before_a_ptp_outage_never_mix_into_the_first_window_after_it_117
         "re-aligned on a window of post-outage samples only"
     );
 }
+
+#[test]
+fn a_ptp_outage_holds_the_learned_integrator_not_the_last_word_117() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let cap = captured.clone();
+    let mut clock = MockSystemClock::new();
+    clock.expect_adjust_frequency().returning(move |factor| {
+        cap.lock().expect("cap").push((factor - 1.0) * 1e6);
+        Ok(())
+    });
+    let mut c = PtpController::new(
+        clock,
+        MockPtpNetwork::new(),
+        MockNtpSource::new(),
+        Arc::new(RwLock::new(SyncStatus::default())),
+        phase_lock_config(),
+    );
+    c.current_gm_uuid = Some(PL_GM);
+    c.is_locked = true;
+    c.drift_baseline_ppm = 12.0;
+    let d = 1_790_000_000_000_000_000_i64;
+    c.date_sync.pending_median_ns = Some(d);
+    c.date_sync.pending_t1_ns = PL_PTP_NOW_NS;
+    c.apply_self_tuning_servo(0.0);
+    // A +500 µs error: the last word carries a large P term on top of the learned frequency.
+    c.date_sync.pending_median_ns = Some(d + 500_000);
+    c.date_sync.pending_t1_ns = PL_PTP_NOW_NS + 500_000_000;
+    c.apply_self_tuning_servo(0.0);
+    let learned = c.date_sync.core.integrator_ppm();
+    let last_word = *captured.lock().expect("cap").last().expect("a word");
+    assert!(
+        (last_word - learned).abs() > 1.0,
+        "the last word carries a P term: {last_word} vs the learned {learned}"
+    );
+
+    // PTP drops out.
+    c.last_ptp_packet = Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 5);
+    c.check_ptp_status();
+    assert!(c.ptp_offline);
+    assert!(!c.date_sync.core.engaged(), "no PTP, no phase lock");
+    let held = *captured.lock().expect("cap").last().expect("a word");
+    assert!(
+        (held - learned).abs() < 1e-9,
+        "the clock holds the learned {learned} ppm through the free-run, got {held}"
+    );
+    assert!((c.applied_freq_ppm - learned).abs() < 1e-9);
+    assert!((c.drift_baseline_ppm - learned).abs() < 1e-9);
+}
+
+#[test]
+fn under_legacy_a_ptp_outage_keeps_every_measurement_and_touches_no_clock_117() {
+    // No clock expectation at all: a frequency hold (the phase lock's) would panic the mock.
+    let mut config = phase_lock_config();
+    config.clock_discipline = CLOCK_DISCIPLINE_LEGACY.to_string();
+    let mut c = PtpController::new(
+        MockSystemClock::new(),
+        MockPtpNetwork::new(),
+        MockNtpSource::new(),
+        Arc::new(RwLock::new(SyncStatus::default())),
+        config,
+    );
+    c.sample_window.push(1_000);
+    c.sample_window.push(2_000);
+    c.prev_t1_ns = 7;
+    c.prev_t2_ns = 9;
+    c.last_ptp_packet = Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 5);
+    c.check_ptp_status();
+    assert!(c.ptp_offline);
+    assert_eq!(
+        c.sample_window,
+        vec![1_000, 2_000],
+        "legacy keeps its window through an outage (the pre-#117 behaviour)"
+    );
+    assert_eq!((c.prev_t1_ns, c.prev_t2_ns), (7, 9));
+}

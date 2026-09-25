@@ -60,6 +60,10 @@ const MASTER_EVENT_LAG_WINDOWS: u64 = 5;
 const GRACE_WINDOWS: u64 = 4;
 /// The master's legacy NTP step threshold while it runs the local date path (PTP offline).
 const MASTER_LOCAL_THRESHOLD_NS: i64 = 200_000;
+/// Wall disagreement allowed while the fleet settles the double fault (a grandmaster change
+/// during a master-only PTP outage): the master's untracked free-run error over its outage (about
+/// 100 µs here) on top of the normal 100 µs envelope, with margin. Measured: 155 µs.
+const SETTLING_BOUND_NS: i64 = 300 * US;
 
 struct Scenario {
     label: &'static str,
@@ -274,6 +278,9 @@ struct RunResult {
     words: Vec<Vec<f64>>,
     steps: Vec<Vec<Step>>,
     max_disagreement_ns: i64,
+    /// The worst wall disagreement while the fleet settles the double fault (only the scenario
+    /// with a grandmaster change during a master outage has such a window; 0 otherwise).
+    max_settling_disagreement_ns: i64,
     /// Window boundaries at which a coordinated step was in flight (some boxes past its instant,
     /// others a few µs short of it): the disagreement there is the step itself, and its
     /// simultaneity is judged by the landing-time spread instead.
@@ -333,6 +340,9 @@ struct Bench<'s> {
     net_rng: Rng,
     // metrics
     max_dis: i64,
+    /// The worst disagreement inside the double fault's settling window (excluded from
+    /// `max_dis`, bounded on its own).
+    max_settling_dis: i64,
     in_flight: u32,
     max_utc: i64,
     /// The FLEET LINE's UTC error, read on a follower (box 1): what every genlocked box shows.
@@ -427,6 +437,7 @@ impl<'s> Bench<'s> {
             ntp_rng: Rng(0xD1B5_4A32_D192_ED03),
             net_rng: Rng(0xABCD_EF01_2345_6789),
             max_dis: 0,
+            max_settling_dis: 0,
             in_flight: 0,
             max_utc: 0,
             max_fleet_utc: 0,
@@ -704,19 +715,22 @@ impl<'s> Bench<'s> {
         // The documented double fault: when the master returns on a new grandmaster it re-bases
         // the fleet D with its own free-run error (~100 µs here). Followers take it at their next
         // poll — a step above the 100 µs absorb tolerance, else an absorb that the phase lock
-        // slews out over ~2 minutes. That settling is the fault's cost, bounded separately (≤ one
-        // late step < 1 ms per follower), not a steady-state disagreement.
+        // slews out over ~2 minutes. That settling is the fault's cost, not a steady-state
+        // disagreement: it is bounded on its own (`max_settling_dis`, and ≤ one late step < 1 ms
+        // per follower).
         let sc = self.sc;
         let double_fault_settling = sc.gm_change_in_master_outage
             && sc.master_ptp_offline.iter().any(|&(from, to)| {
                 (from..to).contains(&GM_CHANGE_AT_WINDOW) && (to..to + 600).contains(&w)
             });
-        if !straddling && !double_fault_settling {
-            let hi = judged.iter().map(|b| b.wall_ns()).max().unwrap();
-            let lo = judged.iter().map(|b| b.wall_ns()).min().unwrap();
-            self.max_dis = self.max_dis.max(hi - lo);
-        } else {
+        let hi = judged.iter().map(|b| b.wall_ns()).max().unwrap();
+        let lo = judged.iter().map(|b| b.wall_ns()).min().unwrap();
+        if straddling {
             self.in_flight += 1;
+        } else if double_fault_settling {
+            self.max_settling_dis = self.max_settling_dis.max(hi - lo);
+        } else {
+            self.max_dis = self.max_dis.max(hi - lo);
         }
     }
 
@@ -755,6 +769,7 @@ impl<'s> Bench<'s> {
             words: self.boxes.iter().map(|b| b.words.clone()).collect(),
             steps: self.boxes.iter().map(|b| b.steps.clone()).collect(),
             max_disagreement_ns: self.max_dis,
+            max_settling_disagreement_ns: self.max_settling_dis,
             in_flight_samples: self.in_flight,
             max_utc_error_ns: self.max_utc,
             max_fleet_utc_error_ns: self.max_fleet_utc,
@@ -833,6 +848,22 @@ fn check(sc: &Scenario, r: &RunResult) {
         "[{label}] walls disagreed by {} µs",
         r.max_disagreement_ns / US
     );
+    // … and while the fleet settles the double fault, within `SETTLING_BOUND_NS`.
+    println!(
+        "[{label}] max wall disagreement while settling the double fault {} µs",
+        r.max_settling_disagreement_ns / US
+    );
+    assert!(
+        r.max_settling_disagreement_ns < SETTLING_BOUND_NS,
+        "[{label}] walls disagreed by {} µs while settling the double fault",
+        r.max_settling_disagreement_ns / US
+    );
+    if sc.gm_change_in_master_outage {
+        assert!(
+            r.max_settling_disagreement_ns > 0,
+            "[{label}] the settling window was actually measured"
+        );
+    }
 
     // RATE: effective rate == the grandmaster's rate, every box, every clean hour.
     let worst = r

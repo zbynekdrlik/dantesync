@@ -74,6 +74,10 @@ const REQUEST_SIZE: usize = 8;
 /// Response packet size
 const RESPONSE_SIZE: usize = 64;
 
+/// dantesync#88 — size of a `"DSYX"` request: padded to the base reply's size, so the extended
+/// reply is never much larger than the request that asked for it (no amplification).
+pub const EXT_REQUEST_SIZE: usize = RESPONSE_SIZE;
+
 /// dantesync#88 — receive buffer for requests. Larger than any request we accept so a stray
 /// oversized datagram never fails the whole `recv_from` on Windows (`WSAEMSGSIZE`).
 const REQUEST_BUF_SIZE: usize = 64;
@@ -359,6 +363,33 @@ const AUTHORITY_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long one poll waits for its reply.
 const AUTHORITY_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Consecutive unanswered polls after which the poller slows down: its NTP server does not
+/// speak `"DSYX"` (an older dantesync, a public NTP pool, a firewall) or is down.
+pub const AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF: u32 = 60;
+
+/// Poll cadence while backed off. Any reply restores the 1 s cadence.
+pub const AUTHORITY_BACKOFF_INTERVAL: Duration = Duration::from_secs(30);
+
+/// dantesync#88 — the poller's cadence: 1 s while the authority answers, slower after a minute
+/// of silence.
+#[derive(Debug, Default)]
+pub struct PollBackoff {
+    silent: u32,
+}
+
+impl PollBackoff {
+    /// A reply to this poll arrived.
+    pub fn on_reply(&mut self) {}
+
+    /// This poll went unanswered.
+    pub fn on_silence(&mut self) {}
+
+    /// How long until the next poll.
+    pub fn interval(&self) -> Duration {
+        AUTHORITY_POLL_INTERVAL
+    }
+}
 
 /// dantesync#88 — polls the NTP master's 31900 with `"DSYX"` once per second on its own thread
 /// and keeps the latest valid reply. DNS resolution and socket waits happen on that thread, so
@@ -789,6 +820,42 @@ mod tests {
     }
 
     #[test]
+    fn a_dsyx_request_is_padded_to_the_base_reply_size_88() {
+        // The reply is 104 bytes: a request of the base reply's size keeps the reply-to-request
+        // ratio at ~1.6 (an 8-byte request would make every spoofed one a 13x amplifier).
+        let req = build_ext_request(3);
+        assert_eq!(req.len(), EXT_REQUEST_SIZE);
+        assert_eq!(EXT_REQUEST_SIZE, RESPONSE_SIZE);
+        assert!(req[8..].iter().all(|&b| b == 0), "zero padding");
+    }
+
+    #[test]
+    fn the_poller_backs_off_after_a_minute_of_silence_and_recovers_on_a_reply_88() {
+        let mut b = PollBackoff::default();
+        assert_eq!(b.interval(), AUTHORITY_POLL_INTERVAL);
+        for _ in 0..AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF - 1 {
+            b.on_silence();
+        }
+        assert_eq!(
+            b.interval(),
+            AUTHORITY_POLL_INTERVAL,
+            "a short silence (a master restart) keeps the 1 s cadence"
+        );
+        b.on_silence();
+        assert_eq!(b.interval(), AUTHORITY_BACKOFF_INTERVAL);
+        for _ in 0..10_000 {
+            b.on_silence();
+        }
+        assert_eq!(b.interval(), AUTHORITY_BACKOFF_INTERVAL, "never slower");
+        b.on_reply();
+        assert_eq!(
+            b.interval(),
+            AUTHORITY_POLL_INTERVAL,
+            "any reply restores 1 s"
+        );
+    }
+
+    #[test]
     fn test_ext_request_magic() {
         assert_eq!(&REQUEST_MAGIC_EXT.to_be_bytes(), b"DSYX");
         let req = build_ext_request(0xDEADBEEF);
@@ -972,6 +1039,19 @@ mod tests {
             n, RESPONSE_SIZE,
             "an old DSYN request gets exactly 64 bytes"
         );
+
+        // A short (unpadded) DSYX is not answered at all: no amplification.
+        let mut short = [0u8; 8];
+        short[0..4].copy_from_slice(b"DSYX");
+        short[4..8].copy_from_slice(&7u32.to_be_bytes());
+        client.send_to(&short, addr).unwrap();
+        for _ in 0..25 {
+            server.handle_requests(&status);
+            assert!(
+                client.recv_from(&mut buf).is_err(),
+                "an unpadded DSYX request got a reply"
+            );
+        }
 
         client.send_to(&build_ext_request(6), addr).unwrap();
         let n = serve_until_reply(&server, &status, &client, &mut buf);
