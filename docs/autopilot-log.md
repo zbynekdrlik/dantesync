@@ -648,3 +648,22 @@ canary evidence before continuing.
   canary-first rollout; keep `"system": { "gm_allowlist": ["10.77.9.0/24"] }` on stream; verify
   `is_locked=true` + `gm_source_ip=10.77.9.184` on stream :8898/status AND survives a restart; only
   then flip `DANTESYNC_GATE_GM_ENFORCE=1` (separate camera-box ticket).
+
+## #88 + #117 — fleet date-offset authority + PTP phase lock (v1.9.0, draft PR #118, branch `issue-117-ptp-rate`)
+
+- #88: `src/date_offset.rs` (codec, `DateAuthority`, `DateFollower`, `same_time_base`) + the DSYX
+  extension of the 31900 reply (`src/time_server.rs`, 64-byte padded request, `UdpAuthorityPoller`
+  with a never-answered-only backoff). Commits `9e83bd1` `e485b28` `b5169aa` `f4b1cd4`, review fixes
+  `24165f1`, `58c9cc0`→`c470c97`, `f4d0e6f`→`b32f098`, docs `742e0a1`.
+- #117: `src/ptp_phase_lock.rs` (PI on `e = (t2 − t1) − D`), `system.clock_discipline`
+  (`ptp_phase_lock` default, `legacy`), controller glue in `src/controller/date_sync.rs`.
+  Commits `7c18589` `e316795` `21ba9b6` `f8152ea` `ef5bbc2`; RED→GREEN review rounds 2-4
+  `e9b6403`→`02bf4a6`, `e9d9eae`→`90aa171`, `56aec20`→`c046965`; round 5 `8043a66` (structure).
+- Proof: `tests/two_clock_bench.rs` (6 boxes, GM change + same-UUID reboot, UTC ±, master-only
+  outages, 24 h): walls ≤ 54 µs, settling ≤ 155 µs, rate ≤ 0.002 ppm/h vs the GM, every step
+  coordinated, frequency words bit-identical across the UTC scenarios.
+- CI red on `c046965` (`test_windows_stability_high_jitter`, 155 vs 150 µs/s) root-caused as the
+  test's own unseeded noise via a rustc replica (same seeds, same result on master / branch /
+  legacy); fixed by seeding (`d4a5a57`), bound unchanged.
+- Not released or deployed. Rollout: canary cam4, then the NTP master, then the rest
+  (`.claude/skills/dantesync-deployment.md` step 4).
