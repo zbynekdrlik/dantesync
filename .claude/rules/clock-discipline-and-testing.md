@@ -7,6 +7,7 @@ paths:
   - "src/ptp_phase_lock.rs"
   - "src/date_offset.rs"
   - "src/time_server.rs"
+  - "src/controller/date_sync.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
