@@ -205,10 +205,12 @@ impl DateAuthority {
         self.pending.is_some()
     }
 
-    /// What the authority publishes right now: the pending step if one is announced, else the
-    /// offset in effect.
-    pub fn announce(&mut self, now_ptp_ns: i64) -> DateAnnounce {
-        self.promote(now_ptp_ns);
+    /// What the authority publishes: the latest announced offset with its effective PTP instant.
+    /// Whether it is still pending is carried by `effective_ptp_ns` against the reader's own
+    /// "now" — a step whose instant has passed reads exactly as the promoted in-effect offset
+    /// (`current = offset, since = eff`), so no promotion is needed here. Read-only, so
+    /// `/status` can publish it from a shared reference.
+    pub fn announce(&self) -> DateAnnounce {
         match self.pending {
             Some((offset, eff)) => DateAnnounce {
                 date_offset_ns: offset,
@@ -255,7 +257,7 @@ impl DateAuthority {
         let eff = now_ptp_ns.saturating_add(self.lead_ns);
         self.pending = Some((self.current_ns.saturating_add(utc_error_ns), eff));
         self.seq = self.seq.wrapping_add(1);
-        Some(self.announce(now_ptp_ns))
+        Some(self.announce())
     }
 
     /// Move `D` WITHOUT a coordinated step, effective immediately: a re-anchor after a
@@ -279,7 +281,7 @@ impl DateAuthority {
         }
         self.over_bound = None;
         self.seq = self.seq.wrapping_add(1);
-        self.announce(now_ptp_new)
+        self.announce()
     }
 }
 
@@ -409,7 +411,12 @@ impl DateFollower {
 
         // In effect.
         let diff = a.date_offset_ns.wrapping_sub(own_anchor_ns);
-        let first = self.adopted_seq.is_none();
+        // A seq BELOW the adopted one is a new authority session (the master restarted and
+        // re-established the offset from seq 1): re-joining it is not a missed announce.
+        let first = match self.adopted_seq {
+            None => true,
+            Some(adopted) => a.seq < adopted,
+        };
         let already = self.adopted_seq == Some(a.seq);
         self.adopted_seq = Some(a.seq);
         // Any scheduled step is superseded by an offset that is already in effect.
@@ -543,7 +550,7 @@ mod tests {
     fn authority_publishes_its_anchor_in_effect_at_seq_1() {
         let mut a = DateAuthority::new(900 * S, 10 * S, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS);
         assert_eq!(
-            a.announce(11 * S),
+            a.announce(),
             DateAnnounce {
                 date_offset_ns: 900 * S,
                 effective_ptp_ns: 10 * S,
@@ -823,6 +830,23 @@ mod tests {
                 delta_ns: 60 * MS
             })
         );
+    }
+
+    #[test]
+    fn a_restarted_authority_is_re_joined_not_counted_late() {
+        let mut f = DateFollower::new();
+        let d = 100 * S;
+        f.on_announce(in_effect(d, 57), d, d + 10 * S);
+        // The master restarted: seq back to 1, its offset re-established 400 µs away.
+        assert_eq!(
+            f.on_announce(in_effect(d + 400_000, 1), d, d + 20 * S),
+            FollowAction::Step {
+                delta_ns: 400_000,
+                kind: StepKind::Join
+            }
+        );
+        assert_eq!(f.late_steps(), 0);
+        assert_eq!(f.adopted_seq(), Some(1));
     }
 
     #[test]
