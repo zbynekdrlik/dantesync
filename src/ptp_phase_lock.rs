@@ -75,6 +75,13 @@ pub const FREQ_CLAMP_PPM: f64 = 500.0;
 /// grandmaster's time base (a GM reboot restarts its uptime under the same UUID). Re-anchor.
 pub const DISCONTINUITY_NS: i64 = 1_000_000_000;
 
+/// On (re-)ENGAGEMENT, a phase error larger than this (the clock free-ran while the rate servo
+/// held it, e.g. through a lock loss) is not slewed back — at the proportional clamp that would
+/// keep the rate off the PTP tick for minutes. `D` is re-anchored on the current offset instead
+/// (the wall stays where it is), and the date layer re-aligns it with ONE step: a follower's
+/// next authority poll sees its `D` differ and joins; the master rebases the fleet offset.
+pub const REANCHOR_ON_ENGAGE_NS: i64 = 1_000_000;
+
 /// `dt` is clamped to this range (s): a first update or a long gap must not scale the integrator
 /// step by an unbounded interval.
 pub const DT_MIN_S: f64 = 0.01;
@@ -136,6 +143,12 @@ impl PhaseLockCore {
     /// The integrator — the learned frequency word (ppm).
     pub fn integrator_ppm(&self) -> f64 {
         self.i_ppm
+    }
+
+    /// True between a grandmaster change and the window that re-anchors on it: `D` still belongs
+    /// to the OLD time base, so it must not be published as the fleet offset.
+    pub fn rebase_pending(&self) -> bool {
+        self.rebase_pending
     }
 
     pub fn last_error_ns(&self) -> Option<i64> {
@@ -202,7 +215,9 @@ impl PhaseLockCore {
                 median_diff_ns
             }
             Some(a) => {
-                if self.rebase_pending || median_diff_ns.wrapping_sub(a).abs() > DISCONTINUITY_NS {
+                let off = median_diff_ns.wrapping_sub(a).abs();
+                let reengaging_far_off = ptp_locked && !self.engaged && off > REANCHOR_ON_ENGAGE_NS;
+                if self.rebase_pending || off > DISCONTINUITY_NS || reengaging_far_off {
                     self.rebase_pending = false;
                     self.anchor_ns = Some(median_diff_ns);
                     event = AnchorEvent::Rebased {
@@ -438,6 +453,48 @@ mod tests {
         let out = c.on_window(D + p.e_ns.round() as i64, true, -29.0, DT);
         assert!(out.freq_ppm.is_some());
         assert_eq!(c.anchor_ns(), Some(D));
+    }
+
+    #[test]
+    fn re_engaging_far_off_the_anchor_re_anchors_instead_of_slewing() {
+        let mut c = PhaseLockCore::new();
+        c.on_window(D, true, 5.0, DT);
+        c.on_window(D, false, 5.0, DT); // lock lost: the rate servo holds the clock …
+                                        // … and it free-ran 3 ms away. Re-engaging must not slew 3 ms at the P clamp.
+        let out = c.on_window(D + 3_000_000, true, 5.0, DT);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Rebased {
+                old_ns: D,
+                new_ns: D + 3_000_000
+            }
+        );
+        assert_eq!(out.error_ns, Some(0));
+        assert!(
+            (out.freq_ppm.unwrap() - 5.0).abs() < 1e-9,
+            "bumpless, no slew"
+        );
+        // A small re-engagement error is simply tracked.
+        c.on_window(D + 3_000_000, false, 5.0, DT);
+        let out = c.on_window(D + 3_000_000 + 400_000, true, 5.0, DT);
+        assert_eq!(out.event, AnchorEvent::None);
+        assert_eq!(out.error_ns, Some(400_000));
+    }
+
+    #[test]
+    fn rebase_pending_is_visible_until_the_re_anchoring_window() {
+        let mut c = PhaseLockCore::new();
+        assert!(!c.rebase_pending());
+        c.request_rebase();
+        assert!(
+            !c.rebase_pending(),
+            "nothing to rebase before the first anchor"
+        );
+        c.on_window(D, true, 0.0, DT);
+        c.request_rebase();
+        assert!(c.rebase_pending());
+        c.on_window(D + 7, true, 0.0, DT);
+        assert!(!c.rebase_pending());
     }
 
     #[test]

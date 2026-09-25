@@ -85,7 +85,10 @@ pub struct SystemConfig {
     /// A String (not an enum) on purpose: an unknown value must degrade to the default with a
     /// loud warning, never fail the whole config parse (see `config-migration.md`). Read it
     /// through [`SystemConfig::legacy_clock_discipline`].
-    #[serde(default = "default_clock_discipline")]
+    #[serde(
+        default = "default_clock_discipline",
+        deserialize_with = "lenient_string"
+    )]
     pub clock_discipline: String,
 
     /// dantesync#88 — the fleet date-offset authority's tuning (read by the NTP master only).
@@ -130,12 +133,56 @@ impl SystemConfig {
 pub struct DateOffsetConfig {
     /// The master announces a date step only when |UTC − wall| exceeds this (ms). Default 50.
     /// `0` means the default (a zero bound would announce on every reading).
-    #[serde(default = "default_date_step_bound_ms")]
+    #[serde(
+        default = "default_date_step_bound_ms",
+        deserialize_with = "lenient_bound_ms"
+    )]
     pub step_bound_ms: u64,
     /// How far ahead a step is announced (ms). Default 5000; floored at 5000 (every follower
     /// polls once per second and needs several chances to hear it).
-    #[serde(default = "default_date_step_lead_ms")]
+    #[serde(
+        default = "default_date_step_lead_ms",
+        deserialize_with = "lenient_lead_ms"
+    )]
     pub step_lead_ms: u64,
+}
+
+/// dantesync#117 — a hand-edit like `"clock_discipline": true` must not fail the WHOLE config
+/// parse (`load_config` would then fall back to defaults). Any non-string becomes a marker string
+/// that `unknown_clock_discipline` reports, so the controller warns and uses the default.
+fn lenient_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(s) => s,
+        other => format!("<not a string: {}>", other),
+    })
+}
+
+/// dantesync#88 — the same leniency for the numeric tuning: a non-integer means the default.
+fn lenient_u64_or(value: serde_json::Value, default: u64) -> u64 {
+    value.as_u64().unwrap_or(default)
+}
+
+fn lenient_bound_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_step_bound_ms(),
+    ))
+}
+
+fn lenient_lead_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_step_lead_ms(),
+    ))
 }
 
 fn default_date_step_bound_ms() -> u64 {
@@ -910,6 +957,31 @@ mod tests {
             .expect("a typo must not fail the parse");
         assert!(!typo.legacy_clock_discipline());
         assert_eq!(typo.unknown_clock_discipline(), Some("legcy"));
+    }
+
+    #[test]
+    fn a_wrongly_typed_new_key_never_fails_the_whole_config_117_88() {
+        for bad in [
+            r#"{"clock_discipline": true}"#,
+            r#"{"clock_discipline": 7}"#,
+            r#"{"clock_discipline": ["legacy"]}"#,
+            r#"{"clock_discipline": null}"#,
+        ] {
+            let c: SystemConfig = serde_json::from_str(bad).expect("must still parse");
+            assert!(
+                !c.legacy_clock_discipline(),
+                "{bad}: the default discipline"
+            );
+            assert!(
+                c.unknown_clock_discipline().is_some(),
+                "{bad}: reported as unknown"
+            );
+        }
+        let c: SystemConfig =
+            serde_json::from_str(r#"{"date_offset":{"step_bound_ms":"fifty","step_lead_ms":-3}}"#)
+                .expect("must still parse");
+        assert_eq!(c.date_offset.step_bound_ns(), 50_000_000);
+        assert_eq!(c.date_offset.step_lead_ns(), 5_000_000_000);
     }
 
     #[test]
