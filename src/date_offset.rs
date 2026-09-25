@@ -262,20 +262,24 @@ impl DateAuthority {
     /// grandmaster change (the wall is continuous, only the PTP time base moved), or a local
     /// step the master already applied outside the coordinated path (PTP-offline fallback).
     ///
+    /// `now_ptp_old_ns` is "now" in the time base the authority is in BEFORE this call
+    /// (`wall − old D`): it is used to promote a due step first, and then converted into the new
+    /// base (`ptp_new = ptp_old − shift`, since `wall = ptp_old + D_old = ptp_new + D_new`).
+    ///
     /// A pending step survives a rebase with its WALL instant and its size unchanged: both the
-    /// pending offset and its effective PTP instant are shifted into the new base
-    /// (`wall = ptp + D` ⇒ a PTP instant maps to `eff − shift`).
-    pub fn rebase(&mut self, new_offset_ns: i64, now_ptp_ns: i64) -> DateAnnounce {
-        self.promote(now_ptp_ns);
+    /// pending offset and its effective PTP instant are shifted into the new base.
+    pub fn rebase(&mut self, new_offset_ns: i64, now_ptp_old_ns: i64) -> DateAnnounce {
+        self.promote(now_ptp_old_ns);
         let shift = new_offset_ns.wrapping_sub(self.current_ns);
+        let now_ptp_new = now_ptp_old_ns.wrapping_sub(shift);
         self.current_ns = new_offset_ns;
-        self.current_since_ptp_ns = now_ptp_ns;
+        self.current_since_ptp_ns = now_ptp_new;
         if let Some((offset, eff)) = self.pending {
             self.pending = Some((offset.wrapping_add(shift), eff.wrapping_sub(shift)));
         }
         self.over_bound = None;
         self.seq = self.seq.wrapping_add(1);
-        self.announce(now_ptp_ns)
+        self.announce(now_ptp_new)
     }
 }
 
@@ -650,16 +654,23 @@ mod tests {
     #[test]
     fn rebase_without_pending_is_in_effect_now() {
         let mut a = DateAuthority::new(10 * S, 0, 50 * MS, MIN_STEP_LEAD_NS);
+        // Now = PTP 50 s in the old base = wall 60 s. D grows by 2 s ⇒ now = PTP 48 s in the new
+        // base: the same wall instant.
         let r = a.rebase(12 * S, 50 * S);
         assert_eq!(
             r,
             DateAnnounce {
                 date_offset_ns: 12 * S,
-                effective_ptp_ns: 50 * S,
+                effective_ptp_ns: 48 * S,
                 seq: 2
             }
         );
-        assert!(!a.has_pending(50 * S));
+        assert_eq!(
+            r.effective_ptp_ns + r.date_offset_ns,
+            60 * S,
+            "wall continuous"
+        );
+        assert!(!a.has_pending(48 * S));
     }
 
     // ---- follower --------------------------------------------------------------------------
