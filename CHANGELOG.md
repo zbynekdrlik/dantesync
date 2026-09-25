@@ -5,6 +5,39 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-09-25
+
+### Changed
+
+- **PTP phase lock: rate AND phase from the Dante grandmaster, NTP only moves the date (issue
+  #117), the new DEFAULT (`system.clock_discipline = "ptp_phase_lock"`).** The old PTP servo was
+  rate-only (`initial_epoch_offset_ns` was never read, NANO ignored < 0.1 µs/s), so cross-box wall
+  agreement was held by NTP, which since #97's `phase_slew` steered the RATE up to ±5-19 ppm away
+  from the Dante tick. New `src/ptp_phase_lock.rs`: once PTP-locked, a critically-damped PI on
+  `e = (t2 − t1) − D` owns the frequency word, taken over bumplessly from the rate servo. `D` is
+  re-anchored with no wall step on a grandmaster change. `phase_slew` is ignored (with a warning)
+  under the phase lock; `clock_discipline = "legacy"` restores the pre-1.9.0 behaviour.
+
+### Added
+
+- **Fleet date-offset authority + coordinated steps (issue #88).** New `src/date_offset.rs`: only
+  the NTP master reads UTC. It announces a new `D` when |UTC − wall| > 50 ms (2 agreeing readings)
+  with an effective instant ≥ 5 s ahead, and every box, the master included, steps at exactly
+  that instant. The announce rides a versioned extension of the UDP 31900 time-query reply,
+  requested with `"DSYX"`. A `"DSYN"` request still gets the byte-identical 64-byte reply, and an
+  older server ignores `"DSYX"`, so a new box on an old master keeps its local NTP date path.
+  Followers poll their NTP server's 31900 once per second on a background thread. Tuning:
+  `system.date_offset.{step_bound_ms, step_lead_ms}`.
+- `/status` (additive): `clock_discipline`, `rate_source`, `ptp_phase_locked`,
+  `ptp_phase_error_us`, `date_authority`, `date_offset_ns`, `date_offset_seq`,
+  `date_offset_effective_ptp_ns`, `date_step_pending_ns`, `date_step_due_in_ms`,
+  `date_offset_error_ms`, `date_step_bound_ms`, `last_date_step_{ns,ts,kind}`, `date_steps_late`.
+  On the master, `ntp_deadband_us` / `ntp_step_threshold_us` report the authority bound.
+- `tests/two_clock_bench.rs`: 6 boxes, a grandmaster change, UTC at +8 / −15 ppm vs the GM, 24
+  simulated hours, run on the production pure modules. Walls agree within 42 µs; the rate matches
+  the current GM within 0.002 ppm per hour; every date step is coordinated (landing spread ≤ 41 µs,
+  0 late); the frequency commands are bit-identical across the two UTC scenarios.
+
 ## [1.8.47] - 2026-08-19
 
 ### Added

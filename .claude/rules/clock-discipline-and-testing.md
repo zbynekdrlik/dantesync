@@ -4,6 +4,9 @@ paths:
   - "src/ntp.rs"
   - "src/ntp_server.rs"
   - "src/status.rs"
+  - "src/ptp_phase_lock.rs"
+  - "src/date_offset.rs"
+  - "src/time_server.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -64,6 +67,8 @@ variance-derived threshold on a new signal, ask whether that signal is noise or 
 
 ## In this architecture, "slew" can only mean small frequent steps
 
+> LEGACY discipline only since #117 — see "#117 — the old PTP servo was RATE-ONLY" below.
+
 PTP owns frequency (`adjust_frequency`) and re-measures phase against the Dante GM every 125 ms. Any
 frequency offset injected to correct UTC phase is read back by the PTP servo as drift and cancelled
 within seconds — the two loops fight and the casualty is the <50 µs precision target. A UTC
@@ -91,6 +96,66 @@ Stepping itself is safe for PTP: the existing post-step machinery (2 s grace, `s
 the fleet one or two client intervals later, so its SIZE is a fleet-coherence budget, not a private
 matter. (#97's slew avoids the step entirely for a sub-50ms error while locked — no propagated step,
 no grace transient — but keeps the step path for cold boot / |e|>50ms / acquisition / PTP-offline.)
+
+## #117 — the old PTP servo was RATE-ONLY; the phase lock is the default now
+
+**Finding (25.9.2026, the anchors of the #117 design question).** Until #117 the "PTP servo" in
+`apply_self_tuning_servo` controlled only `d(offset)/dt`: a P term on the RATE plus an integrator
+into `drift_baseline_ppm`. The offset it differentiated was the mod-1 s display phase
+(`calculate_phase_offset`), and `initial_epoch_offset_ns` was **written once and never read**. So
+nothing held the absolute offset between the box and the grandmaster, and NANO mode additionally
+ignored any rate below `NANO_DEADBAND_US` (0.1 µs/s, i.e. up to 360 µs/h of free drift). Two boxes
+"locked to the same rate" therefore random-walked apart, and all cross-box wall agreement was
+really held by NTP: first by steps (the #67/#83/#88 step storms and chases), then by #97's
+`phase_slew`, which did it by steering the RATE up to ±5-19 ppm away from the Dante tick. That
+last part is the contract violation #117 removes (owner: RATE = the Dante PTP tick only, NTP =
+date stepping only).
+
+**What replaced it (`system.clock_discipline = "ptp_phase_lock"`, the default):**
+
+- `src/ptp_phase_lock.rs`: ONE PI on `e = (t2 − t1) − D` (the raw offset between the two time
+  bases, not the mod-1 s phase and not calibration-corrected). It gives rate AND phase from the same
+  PTP measurement. The rate servo still does acquisition; once PTP-locked the PI takes the
+  frequency word bumplessly. Its `dt` is measured in grandmaster time (`t1`), so loop scheduling
+  and the daemon's own wall steps cannot distort it. Critically damped, ~100 s: Kp 0.02/s,
+  Ki = Kp²/4.
+- `D` (the fleet date offset, `wall = PTP time + D`) is anchored at the first lock, re-anchored
+  from the continuous wall on a grandmaster / sync-source change or a > 1 s time-base jump (a GM
+  reboot restarts its uptime under the same UUID), and shifted by exactly every applied step.
+- `src/date_offset.rs` (#88): only the NTP master reads UTC. It announces a new `D` when
+  |UTC − wall| > 50 ms (2 agreeing readings), ≥ 5 s ahead, in the versioned 31900 extension. Every
+  box, the master included, applies it at that instant through `DateFollower`.
+
+**The decoupling statement (this rule's standing requirement for any loop on this clock).** There
+is no second loop to decouple: the phase lock is the only frequency law once locked, and no
+argument of `PhaseLockCore::on_window` carries NTP. The only NTP-derived quantity is `D`. `D`
+changes either by a STEP of the wall of exactly the same size at the same instant (`note_step`,
+which leaves `e` untouched) or by an absorb of ≤ 100 µs at join time. So NTP contributes nothing
+to the rate. It is PROVEN, not argued: `tests/two_clock_bench.rs` runs the same PTP world under
+two different UTC drifts (+8 / −15 ppm vs the GM) and asserts every box's frequency command
+sequence is **bit-identical** between the two runs. A future change that leaks any NTP term into
+the rate path fails that assertion.
+
+**Consequences for code and tests here:**
+
+- The old "In this architecture, 'slew' can only mean small frequent steps" section above
+  describes the LEGACY discipline. Under the phase lock a follower never steps on its own NTP
+  reading; the master never steps at NTP time. `phase_slew` exists only under
+  `clock_discipline = "legacy"` (the #97/#105 tests pin that explicitly).
+- Without an authority (an older master that ignores `"DSYX"`, a grandmaster the master is not
+  on, PTP offline) a box keeps the existing NTP step path as its LOCAL date fallback, with a
+  pure-PTP rate. That is the canary-safe path. Each local step shifts `D` with the wall.
+- A bench/sim clock must keep its steps APART from the oscillator-driven reading
+  (`wall = continuous + stepped`). Folding a step into an integer-ns clock with a fractional
+  carry perturbs the carry, which makes two runs that step at different times diverge in the last
+  bit. That is a false failure of the decoupling assertion (hit while building the bench).
+- Test a scheduled step's SIMULTANEITY by its landing instant (resolved inside the window), not
+  by sampling at window boundaries. An announce's instant is computed on the master's own window
+  grid, so it lands within µs of a boundary by construction, and boundary sampling reports a
+  spurious 50 ms "disagreement" for the few µs the step is genuinely in flight.
+- In the controller, the step lands within one loop iteration of its instant (1 ms Linux /
+  50 µs Windows) plus the cross-box wall disagreement (µs). For that window the fleet genuinely
+  differs by the step size. It is the only disagreement a coordinated step leaves.
 
 ## `Instant` vs `SystemTime` — this daemon steps its own wall clock
 
