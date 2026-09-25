@@ -10,6 +10,7 @@ paths:
   - "src/controller/date_sync.rs"
   - "src/controller/date_sync/tests.rs"
   - "src/date_offset/tests.rs"
+  - "src/time_server/tests.rs"
   - "tests/two_clock_bench.rs"
   - "tests/simulation_e2e.rs"
 ---
