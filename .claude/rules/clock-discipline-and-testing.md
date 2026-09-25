@@ -8,6 +8,10 @@ paths:
   - "src/date_offset.rs"
   - "src/time_server.rs"
   - "src/controller/date_sync.rs"
+  - "src/controller/date_sync/tests.rs"
+  - "src/date_offset/tests.rs"
+  - "tests/two_clock_bench.rs"
+  - "tests/simulation_e2e.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -210,6 +214,14 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   `update_shared_status` at once. The 10 s `tick_status` comes after the 5 s lead, so waiting
   for it made followers step late. The bench models the snapshot and its publish points so this
   class stays covered.
+- **A `"DSYX"` request is padded to 64 bytes; a shorter one is ignored (round 5).** The extended
+  reply is 104 bytes. Answering an 8-byte request would make every spoofed one a 13x amplifier;
+  a request the size of the base reply keeps the ratio at ~1.6. `"DSYN"` is unchanged (8 bytes,
+  64-byte reply, the pre-existing 8x).
+- **The authority poller backs off (round 5).** After 60 unanswered polls it polls every 30 s;
+  any reply restores 1 s. A follower whose `ntp_server` is not a dantesync master (a public pool,
+  an older master, a firewall) then sends 2 requests a minute instead of 60. A master restart
+  (seconds of silence) never reaches the backoff.
 - **Whole-fleet PTP loss (accepted):** every box runs the local NTP path against the master. When
   PTP returns, each re-joins the fleet line at its own poll: an uncoordinated step of at most
   the fleet's UTC error (≤ 50 ms), then coherent again.
@@ -240,6 +252,21 @@ There is no per-box latency calibration; add one only if the canary shows the sp
 - In the controller, the step lands within one loop iteration of its instant (1 ms Linux /
   50 µs Windows) plus the cross-box wall disagreement (µs). For that window the fleet genuinely
   differs by the step size. It is the only disagreement a coordinated step leaves.
+
+## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
+
+`tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, and its high-jitter test
+asserts an AVERAGE drift rate (< 150 µs/s), a statistic of that noise. Over 60 seeds its RMS is
+~50 µs/s, so the bound sat at about 3σ and roughly one CI run in a few hundred went red for no code
+change (CI run 36182967772: 155 µs/s). Round 5 of #117 gave every test thread a fixed xorshift64*
+seed and runs the high-jitter scenario over eight fixed seeds (the worst must pass), in parallel
+because each run sleeps ~36 s of wall time. The bound did not move. Rules:
+
+- Never widen the bound and never "re-run until green". Reproduce the failure over many seeds on
+  `origin/master` AND the branch first, to tell a code regression from test noise.
+- One fixed seed proves the bound for ONE noise sample. When the assertion is a statistic, run
+  several seeds and assert the worst.
+- A bench's own RNG (`tests/two_clock_bench.rs`) was seeded from the start. Keep it that way.
 
 ## `Instant` vs `SystemTime` — this daemon steps its own wall clock
 
@@ -497,6 +524,17 @@ compile, type-check, or test-run path whatsoever.
 a purely SYNTACTIC tool — it parses every file (following `#[cfg] mod` paths, so it even checks
 Windows-only code), catching a stray brace / broken literal / bad token, but it does NOT type-check.
 Run `cargo fmt --all` then `cargo fmt --all --check` after every edit as your parse-check.
+
+**A second local net: a standalone `rustc` REPLICA (round 5 of #117).** The hook keys on `cargo`;
+plain `rustc` on a scratch file is not a cargo shape. A PURE module (`date_offset.rs`,
+`ptp_phase_lock.rs`, the bench, `time_server.rs` with `log`/`anyhow`/`libc`/`uuid` stubbed) compiles
+and runs its own tests as `rustc --edition 2021 --test`, from a wrapper `mod dantesync { pub mod
+date_offset; … }` in a scratch dir laid out like `src/` (symlinks keep `mod tests;` sibling files
+resolving). Even the CONTROLLER runs this way: strip `serde`, stub the external crates, and drive
+`tests/simulation_e2e.rs` as a binary. That is how the round-5 CI red was diagnosed: the same
+seeds gave the same result on `origin/master`, on the branch and on the branch in legacy mode, so
+the failure was the test's own unseeded noise, not the change. Replica results are evidence, not
+proof: CI still type-checks and runs the real crate.
 
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually

@@ -25,7 +25,8 @@
 //!    hour), and the frequency command sequence of every box is BIT-IDENTICAL across the two UTC
 //!    scenarios — NTP contributes exactly nothing to the rate (the #117 decoupling statement).
 //! 2. PHASE: after the join, all walls agree within 100 µs at every instant, including through
-//!    the date steps and through the grandmaster change.
+//!    the date steps and through the grandmaster change (within 300 µs while the fleet settles
+//!    the one documented double fault: a grandmaster change during a master-only PTP outage).
 //! 3. DATE: every step after the join is a COORDINATED one, applied by every box in the same
 //!    window; zero late or local steps; the master's wall stays within the step bound of UTC.
 //! 4. GM CHANGE: no box steps its wall when the grandmaster changes.

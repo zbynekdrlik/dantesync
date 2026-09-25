@@ -380,10 +380,12 @@ where
         }
     }
 
-    /// #117 — this box just lost PTP. Everything measured before the outage is dropped, exactly
-    /// as on a grandmaster change: the first window after PTP returns must hold only post-outage
-    /// samples, or a pre-outage median hides the free-run error (e = 0) and it is slewed for
-    /// minutes instead of re-aligned. The frequency is held at the learned integrator.
+    /// #117 — this box just lost PTP. Every PHASE measurement taken before the outage is dropped,
+    /// exactly as on a grandmaster change: the first window after PTP returns must hold only
+    /// post-outage samples, or a pre-outage median hides the free-run error (e = 0) and it is
+    /// slewed for minutes instead of re-aligned. The frequency is held at the learned integrator.
+    /// The spike filter's RATE history is kept: the oscillator's rate is a hardware property that
+    /// survives an outage (an outage, unlike a step, puts no transient into the rate).
     pub(super) fn on_ptp_offline_edge(&mut self) {
         if !self.date_sync.enabled {
             return;

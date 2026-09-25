@@ -31,8 +31,9 @@
 //!
 //! # dantesync#88 — the date-offset extension (versioned, opt-in by the REQUEST)
 //!
-//! A request whose magic is `"DSYX"` (0x44535958) instead of `"DSYN"` asks for the reply's
-//! versioned extension: the same 64-byte base, then — when this node has a date-offset state —
+//! A request whose magic is `"DSYX"` (0x44535958) instead of `"DSYN"`, zero-padded to 64 bytes
+//! (so the reply never amplifies it; a shorter one is ignored), asks for the reply's versioned
+//! extension: the same 64-byte base, then — when this node has a date-offset state —
 //! the [`crate::date_offset`] extension (`[64]` version, `[65]` flags with bit 0 = the fleet's
 //! date-offset AUTHORITY, `[68-75]` `date_offset_ns`, `[76-83]` `effective_ptp_ns`, `[84-87]`
 //! `seq`, `[88-93]` the anchor's grandmaster UUID, `[96-103]` the replier's PTP "now"). See
@@ -120,7 +121,14 @@ impl TimeServer {
                 Ok((size, src)) => {
                     if size >= REQUEST_SIZE {
                         let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        if magic == REQUEST_MAGIC || magic == REQUEST_MAGIC_EXT {
+                        if magic == REQUEST_MAGIC_EXT && size < EXT_REQUEST_SIZE {
+                            // #88: the extended reply is 104 bytes; answering a short request
+                            // would make every spoofed one an amplifier.
+                            debug!(
+                                "[TimeServer] Ignoring an unpadded DSYX request ({} bytes) from {}",
+                                size, src
+                            );
+                        } else if magic == REQUEST_MAGIC || magic == REQUEST_MAGIC_EXT {
                             let request_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
                             // Read status (handle poisoned lock gracefully)
@@ -281,9 +289,10 @@ fn build_response_ext(request_id: u32, status: &SyncStatus) -> Vec<u8> {
     out
 }
 
-/// dantesync#88 — a `"DSYX"` request (8 bytes, same layout as `"DSYN"`).
-pub fn build_ext_request(request_id: u32) -> [u8; REQUEST_SIZE] {
-    let mut req = [0u8; REQUEST_SIZE];
+/// dantesync#88 — a `"DSYX"` request: the `"DSYN"` layout (magic, request id), zero-padded to
+/// [`EXT_REQUEST_SIZE`].
+pub fn build_ext_request(request_id: u32) -> [u8; EXT_REQUEST_SIZE] {
+    let mut req = [0u8; EXT_REQUEST_SIZE];
     req[0..4].copy_from_slice(&REQUEST_MAGIC_EXT.to_be_bytes());
     req[4..8].copy_from_slice(&request_id.to_be_bytes());
     req
@@ -380,19 +389,32 @@ pub struct PollBackoff {
 
 impl PollBackoff {
     /// A reply to this poll arrived.
-    pub fn on_reply(&mut self) {}
+    pub fn on_reply(&mut self) {
+        self.silent = 0;
+    }
 
     /// This poll went unanswered.
-    pub fn on_silence(&mut self) {}
+    pub fn on_silence(&mut self) {
+        self.silent = self.silent.saturating_add(1);
+    }
+
+    /// True once the poller runs at the slow cadence.
+    pub fn backed_off(&self) -> bool {
+        self.silent >= AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF
+    }
 
     /// How long until the next poll.
     pub fn interval(&self) -> Duration {
-        AUTHORITY_POLL_INTERVAL
+        if self.backed_off() {
+            AUTHORITY_BACKOFF_INTERVAL
+        } else {
+            AUTHORITY_POLL_INTERVAL
+        }
     }
 }
 
 /// dantesync#88 — polls the NTP master's 31900 with `"DSYX"` once per second on its own thread
-/// and keeps the latest valid reply. DNS resolution and socket waits happen on that thread, so
+/// (every 30 s after a minute of silence, see [`PollBackoff`]) and keeps the latest valid reply. DNS resolution and socket waits happen on that thread, so
 /// the sync loop only ever takes a short mutex.
 pub struct UdpAuthorityPoller {
     latest: Arc<Mutex<Option<AuthorityReply>>>,
@@ -446,8 +468,10 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
     let mut target: Option<std::net::SocketAddr> = None;
     let mut warned_foreign_src = false;
     let mut resolved_at: Option<Instant> = None;
+    let mut backoff = PollBackoff::default();
     while running.load(Ordering::SeqCst) {
         let started = Instant::now();
+        let mut answered = false;
         request_id = request_id.wrapping_add(1);
         // Resolve once a minute (and after a failure), not every second.
         if target.is_none()
@@ -512,15 +536,37 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
                             if let Ok(mut g) = shared.lock() {
                                 *g = Some(reply);
                             }
+                            answered = true;
                             break;
                         }
                     }
                 }
             }
         }
+        let was_backed_off = backoff.backed_off();
+        if answered {
+            backoff.on_reply();
+        } else {
+            backoff.on_silence();
+        }
+        if backoff.backed_off() != was_backed_off {
+            if was_backed_off {
+                info!(
+                    "[DATE] {} answers again — polling every {:?}",
+                    host, AUTHORITY_POLL_INTERVAL
+                );
+            } else {
+                info!(
+                    "[DATE] no DSYX reply from {} for {} polls (an older dantesync, a public NTP \
+                     server or a firewall?) — polling every {:?} until it answers",
+                    host, AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF, AUTHORITY_BACKOFF_INTERVAL
+                );
+            }
+        }
+        let interval = backoff.interval();
         let spent = started.elapsed();
-        if spent < AUTHORITY_POLL_INTERVAL {
-            std::thread::sleep(AUTHORITY_POLL_INTERVAL - spent);
+        if spent < interval {
+            std::thread::sleep(interval - spent);
         }
     }
 }

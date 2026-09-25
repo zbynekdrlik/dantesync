@@ -24,10 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the NTP master reads UTC. It announces a new `D` when |UTC − wall| > 50 ms (2 agreeing readings)
   with an effective instant ≥ 5 s ahead, and every box, the master included, steps at exactly
   that instant. The announce rides a versioned extension of the UDP 31900 time-query reply,
-  requested with `"DSYX"`. A `"DSYN"` request still gets the byte-identical 64-byte reply, and an
-  older server ignores `"DSYX"`, so a new box on an old master keeps its local NTP date path.
-  Followers poll their NTP server's 31900 once per second on a background thread. Tuning:
-  `system.date_offset.{step_bound_ms, step_lead_ms}`.
+  requested with `"DSYX"` (zero-padded to 64 bytes, so the 104-byte reply never amplifies it; a
+  shorter `"DSYX"` is ignored). A `"DSYN"` request still gets the byte-identical 64-byte reply, and
+  an older server ignores `"DSYX"`, so a new box on an old master keeps its local NTP date path.
+  Followers poll their NTP server's 31900 once per second on a background thread, every 30 s after
+  a minute without a reply. Tuning: `system.date_offset.{step_bound_ms, step_lead_ms}`.
 - `/status` (additive): `clock_discipline`, `rate_source`, `ptp_phase_locked`,
   `ptp_phase_error_us`, `date_authority`, `date_offset_ns`, `date_offset_seq`,
   `date_offset_effective_ptp_ns`, `date_step_pending_ns`, `date_step_due_in_ms`,
@@ -36,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/two_clock_bench.rs`: 6 boxes, a grandmaster change (the master notices it last) and a
   reboot of the new grandmaster under the same UUID (the master notices it first), UTC at +8 /
   −15 ppm vs the GM, 24 simulated hours, with and without the controller's 2 s post-step grace,
-  run on the production pure modules. Walls agree within 43 µs (with a 33 µs path-delay spread;
-  the live latency spread is still to be measured by the canary). The rate matches the current GM
+  run on the production pure modules, plus a 3 s first step, master-only PTP outages (10 min,
+  3 h) and a grandmaster change during one. Walls agree within 54 µs (with a 33 µs path-delay
+  spread; the live latency spread is still to be measured by the canary), and within 155 µs while
+  the fleet settles that double fault (bounded at 300 µs). The rate matches the current GM
   within 0.002 ppm per hour. Every date step is coordinated (landing spread ≤ 41 µs, 0 late), no
   step happens at a grandmaster change or reboot, and replies in another time base are refused.
   The frequency LAW's commands are bit-identical across the two UTC scenarios.
@@ -48,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeping any step it already scheduled. One box's fault never moves the fleet D: a master
   without PTP runs its local NTP path on its own wall, then steps back onto the fleet line when
   PTP returns, and a failed master step is retried after a 10 s backoff.
+
+### Fixed
+
+- `tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, so its high-jitter
+  average-rate assertion (a statistic of that noise, bound at about 3σ) failed at random, for no
+  code change. Every test thread now uses a fixed xorshift64* seed, the high-jitter scenario runs
+  eight fixed seeds and asserts the worst, and the bound is unchanged. `rand` is no longer a
+  dev-dependency.
 
 ## [1.8.47] - 2026-08-19
 
