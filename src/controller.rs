@@ -1230,6 +1230,9 @@ where
                     info!("[PTP] Continuing with NTP-only time sync");
                     self.ptp_offline_logged = true;
                 }
+                // #117: drop every pre-outage measurement and hold the phase lock's learned
+                // frequency through the free-run (a no-op under the legacy discipline).
+                self.on_ptp_offline_edge();
                 // Update status to reflect offline state
                 if let Ok(mut status) = self.status_shared.write() {
                     status.settled = false;

@@ -322,6 +322,44 @@ where
         }
         self.date_sync.last_step =
             Some((delta_ns, (wall_now_ns() / 1_000_000_000) as u64, "local"));
+        // The published D in effect (and the replier's PTP now derived from it) moved: publish.
+        self.update_shared_status();
+    }
+
+    /// #117 — this box just lost PTP. Everything measured before the outage is dropped, exactly
+    /// as on a grandmaster change: the first window after PTP returns must hold only post-outage
+    /// samples, or a pre-outage median hides the free-run error (e = 0) and it is slewed for
+    /// minutes instead of re-aligned. The frequency is held at the learned integrator.
+    pub(super) fn on_ptp_offline_edge(&mut self) {
+        if !self.date_sync.enabled {
+            return;
+        }
+        self.sample_window.clear();
+        self.date_sync.window.clear();
+        self.date_sync.pending_median_ns = None;
+        self.date_sync.last_t1_ns = None;
+        self.date_sync.fresh_window = false;
+        self.pending_syncs.clear();
+        self.prev_t1_ns = 0;
+        self.prev_t2_ns = 0;
+        self.last_offset_us = None;
+        self.last_offset_time = None;
+        if self.date_sync.core.engaged() {
+            self.date_sync.core.disengage();
+            let word = self.date_sync.core.integrator_ppm();
+            self.drift_baseline_ppm = word;
+            // Hold the LEARNED frequency (not the last word, which carries the last P term), so
+            // the free-run through the outage is as small as the oscillator allows.
+            self.last_adj_ppm = word;
+            self.applied_freq_ppm = word;
+            if let Err(e) = self.clock.adjust_frequency(1.0 + word / 1_000_000.0) {
+                warn!("[PHASE-LOCK] holding {:+.3}ppm failed: {}", word, e);
+            }
+            info!(
+                "[PHASE-LOCK] disengaged (PTP offline) — holding the learned {:+.3}ppm",
+                word
+            );
+        }
     }
 
     /// #88 — the NTP master back on the fleet line: once its own PTP is online and the phase lock
@@ -454,6 +492,9 @@ where
                     debug!("[DATE] master's own scheduler: {:?}", act);
                 }
             }
+            // Publish NOW: the 31900 time server reads this snapshot, and an announce heard only
+            // at the next 10 s status tick would arrive after its 5 s lead (a late step).
+            self.update_shared_status();
             if self.ptp_offline {
                 // Its OWN wall keeps the local NTP step path while it has no PTP.
                 return false;
@@ -461,7 +502,6 @@ where
             // The NTP step path is bypassed: nothing pending, nothing starved.
             self.ntp_pending_step = None;
             self.ntp_server_checks_since_step = 0;
-            self.update_shared_status();
             return true;
         }
         if self.ptp_offline {
@@ -566,18 +606,9 @@ where
         if !self.date_sync.enabled || self.date_sync.core.anchor_ns().is_none() {
             return;
         }
-        if self.ptp_offline {
-            self.date_sync.fresh_window = false;
-            if self.date_sync.core.engaged() {
-                // No PTP, no phase lock: hand the learned frequency back to the rate servo, and
-                // let the next locked window re-engage (and re-align if the wall free-ran).
-                self.date_sync.core.disengage();
-                self.drift_baseline_ppm = self.date_sync.core.integrator_ppm();
-                info!(
-                    "[PHASE-LOCK] disengaged (PTP offline) — holding {:+.3}ppm",
-                    self.drift_baseline_ppm
-                );
-            }
+        if self.ptp_offline && self.date_sync.core.engaged() {
+            // No PTP, no phase lock (normally done on the offline edge already).
+            self.on_ptp_offline_edge();
         }
         if let Some(due) = self.date_sync.follower.due(wall_now_ns()) {
             self.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
@@ -682,8 +713,8 @@ where
         let sign: i8 = if delta_ns > 0 { 1 } else { -1 };
         if let Err(e) = self.clock.step_clock(dur, sign) {
             // D is NOT moved and the fleet D is untouched. A follower re-joins after the backoff; the
-            // master publishes the fleet D regardless and steps its own wall to it after the
-            // backoff (`realign_master_to_fleet`), feeding no UTC reading meanwhile.
+            // master publishes the fleet D regardless (still feeding the fleet line's UTC error)
+            // and steps its own wall to it after the backoff (`realign_master_to_fleet`).
             warn!(
                 "[DATE] {} date step {:+}us (seq {}) FAILED: {} — retrying the alignment in {}s",
                 label,

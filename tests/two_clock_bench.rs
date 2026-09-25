@@ -123,13 +123,14 @@ fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
     }
 }
 
-/// Whether an NTP cycle refreshes the master's published status (`ntp_under_date_authority`).
-fn master_publishes_after_ntp(ptp_offline: bool) -> bool {
-    !ptp_offline
+/// Whether an NTP cycle refreshes the master's published status (`ntp_under_date_authority`):
+/// always — also off line, or an announce would wait for the next 10 s tick.
+fn master_publishes_after_ntp(_ptp_offline: bool) -> bool {
+    true
 }
 
 /// Whether the master's local NTP step refreshes it (`note_local_date_step`).
-const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = false;
+const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = true;
 
 /// A follower's applicability checks (`service_date_offset`); the time server computes the
 /// replier's PTP now from the SNAPSHOT's D in effect and the live wall.
@@ -484,10 +485,12 @@ fn run(sc: &Scenario) -> RunResult {
                 b.core_gm = gm_id;
             }
             if w < b.grace_until || (i == 0 && sc.master_offline_at(w)) {
-                if i == 0 && sc.master_offline_at(w) {
-                    // No PTP, no phase lock (the controller's `service_date_offset`).
+                if i == 0 && sc.master_offline_at(w) && b.core.engaged() {
+                    // No PTP, no phase lock: the controller's `on_ptp_offline_edge` holds the
+                    // learned frequency through the free-run.
                     b.fresh = false;
                     b.core.disengage();
+                    b.word_ppm = b.core.integrator_ppm();
                 }
                 b.words.push(b.word_ppm);
                 continue;
@@ -650,7 +653,16 @@ fn run(sc: &Scenario) -> RunResult {
                     .pending()
                     .is_some_and(|p| landed.contains(&p.seq))
             });
-            if !straddling {
+            // The documented double fault: when the master returns on a new grandmaster it
+            // re-bases the fleet D with its own free-run error (~100 µs here). Followers take it at
+            // their next poll — a step above the 100 µs absorb tolerance, else an absorb that the
+            // phase lock slews out over ~2 minutes. That settling is the fault's cost, bounded
+            // separately (≤ one late step < 1 ms per follower), not a steady-state disagreement.
+            let double_fault_settling = sc.gm_change_in_master_outage
+                && sc.master_ptp_offline.iter().any(|&(from, to)| {
+                    (from..to).contains(&GM_CHANGE_AT_WINDOW) && (to..to + 600).contains(&w)
+                });
+            if !straddling && !double_fault_settling {
                 let hi = judged.iter().map(|b| b.wall_ns()).max().unwrap();
                 let lo = judged.iter().map(|b| b.wall_ns()).min().unwrap();
                 max_dis = max_dis.max(hi - lo);

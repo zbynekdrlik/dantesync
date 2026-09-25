@@ -175,7 +175,7 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   back, the master steps its OWN wall onto the fleet line (`realign_master_to_fleet`: one Join,
   which also removes the phase error the outage left, measured on a window taken after PTP
   returned). A failed step on the master works the same way: the fleet D stays, the master
-  feeds no UTC reading while it is off the line, and it retries after a 10 s backoff. A
+  retries after a 10 s backoff (it keeps feeding the fleet line's UTC error meanwhile). A
   re-engagement > 1 ms off `D` is `Realigned` (same base, the wall wandered) and is never
   `Rebased` (which is a new time base, and the only event that moves the fleet D without a
   step). An earlier fix moved the fleet D with the master's local steps; the `master-only
@@ -190,15 +190,26 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   reached followers as a step (round 3, RED).
   - **Known double-fault limit:** if the grandmaster changes DURING the master's own PTP outage,
     the observed shift also contains the master's untracked free-run error; it had no PTP to
-    measure it. Followers take that as one small late step (bench: < 1 ms, asserted). Only a
-    follower's continuous line knows the exact shift.
+    measure it. That error is about (held-frequency error) × (outage length): about 100 µs for
+    the bench's 30 min outage holding the learned integrator, and ms for a multi-hour one.
+    Followers take it at their next poll, as one late step above the 100 µs absorb tolerance or
+    as an absorb the phase lock slews out in ~2 min. Only a follower's continuous line knows the
+    exact shift.
 - **A master's local step drops its own SCHEDULED step** (`cancel_pending`, it re-aligns
   anyway). A FOLLOWER's local step keeps it: its NTP source is the master, whose wall has not
   stepped yet. `DateFollower::forget` (authority loss) also KEEPS a scheduled step, since the
   rest of the fleet applies it.
-- **No PTP, no phase lock:** a PTP-offline box disengages the core and hands the learned
-  frequency to the rate servo. The next locked window re-engages and is `Realigned` if the wall
+- **No PTP, no phase lock (rounds 3-4):** on the offline EDGE a box drops every pre-outage
+  measurement: both windows, pending syncs, the rate tracker, and the PI's `dt` base. Otherwise a
+  pre-outage median hides the free-run (e = 0) and it is slewed for minutes. It also disengages
+  the core and APPLIES the learned integrator (not the last word with its P term). The next
+  window, which holds only post-outage samples, re-engages and is `Realigned` if the wall
   free-ran > 1 ms.
+- **Publish immediately what the 31900 server serves (round 4).** The time server reads the
+  status SNAPSHOT at reply time. An off-line master's announce, or its local step, must call
+  `update_shared_status` at once. The 10 s `tick_status` comes after the 5 s lead, so waiting
+  for it made followers step late. The bench models the snapshot and its publish points so this
+  class stays covered.
 - **Whole-fleet PTP loss (accepted):** every box runs the local NTP path against the master. When
   PTP returns, each re-joins the fleet line at its own poll: an uncoordinated step of at most
   the fleet's UTC error (≤ 50 ms), then coherent again.
