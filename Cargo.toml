@@ -16,7 +16,7 @@ serde_json = "1.0"
 
 [package]
 name = "dantesync"
-version = "1.8.54"
+version = "1.9.0"
 edition = "2021"
 description = "High-precision PTP synchronization for Dante Audio networks"
 license = "MIT"
@@ -62,7 +62,6 @@ sd-notify = "0.4"
 
 [dev-dependencies]
 mockall = "0.12"
-rand = "0.9.2"
 tempfile = "3.10"
 
 [[bin]]

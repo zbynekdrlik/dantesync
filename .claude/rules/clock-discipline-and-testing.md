@@ -4,6 +4,15 @@ paths:
   - "src/ntp.rs"
   - "src/ntp_server.rs"
   - "src/status.rs"
+  - "src/ptp_phase_lock.rs"
+  - "src/date_offset.rs"
+  - "src/time_server.rs"
+  - "src/controller/date_sync.rs"
+  - "src/controller/date_sync/tests.rs"
+  - "src/date_offset/tests.rs"
+  - "src/time_server/tests.rs"
+  - "tests/two_clock_bench.rs"
+  - "tests/simulation_e2e.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -64,6 +73,8 @@ variance-derived threshold on a new signal, ask whether that signal is noise or 
 
 ## In this architecture, "slew" can only mean small frequent steps
 
+> LEGACY discipline only since #117 — see "#117 — the old PTP servo was RATE-ONLY" below.
+
 PTP owns frequency (`adjust_frequency`) and re-measures phase against the Dante GM every 125 ms. Any
 frequency offset injected to correct UTC phase is read back by the PTP servo as drift and cancelled
 within seconds — the two loops fight and the casualty is the <50 µs precision target. A UTC
@@ -91,6 +102,177 @@ Stepping itself is safe for PTP: the existing post-step machinery (2 s grace, `s
 the fleet one or two client intervals later, so its SIZE is a fleet-coherence budget, not a private
 matter. (#97's slew avoids the step entirely for a sub-50ms error while locked — no propagated step,
 no grace transient — but keeps the step path for cold boot / |e|>50ms / acquisition / PTP-offline.)
+
+## #117 — the old PTP servo was RATE-ONLY; the phase lock is the default now
+
+**Finding (25.9.2026, the anchors of the #117 design question).** Until #117 the "PTP servo" in
+`apply_self_tuning_servo` controlled only `d(offset)/dt`: a P term on the RATE plus an integrator
+into `drift_baseline_ppm`. The offset it differentiated was the mod-1 s display phase
+(`calculate_phase_offset`), and `initial_epoch_offset_ns` was **written once and never read**. So
+nothing held the absolute offset between the box and the grandmaster, and NANO mode additionally
+ignored any rate below `NANO_DEADBAND_US` (0.1 µs/s, i.e. up to 360 µs/h of free drift). Two boxes
+"locked to the same rate" therefore random-walked apart, and all cross-box wall agreement was
+really held by NTP: first by steps (the #67/#83/#88 step storms and chases), then by #97's
+`phase_slew`, which did it by steering the RATE up to ±5-19 ppm away from the Dante tick. That
+last part is the contract violation #117 removes (owner: RATE = the Dante PTP tick only, NTP =
+date stepping only).
+
+**What replaced it (`system.clock_discipline = "ptp_phase_lock"`, the default):**
+
+- `src/ptp_phase_lock.rs`: ONE PI on `e = (t2 − t1) − D` (the raw offset between the two time
+  bases, not the mod-1 s phase and not calibration-corrected). It gives rate AND phase from the same
+  PTP measurement. The rate servo still does acquisition; once PTP-locked the PI takes the
+  frequency word bumplessly. Its `dt` is measured in grandmaster time (`t1`), so loop scheduling
+  and the daemon's own wall steps cannot distort it. Critically damped, ~100 s: Kp 0.02/s,
+  Ki = Kp²/4.
+- `D` (the fleet date offset, `wall = PTP time + D`) is anchored at the first lock, re-anchored
+  from the continuous wall on a grandmaster / sync-source change or a > 1 s time-base jump (a GM
+  reboot restarts its uptime under the same UUID), and shifted by exactly every applied step.
+- `src/date_offset.rs` (#88): only the NTP master reads UTC. It announces a new `D` when
+  |UTC − wall| > 50 ms (2 agreeing readings), ≥ 5 s ahead, in the versioned 31900 extension. Every
+  box, the master included, applies it at that instant through `DateFollower`.
+
+**The decoupling statement (this rule's standing requirement for any loop on this clock).** There
+is no second loop to decouple: the phase lock is the only frequency law once locked, and no
+argument of `PhaseLockCore::on_window` carries NTP. The only NTP-derived quantity is `D`. `D`
+changes either by a STEP of the wall of exactly the same size at the same instant (`note_step`,
+which leaves `e` untouched) or by an absorb of ≤ 100 µs at join time. So NTP contributes nothing
+to the rate. For the frequency LAW this is shown by running, not argued: `tests/two_clock_bench.rs`
+runs the same PTP world under two different UTC drifts (+8 / −15 ppm vs the GM) and asserts every
+box's frequency command sequence is **bit-identical** between the two runs. A future change that
+leaks any NTP term into the law fails that assertion. Scope it honestly: the bench drives the
+pure modules with the controller's glue mirrored. The controller additionally drops 2 s of PTP
+windows after every step (holding the word). Those holds fall at UTC-dependent times, so the
+controller's words are NOT bit-identical across UTC scenarios. The hold carries no NTP value,
+though, and the bench's `with_grace` variant shows every envelope still holds.
+
+**Cross-box agreement = per-box receive-latency ASYMMETRY.** Every box holds the raw `t2 − t1`
+equal to the same `D`, so each wall sits its own one-way PTP latency (network + software
+timestamp) behind the grandmaster line. The bench's < 100 µs uses a 25-58 µs delay spread.
+The live Windows-Npcap vs Linux-kernel timestamp-latency spread is NOT measured yet. The
+canary must read it: compare the boxes' 31900 wall readings, or the camera-box genlock audit.
+There is no per-box latency calibration; add one only if the canary shows the spread matters.
+
+**Lessons from the #117 review (each is a test now):**
+
+- **A published `D` must name its time base.** The extension carries the ANCHOR's grandmaster,
+  never "the one I hear now". During a GM change those differ for a window, and a box that
+  re-anchored first would otherwise adopt a days-wrong offset. Nothing is published while a
+  re-anchor is pending.
+- **The UUID is not enough: check the time base.** A grandmaster that REBOOTS keeps its UUID and
+  restarts its uptime. `date_offset::same_time_base` compares both nodes' PTP "now"
+  (`wall − D`, independent of either wall's error). The bench's negative control, with the check
+  removed, shows walls ~11.7 days apart.
+- **Offsets that take effect "now" are backdated 1 s** (`IMMEDIATE_BACKDATE_NS`). Otherwise a
+  follower whose PTP view trails by µs reads a rebase as a pending step and schedules a µs step.
+- **A follower must be able to STOP following.** After 30 s with no applicable reply it forgets
+  the authority and returns to the local NTP date path. Otherwise a silent master leaves it
+  drifting at the GM-vs-UTC rate while it still reports "follower".
+- **Take PTP "now" from the D IN EFFECT, never from the published D (round 2).** The published D
+  carries a pending step, and an announced step is larger than the step bound by construction
+  with no upper limit. A master whose boot NTP failed announces seconds. So the extension carries
+  the replier's own `now_ptp_ns = wall − D in effect`, and `same_time_base` compares that. The
+  bench's `3 s first step` scenario was RED with the published D.
+- **One box's fault never moves the fleet D (round 2).** While ONLY the master lacks PTP, it
+  runs the local NTP path on its own wall and D. The authority keeps publishing the fleet D,
+  moved only by coordinated announces (see the round-3 fleet-line feed below). Followers hold the
+  fleet line, and none of the master's own steps reaches them. Once its PTP is
+  back, the master steps its OWN wall onto the fleet line (`realign_master_to_fleet`: one Join,
+  which also removes the phase error the outage left, measured on a window taken after PTP
+  returned). A failed step on the master works the same way: the fleet D stays, the master
+  retries after a 10 s backoff (it keeps feeding the fleet line's UTC error meanwhile). A
+  re-engagement > 1 ms off `D` is `Realigned` (same base, the wall wandered) and is never
+  `Rebased` (which is a new time base, and the only event that moves the fleet D without a
+  step). An earlier fix moved the fleet D with the master's local steps; the `master-only
+  outage` scenario showed it reaching every follower as a late step (walls 821 µs apart).
+- **The authority is fed the FLEET line's UTC error, not the master's own (round 3).** It is
+  `reading + (anchor − fleet)`, fed even while ONLY the master lacks PTP. Otherwise a long outage
+  freezes the fleet D: +8 ppm is 29 ms/h, and the 3 h bench scenario breached the bound (a
+  94 ms catch-up). An off-line master announces for the fleet but does not schedule the step
+  for its own wall (it re-aligns later). The only error left is its free-run drift, ≪ the bound.
+- **A rebase shifts the fleet D by the observed BASE SHIFT** (`fleet_old + (new − old)`), never
+  onto the master's own anchor. That anchor may be off the fleet line, and folding its offset in
+  reached followers as a step (round 3, RED).
+  - **Known double-fault limit:** if the grandmaster changes DURING the master's own PTP outage,
+    the observed shift also contains the master's untracked free-run error; it had no PTP to
+    measure it. That error is about (held-frequency error) × (outage length): about 100 µs for
+    the bench's 30 min outage holding the learned integrator, and ms for a multi-hour one.
+    Followers take it at their next poll, as one late step above the 100 µs absorb tolerance or
+    as an absorb the phase lock slews out in ~2 min. Only a follower's continuous line knows the
+    exact shift.
+- **A master's local step drops its own SCHEDULED step** (`cancel_pending`, it re-aligns
+  anyway). A FOLLOWER's local step keeps it: its NTP source is the master, whose wall has not
+  stepped yet. `DateFollower::forget` (authority loss) also KEEPS a scheduled step, since the
+  rest of the fleet applies it.
+- **No PTP, no phase lock (rounds 3-4):** on the offline EDGE a box drops every pre-outage
+  measurement: both windows, pending syncs, the rate tracker, and the PI's `dt` base. Otherwise a
+  pre-outage median hides the free-run (e = 0) and it is slewed for minutes. It also disengages
+  the core and APPLIES the learned integrator (not the last word with its P term). The next
+  window, which holds only post-outage samples, re-engages and is `Realigned` if the wall
+  free-ran > 1 ms.
+- **Publish immediately what the 31900 server serves (round 4).** The time server reads the
+  status SNAPSHOT at reply time. An off-line master's announce, or its local step, must call
+  `update_shared_status` at once. The 10 s `tick_status` comes after the 5 s lead, so waiting
+  for it made followers step late. The bench models the snapshot and its publish points so this
+  class stays covered.
+- **A `"DSYX"` request is padded to 64 bytes; a shorter one is ignored (round 5).** The extended
+  reply is 104 bytes. Answering an 8-byte request would make every spoofed one a 13x amplifier;
+  a request the size of the base reply keeps the ratio at ~1.6. `"DSYN"` is unchanged (8 bytes,
+  64-byte reply, the pre-existing 8x). The cost (round 6): an OLD Windows server reads into an
+  8-byte buffer, so the padded datagram fails its `recv_from` with `WSAEMSGSIZE` and it logs a
+  socket error per poll. The rollout upgrades the NTP master right after the canary
+  (`.claude/skills/dantesync-deployment.md`, step 4).
+- **The authority poller backs off only for a host that NEVER answered (rounds 5-6).** After 60
+  unanswered polls such a host (a public NTP server, an older master, a firewall) is polled every
+  30 s; its first reply restores 1 s for good. A host that answered once is never slowed: after a
+  reboot it may announce a step 5 s ahead, and a 30 s poll would hear it after the instant (a
+  late step). Pinned: `PollBackoff` tests assert the poll stays ≤ `MIN_STEP_LEAD_NS / 2` once
+  answered.
+- **Whole-fleet PTP loss (accepted):** every box runs the local NTP path against the master. When
+  PTP returns, each re-joins the fleet line at its own poll: an uncoordinated step of at most
+  the fleet's UTC error (≤ 50 ms), then coherent again.
+- **"late" counts real misses only in normal operation.** It also counts the double fault above
+  and a GM-change re-anchor residual > 100 µs. It is a health counter, and over-counting is the
+  conservative side.
+- The follower still publishes its adaptive `ntp_step_threshold_us`. Its `ntp_offset_us` is now
+  a µs-level health signal against the master, and ≥ 500 µs is the right envelope to grade it.
+  Only the master's UTC error uses the 50 ms authority bound.
+
+**Consequences for code and tests here:**
+
+- The old "In this architecture, 'slew' can only mean small frequent steps" section above
+  describes the LEGACY discipline. Under the phase lock a follower never steps on its own NTP
+  reading; the master never steps at NTP time. `phase_slew` exists only under
+  `clock_discipline = "legacy"` (the #97/#105 tests pin that explicitly).
+- Without an authority (an older master that ignores `"DSYX"`, a grandmaster the master is not
+  on, PTP offline) a box keeps the existing NTP step path as its LOCAL date fallback, with a
+  pure-PTP rate. That is the canary-safe path. Each local step shifts `D` with the wall.
+- A bench/sim clock must keep its steps APART from the oscillator-driven reading
+  (`wall = continuous + stepped`). Folding a step into an integer-ns clock with a fractional
+  carry perturbs the carry, which makes two runs that step at different times diverge in the last
+  bit. That is a false failure of the decoupling assertion (hit while building the bench).
+- Test a scheduled step's SIMULTANEITY by its landing instant (resolved inside the window), not
+  by sampling at window boundaries. An announce's instant is computed on the master's own window
+  grid, so it lands within µs of a boundary by construction, and boundary sampling reports a
+  spurious 50 ms "disagreement" for the few µs the step is genuinely in flight.
+- In the controller, the step lands within one loop iteration of its instant (1 ms Linux /
+  50 µs Windows) plus the cross-box wall disagreement (µs). For that window the fleet genuinely
+  differs by the step size. It is the only disagreement a coordinated step leaves.
+
+## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
+
+`tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, and its high-jitter test
+asserts an AVERAGE drift rate (< 150 µs/s), a statistic of that noise. Over 60 seeds its RMS is
+~50 µs/s, so the bound sat at about 3σ and roughly one CI run in a few hundred went red for no code
+change (CI run 36182967772: 155 µs/s). Round 5 of #117 gave every test thread a fixed xorshift64*
+seed and runs the high-jitter scenario over eight fixed seeds (the worst must pass), in parallel
+because each run sleeps ~36 s of wall time. The bound did not move. Rules:
+
+- Never widen the bound and never "re-run until green". Reproduce the failure over many seeds on
+  `origin/master` AND the branch first, to tell a code regression from test noise.
+- One fixed seed proves the bound for ONE noise sample. When the assertion is a statistic, run
+  several seeds and assert the worst.
+- A bench's own RNG (`tests/two_clock_bench.rs`) was seeded from the start. Keep it that way.
 
 ## `Instant` vs `SystemTime` — this daemon steps its own wall clock
 
@@ -348,6 +530,17 @@ compile, type-check, or test-run path whatsoever.
 a purely SYNTACTIC tool — it parses every file (following `#[cfg] mod` paths, so it even checks
 Windows-only code), catching a stray brace / broken literal / bad token, but it does NOT type-check.
 Run `cargo fmt --all` then `cargo fmt --all --check` after every edit as your parse-check.
+
+**A second local net: a standalone `rustc` REPLICA (round 5 of #117).** The hook keys on `cargo`;
+plain `rustc` on a scratch file is not a cargo shape. A PURE module (`date_offset.rs`,
+`ptp_phase_lock.rs`, the bench, `time_server.rs` with `log`/`anyhow`/`libc`/`uuid` stubbed) compiles
+and runs its own tests as `rustc --edition 2021 --test`, from a wrapper `mod dantesync { pub mod
+date_offset; … }` in a scratch dir laid out like `src/` (symlinks keep `mod tests;` sibling files
+resolving). Even the CONTROLLER runs this way: strip `serde`, stub the external crates, and drive
+`tests/simulation_e2e.rs` as a binary. That is how the round-5 CI red was diagnosed: the same
+seeds gave the same result on `origin/master`, on the branch and on the branch in legacy mode, so
+the failure was the test's own unseeded noise, not the change. Replica results are evidence, not
+proof: CI still type-checks and runs the real crate.
 
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually

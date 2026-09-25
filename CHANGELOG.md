@@ -5,6 +5,64 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-09-25
+
+### Changed
+
+- **PTP phase lock: rate AND phase from the Dante grandmaster, NTP only moves the date (issue
+  #117), the new DEFAULT (`system.clock_discipline = "ptp_phase_lock"`).** The old PTP servo was
+  rate-only (`initial_epoch_offset_ns` was never read, NANO ignored < 0.1 µs/s), so cross-box wall
+  agreement was held by NTP, which since #97's `phase_slew` steered the RATE up to ±5-19 ppm away
+  from the Dante tick. New `src/ptp_phase_lock.rs`: once PTP-locked, a critically-damped PI on
+  `e = (t2 − t1) − D` owns the frequency word, taken over bumplessly from the rate servo. `D` is
+  re-anchored with no wall step on a grandmaster change. `phase_slew` is ignored (with a warning)
+  under the phase lock; `clock_discipline = "legacy"` restores the pre-1.9.0 behaviour.
+
+### Added
+
+- **Fleet date-offset authority + coordinated steps (issue #88).** New `src/date_offset.rs`: only
+  the NTP master reads UTC. It announces a new `D` when |UTC − wall| > 50 ms (2 agreeing readings)
+  with an effective instant ≥ 5 s ahead, and every box, the master included, steps at exactly
+  that instant. The announce rides a versioned extension of the UDP 31900 time-query reply,
+  requested with `"DSYX"` (zero-padded to 64 bytes, so the 104-byte reply never amplifies it; a
+  shorter `"DSYX"` is ignored). A `"DSYN"` request still gets the byte-identical 64-byte reply, and
+  an older server never answers `"DSYX"`, so a new box on an old master keeps its local NTP date
+  path. An older WINDOWS master logs a socket error per such poll (its 8-byte read buffer fails
+  the padded request), so the NTP master is upgraded right after the canary
+  (`.claude/skills/dantesync-deployment.md`, step 4). Followers poll their NTP server's
+  31900 once per second on a background thread; a host that has never answered is polled every
+  30 s after a minute. Tuning: `system.date_offset.{step_bound_ms, step_lead_ms}`.
+- `/status` (additive): `clock_discipline`, `rate_source`, `ptp_phase_locked`,
+  `ptp_phase_error_us`, `date_authority`, `date_offset_ns`, `date_offset_seq`,
+  `date_offset_effective_ptp_ns`, `date_step_pending_ns`, `date_step_due_in_ms`,
+  `date_offset_error_ms`, `date_step_bound_ms`, `last_date_step_{ns,ts,kind}`, `date_steps_late`.
+  On the master, `ntp_deadband_us` / `ntp_step_threshold_us` report the authority bound.
+- `tests/two_clock_bench.rs`: 6 boxes, a grandmaster change (the master notices it last) and a
+  reboot of the new grandmaster under the same UUID (the master notices it first), UTC at +8 /
+  −15 ppm vs the GM, 24 simulated hours, with and without the controller's 2 s post-step grace,
+  run on the production pure modules, plus a 3 s first step, master-only PTP outages (10 min,
+  3 h) and a grandmaster change during one. Walls agree within 54 µs (with a 33 µs path-delay
+  spread; the live latency spread is still to be measured by the canary), and within 155 µs while
+  the fleet settles that double fault (bounded at 300 µs). The rate matches the current GM
+  within 0.002 ppm per hour. Every date step is coordinated (landing spread ≤ 41 µs, 0 late), no
+  step happens at a grandmaster change or reboot, and replies in another time base are refused.
+  The frequency LAW's commands are bit-identical across the two UTC scenarios.
+- Safety of the announce: the extension names the anchor's grandmaster and carries the
+  replier's PTP "now" (from its D in effect). A follower adopts only in the same PTP time base
+  (`same_time_base`), and only replies from the polled address with an unpredictable request id
+  are accepted. A follower returns to the local NTP path after 30 s without an applicable reply,
+  keeping any step it already scheduled. One box's fault never moves the fleet D: a master
+  without PTP runs its local NTP path on its own wall, then steps back onto the fleet line when
+  PTP returns, and a failed master step is retried after a 10 s backoff.
+
+### Fixed
+
+- `tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, so its high-jitter
+  average-rate assertion (a statistic of that noise, bound at about 3σ) failed at random, for no
+  code change. Every test thread now uses a fixed xorshift64* seed, the high-jitter scenario runs
+  eight fixed seeds and asserts the worst, and the bound is unchanged. `rand` is no longer a
+  dev-dependency.
+
 ## [1.8.47] - 2026-08-19
 
 ### Added

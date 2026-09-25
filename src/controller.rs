@@ -17,6 +17,7 @@ use crate::phase_slew::{self, PhaseSlewOutput, PhaseSlewServo};
 use crate::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header, PtpV1SyncMessageBody};
 use crate::spike_filter::{FilterMode, JitterEstimator, SpikeFilter};
 use crate::status::SyncStatus;
+use crate::time_server::DateAuthoritySource;
 use crate::traits::{NtpSource, PtpNetwork};
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -24,9 +25,24 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+/// dantesync#117 / #88 — the PTP phase lock and fleet date-offset glue (the frequency word once
+/// locked, the NTP master's authority, a follower's poll/join/schedule, the coordinated step, the
+/// status fields). A child module so it can reach the controller's private state without growing
+/// this file; its state is the one `date_sync` field.
+mod date_sync;
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/// dantesync#117/#88 — the wall clock now, ns since the Unix epoch. `t2` (the PTP receive time)
+/// is on this same clock, so `wall − D` is this box's view of the grandmaster's PTP time.
+fn wall_now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
 
 /// Format a 6-byte UUID/MAC as a readable string (e.g., "00:1D:C1:AB:CD:EF")
 fn format_mac(uuid: &[u8; 6]) -> String {
@@ -816,6 +832,11 @@ where
     /// persistent not-locked spell, e.g. a GM changeover where the true DC may have changed) the
     /// controller does a FULL reset instead of preserving. Reset to 0 whenever a slew succeeds.
     phase_slew_preserve_streak: u32,
+
+    /// dantesync#117 / #88 — the PTP phase lock and the fleet date offset (the anchor `D`, the
+    /// authority on the NTP master, a follower's scheduler and poll source). One sub-struct, owned
+    /// by `controller/date_sync.rs`.
+    date_sync: date_sync::DateSync,
 }
 
 struct PendingSync {
@@ -845,6 +866,9 @@ where
         let calibration_complete = calibration_count == 0;
         // #97: read the flag before `config` is moved into the struct below.
         let config_phase_slew_enabled = config.phase_slew.enabled;
+
+        // #117: the clock discipline (logged); phase_slew survives only under "legacy".
+        let date_sync = date_sync::DateSync::new(&config, window_size);
 
         // #114: read the alarm cadence before `config` is moved. The effective
         // (floored) value is published in /status; the raw value is floored again
@@ -988,7 +1012,7 @@ where
             // #679 — throttled drift summary log counter
             drift_log_sample_count: 0,
             // #97 — phase-slew servo; Some only when the flag is set, so None = pre-#97 behaviour
-            phase_slew: if config_phase_slew_enabled {
+            phase_slew: if config_phase_slew_enabled && !date_sync.enabled {
                 info!("[PHASE-SLEW] enabled — sub-50ms UTC errors will SLEW (bounded PI servo, feed-forward decoupled), not step");
                 Some(PhaseSlewServo::new())
             } else {
@@ -1000,6 +1024,7 @@ where
             last_phase_slew_update: None,
             phase_slew_alarm_active: false,
             phase_slew_preserve_streak: 0,
+            date_sync,
         }
     }
 
@@ -1009,6 +1034,18 @@ where
 
     pub fn get_status_shared(&self) -> Arc<RwLock<SyncStatus>> {
         self.status_shared.clone()
+    }
+
+    /// #117: true unless `system.clock_discipline = "legacy"`.
+    pub fn phase_lock_enabled(&self) -> bool {
+        self.date_sync.enabled
+    }
+
+    /// #88: where this node reads its master's date-offset announce. `main` wires the UDP poller
+    /// on every non-master node; the master (and a test that wants no authority) keeps the default
+    /// `NoAuthority`.
+    pub fn set_date_authority_source(&mut self, source: Box<dyn DateAuthoritySource>) {
+        self.date_sync.source = source;
     }
 
     /// #68 — record a SUCCESSFUL upstream measurement: publish it to
@@ -1193,6 +1230,9 @@ where
                     info!("[PTP] Continuing with NTP-only time sync");
                     self.ptp_offline_logged = true;
                 }
+                // #117: drop every pre-outage measurement and hold the phase lock's learned
+                // frequency through the free-run (a no-op under the legacy discipline).
+                self.on_ptp_offline_edge();
                 // Update status to reflect offline state
                 if let Ok(mut status) = self.status_shared.write() {
                     status.settled = false;
@@ -1279,6 +1319,13 @@ where
                 self.ntp_offset_samples.push_back(offset_us);
                 if self.ntp_offset_samples.len() > NTP_SAMPLE_COUNT + 2 {
                     self.ntp_offset_samples.pop_front();
+                }
+
+                // #117 / #88: under the PTP phase lock NTP never steers the rate, and once this node
+                // has a date authority it never steps the clock on its own either — the master
+                // turns its UTC error into a coordinated announce, a follower only watches.
+                if self.ntp_under_date_authority(offset_us) {
+                    return;
                 }
 
                 // #97: PHASE SLEW. While genuinely PTP-locked, a small (<50ms) UTC error is
@@ -1509,23 +1556,14 @@ where
                         if !(locked_now && step_us != offset_us) {
                             self.ntp_server_checks_since_step = 0;
                         }
-                        // Clear PTP sample window to discard post-step transient samples
-                        self.sample_window.clear();
-                        // Set grace period to skip PTP samples for 2s after step
-                        self.last_ntp_step = Some(Instant::now());
-                        // Reset drift tracking to avoid false spike from step
-                        self.last_offset_us = None;
-                        self.last_offset_time = None;
-                        // Reset prev timestamps so min_delta filter works correctly after grace period
-                        self.prev_t1_ns = 0;
-                        self.prev_t2_ns = 0;
-                        // Clear spike filter to prevent false positives from step transient
-                        self.spike_filter.clear();
-                        // NOTE: jitter_estimator is NOT cleared on NTP step because
-                        // jitter is a hardware property that persists across steps
-                        // Reset accumulated phase error - we just aligned to UTC
-                        self.accumulated_phase_error_us = 0.0;
-                        self.last_phase_accumulation_time = None;
+                        // Discard the post-step transient from every PTP measurement path.
+                        self.reset_ptp_measurement_after_step();
+                        // #117: a step moves the wall, so D moves with it (the phase lock sees no
+                        // disturbance) — this is the LOCAL date path (no authority heard, or PTP
+                        // offline). It never moves the FLEET date offset (see date_sync.rs).
+                        if self.date_sync.enabled {
+                            self.note_local_date_step(step_us.saturating_mul(1_000));
+                        }
                         // #68: publish what REMAINS, not the error just cancelled
                         // (0 for a full step, the remainder for a bounded one).
                         self.publish_post_step_residual(offset_us - step_us);
@@ -1668,6 +1706,36 @@ where
         // dt stays the real elapsed time.
         // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
         self.phase_slew_alarm_active = false;
+    }
+
+    // ========================================================================
+    // FLEET DATE OFFSET (dantesync#88) + PTP PHASE LOCK ANCHOR (#117)
+    // ========================================================================
+
+    /// Discard the transient a clock step leaves in every PTP measurement path: the sample
+    /// windows, the 2 s grace, the rate tracker, the min-delta filter and the spike filter.
+    /// Shared by the NTP step path and the coordinated date step, so both reset identically.
+    fn reset_ptp_measurement_after_step(&mut self) {
+        // Clear PTP sample windows to discard post-step transient samples
+        self.sample_window.clear();
+        self.date_sync.window.clear();
+        self.date_sync.pending_median_ns = None;
+        self.date_sync.fresh_window = false;
+        // Set grace period to skip PTP samples for 2s after step
+        self.last_ntp_step = Some(Instant::now());
+        // Reset drift tracking to avoid false spike from step
+        self.last_offset_us = None;
+        self.last_offset_time = None;
+        // Reset prev timestamps so min_delta filter works correctly after grace period
+        self.prev_t1_ns = 0;
+        self.prev_t2_ns = 0;
+        // Clear spike filter to prevent false positives from step transient
+        self.spike_filter.clear();
+        // NOTE: jitter_estimator is NOT cleared on NTP step because
+        // jitter is a hardware property that persists across steps
+        // Reset accumulated phase error - we just aligned to UTC
+        self.accumulated_phase_error_us = 0.0;
+        self.last_phase_accumulation_time = None;
     }
 
     /// True while this node is the fleet's NTP server (#68).
@@ -2023,6 +2091,11 @@ where
         // Check PTP status first (handles timeout detection for NTP-only fallback)
         self.check_ptp_status();
 
+        // #88: apply a coordinated date step the moment its instant arrives, and follow the
+        // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
+        // step lands within one loop period of the announced instant on every box.
+        self.service_date_offset();
+
         let (buf, size, t2, source_ip) = match self.network.recv_packet()? {
             Some(res) => res,
             None => {
@@ -2149,6 +2222,8 @@ where
                 self.sample_window.clear();
                 self.prev_t1_ns = 0;
                 self.prev_t2_ns = 0;
+                // #117: a different sender may carry a different time base.
+                self.date_sync.on_time_base_change();
                 // Keep: applied_freq_ppm, drift_baseline_ppm (learned values)
                 // Stay in production mode - let servo naturally adjust if needed
                 info!(
@@ -2196,6 +2271,7 @@ where
                     );
                     self.current_gm_uuid = Some(new_uuid);
                     // Note: sync source change already did soft reset if needed
+                    self.on_grandmaster_uuid_change(); // #117: re-anchor D
                 }
                 None => {
                     info!("Grandmaster UUID: {}", format_mac(&new_uuid));
@@ -2345,6 +2421,7 @@ where
         // Collect sample if enough time has passed
         if self.should_add_sample(t1_ns) {
             self.sample_window.push(phase_offset_ns);
+            self.date_sync.push_raw_sample(t1_ns, t2_ns); // #117
         }
 
         // Process window when full - pass master time for drift calculation
@@ -2388,7 +2465,7 @@ where
     //
     // ========================================================================
 
-    fn process_sample_window(&mut self, _master_time_ns: i64) {
+    fn process_sample_window(&mut self, master_time_ns: i64) {
         let mut sorted = self.sample_window.clone();
         sorted.sort();
 
@@ -2406,6 +2483,8 @@ where
         );
 
         self.last_phase_offset_ns = offset_ns;
+
+        self.date_sync.close_raw_window(master_time_ns); // #117: the phase lock's window
 
         // Apply self-tuning servo
         self.apply_self_tuning_servo(offset_us);
@@ -2433,6 +2512,11 @@ where
         // - If offset is shrinking → local clock is too slow
         //
         // NTP handles UTC alignment separately. PTP only matches frequency.
+        //
+        // #117: under the PTP phase lock (the default) this rate servo only ACQUIRES; once
+        // PTP-locked, `crate::ptp_phase_lock` takes the frequency word from the phase error
+        // below. Taken first so a grace-period return discards it with the window.
+        let phase_median_ns = self.date_sync.pending_median_ns.take();
 
         // Skip correction during post-step grace period
         if let Some(step_time) = self.last_ntp_step {
@@ -2684,10 +2768,14 @@ where
             }
         }
 
-        // Apply correction. `total_correction` is f_ptp — the PTP servo's own frequency word,
-        // computed from the DECOUPLED rate above (so its meaning, and `drift_ppm`, are unchanged).
-        self.last_adj_ppm = total_correction;
-        self.applied_freq_ppm = total_correction;
+        // #117: THE PTP PHASE LOCK owns the frequency word once PTP-locked (controller/date_sync.rs).
+        let applied_word = self.phase_lock_word(phase_median_ns, total_correction, dt_secs);
+
+        // Apply correction. `applied_word` is f_ptp — the PTP servo's own frequency word (the rate
+        // servo's `total_correction`, computed from the DECOUPLED rate above, or the #117 phase
+        // lock's word once engaged).
+        self.last_adj_ppm = applied_word;
+        self.applied_freq_ppm = applied_word;
 
         // #97: compose the ONE frequency word actually applied to the clock — f_total = f_ptp +
         // f_phase — through the SAME `adjust_frequency` path on every platform (so the Windows
@@ -2695,9 +2783,9 @@ where
         // Then remember the applied f_phase for the NEXT interval's decoupling. When the servo is
         // disabled this is exactly `total_correction` and `last_applied_f_phase_ppm` stays 0.
         let f_total = if self.phase_slew.is_some() {
-            phase_slew::compose_frequency(total_correction, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
+            phase_slew::compose_frequency(applied_word, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
         } else {
-            total_correction
+            applied_word
         };
         self.last_applied_f_phase_ppm = if self.phase_slew.is_some() {
             self.pending_f_phase_ppm
@@ -2730,14 +2818,15 @@ where
                 let drift_ns = rate_ppm * 1000.0; // Convert µs/s to ns/s
                 info!(
                     "[PTP] {:4}  Drift:{:+7.0}ns/s  Adj:{:+6.2}ppm",
-                    status, drift_ns, total_correction
+                    status, drift_ns, applied_word
                 );
             } else {
                 info!(
                     "[PTP] {:4}  Drift:{:+6.1}us/s  Adj:{:+6.1}ppm",
-                    status, rate_ppm, total_correction
+                    status, rate_ppm, applied_word
                 );
             }
+            self.log_phase_lock_word(applied_word);
         }
 
         if let Err(e) = self.clock.adjust_frequency(factor) {
@@ -2853,7 +2942,12 @@ where
             // #83: the currently-active step threshold, server mode only -- lets a
             // consumer grade ntp_offset_us against the box's OWN current tolerance
             // (a large deadband while genuinely PTP-locked) instead of a fixed bound.
-            status.ntp_deadband_us = if self.ntp_server_mode {
+            // #88: while this master is the date-offset authority its only step threshold is the
+            // authority's bound (it never steps on the tight NTP thresholds then).
+            let authority_active = self.date_authority_active();
+            status.ntp_deadband_us = if authority_active {
+                Some(self.date_sync.step_bound_ns / 1_000)
+            } else if self.ntp_server_mode {
                 Some(server_step_threshold_us(self.is_locked, self.ptp_offline))
             } else {
                 None
@@ -2865,7 +2959,9 @@ where
             // deliberately does NOT publish on a client (#83). Lets a HTTP-only consumer (a Windows
             // camera-box client with no journald) read its own step envelope for the step-aware
             // median+spread gate widening instead of falling back to a fixed guess (camera-box #1129).
-            status.ntp_step_threshold_us = Some(if self.ntp_server_mode {
+            status.ntp_step_threshold_us = Some(if authority_active {
+                self.date_sync.step_bound_ns / 1_000
+            } else if self.ntp_server_mode {
                 server_step_threshold_us(self.is_locked, self.ptp_offline)
             } else {
                 self.calculate_ntp_adaptive_threshold()
@@ -2918,6 +3014,9 @@ where
                 status.f_phase_i_ppm = self.pending_f_phase_ppm;
                 status.phase_slew_saturated = false;
             }
+
+            // #117 / #88: the discipline, the phase lock and the fleet date offset.
+            self.publish_date_status(&mut status);
         }
     }
 }
@@ -6581,6 +6680,8 @@ mod tests {
 
     fn slew_config() -> SystemConfig {
         let mut config = SystemConfig::default();
+        // #117: phase_slew (NTP in the rate path) exists only under the legacy discipline.
+        config.clock_discipline = crate::config::CLOCK_DISCIPLINE_LEGACY.to_string();
         config.phase_slew.enabled = true;
         config.filters.calibration_samples = 0;
         config.filters.warmup_secs = 0.0;
@@ -6911,6 +7012,8 @@ mod tests {
         // chases the full 50ppm — the exact fight the decoupling exists to prevent.
         fn smoothed_after(decoupled: bool) -> f64 {
             let mut config = SystemConfig::default();
+            // #117: phase_slew exists only under the legacy discipline.
+            config.clock_discipline = crate::config::CLOCK_DISCIPLINE_LEGACY.to_string();
             config.phase_slew.enabled = decoupled;
             config.filters.calibration_samples = 0;
             config.filters.warmup_secs = 0.0;

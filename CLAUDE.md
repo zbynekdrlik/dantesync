@@ -113,7 +113,13 @@ is running.
 - Clock discipline + how to test a control loop (closed-loop mocks vs constant ones, MAD models
   jitter not a drift ramp, Instant vs SystemTime on a daemon that steps its own clock, the
   additive-only `/status` contract) → `.claude/rules/clock-discipline-and-testing.md`
-- Phase-slew PI servo (#97 — the feed-forward decoupling sign invariant, the deadbeat gain cap for
+- PTP phase lock + fleet date offset (#117/#88 — rate AND phase from PTP, the NTP master's
+  coordinated date announce on 31900, the decoupling proof by the bit-identical two-clock bench,
+  the local fallback, seeding every simulated noise source, the standalone-`rustc` replica as a
+  second local net) → `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
+  `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
+  `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)
+- Phase-slew PI servo (#97, LEGACY discipline only since #117 — the feed-forward decoupling sign invariant, the deadbeat gain cap for
   the client's slow cadence, the I-deadband, verify-by-simulation, the canary re-tighten proof) →
   `.claude/rules/phase-slew-servo.md` (auto-loads on `src/phase_slew.rs`)
 - Adding a config key (the `serde_json` `IndexMut` startup-panic trap, serde defaults, flooring
@@ -273,22 +279,23 @@ DanteSync is a high-precision PTP (Precision Time Protocol) synchronization tool
 
 **Dante PTP provides DEVICE UPTIME, not UTC time.** This is fundamental to the architecture:
 
-- Dante grandmaster clock uses device uptime (time since power-on), NOT real UTC
-- The PTP offset between local clock and Dante master is MEANINGLESS for absolute time
-- PTP is used ONLY for **frequency synchronization** (making clocks tick at the same rate)
-- NTP is used for **UTC phase alignment** (setting the correct absolute time)
+- The Dante grandmaster clock uses device uptime (time since power-on), NOT real UTC.
+- The owner contract (#117): **RATE = the Dante PTP tick only; NTP = date stepping only.**
 
-**Dual-Source Architecture:**
+**The default discipline (`system.clock_discipline = "ptp_phase_lock"`, #117 + #88):**
 
-1. **PTP (Dante)** → `adjust_frequency()` - controls clock tick rate
-2. **NTP (UTC)** → `step_clock()` - periodically corrects absolute time
+1. **PTP (Dante)** → `adjust_frequency()`: rate AND phase. Once PTP-locked, `src/ptp_phase_lock.rs`
+   holds `wall = PTP time + D` with a PI on `e = (t2 − t1) − D`. Every box ticks with the GM and
+   shows the same wall time (µs). A GM change re-anchors `D` with no wall step.
+2. **NTP (UTC)** → the fleet date offset `D` only. The NTP master alone reads UTC and is the
+   authority (`src/date_offset.rs`): when |UTC − wall| > 50 ms it announces a new `D`, ≥ 5 s ahead,
+   in the versioned extension of the UDP 31900 time-query reply. Every box `step_clock()`s at
+   exactly that instant. Followers never step on their own NTP reading.
 
-These operations are INDEPENDENT:
-
-- `step_clock()` sets absolute time value (does NOT affect frequency)
-- `adjust_frequency()` sets tick rate (does NOT affect absolute time)
-
-**PTP stepping has been removed from the codebase** - stepping based on Dante offset would desync from UTC. Only NTP steps the clock via `check_ntp_utc_tracking()`.
+Without an authority (older master, other grandmaster, PTP offline) a box falls back to the NTP
+step path for the date, still with a pure-PTP rate. `"legacy"` restores the pre-#117 rate-only
+servo + NTP steps + `phase_slew`. The old servo was rate-only and `initial_epoch_offset_ns` was
+never read: see `.claude/rules/clock-discipline-and-testing.md`.
 
 ### Sync Flow
 

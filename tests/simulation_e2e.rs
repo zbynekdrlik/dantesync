@@ -21,6 +21,40 @@ use std::time::{Duration, SystemTime};
 // - NTP handles UTC alignment separately
 // ============================================================================
 
+// --- Deterministic noise ---
+
+/// Fixed seed of the simulated PTP jitter. Every test thread starts from it, so a test's noise
+/// sequence does not depend on test order or on the run.
+///
+/// Why not an unseeded random source: the servo metrics these tests assert (e.g. the steady-state
+/// average drift rate under 1 ms jitter) are statistics of the noise. An unseeded run draws a new
+/// sample every CI run, so a bound that sits in the tail of that distribution fails at random, for
+/// no code change. Fixed seeds keep every bound as strict as before and make a red run
+/// reproducible; a test that wants the spread runs several seeds (see `reseed_sim_noise`).
+const SIM_NOISE_SEED: u64 = 0x5EED_0117_0088_2026;
+
+thread_local! {
+    static SIM_NOISE_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(SIM_NOISE_SEED) };
+}
+
+/// Restart this thread's noise from another fixed seed (never 0: xorshift64* would stay at 0).
+fn reseed_sim_noise(seed: u64) {
+    assert_ne!(seed, 0, "xorshift64* needs a non-zero seed");
+    SIM_NOISE_STATE.with(|state| state.set(seed));
+}
+
+/// Uniform sample in [0, 1) from a xorshift64* generator (53-bit mantissa).
+fn sim_uniform() -> f64 {
+    SIM_NOISE_STATE.with(|state| {
+        let mut x = state.get();
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        state.set(x);
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
 // --- Physics Engine ---
 
 struct PhysicsEngine {
@@ -115,9 +149,9 @@ impl PtpNetwork for StatefulNetwork {
         // Calculate T2 (Local Receive Time)
         let offset = phys.offset_ns + phys.step_offset_ns;
 
-        // Box-Muller Noise
-        let u1: f64 = rand::random();
-        let u2: f64 = rand::random();
+        // Box-Muller Noise, from the per-test deterministic generator (see `sim_uniform`).
+        let u1: f64 = sim_uniform();
+        let u2: f64 = sim_uniform();
         let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
         let noise = z0 * self.jitter_sigma_ns;
 
@@ -331,7 +365,11 @@ fn test_linux_stability_low_jitter() {
     );
 }
 
-/// Test rate-based servo stability with high jitter (Windows-like conditions)
+/// Test rate-based servo stability with high jitter (Windows-like conditions).
+///
+/// The average rate under 1 ms jitter is a statistic of the noise, so one fixed seed would prove
+/// the bound for one noise sample only. Eight fixed seeds (run in parallel: each run sleeps ~36 s)
+/// keep the check deterministic AND sample the spread; the WORST one must stay in the bound.
 #[test]
 fn test_windows_stability_high_jitter() {
     let mut config = SystemConfig::default();
@@ -342,26 +380,42 @@ fn test_windows_stability_high_jitter() {
     config.filters.sample_window_size = 4;
     config.filters.warmup_secs = 0.0;
 
-    // 1ms jitter, 50ppm drift - high but manageable conditions
-    // Reduced from 2ms/100ppm to be more reliable in CI environments
-    let result = run_simulation(config, 1_000_000.0, 50.0, 150);
+    let runs: Vec<(u64, SimulationResult)> = (1..=8u64)
+        .map(|k| {
+            let seed = SIM_NOISE_SEED ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let config = config.clone();
+            std::thread::spawn(move || {
+                reseed_sim_noise(seed);
+                // 1ms jitter, 50ppm drift - high but manageable conditions
+                (seed, run_simulation(config, 1_000_000.0, 50.0, 150))
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().expect("simulation thread"))
+        .collect();
 
-    println!(
-        "Windows Stable: AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
-        result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked
-    );
-    println!(
-        "  (Offset: Final={:.1}ms Max={:.1}ms - may drift, NTP handles UTC)",
-        result.final_offset_ns / 1_000_000.0,
-        result.max_offset_steady_ns / 1_000_000.0
-    );
-
-    // Relaxed threshold for high-jitter environment (CI VMs can have timing variance)
-    assert!(
-        result.avg_rate_us_per_s.abs() < 150.0,
-        "Average drift rate {:.2}us/s too high - servo unstable!",
-        result.avg_rate_us_per_s
-    );
+    for (seed, result) in &runs {
+        println!(
+            "Windows Stable (seed {:#018x}): AvgRate={:.2}us/s MaxRate={:.2}us/s Locked={}",
+            seed, result.avg_rate_us_per_s, result.max_rate_us_per_s, result.rate_locked
+        );
+        println!(
+            "  (Offset: Final={:.1}ms Max={:.1}ms - may drift, NTP handles UTC)",
+            result.final_offset_ns / 1_000_000.0,
+            result.max_offset_steady_ns / 1_000_000.0
+        );
+    }
+    // Every run, not a fold over them: a NaN rate must fail (a fold's `>` comparison skips it).
+    for (seed, result) in &runs {
+        // Relaxed threshold for high-jitter environment (CI VMs can have timing variance)
+        assert!(
+            result.avg_rate_us_per_s.abs() < 150.0,
+            "Average drift rate {:.2}us/s (seed {:#018x}) too high - servo unstable!",
+            result.avg_rate_us_per_s,
+            seed
+        );
+    }
 }
 
 /// Regression test: verify high-gain settings cause rate instability

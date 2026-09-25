@@ -246,6 +246,94 @@ pub struct SyncStatus {
     /// list is the loud, machine-readable "grandmaster name unresolvable" signal.
     #[serde(default)]
     pub gm_allowlist_unresolved: Vec<String>,
+
+    // ========================================================================
+    // Fleet date offset (dantesync#88) — additive; all default to the "no date
+    // authority known" reading so an old JSON blob still deserializes.
+    // ========================================================================
+    /// dantesync#88: this node's role for the fleet date offset `D` (wall = PTP time + D):
+    /// `"master"` = the NTP master, the single authority that announces `D`; `"follower"` =
+    /// aligned with the master's announced `D` (steps only at the announced instants);
+    /// `"local"` = PTP phase-locked but no authority heard yet (an older master, a grandmaster
+    /// mismatch, the master unreachable) — the date then follows this node's own NTP step path;
+    /// `""` = the legacy discipline, or not PTP-phase-locked yet.
+    #[serde(default)]
+    pub date_authority: String,
+
+    /// dantesync#88: `D` in effect on this node (ns), `null` until anchored.
+    #[serde(default)]
+    pub date_offset_ns: Option<i64>,
+
+    /// dantesync#88: the announce this node publishes (the master) or last aligned with (a
+    /// follower): its `seq` and its effective PTP instant. `null` until known.
+    #[serde(default)]
+    pub date_offset_seq: Option<u32>,
+    /// dantesync#88: the grandmaster whose PTP time base `date_offset_ns` belongs to (the anchor's
+    /// grandmaster — during a grandmaster change it can differ from `gm_uuid` for one window, and
+    /// is `null` then). `null` until anchored.
+    #[serde(default)]
+    pub date_offset_gm_uuid: Option<[u8; 6]>,
+    #[serde(default)]
+    pub date_offset_effective_ptp_ns: Option<i64>,
+
+    /// dantesync#88: a coordinated date step scheduled on this node: its size (ns) and the time
+    /// left until it applies (ms, negative = overdue). `null` when none is scheduled. On the
+    /// MASTER this is "the announced fleet D minus my own D": the pending step, or — while the
+    /// master's own wall is off the fleet line (its own PTP outage, a failed step) — the way back
+    /// to it, with a negative (overdue) due time until it re-aligns. `date_offset_ns +
+    /// date_step_pending_ns` is therefore always the D the 31900 extension publishes.
+    #[serde(default)]
+    pub date_step_pending_ns: Option<i64>,
+    #[serde(default)]
+    pub date_step_due_in_ms: Option<i64>,
+
+    /// dantesync#88: the FLEET line's UTC error (ms) as the master feeds its authority — its own
+    /// reading plus how far its own wall is off the fleet line (equal to its reading while on the
+    /// line) — and the bound (ms) past which it announces a step. `null` on a non-master.
+    #[serde(default)]
+    pub date_offset_error_ms: Option<f64>,
+    #[serde(default)]
+    pub date_step_bound_ms: Option<f64>,
+
+    /// dantesync#88: the last date step this node applied — size (ns), wall epoch second, and
+    /// kind (`"coordinated"`, `"join"`, `"late"`, `"local"`). `null`/empty until one happened.
+    #[serde(default)]
+    pub last_date_step_ns: Option<i64>,
+    #[serde(default)]
+    pub last_date_step_ts: Option<u64>,
+    #[serde(default)]
+    pub last_date_step_kind: String,
+
+    /// dantesync#88: announces this node heard only after their instant and applied late. In a
+    /// healthy fleet this stays 0 — every step lands at the announced instant on every box.
+    #[serde(default)]
+    pub date_steps_late: u32,
+
+    // ========================================================================
+    // PTP phase lock (dantesync#117) — additive.
+    // ========================================================================
+    /// dantesync#117: `"ptp_phase_lock"` (rate AND phase from the Dante grandmaster, NTP only
+    /// moves the date) or `"legacy"` (the pre-#117 rate-only servo + NTP steps / phase_slew).
+    /// Empty in a pre-#117 blob.
+    #[serde(default)]
+    pub clock_discipline: String,
+
+    /// dantesync#117: what steers the frequency word. `"ptp"` whenever NTP has no term in it (the
+    /// phase lock, or legacy with phase_slew off); `"ptp+ntp"` for legacy with phase_slew on (the
+    /// contract violation #117 removes). Empty in a pre-#117 blob.
+    #[serde(default)]
+    pub rate_source: String,
+
+    /// dantesync#117: true while the PTP phase lock owns the frequency word (engaged after PTP
+    /// lock; the rate servo holds it during acquisition).
+    #[serde(default)]
+    pub ptp_phase_locked: bool,
+
+    /// dantesync#117: the phase-lock error `e = (t2 − t1) − D` (µs) of the last PTP window;
+    /// `null` until anchored. This — not `ntp_offset_us` — is the node's lock quality against the
+    /// fleet time line.
+    #[serde(default)]
+    pub ptp_phase_error_us: Option<f64>,
 }
 
 fn default_clock_alarm_interval_s() -> u64 {
@@ -306,6 +394,25 @@ impl Default for SyncStatus {
             // #113: no resolved / unresolved hostnames by default
             gm_allowlist_resolved: Vec::new(),
             gm_allowlist_unresolved: Vec::new(),
+            // #88: no date authority known until the phase lock anchors
+            date_authority: String::new(),
+            date_offset_ns: None,
+            date_offset_seq: None,
+            date_offset_gm_uuid: None,
+            date_offset_effective_ptp_ns: None,
+            date_step_pending_ns: None,
+            date_step_due_in_ms: None,
+            date_offset_error_ms: None,
+            date_step_bound_ms: None,
+            last_date_step_ns: None,
+            last_date_step_ts: None,
+            last_date_step_kind: String::new(),
+            date_steps_late: 0,
+            // #117: unknown until the controller publishes
+            clock_discipline: String::new(),
+            rate_source: String::new(),
+            ptp_phase_locked: false,
+            ptp_phase_error_us: None,
         }
     }
 }
@@ -678,6 +785,56 @@ mod tests {
             back.gm_allowlist_unresolved,
             vec!["video-clock.lan".to_string()]
         );
+    }
+
+    /// dantesync#88: the date-offset fields are additive. A pre-#88 blob (today's live shape,
+    /// with the #113 fields) must still deserialize to "no authority known", and a master's
+    /// published state round-trips.
+    #[test]
+    fn test_sync_status_date_offset_fields_are_additive_88() {
+        let pre_88 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1786439763,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "ntp_spread_us":0,"ntp_sample_count":0,"pcap_ntp_active":false,"ntp_updated_ts":0,
+            "ntp_age_s":null,"ntp_deadband_us":1000,"ntp_steps_last_hour":0,"ntp_step_storm":false,
+            "phase_slew_enabled":true,"f_phase_ppm":-11.4,"gm_allowlist_resolved":[],
+            "gm_allowlist_unresolved":[]}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(pre_88).expect("pre-#88 JSON must still deserialize");
+        assert_eq!(restored.date_authority, "");
+        assert_eq!(restored.date_offset_ns, None);
+        assert_eq!(restored.date_offset_seq, None);
+        assert_eq!(restored.date_offset_gm_uuid, None);
+        assert_eq!(restored.date_step_pending_ns, None);
+        assert_eq!(restored.last_date_step_ts, None);
+        assert_eq!(restored.date_steps_late, 0);
+        assert_eq!(restored.clock_discipline, "");
+        assert_eq!(restored.rate_source, "");
+        assert!(!restored.ptp_phase_locked);
+        assert_eq!(restored.ptp_phase_error_us, None);
+
+        let master = SyncStatus {
+            date_authority: "master".to_string(),
+            date_offset_ns: Some(1_790_000_000_123_456_789),
+            date_offset_seq: Some(4),
+            date_offset_effective_ptp_ns: Some(98_765),
+            date_step_pending_ns: Some(-51_000_000),
+            date_step_due_in_ms: Some(4_200),
+            date_offset_error_ms: Some(-51.0),
+            date_step_bound_ms: Some(50.0),
+            last_date_step_ns: Some(50_500_000),
+            last_date_step_ts: Some(1_790_000_000),
+            last_date_step_kind: "coordinated".to_string(),
+            date_steps_late: 0,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&master).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(back.date_authority, "master");
+        assert_eq!(back.date_offset_ns, Some(1_790_000_000_123_456_789));
+        assert_eq!(back.date_offset_seq, Some(4));
+        assert_eq!(back.date_step_pending_ns, Some(-51_000_000));
+        assert_eq!(back.last_date_step_kind, "coordinated");
     }
 
     #[test]

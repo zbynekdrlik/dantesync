@@ -5,6 +5,11 @@ paths:
 
 # The phase-slew PI servo (#97) — before you touch the gains or the wiring
 
+> **#117: LEGACY-ONLY.** Under the default `system.clock_discipline = "ptp_phase_lock"` this servo
+> is never built (a config that still enables it gets a warning): NTP must not steer the rate
+> (owner contract). It survives only under `clock_discipline = "legacy"` for the rollout. The
+> phase lock that replaced it is `src/ptp_phase_lock.rs`; see `clock-discipline-and-testing.md`.
+
 `src/phase_slew.rs` is a bounded PI servo that corrects a small (<50ms) UTC phase error by a
 frequency SLEW composed with the PTP word (`f_total = f_ptp + f_phase`) instead of a step. It is
 **default OFF** (`system.phase_slew.enabled`); the canary rollout flips it per box. The controller
