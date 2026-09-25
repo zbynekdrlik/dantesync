@@ -406,21 +406,16 @@ fn test_windows_stability_high_jitter() {
             result.max_offset_steady_ns / 1_000_000.0
         );
     }
-    let (worst_seed, worst) = runs
-        .iter()
-        .map(|(seed, r)| (*seed, r.avg_rate_us_per_s))
-        .fold(
-            (0, 0.0f64),
-            |acc, x| if x.1.abs() > acc.1.abs() { x } else { acc },
+    // Every run, not a fold over them: a NaN rate must fail (a fold's `>` comparison skips it).
+    for (seed, result) in &runs {
+        // Relaxed threshold for high-jitter environment (CI VMs can have timing variance)
+        assert!(
+            result.avg_rate_us_per_s.abs() < 150.0,
+            "Average drift rate {:.2}us/s (seed {:#018x}) too high - servo unstable!",
+            result.avg_rate_us_per_s,
+            seed
         );
-
-    // Relaxed threshold for high-jitter environment (CI VMs can have timing variance)
-    assert!(
-        worst.abs() < 150.0,
-        "Average drift rate {:.2}us/s (seed {:#018x}) too high - servo unstable!",
-        worst,
-        worst_seed
-    );
+    }
 }
 
 /// Regression test: verify high-gain settings cause rate instability

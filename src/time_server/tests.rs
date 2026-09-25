@@ -276,6 +276,25 @@ fn the_poller_backs_off_after_a_minute_of_silence_and_recovers_on_a_reply_88() {
 }
 
 #[test]
+fn a_poller_whose_authority_ever_answered_never_backs_off_past_the_step_lead_88() {
+    // A master that answered and then went quiet (a host reboot, a network blip) may announce a
+    // step seconds after it is back: a follower polling every 30 s would hear it after its
+    // instant and step late. Only a host that NEVER answered DSYX (an older dantesync, a public
+    // NTP server) earns the slow cadence.
+    let mut b = PollBackoff::default();
+    b.on_reply();
+    for _ in 0..10_000 {
+        b.on_silence();
+    }
+    assert!(!b.backed_off());
+    assert!(
+        b.interval().as_nanos() as i64 <= crate::date_offset::MIN_STEP_LEAD_NS / 2,
+        "polls at least twice per minimum announce lead, got {:?}",
+        b.interval()
+    );
+}
+
+#[test]
 fn test_ext_request_magic() {
     assert_eq!(&REQUEST_MAGIC_EXT.to_be_bytes(), b"DSYX");
     let req = build_ext_request(0xDEADBEEF);
