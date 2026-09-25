@@ -241,12 +241,18 @@ fn build_response(request_id: u32, status: &SyncStatus) -> [u8; RESPONSE_SIZE] {
 /// the node has a date-offset state (not PTP-phase-locked yet, or the legacy discipline). The
 /// AUTHORITY flag is set only on the master — a follower mirrors its state for observability but
 /// must never be adopted by anyone.
+///
+/// `status.date_offset_ns` is the `D` IN EFFECT; while a coordinated step is scheduled
+/// (`date_step_pending_ns`), the published offset is the one it will take — `D + step` — with
+/// `date_offset_effective_ptp_ns` (the step's future instant). The controller writes the anchor
+/// and the pending step in ONE status update, so a reader never sees the step counted twice.
 fn date_extension_from_status(status: &SyncStatus) -> Option<DateExtension> {
+    let in_effect = status.date_offset_ns?;
     Some(DateExtension {
         version: crate::date_offset::EXT_VERSION,
         authority: status.date_authority == "master",
         announce: DateAnnounce {
-            date_offset_ns: status.date_offset_ns?,
+            date_offset_ns: in_effect.wrapping_add(status.date_step_pending_ns.unwrap_or(0)),
             effective_ptp_ns: status.date_offset_effective_ptp_ns?,
             seq: status.date_offset_seq?,
         },
@@ -403,7 +409,7 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
                         {
                             serial += 1;
                             reply.serial = serial;
-                            let has_ext = reply.ext.map(|e| e.authority).unwrap_or(false);
+                            let has_ext = reply.ext.is_some_and(|e| e.authority);
                             if had_ext != Some(has_ext) {
                                 if has_ext {
                                     info!(
@@ -785,6 +791,21 @@ mod tests {
             i32::from_be_bytes([old_view[56], old_view[57], old_view[58], old_view[59]]),
             -1234
         );
+    }
+
+    #[test]
+    fn a_pending_step_is_published_as_the_offset_it_will_take_88() {
+        let mut status = master_status();
+        status.date_step_pending_ns = Some(-51_000_000);
+        status.date_offset_effective_ptp_ns = Some(12_350_000_000_000);
+        status.date_offset_seq = Some(4);
+        let ext = date_extension_from_status(&status).unwrap();
+        assert_eq!(
+            ext.announce.date_offset_ns,
+            1_790_000_000_000_000_000 - 51_000_000
+        );
+        assert_eq!(ext.announce.effective_ptp_ns, 12_350_000_000_000);
+        assert_eq!(ext.announce.seq, 4);
     }
 
     #[test]
