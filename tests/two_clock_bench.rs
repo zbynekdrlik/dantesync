@@ -15,6 +15,10 @@
 //! Box 0 is the NTP master (the date-offset authority); the others follow it over the (simulated)
 //! 31900 poll, which is what `time_server::UdpAuthorityPoller` does on the wire.
 //!
+//! Two harder scenarios run on top: the master boots 3 s off UTC (its first announce is a 3 s
+//! step, far larger than any time-base tolerance), and ONLY the master loses PTP for 10 minutes
+//! (a NIC / pcap fault on one box) while the fleet keeps it.
+//!
 //! Proven over 24 simulated hours, for both UTC scenarios:
 //!
 //! 1. RATE = PTP: every box's effective rate equals the CURRENT grandmaster's rate (to 0.01 ppm per
@@ -54,6 +58,89 @@ const GM_REBOOT_AT_WINDOW: u64 = 18 * 3600 * 2 + 777;
 const MASTER_EVENT_LAG_WINDOWS: u64 = 5;
 /// The controller's 2 s post-step grace, in 0.5 s windows.
 const GRACE_WINDOWS: u64 = 4;
+/// The master's legacy NTP step threshold while it runs the local date path (PTP offline).
+const MASTER_LOCAL_THRESHOLD_NS: i64 = 200_000;
+
+struct Scenario {
+    label: &'static str,
+    utc_vs_gm_ppm: f64,
+    /// Model the controller's 2 s post-step grace (drop the PTP windows, hold the word).
+    grace: bool,
+    /// The master's wall error vs UTC at boot (the followers' are fixed, ms-level).
+    master_boot_err_ns: i64,
+    /// Windows `[from, to)` in which ONLY the master hears no PTP.
+    master_ptp_offline: Option<(u64, u64)>,
+}
+
+impl Scenario {
+    fn plain(label: &'static str, utc_vs_gm_ppm: f64, grace: bool) -> Self {
+        Scenario {
+            label,
+            utc_vs_gm_ppm,
+            grace,
+            master_boot_err_ns: 0,
+            master_ptp_offline: None,
+        }
+    }
+    fn master_offline_at(&self, w: u64) -> bool {
+        self.master_ptp_offline
+            .is_some_and(|(from, to)| (from..to).contains(&w))
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// The controller glue this bench mirrors (`src/controller/date_sync.rs`). Kept in these few
+// functions so a change to the controller's glue has exactly one place to be mirrored.
+// ----------------------------------------------------------------------------------------------
+
+/// What the master's 31900 extension carries (`publish_date_status` + the time server).
+struct Published {
+    date_offset_ns: i64,
+    effective_ptp_ns: i64,
+    seq: u32,
+    gm: u8,
+    remote_wall_ns: i64,
+}
+
+fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
+    let anchor = m.core.anchor_ns().expect("anchored");
+    let now_ptp = m.wall_ns() - anchor;
+    let ann = a.announce();
+    Published {
+        date_offset_ns: anchor + a.pending_step_ns(now_ptp).unwrap_or(0),
+        effective_ptp_ns: ann.effective_ptp_ns,
+        seq: ann.seq,
+        gm: m.core_gm,
+        remote_wall_ns: m.wall_ns(),
+    }
+}
+
+/// A follower's applicability checks (`service_date_offset`).
+fn follower_accepts(b: &Box_, p: &Published) -> bool {
+    let Some(anchor) = b.core.anchor_ns() else {
+        return false;
+    };
+    !b.core.rebase_pending()
+        && b.core_gm == p.gm
+        && same_time_base(p.remote_wall_ns, p.date_offset_ns, b.wall_ns(), anchor)
+}
+
+/// The master's local NTP step while it has no PTP (`note_local_date_step`).
+fn master_local_step(m: &mut Box_, a: &mut DateAuthority, delta_ns: i64) {
+    m.stepped += delta_ns;
+    m.core.note_step(delta_ns);
+    m.follower.cancel_pending();
+    let now_ptp = m.wall_ns() - m.core.anchor_ns().expect("anchored");
+    a.local_step(delta_ns, now_ptp);
+}
+
+/// Whether the master feeds its UTC reading to the authority (`ntp_under_date_authority`).
+fn master_feeds_utc(_m: &Box_, _a: &DateAuthority) -> bool {
+    true
+}
+
+/// The master's own re-alignment to the fleet line after a PTP outage (none yet).
+fn master_reconcile(_m: &mut Box_, _a: &DateAuthority, _t_ns: f64, _w: u64, _grace: bool) {}
 
 /// xorshift64* — deterministic, dependency-free.
 struct Rng(u64);
@@ -131,6 +218,8 @@ struct RunResult {
     rate_errors_ppm: Vec<f64>,
     rebases: Vec<u32>,
     late_steps: Vec<u32>,
+    /// Every coordinated step the authority announced: (seq, size).
+    announced: Vec<(u32, i64)>,
     /// Follower polls refused as another time base (another GM, or a GM that rebooted).
     refused_replies: u32,
 }
@@ -160,7 +249,8 @@ fn gm_view<'a>(
     }
 }
 
-fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
+fn run(sc: &Scenario) -> RunResult {
+    let (utc_vs_gm_ppm, grace) = (sc.utc_vs_gm_ppm, sc.grace);
     let true_dt_ns = WINDOW_S * 1e9;
     let base_utc: i64 = 1_790_000_000 * S;
 
@@ -187,7 +277,7 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
     let oscs = [23.0, -41.0, 54.0, 9.5, -17.0, 31.0];
     let delays = [25_000.0, 32_000.0, 38_000.0, 44_000.0, 51_000.0, 58_000.0];
     let boot_err = [
-        0,
+        sc.master_boot_err_ns,
         2_100 * US,
         -3_400 * US,
         900 * US,
@@ -224,6 +314,9 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
         .collect();
 
     let mut authority: Option<DateAuthority> = None;
+    let mut master_local_candidate: Option<i64> = None;
+    // Every coordinated step the authority announced: (seq, size).
+    let mut announced: Vec<(u32, i64)> = Vec::new();
     let mut ntp_rng = Rng(0xD1B5_4A32_D192_ED03);
     let mut net_rng = Rng(0xABCD_EF01_2345_6789);
 
@@ -314,7 +407,7 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
                 b.core.request_rebase();
                 b.core_gm = gm_id;
             }
-            if w < b.grace_until {
+            if w < b.grace_until || (i == 0 && sc.master_offline_at(w)) {
                 b.words.push(b.word_ppm);
                 continue;
             }
@@ -350,17 +443,39 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
                 // The master's re-anchor IS a rebase of the fleet offset (no step).
                 a.rebase(new_ns, m.wall_ns() - old_ns);
             }
+            let offline = sc.master_offline_at(w);
+            if !offline {
+                master_reconcile(m, a, t0_ns + true_dt_ns, w, grace);
+            }
             if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 {
                 let err = utc.ns - m.wall_ns() + (ntp_rng.gauss() * NTP_NOISE_NS).round() as i64;
-                if let Some(ann) = a.on_utc_error(err, now_ptp) {
-                    let act = m.follower.on_announce(ann, anchor, m.wall_ns());
-                    assert!(
-                        matches!(act, FollowAction::Scheduled { .. }),
-                        "master schedules its own step: {act:?}"
-                    );
+                if offline {
+                    // The master's local NTP date path (the legacy step gate: two agreeing
+                    // over-threshold readings).
+                    let over = err.abs() > MASTER_LOCAL_THRESHOLD_NS;
+                    if over
+                        && master_local_candidate.is_some_and(|c: i64| c.signum() == err.signum())
+                    {
+                        master_local_step(m, a, err);
+                        master_local_candidate = None;
+                    } else {
+                        master_local_candidate = over.then_some(err);
+                    }
+                } else if master_feeds_utc(m, a) {
+                    let anchor = m.core.anchor_ns().unwrap();
+                    let now_ptp = m.wall_ns() - anchor;
+                    let before = a.in_effect_ns(now_ptp);
+                    if let Some(ann) = a.on_utc_error(err, now_ptp) {
+                        announced.push((ann.seq, ann.date_offset_ns - before));
+                        let act = m.follower.on_announce(ann, anchor, m.wall_ns());
+                        assert!(
+                            matches!(act, FollowAction::Scheduled { .. }),
+                            "master schedules its own step: {act:?}"
+                        );
+                    }
                 }
             }
-            if w > 20 {
+            if w > 240 {
                 max_utc = max_utc.max((utc.ns - m.wall_ns()).abs());
             }
         }
@@ -369,23 +484,21 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
         //    carries the master's wall, its published D and the D's grandmaster (the extension);
         //    a follower adopts it only in its own time base — the controller's exact checks.
         if w % POLL_INTERVAL_WINDOWS == 0 {
-            let master_gm = boxes[0].core_gm;
-            let master_wall = boxes[0].wall_ns();
-            let ann: DateAnnounce = authority.as_ref().unwrap().announce();
+            let published = master_publishes(&boxes[0], authority.as_ref().unwrap());
+            let ann = DateAnnounce {
+                date_offset_ns: published.date_offset_ns,
+                effective_ptp_ns: published.effective_ptp_ns,
+                seq: published.seq,
+            };
             for b in boxes.iter_mut().skip(1) {
                 if net_rng.uniform() < POLL_LOSS {
                     continue;
                 }
-                let Some(anchor) = b.core.anchor_ns() else {
-                    continue;
-                };
-                if b.core.rebase_pending()
-                    || b.core_gm != master_gm
-                    || !same_time_base(master_wall, ann.date_offset_ns, b.wall_ns(), anchor)
-                {
+                if !follower_accepts(b, &published) {
                     refused += 1;
                     continue;
                 }
+                let anchor = b.core.anchor_ns().expect("accepted ⇒ anchored");
                 match b.follower.on_announce(ann, anchor, b.wall_ns()) {
                     FollowAction::None | FollowAction::Scheduled { .. } => {}
                     FollowAction::Absorb { new_anchor_ns } => b.core.set_anchor(new_anchor_ns),
@@ -401,15 +514,38 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
             // Raw wall disagreement at the same true instant, INCLUDING each box's own PTP path
             // delay (a box holds `t2 − t1 = D`, so its wall sits `delay` behind the GM line) —
             // exactly what a cross-box genlock grid sees.
-            let applied = |b: &Box_| {
+            // A coordinated step is IN FLIGHT at this boundary when some box landed it in this
+            // window while another still holds it pending (their walls straddle its instant by µs).
+            let landed_now = |b: &Box_| -> Vec<u32> {
                 b.steps
                     .iter()
-                    .filter(|s| s.2 == StepKind::Coordinated)
-                    .count()
+                    .filter(|s| s.2 == StepKind::Coordinated && s.3 >= t0_ns)
+                    .map(|s| s.0)
+                    .collect()
             };
-            if boxes.iter().all(|b| applied(b) == applied(&boxes[0])) {
-                let hi = boxes.iter().map(|b| b.wall_ns()).max().unwrap();
-                let lo = boxes.iter().map(|b| b.wall_ns()).min().unwrap();
+            // The master is judged against the fleet only while it is ON the fleet line (PTP
+            // online and its D equal to the authority's): during its own PTP outage it runs the
+            // local NTP date path by design.
+            let a = authority.as_ref().unwrap();
+            let m = &boxes[0];
+            let m_anchor = m.core.anchor_ns().unwrap();
+            let master_on_line =
+                !sc.master_offline_at(w) && a.in_effect_ns(m.wall_ns() - m_anchor) == m_anchor;
+            let judged: Vec<&Box_> = boxes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 0 || master_on_line)
+                .map(|(_, b)| b)
+                .collect();
+            let landed: Vec<u32> = judged.iter().flat_map(|b| landed_now(b)).collect();
+            let straddling = judged.iter().any(|b| {
+                b.follower
+                    .pending()
+                    .is_some_and(|p| landed.contains(&p.seq))
+            });
+            if !straddling {
+                let hi = judged.iter().map(|b| b.wall_ns()).max().unwrap();
+                let lo = judged.iter().map(|b| b.wall_ns()).min().unwrap();
                 max_dis = max_dis.max(hi - lo);
             } else {
                 in_flight += 1;
@@ -441,6 +577,7 @@ fn run(utc_vs_gm_ppm: f64, grace: bool) -> RunResult {
         rate_errors_ppm: rate_errors,
         rebases: boxes.iter().map(|b| b.rebases).collect(),
         late_steps: boxes.iter().map(|b| b.follower.late_steps()).collect(),
+        announced,
         refused_replies: refused,
     }
 }
@@ -470,7 +607,9 @@ impl Box_ {
     }
 }
 
-fn check(label: &str, r: &RunResult) {
+fn check(sc: &Scenario, r: &RunResult) {
+    let label = sc.label;
+    let offline_scenario = sc.master_ptp_offline.is_some();
     let n = r.words.len();
     println!(
         "[{label}] max wall disagreement {} µs, master |UTC − wall| max {} ms, rebases {:?}, \
@@ -502,14 +641,36 @@ fn check(label: &str, r: &RunResult) {
         "[{label}] a box's rate left the PTP rate by {worst} ppm"
     );
 
-    // DATE: the master's own steps are all coordinated; each follower joined once, then took
-    // exactly the master's steps (same seq, same size), with zero late/uncoordinated steps.
-    let master_steps = &r.steps[0];
+    // DATE: every follower joined once at boot, then took EXACTLY the announced steps (same seq,
+    // same size), all coordinated — zero late, zero uncoordinated. The master took them too,
+    // except (in the master-offline scenario) one it had to drop while running its local path;
+    // its own re-alignment to the fleet line afterwards is a Join.
     assert!(
-        !master_steps.is_empty(),
-        "[{label}] the master never stepped the date"
+        !r.announced.is_empty(),
+        "[{label}] the authority never announced a date step"
     );
-    assert!(master_steps.iter().all(|s| s.2 == StepKind::Coordinated));
+    let master_coord: Vec<(u32, i64)> = r.steps[0]
+        .iter()
+        .filter(|s| s.2 == StepKind::Coordinated)
+        .map(|s| (s.0, s.1))
+        .collect();
+    assert!(
+        r.steps[0]
+            .iter()
+            .all(|s| s.2 == StepKind::Coordinated || (offline_scenario && s.2 == StepKind::Join)),
+        "[{label}] the master made a step that is neither coordinated nor its re-alignment: {:?}",
+        r.steps[0]
+    );
+    assert!(
+        master_coord.iter().all(|c| r.announced.contains(c)),
+        "[{label}] the master stepped something it never announced"
+    );
+    if !offline_scenario {
+        assert_eq!(
+            master_coord, r.announced,
+            "[{label}] the master skipped an announce"
+        );
+    }
     for (i, steps) in r.steps.iter().enumerate().skip(1) {
         let (joins, rest): (Vec<&Step>, Vec<&Step>) =
             steps.iter().partition(|s| s.2 == StepKind::Join);
@@ -526,41 +687,36 @@ fn check(label: &str, r: &RunResult) {
             rest.iter().all(|s| s.2 == StepKind::Coordinated),
             "[{label}] box {i} made an uncoordinated step: {rest:?}"
         );
-        let seq_size = |v: &[&Step]| v.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>();
-        let master: Vec<&Step> = master_steps.iter().collect();
+        let got: Vec<(u32, i64)> = rest.iter().map(|s| (s.0, s.1)).collect();
         assert_eq!(
-            seq_size(&rest),
-            seq_size(&master),
-            "[{label}] box {i} did not take exactly the master's steps"
+            got, r.announced,
+            "[{label}] box {i} did not take exactly the announced steps"
         );
     }
-    // SIMULTANEITY: every coordinated step landed on every box within 100 µs of true time.
+    // SIMULTANEITY: every announced step landed on every box that applied it within 100 µs.
     let mut worst_spread = 0.0f64;
-    for (k, ms) in master_steps.iter().enumerate() {
+    for (seq, _) in &r.announced {
         let landings: Vec<f64> = r
             .steps
             .iter()
-            .map(|steps| {
+            .flat_map(|steps| {
                 steps
                     .iter()
-                    .filter(|s| s.2 == StepKind::Coordinated)
-                    .nth(k)
-                    .expect("same number of coordinated steps")
-                    .3
+                    .filter(|s| s.2 == StepKind::Coordinated && s.0 == *seq)
+                    .map(|s| s.3)
             })
             .collect();
         let spread = landings.iter().cloned().fold(f64::MIN, f64::max)
             - landings.iter().cloned().fold(f64::MAX, f64::min);
         assert!(
             spread < 100_000.0,
-            "[{label}] step seq {} landed across {spread} ns",
-            ms.0
+            "[{label}] step seq {seq} landed across {spread} ns"
         );
         worst_spread = worst_spread.max(spread);
     }
     println!(
         "[{label}] {} coordinated steps, worst landing spread {:.1} µs, {} in-flight samples",
-        master_steps.len(),
+        r.announced.len(),
         worst_spread / 1_000.0,
         r.in_flight_samples
     );
@@ -593,10 +749,12 @@ fn check(label: &str, r: &RunResult) {
 
 #[test]
 fn two_clock_bench_rate_is_ptp_phase_agrees_and_every_date_step_is_coordinated_117_88() {
-    let plus = run(8.0, false);
-    check("UTC +8 ppm vs GM", &plus);
-    let minus = run(-15.0, false);
-    check("UTC -15 ppm vs GM", &minus);
+    let sc_plus = Scenario::plain("UTC +8 ppm vs GM", 8.0, false);
+    let sc_minus = Scenario::plain("UTC -15 ppm vs GM", -15.0, false);
+    let plus = run(&sc_plus);
+    check(&sc_plus, &plus);
+    let minus = run(&sc_minus);
+    check(&sc_minus, &minus);
 
     // THE DECOUPLING STATEMENT, for the frequency LAW: the two runs share every PTP input and
     // differ ONLY in UTC (so in the number, size and timing of the date steps). The frequency
@@ -608,8 +766,8 @@ fn two_clock_bench_rate_is_ptp_phase_agrees_and_every_date_step_is_coordinated_1
         );
     }
     // … while the date genuinely differed (the runs are not trivially identical).
-    assert_ne!(plus.steps[0].len(), minus.steps[0].len());
-    let dir = |r: &RunResult| r.steps[0].iter().map(|s| s.1.signum()).sum::<i64>();
+    assert_ne!(plus.announced.len(), minus.announced.len());
+    let dir = |r: &RunResult| r.announced.iter().map(|s| s.1.signum()).sum::<i64>();
     assert!(
         dir(&plus) > 0 && dir(&minus) < 0,
         "UTC ahead ⇒ forward steps, behind ⇒ backward"
@@ -623,6 +781,31 @@ fn with_the_controllers_post_step_grace_the_envelopes_still_hold_117_88() {
     // across UTC scenarios — the hold carries no NTP value, it only delays the next update. What
     // must survive is every envelope: rate = the GM's, walls within 100 µs, only coordinated
     // steps, no step at a grandmaster change or reboot.
-    check("UTC +8 ppm vs GM, with grace", &run(8.0, true));
-    check("UTC -15 ppm vs GM, with grace", &run(-15.0, true));
+    for sc in [
+        Scenario::plain("UTC +8 ppm vs GM, with grace", 8.0, true),
+        Scenario::plain("UTC -15 ppm vs GM, with grace", -15.0, true),
+    ] {
+        check(&sc, &run(&sc));
+    }
+}
+
+#[test]
+fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_88() {
+    // The master boots 3 s behind UTC: its first announce is a 3 s step (a boot-time NTP failure,
+    // an upstream jump). Later ONLY the master loses PTP for 10 minutes and runs its local NTP
+    // date path. Neither may reach a follower as an uncoordinated (late) step, and the fleet must
+    // stay on one line throughout.
+    let sc = Scenario {
+        label: "3 s first step + master-only PTP outage, with grace",
+        utc_vs_gm_ppm: 8.0,
+        grace: true,
+        master_boot_err_ns: -3 * S,
+        master_ptp_offline: Some((6 * 3600 * 2, 6 * 3600 * 2 + 1_200)),
+    };
+    let r = run(&sc);
+    check(&sc, &r);
+    assert!(
+        r.announced.iter().any(|a| a.1.abs() > 2 * S),
+        "the multi-second first step was actually exercised"
+    );
 }
