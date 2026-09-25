@@ -115,8 +115,10 @@ is running.
   additive-only `/status` contract) → `.claude/rules/clock-discipline-and-testing.md`
 - PTP phase lock + fleet date offset (#117/#88 — rate AND phase from PTP, the NTP master's
   coordinated date announce on 31900, the decoupling proof by the bit-identical two-clock bench,
-  the local fallback) → `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
-  `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs`)
+  the local fallback, seeding every simulated noise source, the standalone-`rustc` replica as a
+  second local net) → `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
+  `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
+  `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)
 - Phase-slew PI servo (#97, LEGACY discipline only since #117 — the feed-forward decoupling sign invariant, the deadbeat gain cap for
   the client's slow cadence, the I-deadband, verify-by-simulation, the canary re-tighten proof) →
   `.claude/rules/phase-slew-servo.md` (auto-loads on `src/phase_slew.rs`)
