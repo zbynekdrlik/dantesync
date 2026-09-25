@@ -2220,12 +2220,10 @@ where
                 // synchronized to the same grandmaster time
                 self.pending_syncs.clear();
                 self.sample_window.clear();
-                self.date_sync.window.clear();
                 self.prev_t1_ns = 0;
                 self.prev_t2_ns = 0;
-                // #117: a different sender may carry a different time base — re-anchor D from
-                // the next window so the wall stays continuous (never a wall step).
-                self.date_sync.core.request_rebase();
+                // #117: a different sender may carry a different time base.
+                self.date_sync.on_time_base_change();
                 // Keep: applied_freq_ppm, drift_baseline_ppm (learned values)
                 // Stay in production mode - let servo naturally adjust if needed
                 info!(
@@ -2273,13 +2271,7 @@ where
                     );
                     self.current_gm_uuid = Some(new_uuid);
                     // Note: sync source change already did soft reset if needed
-                    // #117: the grandmaster's uptime is a different time base — re-anchor D.
-                    if self.date_sync.enabled {
-                        // A whole fresh window in the new time base, for both servos.
-                        self.sample_window.clear();
-                        self.date_sync.window.clear();
-                        self.date_sync.core.request_rebase();
-                    }
+                    self.on_grandmaster_uuid_change(); // #117: re-anchor D
                 }
                 None => {
                     info!("Grandmaster UUID: {}", format_mac(&new_uuid));
@@ -2429,11 +2421,7 @@ where
         // Collect sample if enough time has passed
         if self.should_add_sample(t1_ns) {
             self.sample_window.push(phase_offset_ns);
-            // #117: the RAW offset between the two time bases (not the mod-1 s display phase,
-            // not calibration-corrected) — what the phase lock holds equal to D.
-            if self.date_sync.enabled {
-                self.date_sync.window.push(t2_ns.wrapping_sub(t1_ns));
-            }
+            self.date_sync.push_raw_sample(t1_ns, t2_ns); // #117
         }
 
         // Process window when full - pass master time for drift calculation
@@ -2496,16 +2484,7 @@ where
 
         self.last_phase_offset_ns = offset_ns;
 
-        // #117: the median of the raw `t2 − t1` window, for the phase lock.
-        self.date_sync.pending_median_ns = if self.date_sync.window.is_empty() {
-            None
-        } else {
-            let mut raw = self.date_sync.window.clone();
-            raw.sort_unstable();
-            Some(raw[raw.len() / 2])
-        };
-        self.date_sync.pending_t1_ns = master_time_ns;
-        self.date_sync.window.clear();
+        self.date_sync.close_raw_window(master_time_ns); // #117: the phase lock's window
 
         // Apply self-tuning servo
         self.apply_self_tuning_servo(offset_us);
@@ -2847,18 +2826,7 @@ where
                     status, rate_ppm, applied_word
                 );
             }
-            if self.date_sync.core.engaged() {
-                info!(
-                    "[PHASE-LOCK] e={:+.1}us word={:+.3}ppm D-seq={}",
-                    self.date_sync.core.last_error_ns().unwrap_or(0) as f64 / 1_000.0,
-                    applied_word,
-                    self.date_sync
-                        .follower
-                        .adopted_seq()
-                        .map(|q| q.to_string())
-                        .unwrap_or_else(|| "-".to_string())
-                );
-            }
+            self.log_phase_lock_word(applied_word);
         }
 
         if let Err(e) = self.clock.adjust_frequency(factor) {
