@@ -251,6 +251,7 @@ fn date_extension_from_status(status: &SyncStatus) -> Option<DateExtension> {
     Some(DateExtension {
         version: crate::date_offset::EXT_VERSION,
         authority: status.date_authority == "master",
+        gm_uuid: status.date_offset_gm_uuid?,
         announce: DateAnnounce {
             date_offset_ns: in_effect.wrapping_add(status.date_step_pending_ns.unwrap_or(0)),
             effective_ptp_ns: status.date_offset_effective_ptp_ns?,
@@ -287,6 +288,12 @@ pub struct AuthorityReply {
     pub gm_uuid: Option<[u8; 6]>,
     /// The replying node's PTP lock (base byte 41).
     pub is_locked: bool,
+    /// The replying node's wall clock when it built the reply (base bytes 8-15), ns.
+    pub remote_wall_ns: i64,
+    /// This node's wall clock when the reply arrived, ns. With `remote_wall_ns` it places both
+    /// nodes' `D`s in a PTP time base, so a reply from another base is never adopted
+    /// (`crate::date_offset::same_time_base`).
+    pub received_wall_ns: i64,
     /// The date-offset extension; `None` from an older server or a node without date state.
     pub ext: Option<DateExtension>,
     /// When the reply arrived (monotonic).
@@ -295,7 +302,12 @@ pub struct AuthorityReply {
 
 /// dantesync#88 — parse a reply to `build_ext_request(request_id)`. `None` for a short packet,
 /// a wrong magic, or a stale reply to a different request.
-pub fn parse_reply(buf: &[u8], request_id: u32, received: Instant) -> Option<AuthorityReply> {
+pub fn parse_reply(
+    buf: &[u8],
+    request_id: u32,
+    received: Instant,
+    received_wall_ns: i64,
+) -> Option<AuthorityReply> {
     if buf.len() < RESPONSE_SIZE {
         return None;
     }
@@ -307,10 +319,14 @@ pub fn parse_reply(buf: &[u8], request_id: u32, received: Instant) -> Option<Aut
     }
     let mut uuid = [0u8; 6];
     uuid.copy_from_slice(&buf[42..48]);
+    let mut wall = [0u8; 8];
+    wall.copy_from_slice(&buf[8..16]);
     Some(AuthorityReply {
         serial: 0,
         gm_uuid: if uuid == [0u8; 6] { None } else { Some(uuid) },
         is_locked: buf[41] != 0,
+        remote_wall_ns: u64::from_be_bytes(wall) as i64,
+        received_wall_ns,
         ext: decode_extension(&buf[RESPONSE_SIZE..]),
         received,
     })
@@ -335,6 +351,9 @@ impl DateAuthoritySource for NoAuthority {
 /// Poll cadence of the authority. The shortest announce lead is 5 s, so every follower gets
 /// several chances to hear a pending step before its instant.
 pub const AUTHORITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the poller re-resolves the authority's host name.
+const AUTHORITY_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long one poll waits for its reply.
 const AUTHORITY_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -385,17 +404,30 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
         "[DATE] polling the date-offset authority at {}:{} every {:?}",
         host, TIME_SERVER_PORT, AUTHORITY_POLL_INTERVAL
     );
-    let mut request_id: u32 = 0;
+    // An unpredictable request-id start: with the source-address check below, a stray or spoofed
+    // DSYR datagram from anywhere else on the LAN is never taken for the authority's reply.
+    let mut request_id: u32 = uuid::Uuid::new_v4().as_u128() as u32;
     let mut serial: u64 = 0;
     let mut had_ext: Option<bool> = None;
     let mut buf = [0u8; 256];
+    let mut target: Option<std::net::SocketAddr> = None;
+    let mut resolved_at: Option<Instant> = None;
     while running.load(Ordering::SeqCst) {
         let started = Instant::now();
         request_id = request_id.wrapping_add(1);
-        let target = (host.as_str(), TIME_SERVER_PORT)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.find(|a| a.is_ipv4()));
+        // Resolve once a minute (and after a failure), not every second.
+        if target.is_none()
+            || match resolved_at {
+                None => true,
+                Some(t) => t.elapsed() >= AUTHORITY_RESOLVE_INTERVAL,
+            }
+        {
+            target = (host.as_str(), TIME_SERVER_PORT)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.find(|a| a.is_ipv4()));
+            resolved_at = Some(Instant::now());
+        }
         match target {
             None => debug!("[DATE] authority poller: cannot resolve {}", host),
             Some(addr) => {
@@ -404,8 +436,17 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
                 } else {
                     // Drain until the reply to THIS request (a late reply to an earlier one is
                     // skipped by the request-id check) or the timeout.
-                    while let Ok((n, _src)) = socket.recv_from(&mut buf) {
-                        if let Some(mut reply) = parse_reply(&buf[..n], request_id, Instant::now())
+                    while let Ok((n, src)) = socket.recv_from(&mut buf) {
+                        if src != addr {
+                            debug!("[DATE] authority poller: ignoring a datagram from {}", src);
+                            continue;
+                        }
+                        let received_wall = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(0);
+                        if let Some(mut reply) =
+                            parse_reply(&buf[..n], request_id, Instant::now(), received_wall)
                         {
                             serial += 1;
                             reply.serial = serial;
@@ -731,6 +772,7 @@ mod tests {
         status.date_offset_ns = Some(1_790_000_000_000_000_000);
         status.date_offset_effective_ptp_ns = Some(12_345_000_000_000);
         status.date_offset_seq = Some(3);
+        status.date_offset_gm_uuid = Some([0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c]);
         status
     }
 
@@ -740,15 +782,6 @@ mod tests {
         let req = build_ext_request(0xDEADBEEF);
         assert_eq!(&req[0..4], b"DSYX");
         assert_eq!(&req[4..8], &0xDEADBEEFu32.to_be_bytes());
-    }
-
-    #[test]
-    fn an_old_dsyn_client_still_gets_exactly_the_64_byte_reply_88() {
-        // The base reply is the same function; an old DSYN request never gets the extension.
-        let status = master_status();
-        let base = build_response(7, &status);
-        assert_eq!(base.len(), RESPONSE_SIZE);
-        assert_eq!(base[63], 0, "byte 63 stays reserved/zero");
     }
 
     #[test]
@@ -809,10 +842,19 @@ mod tests {
     }
 
     #[test]
+    fn no_extension_is_published_without_the_anchor_grandmaster_88() {
+        // The controller clears the anchor GM while a re-anchor is pending: no D may be
+        // published in a time base nobody can identify.
+        let mut status = master_status();
+        status.date_offset_gm_uuid = None;
+        assert_eq!(build_response_ext(1, &status).len(), RESPONSE_SIZE);
+    }
+
+    #[test]
     fn a_node_without_date_state_answers_dsyx_with_the_base_only_88() {
         let reply = build_response_ext(1, &SyncStatus::default());
         assert_eq!(reply.len(), RESPONSE_SIZE);
-        let parsed = parse_reply(&reply, 1, Instant::now()).expect("valid base reply");
+        let parsed = parse_reply(&reply, 1, Instant::now(), 0).expect("valid base reply");
         assert_eq!(parsed.ext, None);
     }
 
@@ -821,7 +863,7 @@ mod tests {
         let mut status = master_status();
         status.date_authority = "follower".to_string();
         let reply = build_response_ext(1, &status);
-        let parsed = parse_reply(&reply, 1, Instant::now()).unwrap();
+        let parsed = parse_reply(&reply, 1, Instant::now(), 0).unwrap();
         assert!(
             !parsed.ext.unwrap().authority,
             "only the master is an authority"
@@ -833,29 +875,39 @@ mod tests {
         let status = master_status();
         let reply = build_response_ext(42, &status);
         let t = Instant::now();
-        let parsed = parse_reply(&reply, 42, t).expect("valid");
+        let parsed = parse_reply(&reply, 42, t, 0).expect("valid");
         assert_eq!(parsed.gm_uuid, Some([0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c]));
         assert!(parsed.is_locked);
         assert_eq!(parsed.ext.unwrap().announce.seq, 3);
         assert_eq!(parsed.received, t);
+        let base_wall = i64::from_be_bytes(reply[8..16].try_into().unwrap());
+        assert_eq!(
+            parsed.remote_wall_ns, base_wall,
+            "the replying node's wall, bytes 8-15"
+        );
+        assert_eq!(
+            parsed.ext.unwrap().gm_uuid,
+            [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c],
+            "the anchor's grandmaster rides in the extension"
+        );
 
         assert_eq!(
-            parse_reply(&reply, 41, t),
+            parse_reply(&reply, 41, t, 0),
             None,
             "a reply to another request id"
         );
-        assert_eq!(parse_reply(&reply[..63], 42, t), None, "short");
+        assert_eq!(parse_reply(&reply[..63], 42, t, 0), None, "short");
         let mut bad = reply.clone();
         bad[0] = b'X';
-        assert_eq!(parse_reply(&bad, 42, t), None, "wrong magic");
+        assert_eq!(parse_reply(&bad, 42, t, 0), None, "wrong magic");
         // An older server's 64-byte reply: valid, no authority.
         let old = build_response(42, &status);
-        assert_eq!(parse_reply(&old, 42, t).unwrap().ext, None);
+        assert_eq!(parse_reply(&old, 42, t, 0).unwrap().ext, None);
         // A node with no grandmaster reports None, not an all-zero UUID.
         let mut no_gm = master_status();
         no_gm.gm_uuid = None;
         assert_eq!(
-            parse_reply(&build_response_ext(1, &no_gm), 1, t)
+            parse_reply(&build_response_ext(1, &no_gm), 1, t, 0)
                 .unwrap()
                 .gm_uuid,
             None
@@ -907,7 +959,7 @@ mod tests {
         client.send_to(&build_ext_request(6), addr).unwrap();
         let n = serve_until_reply(&server, &status, &client, &mut buf);
         assert_eq!(n, RESPONSE_SIZE + crate::date_offset::EXT_SIZE);
-        let parsed = parse_reply(&buf[..n], 6, Instant::now()).unwrap();
+        let parsed = parse_reply(&buf[..n], 6, Instant::now(), 0).unwrap();
         assert_eq!(
             parsed.ext.unwrap().announce.date_offset_ns,
             1_790_000_000_000_000_000

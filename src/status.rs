@@ -268,6 +268,11 @@ pub struct SyncStatus {
     /// follower): its `seq` and its effective PTP instant. `null` until known.
     #[serde(default)]
     pub date_offset_seq: Option<u32>,
+    /// dantesync#88: the grandmaster whose PTP time base `date_offset_ns` belongs to (the anchor's
+    /// grandmaster — during a grandmaster change it can differ from `gm_uuid` for one window, and
+    /// is `null` then). `null` until anchored.
+    #[serde(default)]
+    pub date_offset_gm_uuid: Option<[u8; 6]>,
     #[serde(default)]
     pub date_offset_effective_ptp_ns: Option<i64>,
 
@@ -388,6 +393,7 @@ impl Default for SyncStatus {
             date_authority: String::new(),
             date_offset_ns: None,
             date_offset_seq: None,
+            date_offset_gm_uuid: None,
             date_offset_effective_ptp_ns: None,
             date_step_pending_ns: None,
             date_step_due_in_ms: None,
@@ -793,6 +799,7 @@ mod tests {
         assert_eq!(restored.date_authority, "");
         assert_eq!(restored.date_offset_ns, None);
         assert_eq!(restored.date_offset_seq, None);
+        assert_eq!(restored.date_offset_gm_uuid, None);
         assert_eq!(restored.date_step_pending_ns, None);
         assert_eq!(restored.last_date_step_ts, None);
         assert_eq!(restored.date_steps_late, 0);
