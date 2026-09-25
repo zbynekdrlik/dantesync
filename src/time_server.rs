@@ -246,12 +246,14 @@ fn build_response(request_id: u32, status: &SyncStatus) -> [u8; RESPONSE_SIZE] {
 /// (`date_step_pending_ns`), the published offset is the one it will take — `D + step` — with
 /// `date_offset_effective_ptp_ns` (the step's future instant). The controller writes the anchor
 /// and the pending step in ONE status update, so a reader never sees the step counted twice.
-fn date_extension_from_status(status: &SyncStatus) -> Option<DateExtension> {
+fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<DateExtension> {
     let in_effect = status.date_offset_ns?;
     Some(DateExtension {
         version: crate::date_offset::EXT_VERSION,
         authority: status.date_authority == "master",
         gm_uuid: status.date_offset_gm_uuid?,
+        // This node's PTP "now" from its D IN EFFECT (never the published, possibly pending D).
+        now_ptp_ns: now_wall_ns.wrapping_sub(in_effect),
         announce: DateAnnounce {
             date_offset_ns: in_effect.wrapping_add(status.date_step_pending_ns.unwrap_or(0)),
             effective_ptp_ns: status.date_offset_effective_ptp_ns?,
@@ -264,7 +266,11 @@ fn date_extension_from_status(status: &SyncStatus) -> Option<DateExtension> {
 /// extension when this node has a date-offset state (else just the base).
 fn build_response_ext(request_id: u32, status: &SyncStatus) -> Vec<u8> {
     let mut out = build_response(request_id, status).to_vec();
-    if let Some(ext) = date_extension_from_status(status) {
+    let now_wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    if let Some(ext) = date_extension_from_status(status, now_wall) {
         out.extend_from_slice(&encode_extension(&ext));
     }
     out
@@ -288,10 +294,8 @@ pub struct AuthorityReply {
     pub gm_uuid: Option<[u8; 6]>,
     /// The replying node's PTP lock (base byte 41).
     pub is_locked: bool,
-    /// The replying node's wall clock when it built the reply (base bytes 8-15), ns.
-    pub remote_wall_ns: i64,
-    /// This node's wall clock when the reply arrived, ns. With `remote_wall_ns` it places both
-    /// nodes' `D`s in a PTP time base, so a reply from another base is never adopted
+    /// This node's wall clock when the reply arrived, ns. With the extension's `now_ptp_ns` it
+    /// places both nodes in a PTP time base, so a reply from another base is never adopted
     /// (`crate::date_offset::same_time_base`).
     pub received_wall_ns: i64,
     /// The date-offset extension; `None` from an older server or a node without date state.
@@ -319,13 +323,10 @@ pub fn parse_reply(
     }
     let mut uuid = [0u8; 6];
     uuid.copy_from_slice(&buf[42..48]);
-    let mut wall = [0u8; 8];
-    wall.copy_from_slice(&buf[8..16]);
     Some(AuthorityReply {
         serial: 0,
         gm_uuid: if uuid == [0u8; 6] { None } else { Some(uuid) },
         is_locked: buf[41] != 0,
-        remote_wall_ns: u64::from_be_bytes(wall) as i64,
         received_wall_ns,
         ext: decode_extension(&buf[RESPONSE_SIZE..]),
         received,
@@ -411,6 +412,7 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
     let mut had_ext: Option<bool> = None;
     let mut buf = [0u8; 256];
     let mut target: Option<std::net::SocketAddr> = None;
+    let mut warned_foreign_src = false;
     let mut resolved_at: Option<Instant> = None;
     while running.load(Ordering::SeqCst) {
         let started = Instant::now();
@@ -438,7 +440,16 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
                     // skipped by the request-id check) or the timeout.
                     while let Ok((n, src)) = socket.recv_from(&mut buf) {
                         if src != addr {
-                            debug!("[DATE] authority poller: ignoring a datagram from {}", src);
+                            // Logged once at info: on a multi-homed master that answers from
+                            // another address this is the whole diagnosis.
+                            if !warned_foreign_src {
+                                info!(
+                                    "[DATE] authority poller: ignoring replies from {} (polling \
+                                     {}) — only the polled address is trusted",
+                                    src, addr
+                                );
+                                warned_foreign_src = true;
+                            }
                             continue;
                         }
                         let received_wall = SystemTime::now()
@@ -832,10 +843,14 @@ mod tests {
         status.date_step_pending_ns = Some(-51_000_000);
         status.date_offset_effective_ptp_ns = Some(12_350_000_000_000);
         status.date_offset_seq = Some(4);
-        let ext = date_extension_from_status(&status).unwrap();
+        let ext = date_extension_from_status(&status, 1_790_000_100_000_000_000).unwrap();
         assert_eq!(
             ext.announce.date_offset_ns,
             1_790_000_000_000_000_000 - 51_000_000
+        );
+        assert_eq!(
+            ext.now_ptp_ns, 100_000_000_000,
+            "PTP now from the D in effect, not from the pending one"
         );
         assert_eq!(ext.announce.effective_ptp_ns, 12_350_000_000_000);
         assert_eq!(ext.announce.seq, 4);
@@ -881,9 +896,10 @@ mod tests {
         assert_eq!(parsed.ext.unwrap().announce.seq, 3);
         assert_eq!(parsed.received, t);
         let base_wall = i64::from_be_bytes(reply[8..16].try_into().unwrap());
-        assert_eq!(
-            parsed.remote_wall_ns, base_wall,
-            "the replying node's wall, bytes 8-15"
+        let now_ptp = parsed.ext.unwrap().now_ptp_ns;
+        assert!(
+            (now_ptp - (base_wall - 1_790_000_000_000_000_000)).abs() < 1_000_000_000,
+            "the replier's PTP now = its wall − its D IN EFFECT"
         );
         assert_eq!(
             parsed.ext.unwrap().gm_uuid,

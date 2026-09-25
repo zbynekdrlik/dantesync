@@ -65,6 +65,9 @@ pub(super) struct DateSync {
     /// The announce this follower last aligned with (published for observability).
     pub(super) last_announce: Option<DateAnnounce>,
     pub(super) last_applicable_reply: Option<Instant>,
+    /// A phase-lock window was processed since the last step / PTP outage, so the core's last
+    /// error describes the wall as it is NOW (the master's re-alignment needs that).
+    pub(super) fresh_window: bool,
     pub(super) step_failed_at: Option<Instant>,
     pub(super) step_bound_ns: i64,
     pub(super) step_lead_ns: i64,
@@ -121,6 +124,7 @@ impl DateSync {
             last_serial: 0,
             last_announce: None,
             last_applicable_reply: None,
+            fresh_window: false,
             step_failed_at: None,
             step_bound_ns: config.date_offset.step_bound_ns(),
             step_lead_ns: config.date_offset.step_lead_ns(),
@@ -173,6 +177,7 @@ where
             .core
             .on_window(median_ns, locked, total_correction, dt);
         self.handle_phase_anchor_event(out.event);
+        self.date_sync.fresh_window = out.error_ns.is_some();
         match out.freq_ppm {
             Some(word) => {
                 if !was_engaged {
@@ -257,15 +262,19 @@ where
         };
         status.date_offset_seq = anchor.and(published.map(|p| p.seq));
         status.date_offset_effective_ptp_ns = anchor.and(published.map(|p| p.effective_ptp_ns));
-        // The master's pending step comes from its authority (the single source of what it
-        // publishes); a follower's from its own scheduler.
+        // The master publishes exactly its authority's announce: D in effect on its own wall
+        // (the anchor) plus the difference to the announced D. While a step is pending that is
+        // the step; once its instant has passed but before this loop applies it, or while the
+        // master is off the fleet line (its own PTP outage, a failed step), it is the correction
+        // back to the fleet D — so a follower always reads the FLEET D, never the master's own.
         match (ds.authority.as_ref(), anchor) {
             (Some(a), Some(d)) => {
-                let now_ptp = now_wall.wrapping_sub(d);
-                status.date_step_pending_ns = a.pending_step_ns(now_ptp);
-                status.date_step_due_in_ms = status
-                    .date_step_pending_ns
-                    .map(|_| a.announce().effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000);
+                let ann = a.announce();
+                let delta = ann.date_offset_ns.wrapping_sub(d);
+                status.date_step_pending_ns = (delta != 0).then_some(delta);
+                status.date_step_due_in_ms = status.date_step_pending_ns.map(|_| {
+                    ann.effective_ptp_ns.wrapping_sub(now_wall.wrapping_sub(d)) / 1_000_000
+                });
             }
             _ => {
                 status.date_step_pending_ns = ds.follower.pending().map(|p| p.delta_ns);
@@ -290,28 +299,72 @@ where
         status.date_steps_late = ds.follower.late_steps();
     }
 
-    /// #117 — the LOCAL date path stepped the wall by `delta_ns` (the NTP step path, used while no
-    /// authority is heard or PTP is offline). `D` moves with the wall so the phase lock sees no
-    /// disturbance. A scheduled coordinated step is dropped (this step already corrected the
-    /// error): on the master through `DateAuthority::local_step`, which keeps the PTP time base
-    /// and cancels the pending announce, so followers re-align at their next poll.
+    /// #117 — the LOCAL date path stepped the wall by `delta_ns` (the NTP step path: no authority
+    /// heard, or this box's own PTP is offline). `D` moves with the wall so the phase lock sees no
+    /// disturbance, and a scheduled coordinated step is dropped (this step already corrected the
+    /// error). The FLEET date offset is never moved by it: on the master the authority keeps the
+    /// fleet D, and the master re-aligns its own wall to it once PTP is back
+    /// (`realign_master_to_fleet`) — a single box's fault never reaches the fleet as a step.
     pub(super) fn note_local_date_step(&mut self, delta_ns: i64) {
         self.date_sync.core.note_step(delta_ns);
         self.date_sync.follower.cancel_pending();
-        if let Some(new_anchor) = self.date_sync.core.anchor_ns() {
-            // The PTP time did not move: now in the (unchanged) base = wall − the new D.
-            let now_ptp = wall_now_ns().wrapping_sub(new_anchor);
-            if let Some(a) = self.date_sync.authority.as_mut() {
-                let ann = a.local_step(delta_ns, now_ptp);
-                info!(
-                    "[DATE] authority moved by a local step of {:+}us (seq {})",
-                    delta_ns / 1_000,
-                    ann.seq
-                );
-            }
-        }
         self.date_sync.last_step =
             Some((delta_ns, (wall_now_ns() / 1_000_000_000) as u64, "local"));
+    }
+
+    /// #88 — the NTP master back on the fleet line: once its own PTP is online and the phase lock
+    /// engaged, a master whose `D` differs from the authority's (it ran the local NTP path through
+    /// its own PTP outage, re-anchored on re-engagement, or a coordinated step failed on it) steps
+    /// its OWN wall to the fleet D — one Join step, never a change of the fleet D. Nothing happens
+    /// while a coordinated step is pending (the scheduler owns that), during the failure backoff,
+    /// or mid re-anchor.
+    fn realign_master_to_fleet(&mut self) {
+        if !self.date_authority_active()
+            || !self.date_sync.core.engaged()
+            || self.date_sync.core.rebase_pending()
+        {
+            return;
+        }
+        if let Some(t) = self.date_sync.step_failed_at {
+            if t.elapsed() < STEP_FAILURE_BACKOFF {
+                return;
+            }
+        }
+        let (Some(anchor), Some(a)) = (
+            self.date_sync.core.anchor_ns(),
+            self.date_sync.authority.as_ref(),
+        ) else {
+            return;
+        };
+        let now_ptp = wall_now_ns().wrapping_sub(anchor);
+        if a.pending_step_ns(now_ptp).is_some() || self.date_sync.follower.pending().is_some() {
+            return;
+        }
+        let fleet = a.in_effect_ns(now_ptp);
+        if fleet == anchor {
+            return;
+        }
+        // The wall must land ON the fleet line, so the step also removes the phase error the
+        // outage left (the clock free-ran with no PTP windows): it is measured, so wait for a
+        // window taken after PTP came back.
+        if !self.date_sync.fresh_window {
+            return;
+        }
+        let e = self.date_sync.core.last_error_ns().unwrap_or(0);
+        let delta = fleet.wrapping_sub(anchor).wrapping_sub(e);
+        let seq = a.seq();
+        if delta.abs() > crate::date_offset::ABSORB_TOLERANCE_NS {
+            warn!(
+                "[DATE] the master is {:+}us off the fleet date offset (its own PTP outage, a \
+                 re-anchor or a failed step) — stepping its OWN wall back to the fleet line",
+                delta / 1_000
+            );
+            self.apply_date_step(delta, StepKind::Join, seq);
+            if self.date_sync.step_failed_at.is_some() {
+                return;
+            }
+        }
+        self.date_sync.core.set_anchor(fleet);
     }
 
     /// #117 / #88 — the NTP reading under the phase lock. Returns true when it was fully handled
@@ -345,11 +398,25 @@ where
                 offset_us,
                 self.date_sync.step_bound_ns / 1_000
             );
-            let announced = self
+            // The UTC error describes the fleet line only while the master's wall is ON it (its D
+            // equals the authority's) and no failed step is being retried.
+            let backing_off = self
+                .date_sync
+                .step_failed_at
+                .is_some_and(|t| t.elapsed() < STEP_FAILURE_BACKOFF);
+            let on_line = self
                 .date_sync
                 .authority
-                .as_mut()
-                .and_then(|a| a.on_utc_error(err_ns, now_ptp));
+                .as_ref()
+                .is_some_and(|a| a.in_effect_ns(now_ptp) == anchor);
+            let announced = if on_line && !backing_off {
+                self.date_sync
+                    .authority
+                    .as_mut()
+                    .and_then(|a| a.on_utc_error(err_ns, now_ptp))
+            } else {
+                None
+            };
             if let Some(ann) = announced {
                 info!(
                     "[DATE] AUTHORITY: UTC − wall = {:+}us exceeds {}us — announcing a fleet date \
@@ -429,6 +496,15 @@ where
                 self.date_sync.anchor_gm = self.current_gm_uuid;
                 self.ensure_date_authority();
             }
+            AnchorEvent::Realigned { old_ns, new_ns } => {
+                // Same time base, this box's wall wandered: the fleet D stays. A follower re-joins
+                // at its next poll; the master steps its own wall back (`realign_master_to_fleet`).
+                info!(
+                    "[PHASE-LOCK] re-engaged {:+}us off D — re-anchored on the current offset; \
+                     the date layer re-aligns the wall to the fleet with one step",
+                    new_ns.wrapping_sub(old_ns) / 1_000
+                );
+            }
             AnchorEvent::Rebased { old_ns, new_ns } => {
                 info!(
                     "[PHASE-LOCK] re-anchored, wall continuous (no step): D {} -> {} ns \
@@ -454,11 +530,15 @@ where
         if !self.date_sync.enabled || self.date_sync.core.anchor_ns().is_none() {
             return;
         }
+        if self.ptp_offline {
+            self.date_sync.fresh_window = false;
+        }
         if let Some(due) = self.date_sync.follower.due(wall_now_ns()) {
             self.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
         }
         if self.ntp_server_mode {
             self.ensure_date_authority();
+            self.realign_master_to_fleet();
             return;
         }
         let lost = match self.date_sync.last_applicable_reply {
@@ -503,12 +583,7 @@ where
             return;
         };
         if Some(ext.gm_uuid) != self.date_sync.anchor_gm
-            || !same_time_base(
-                reply.remote_wall_ns,
-                ext.announce.date_offset_ns,
-                reply.received_wall_ns,
-                anchor,
-            )
+            || !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, anchor)
         {
             debug!(
                 "[DATE] authority announce seq {} is in another PTP time base (its GM {:?}, ours \
@@ -562,9 +637,9 @@ where
         let dur = Duration::from_nanos(delta_ns.unsigned_abs());
         let sign: i8 = if delta_ns > 0 { 1 } else { -1 };
         if let Err(e) = self.clock.step_clock(dur, sign) {
-            // D is NOT moved. A follower re-joins after the backoff; the MASTER re-publishes its
-            // actual offset, so the authority never announces an offset its own wall does not
-            // follow (which would make the next announce double-count this step).
+            // D is NOT moved and the fleet D is untouched. A follower re-joins after the backoff; the
+            // master publishes the fleet D regardless and steps its own wall to it after the
+            // backoff (`realign_master_to_fleet`), feeding no UTC reading meanwhile.
             warn!(
                 "[DATE] {} date step {:+}us (seq {}) FAILED: {} — retrying the alignment in {}s",
                 label,
@@ -574,21 +649,19 @@ where
                 STEP_FAILURE_BACKOFF.as_secs()
             );
             self.date_sync.step_failed_at = Some(Instant::now());
-            if let (Some(anchor), Some(a)) = (
-                self.date_sync.core.anchor_ns(),
-                self.date_sync.authority.as_mut(),
-            ) {
-                let ann = a.resync(anchor, wall_now_ns().wrapping_sub(anchor));
-                warn!(
-                    "[DATE] authority re-synced to the master's actual offset (seq {})",
-                    ann.seq
-                );
-            }
             self.update_shared_status();
             return;
         }
         self.date_sync.step_failed_at = None;
         self.date_sync.core.note_step(delta_ns);
+        // #68 on the master: publish the UTC error that REMAINS, not the one just stepped away.
+        if self.date_sync.authority.is_some() {
+            if let Some(err) = self.date_sync.master_utc_error_ns {
+                let residual = err.wrapping_sub(delta_ns);
+                self.date_sync.master_utc_error_ns = Some(residual);
+                self.publish_post_step_residual(residual / 1_000);
+            }
+        }
         self.reset_ptp_measurement_after_step();
         self.ntp_offset_samples.clear();
         self.ntp_pending_step = None;
@@ -700,14 +773,32 @@ mod tests {
         effective_ptp_ns: i64,
         seq: u32,
     ) -> crate::time_server::AuthorityReply {
-        // Both walls read "now": the replying master's PTP time is `now − date_offset_ns`, so a
-        // `date_offset_ns` in this box's base passes the time-base check and one days away fails.
+        authority_reply_in_effect(
+            serial,
+            gm,
+            date_offset_ns,
+            effective_ptp_ns,
+            seq,
+            date_offset_ns,
+        )
+    }
+
+    /// A reply whose published D may carry a pending step; `in_effect_ns` is the master's D in
+    /// effect (what its PTP "now" is taken from). Both walls read "now", so a D in effect in this
+    /// box's base passes the time-base check and one days away fails.
+    fn authority_reply_in_effect(
+        serial: u64,
+        gm: [u8; 6],
+        date_offset_ns: i64,
+        effective_ptp_ns: i64,
+        seq: u32,
+        in_effect_ns: i64,
+    ) -> crate::time_server::AuthorityReply {
         let now = wall_now_ns();
         crate::time_server::AuthorityReply {
             serial,
             gm_uuid: Some(gm),
             is_locked: true,
-            remote_wall_ns: now,
             received_wall_ns: now,
             ext: Some(crate::date_offset::DateExtension {
                 version: crate::date_offset::EXT_VERSION,
@@ -718,6 +809,7 @@ mod tests {
                     seq,
                 },
                 gm_uuid: gm,
+                now_ptp_ns: now - in_effect_ns,
             }),
             received: Instant::now(),
         }
@@ -1063,56 +1155,129 @@ mod tests {
     }
 
     #[test]
-    fn a_local_step_on_the_master_cancels_its_announced_step_so_it_never_doubles_88() {
+    fn a_follower_schedules_a_multi_second_announced_step_88() {
+        // The master booted seconds off UTC: its first announce is +3 s. The PUBLISHED D carries
+        // the pending step, but the time-base check uses the master's D in effect, so the
+        // follower schedules it like any other coordinated step (no refusal, no late step).
+        let (mut c, d) = anchored_controller(MockSystemClock::new(), MockNtpSource::new(), false);
+        let slot = with_authority(&mut c);
+        *slot.lock().unwrap() = Some(authority_reply(1, PL_GM, d, 1_000_000_000, 1));
+        c.service_date_offset();
+        let now_ptp = wall_now_ns() - d;
+        *slot.lock().unwrap() = Some(authority_reply_in_effect(
+            2,
+            PL_GM,
+            d + 3_000_000_000,
+            now_ptp + 5_000_000_000,
+            2,
+            d,
+        ));
+        c.service_date_offset();
+        c.update_shared_status();
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(st.date_step_pending_ns, Some(3_000_000_000));
+        assert_eq!(st.date_steps_late, 0);
+    }
+
+    #[test]
+    fn a_master_local_step_never_moves_the_fleet_offset_and_the_master_realigns_88() {
+        // ONLY the master lost PTP and its local NTP path stepped −250 µs. The fleet D must not
+        // move (followers hold it); once PTP is back the master steps its OWN wall back to it.
+        let mut clock = MockSystemClock::new();
+        clock
+            .expect_step_clock()
+            .times(1)
+            .withf(|dur, sign| *dur == Duration::from_micros(250) && *sign == 1)
+            .returning(|_, _| Ok(()));
+        let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), true);
+        c.note_local_date_step(-250_000);
+        assert_eq!(c.date_sync.core.anchor_ns(), Some(d - 250_000));
+        let now_ptp = wall_now_ns() - d;
+        assert_eq!(
+            c.date_sync
+                .authority
+                .as_ref()
+                .unwrap()
+                .in_effect_ns(now_ptp),
+            d,
+            "the fleet D is untouched"
+        );
+        c.update_shared_status();
+        {
+            let st = c.get_status_shared();
+            let st = st.read().expect("status");
+            assert_eq!(
+                st.date_offset_ns,
+                Some(d - 250_000),
+                "the master's own D in effect"
+            );
+            assert_eq!(
+                st.date_step_pending_ns,
+                Some(250_000),
+                "but it publishes the FLEET D (own D + the way back)"
+            );
+        }
+        // PTP online and engaged: the master re-aligns its own wall (+250 µs, a Join step).
+        c.service_date_offset();
+        assert_eq!(c.date_sync.core.anchor_ns(), Some(d));
+    }
+
+    #[test]
+    fn a_failed_step_on_the_master_keeps_the_fleet_offset_and_retries_after_the_backoff_88() {
+        let mut seq_calls = mockall::Sequence::new();
+        let mut clock = MockSystemClock::new();
+        clock
+            .expect_step_clock()
+            .times(1)
+            .in_sequence(&mut seq_calls)
+            .returning(|_, _| Err(anyhow::anyhow!("clock refused")));
+        clock
+            .expect_step_clock()
+            .times(1)
+            .in_sequence(&mut seq_calls)
+            .withf(|dur, sign| *dur == Duration::from_micros(250) && *sign == 1)
+            .returning(|_, _| Ok(()));
         let mut ntp = MockNtpSource::new();
         ntp.expect_get_offset()
-            .returning(|| Ok(one_offset(60_000, 1)));
-        let (mut c, d) = anchored_controller(MockSystemClock::new(), ntp, true);
+            .returning(|| Ok(one_offset(70_000, 1)));
+        let (mut c, d) = anchored_controller(clock, ntp, true);
+        // The master is 250 µs off the fleet line (a local step during its own PTP outage).
+        c.note_local_date_step(-250_000);
+        let seq = c.date_sync.authority.as_ref().unwrap().seq();
+
+        // Its re-alignment step fails: D stays, the fleet D stays, announces back off.
+        c.service_date_offset();
+        assert_eq!(c.date_sync.core.anchor_ns(), Some(d - 250_000));
+        assert!(c.date_sync.step_failed_at.is_some());
+        let now_ptp = wall_now_ns() - (d - 250_000);
+        assert_eq!(
+            c.date_sync
+                .authority
+                .as_ref()
+                .unwrap()
+                .in_effect_ns(now_ptp),
+            d,
+            "a failed step never moves the fleet D"
+        );
+        // No retry storm inside the backoff …
+        c.service_date_offset();
+        // … and no UTC reading is fed while the master is off the fleet line.
         for _ in 0..2 {
             c.last_ntp_check = Instant::now() - Duration::from_secs(60);
             c.check_ntp_utc_tracking();
         }
-        assert!(
-            c.date_sync.follower.pending().is_some(),
-            "a +60 ms step is announced"
-        );
-        // PTP goes offline and the local NTP path steps +60 ms itself.
-        c.note_local_date_step(60_000_000);
-        assert_eq!(c.date_sync.core.anchor_ns(), Some(d + 60_000_000));
-        assert!(
-            c.date_sync.follower.pending().is_none(),
-            "the scheduled step is dropped"
-        );
-        let now_ptp = wall_now_ns() - (d + 60_000_000);
-        let a = c.date_sync.authority.as_ref().expect("authority");
         assert_eq!(
-            a.pending_step_ns(now_ptp),
-            None,
-            "the announce is cancelled too"
+            c.date_sync.authority.as_ref().unwrap().seq(),
+            seq,
+            "no announce"
         );
-        assert_eq!(a.in_effect_ns(now_ptp + 10_000_000_000), d + 60_000_000);
-    }
 
-    #[test]
-    fn a_failed_step_on_the_master_re_syncs_the_authority_to_its_actual_offset_88() {
-        let mut clock = MockSystemClock::new();
-        clock
-            .expect_step_clock()
-            .returning(|_, _| Err(anyhow::anyhow!("clock refused")));
-        let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), true);
-        let seq = c.date_sync.authority.as_ref().unwrap().seq();
-        c.apply_date_step(52_000_000, StepKind::Coordinated, seq);
-        assert_eq!(c.date_sync.core.anchor_ns(), Some(d), "D did not move");
-        let a = c.date_sync.authority.as_ref().unwrap();
-        assert_eq!(a.seq(), seq + 1);
-        assert_eq!(
-            a.announce().date_offset_ns,
-            d,
-            "publishes the offset its wall follows"
-        );
-        assert!(
-            c.date_sync.step_failed_at.is_some(),
-            "announces back off after a failure"
-        );
+        // After the backoff the re-alignment is retried and lands.
+        c.date_sync.step_failed_at =
+            Some(Instant::now() - STEP_FAILURE_BACKOFF - Duration::from_secs(1));
+        c.service_date_offset();
+        assert_eq!(c.date_sync.core.anchor_ns(), Some(d));
+        assert!(c.date_sync.step_failed_at.is_none());
     }
 }

@@ -92,7 +92,8 @@ pub struct SystemConfig {
     pub clock_discipline: String,
 
     /// dantesync#88 — the fleet date-offset authority's tuning (read by the NTP master only).
-    #[serde(default)]
+    /// Lenient as a whole: `null` or a non-object means the defaults, never a failed parse.
+    #[serde(default, deserialize_with = "lenient_date_offset")]
     pub date_offset: DateOffsetConfig,
 }
 
@@ -160,9 +161,28 @@ where
     })
 }
 
-/// dantesync#88 — the same leniency for the numeric tuning: a non-integer means the default.
+/// dantesync#88 — the same leniency for the numeric tuning: a non-negative number (an integer, or
+/// a float like `10000.0` rounded) is taken; anything else means the default.
 fn lenient_u64_or(value: serde_json::Value, default: u64) -> u64 {
-    value.as_u64().unwrap_or(default)
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .map(|f| f.round() as u64)
+        })
+        .unwrap_or(default)
+}
+
+/// dantesync#88 — `"date_offset": null` / a string / an array must not fail the whole config
+/// parse (which would make `load_config` overwrite the file with defaults, losing `ntp_server`).
+fn lenient_date_offset<'de, D>(deserializer: D) -> Result<DateOffsetConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 fn lenient_bound_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -982,6 +1002,24 @@ mod tests {
                 .expect("must still parse");
         assert_eq!(c.date_offset.step_bound_ns(), 50_000_000);
         assert_eq!(c.date_offset.step_lead_ns(), 5_000_000_000);
+        for bad in [
+            r#"{"date_offset": null}"#,
+            r#"{"date_offset": "x"}"#,
+            r#"{"date_offset": []}"#,
+            r#"{"date_offset": 5}"#,
+        ] {
+            let c: SystemConfig = serde_json::from_str(bad).expect("must still parse");
+            assert_eq!(c.date_offset.step_bound_ns(), 50_000_000, "{bad}");
+        }
+        let c: SystemConfig =
+            serde_json::from_str(r#"{"date_offset":{"step_bound_ms":20.0,"step_lead_ms":9000.4}}"#)
+                .expect("parses");
+        assert_eq!(
+            c.date_offset.step_bound_ns(),
+            20_000_000,
+            "a float is accepted"
+        );
+        assert_eq!(c.date_offset.step_lead_ns(), 9_000_000_000);
     }
 
     #[test]

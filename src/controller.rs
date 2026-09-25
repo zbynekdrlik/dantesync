@@ -1717,6 +1717,7 @@ where
         self.sample_window.clear();
         self.date_sync.window.clear();
         self.date_sync.pending_median_ns = None;
+        self.date_sync.fresh_window = false;
         // Set grace period to skip PTP samples for 2s after step
         self.last_ntp_step = Some(Instant::now());
         // Reset drift tracking to avoid false spike from step

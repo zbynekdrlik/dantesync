@@ -93,25 +93,26 @@ impl Scenario {
 // functions so a change to the controller's glue has exactly one place to be mirrored.
 // ----------------------------------------------------------------------------------------------
 
-/// What the master's 31900 extension carries (`publish_date_status` + the time server).
+/// What the master's 31900 extension carries (`publish_date_status` + the time server): the
+/// FLEET D (its authority's announce, even while its own wall is off the fleet line) and its PTP
+/// "now" taken from its own D in effect.
 struct Published {
     date_offset_ns: i64,
     effective_ptp_ns: i64,
     seq: u32,
     gm: u8,
-    remote_wall_ns: i64,
+    now_ptp_ns: i64,
 }
 
 fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
     let anchor = m.core.anchor_ns().expect("anchored");
-    let now_ptp = m.wall_ns() - anchor;
     let ann = a.announce();
     Published {
-        date_offset_ns: anchor + a.pending_step_ns(now_ptp).unwrap_or(0),
+        date_offset_ns: ann.date_offset_ns,
         effective_ptp_ns: ann.effective_ptp_ns,
         seq: ann.seq,
         gm: m.core_gm,
-        remote_wall_ns: m.wall_ns(),
+        now_ptp_ns: m.wall_ns() - anchor,
     }
 }
 
@@ -122,25 +123,46 @@ fn follower_accepts(b: &Box_, p: &Published) -> bool {
     };
     !b.core.rebase_pending()
         && b.core_gm == p.gm
-        && same_time_base(p.remote_wall_ns, p.date_offset_ns, b.wall_ns(), anchor)
+        && same_time_base(p.now_ptp_ns, b.wall_ns(), anchor)
 }
 
-/// The master's local NTP step while it has no PTP (`note_local_date_step`).
-fn master_local_step(m: &mut Box_, a: &mut DateAuthority, delta_ns: i64) {
+/// The master's local NTP step while it has no PTP (`note_local_date_step`): its own wall and D
+/// only — the fleet D never moves for one box's fault.
+fn master_local_step(m: &mut Box_, _a: &mut DateAuthority, delta_ns: i64) {
     m.stepped += delta_ns;
     m.core.note_step(delta_ns);
+    m.fresh = false;
     m.follower.cancel_pending();
-    let now_ptp = m.wall_ns() - m.core.anchor_ns().expect("anchored");
-    a.local_step(delta_ns, now_ptp);
 }
 
-/// Whether the master feeds its UTC reading to the authority (`ntp_under_date_authority`).
-fn master_feeds_utc(_m: &Box_, _a: &DateAuthority) -> bool {
-    true
+/// Whether the master feeds its UTC reading to the authority (`ntp_under_date_authority`): only
+/// while its wall is on the fleet line.
+fn master_feeds_utc(m: &Box_, a: &DateAuthority) -> bool {
+    let anchor = m.core.anchor_ns().expect("anchored");
+    a.in_effect_ns(m.wall_ns() - anchor) == anchor
 }
 
-/// The master's own re-alignment to the fleet line after a PTP outage (none yet).
-fn master_reconcile(_m: &mut Box_, _a: &DateAuthority, _t_ns: f64, _w: u64, _grace: bool) {}
+/// The master's own re-alignment to the fleet line once its PTP is back
+/// (`realign_master_to_fleet`): one Join step that lands its wall ON the fleet line (removing the
+/// phase error the outage left, measured by a window taken after PTP came back), nothing while a
+/// step is pending.
+fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u64, grace: bool) {
+    let anchor = m.core.anchor_ns().expect("anchored");
+    let now_ptp = m.wall_ns() - anchor;
+    if a.pending_step_ns(now_ptp).is_some() || m.follower.pending().is_some() {
+        return;
+    }
+    let fleet = a.in_effect_ns(now_ptp);
+    if fleet == anchor || !m.fresh {
+        return;
+    }
+    let e = m.core.last_error_ns().unwrap_or(0);
+    let delta = fleet - anchor - e;
+    if delta.abs() > dantesync::date_offset::ABSORB_TOLERANCE_NS {
+        m.apply_step(a.seq(), delta, StepKind::Join, t_ns, w, grace);
+    }
+    m.core.set_anchor(fleet);
+}
 
 /// xorshift64* — deterministic, dependency-free.
 struct Rng(u64);
@@ -196,6 +218,8 @@ struct Box_ {
     lag: (u64, u64),
     /// PTP windows before this one are dropped (the post-step grace), `grace` runs only.
     grace_until: u64,
+    /// A phase-lock window ran since the last step / PTP outage (the controller's `fresh_window`).
+    fresh: bool,
     rng: Rng,
     // metrics
     words: Vec<f64>,
@@ -306,6 +330,7 @@ fn run(sc: &Scenario) -> RunResult {
             core_gm: 1,
             lag: (change_lags[i], reboot_lags[i]),
             grace_until: 0,
+            fresh: false,
             rng: Rng(0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1) * 0x1000_0000_01B3),
             words: Vec::new(),
             steps: Vec::new(),
@@ -408,10 +433,14 @@ fn run(sc: &Scenario) -> RunResult {
                 b.core_gm = gm_id;
             }
             if w < b.grace_until || (i == 0 && sc.master_offline_at(w)) {
+                if i == 0 && sc.master_offline_at(w) {
+                    b.fresh = false;
+                }
                 b.words.push(b.word_ppm);
                 continue;
             }
             let out = b.core.on_window(median, true, b.word_ppm, WINDOW_S);
+            b.fresh = true;
             if let AnchorEvent::Rebased { old_ns, new_ns } = out.event {
                 b.rebases += 1;
                 if i == 0 {
@@ -557,7 +586,13 @@ fn run(sc: &Scenario) -> RunResult {
             for (i, b) in boxes.iter().enumerate() {
                 let (_, gm) = gm_view(w, b.lag, &gm_a, &gm_b_pre, &gm_b_post);
                 let (w0, g0) = hour_start[i];
-                if w > 7_200 && !near_event(w) {
+                // The master's hours around its own PTP outage are skipped too: with no PTP it
+                // free-runs on its held word by design (it has nothing to lock to).
+                let master_outage = i == 0
+                    && sc
+                        .master_ptp_offline
+                        .is_some_and(|(from, to)| from < w && to + 600 > w.saturating_sub(7_200));
+                if w > 7_200 && !near_event(w) && !master_outage {
                     // The continuous clock (the wall without its steps) against the GM's time.
                     let d_wall = (b.wall.ns - w0) as f64;
                     let d_gm = (gm.ns - g0) as f64;
@@ -600,6 +635,7 @@ impl Box_ {
     ) {
         self.stepped += delta_ns;
         self.core.note_step(delta_ns);
+        self.fresh = false;
         self.steps.push((seq, delta_ns, kind, t_ns));
         if grace {
             self.grace_until = w + 1 + GRACE_WINDOWS;

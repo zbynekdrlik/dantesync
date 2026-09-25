@@ -50,14 +50,16 @@ pub const EXT_VERSION: u8 = 1;
 /// [20-23]  seq              (u32) — bumped on every change of D
 /// [24-29]  gm_uuid          (6 bytes) — the grandmaster whose PTP time base D belongs to
 /// [30-31]  reserved (zero)
+/// [32-39]  now_ptp_ns       (i64) — the replying node's PTP time when it built the reply
+///                            (its wall − its D IN EFFECT), for the follower's time-base check
 /// ```
 ///
 /// `gm_uuid` is the grandmaster of the authority's ANCHOR, not "the grandmaster I hear right now":
 /// during a grandmaster change those differ for a window, and publishing the new UUID beside an
 /// old-base `D` would let a follower that already re-anchored adopt a days-wrong offset.
 ///
-/// A future version APPENDS fields; a v1 reader decodes the first 32 bytes of any version ≥ 1.
-pub const EXT_SIZE: usize = 32;
+/// A future version APPENDS fields; a v1 reader decodes the first 40 bytes of any version ≥ 1.
+pub const EXT_SIZE: usize = 40;
 
 /// Extension flag: the replying node is the fleet's date-offset authority.
 pub const EXT_FLAG_AUTHORITY: u8 = 0x01;
@@ -69,7 +71,7 @@ pub const DEFAULT_STEP_BOUND_NS: i64 = 50_000_000;
 /// Every client polls the authority once per second, so 5 s gives ≥ 4 chances to hear it.
 pub const MIN_STEP_LEAD_NS: i64 = 5_000_000_000;
 
-/// An offset that takes effect IMMEDIATELY (the first anchor, a rebase, a local step, a resync) is
+/// An offset that takes effect IMMEDIATELY (the first anchor, a rebase onto a new time base) is
 /// published with its effective instant this far in the PAST. It marks no wall step to meet — the
 /// instant is informational — and a follower whose PTP view of "now" trails the master's by a few
 /// µs (path delay, re-anchor noise) must read it as in effect, never as a pending step to schedule.
@@ -80,26 +82,25 @@ pub const IMMEDIATE_BACKDATE_NS: i64 = 1_000_000_000;
 /// against a single wild reading (a mis-set upstream answering once) moving the whole fleet.
 pub const AUTHORITY_AGREEMENT_N: u32 = 2;
 
-/// A reply is only applicable when the replying node's PTP time now (`its wall − its D`) and this
-/// node's (`own wall − own D`) agree within this. Two different time bases — another
-/// grandmaster, or the same grandmaster after a reboot restarted its uptime under the same UUID —
-/// differ by the grandmasters' uptime difference (seconds to days), while two nodes in the same
-/// base differ only by the reply's age and the wall disagreement (≪ 1 s; the pending step it may
-/// carry is ≤ the step bound). Independent of either node's wall error, so it holds before a join.
+/// A reply is only applicable when the replying node's PTP time "now" and this node's agree within
+/// this. Two different time bases — another grandmaster, or the same grandmaster after a reboot
+/// restarted its uptime under the same UUID — differ by the grandmasters' uptime difference
+/// (seconds to days), while two nodes in the same base differ only by the reply's age and the
+/// wall disagreement (≪ 1 s).
+///
+/// Both "now"s are taken from each node's D IN EFFECT — never from a published D that may carry a
+/// pending step: an announced step is larger than the step bound by construction and has no
+/// upper limit (a master whose boot-time NTP failed announces seconds), so a check fed the pending
+/// D would refuse exactly the steps that matter most.
 pub const TIME_BASE_TOLERANCE_NS: i64 = 1_000_000_000;
 
-/// Are two nodes' `D`s in the same PTP time base? See [`TIME_BASE_TOLERANCE_NS`].
-/// `remote_*` from the reply (its wall at reply time, its published `D`), `own_*` this node's wall
-/// when the reply was received and its own `D`.
-pub fn same_time_base(
-    remote_wall_ns: i64,
-    remote_offset_ns: i64,
-    own_wall_ns: i64,
-    own_offset_ns: i64,
-) -> bool {
-    let remote_ptp = remote_wall_ns.wrapping_sub(remote_offset_ns);
+/// Is a reply in this node's PTP time base? `remote_now_ptp_ns` is the replying node's PTP time
+/// when it built the reply (the extension's `now_ptp_ns`), `own_wall_ns` this node's wall when the
+/// reply arrived, `own_offset_ns` this node's `D` in effect. Independent of either node's wall
+/// error, so it holds before a join. See [`TIME_BASE_TOLERANCE_NS`].
+pub fn same_time_base(remote_now_ptp_ns: i64, own_wall_ns: i64, own_offset_ns: i64) -> bool {
     let own_ptp = own_wall_ns.wrapping_sub(own_offset_ns);
-    remote_ptp.wrapping_sub(own_ptp).unsigned_abs() <= TIME_BASE_TOLERANCE_NS as u64
+    remote_now_ptp_ns.wrapping_sub(own_ptp).unsigned_abs() <= TIME_BASE_TOLERANCE_NS as u64
 }
 
 /// A follower whose own `D` differs from the authority's by at most this ADOPTS the authority's
@@ -130,6 +131,8 @@ pub struct DateExtension {
     pub announce: DateAnnounce,
     /// The grandmaster whose PTP time base `announce.date_offset_ns` belongs to.
     pub gm_uuid: [u8; 6],
+    /// The replying node's PTP time when it built the reply (its wall − its `D` in effect).
+    pub now_ptp_ns: i64,
 }
 
 /// Encode the v1 extension (see [`EXT_SIZE`] for the layout).
@@ -141,6 +144,7 @@ pub fn encode_extension(ext: &DateExtension) -> [u8; EXT_SIZE] {
     out[12..20].copy_from_slice(&ext.announce.effective_ptp_ns.to_be_bytes());
     out[20..24].copy_from_slice(&ext.announce.seq.to_be_bytes());
     out[24..30].copy_from_slice(&ext.gm_uuid);
+    out[32..40].copy_from_slice(&ext.now_ptp_ns.to_be_bytes());
     out
 }
 
@@ -167,6 +171,7 @@ pub fn decode_extension(bytes: &[u8]) -> Option<DateExtension> {
         gm_uuid: [
             bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29],
         ],
+        now_ptp_ns: i64_at(32),
     })
 }
 
@@ -280,34 +285,6 @@ impl DateAuthority {
             Some((offset, eff)) if eff <= now_ptp_ns => offset,
             _ => self.current_ns,
         }
-    }
-
-    /// The master stepped its wall by `delta_ns` OUTSIDE the coordinated path (the local NTP
-    /// fallback while PTP is offline). The PTP time base did not move — `now_ptp_ns` is plain
-    /// "now" in it — so `D` moves by the step, effective now. A pending coordinated step is
-    /// CANCELLED: the local step already corrected the error it was announced for, and applying
-    /// it too would double the correction.
-    pub fn local_step(&mut self, delta_ns: i64, now_ptp_ns: i64) -> DateAnnounce {
-        self.promote(now_ptp_ns);
-        self.current_ns = self.current_ns.wrapping_add(delta_ns);
-        self.current_since_ptp_ns = now_ptp_ns.wrapping_sub(IMMEDIATE_BACKDATE_NS);
-        self.pending = None;
-        self.over_bound = None;
-        self.seq = self.seq.wrapping_add(1);
-        self.announce()
-    }
-
-    /// Re-establish `D` from the master's ACTUAL anchor (a coordinated step failed on the master,
-    /// so its wall did not move while the authority promoted the new offset). Effective now, any
-    /// pending step dropped — the authority must never publish an offset the master's own wall
-    /// does not follow.
-    pub fn resync(&mut self, offset_ns: i64, now_ptp_ns: i64) -> DateAnnounce {
-        self.current_ns = offset_ns;
-        self.current_since_ptp_ns = now_ptp_ns.wrapping_sub(IMMEDIATE_BACKDATE_NS);
-        self.pending = None;
-        self.over_bound = None;
-        self.seq = self.seq.wrapping_add(1);
-        self.announce()
     }
 
     /// Feed one UTC measurement: `utc_error_ns = UTC − wall` on the master (the NTP offset).
@@ -460,11 +437,11 @@ impl DateFollower {
         self.pending = None;
     }
 
-    /// Forget the authority alignment (the authority is gone for good, or this box stopped
-    /// following). A pending step is dropped with it.
+    /// Forget the authority alignment (the authority went silent, or this box stopped
+    /// following). A step already SCHEDULED is kept: the announce was valid when heard and the rest
+    /// of the fleet applies it at its instant, so dropping it would split this box off the fleet.
     pub fn forget(&mut self) {
         self.adopted_seq = None;
-        self.pending = None;
     }
 
     /// Handle an announce from the authority. `own_anchor_ns` is this box's `D`, `now_wall_ns`
@@ -575,6 +552,7 @@ mod tests {
                 seq,
             },
             gm_uuid: [0x00, 0x1d, 0xc1, 0x01, 0x02, (seq & 0xff) as u8],
+            now_ptp_ns: eff.wrapping_add(7),
         }
     }
 
@@ -616,6 +594,11 @@ mod tests {
             "anchor GM"
         );
         assert_eq!(&bytes[30..32], &[0, 0], "reserved");
+        assert_eq!(
+            i64::from_be_bytes(bytes[32..40].try_into().unwrap()),
+            0x1112_1314_1516_1718 + 7,
+            "the replier's PTP now"
+        );
     }
 
     // ---- time-base check -------------------------------------------------------------------
@@ -625,20 +608,18 @@ mod tests {
         // Both hear GM time 1000 s. The follower's wall is 3 h off (never joined yet), but its D
         // carries the same error, so its PTP view is the same.
         let gm = 1_000 * S;
-        let (master_d, own_d) = (1_789_000_000 * S, 1_789_000_000 * S + 3 * 3_600 * S);
-        assert!(same_time_base(
-            gm + master_d,
-            master_d,
-            gm + own_d + 5 * MS,
-            own_d
-        ));
-        // A pending step shifts the published D by ≤ the bound: still the same base.
-        assert!(same_time_base(
-            gm + master_d,
-            master_d + 50 * MS,
-            gm + own_d,
-            own_d
-        ));
+        let own_d = 1_789_000_000 * S + 3 * 3_600 * S;
+        assert!(same_time_base(gm, gm + own_d + 5 * MS, own_d));
+    }
+
+    #[test]
+    fn a_multi_second_pending_step_does_not_disturb_the_check() {
+        // The master announced a +3 s step: its PUBLISHED D is D + 3 s, but its PTP now comes from
+        // the D in effect, so a follower in the same base still recognises it.
+        let d = 1_789_000_000 * S;
+        let gm = 5_000 * S;
+        let master_now_ptp = gm; // its wall (gm + d) − its D in effect (d)
+        assert!(same_time_base(master_now_ptp, gm + d + 2 * MS, d));
     }
 
     #[test]
@@ -646,56 +627,14 @@ mod tests {
         let d_old = 1_789_000_000 * S - 3 * 86_400 * S; // GM uptime 3 days
         let d_new = 1_789_000_000 * S - 10 * S; // the same GM after a reboot: uptime 10 s
         let wall = 1_789_000_000 * S;
-        assert!(!same_time_base(wall, d_old, wall, d_new));
+        assert!(!same_time_base(wall - d_old, wall, d_new));
         assert!(
-            !same_time_base(wall, d_new, wall + 2 * S, d_new),
+            !same_time_base(wall - d_new + 2 * S, wall, d_new),
             "2 s apart is not the same view"
         );
     }
 
-    // ---- authority: local steps and resync ------------------------------------------------
-
-    #[test]
-    fn a_local_step_moves_d_in_the_same_base_and_cancels_a_pending_step() {
-        let mut a = DateAuthority::new(1_000 * S, 0, 50 * MS, MIN_STEP_LEAD_NS);
-        a.on_utc_error(-60 * MS, 100 * S);
-        a.on_utc_error(-60 * MS, 101 * S).expect("announced");
-        assert_eq!(a.pending_step_ns(102 * S), Some(-60 * MS));
-        // PTP goes offline: the master steps −60 ms itself at PTP 102 s.
-        let r = a.local_step(-60 * MS, 102 * S);
-        assert_eq!(
-            r,
-            DateAnnounce {
-                date_offset_ns: 1_000 * S - 60 * MS,
-                effective_ptp_ns: 102 * S - IMMEDIATE_BACKDATE_NS,
-                seq: 3
-            },
-            "effective at the TRUE PTP now, same base"
-        );
-        assert_eq!(
-            a.pending_step_ns(103 * S),
-            None,
-            "the announced step is cancelled"
-        );
-        assert_eq!(
-            a.in_effect_ns(200 * S),
-            1_000 * S - 60 * MS,
-            "never applied twice"
-        );
-    }
-
-    #[test]
-    fn resync_republishes_the_masters_actual_offset() {
-        let mut a = DateAuthority::new(7 * S, 0, 50 * MS, MIN_STEP_LEAD_NS);
-        a.on_utc_error(70 * MS, S);
-        a.on_utc_error(70 * MS, 2 * S);
-        assert_eq!(a.in_effect_ns(8 * S), 7 * S + 70 * MS);
-        // The master's own step failed: its wall is still on 7 s.
-        let r = a.resync(7 * S, 8 * S);
-        assert_eq!(r.date_offset_ns, 7 * S);
-        assert_eq!(r.seq, 3);
-        assert_eq!(a.pending_step_ns(8 * S), None);
-    }
+    // ---- authority: read-only views ----------------------------------------------------------
 
     #[test]
     fn pending_step_and_in_effect_views_do_not_mutate() {
@@ -1060,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_drops_the_alignment_and_any_pending_step() {
+    fn forget_drops_the_alignment_but_keeps_a_scheduled_step() {
         let mut f = DateFollower::new();
         f.on_announce(in_effect(S, 1), S, 5 * S);
         f.on_announce(
@@ -1074,6 +1013,13 @@ mod tests {
         );
         f.forget();
         assert!(!f.adopted());
-        assert_eq!(f.due(100 * S), None);
+        // The fleet applies seq 2 at its instant; so must this box, even if it stopped following.
+        assert_eq!(
+            f.due(11 * S),
+            Some(DueStep {
+                seq: 2,
+                delta_ns: 60 * MS
+            })
+        );
     }
 }

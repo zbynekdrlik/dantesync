@@ -41,11 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within 0.002 ppm per hour. Every date step is coordinated (landing spread ≤ 41 µs, 0 late), no
   step happens at a grandmaster change or reboot, and replies in another time base are refused.
   The frequency LAW's commands are bit-identical across the two UTC scenarios.
-- Safety of the announce: the extension names the anchor's grandmaster; a follower adopts only in
-  the same PTP time base (`same_time_base`), and only replies from the polled address with an
-  unpredictable request id are accepted. A follower returns to the local NTP path after 30 s
-  without an applicable reply. A local step cancels a pending coordinated step, and a failed
-  master step re-syncs the authority.
+- Safety of the announce: the extension names the anchor's grandmaster and carries the
+  replier's PTP "now" (from its D in effect). A follower adopts only in the same PTP time base
+  (`same_time_base`), and only replies from the polled address with an unpredictable request id
+  are accepted. A follower returns to the local NTP path after 30 s without an applicable reply,
+  keeping any step it already scheduled. One box's fault never moves the fleet D: a master
+  without PTP runs its local NTP path on its own wall, then steps back onto the fleet line when
+  PTP returns, and a failed master step is retried after a 10 s backoff.
 
 ## [1.8.47] - 2026-08-19
 

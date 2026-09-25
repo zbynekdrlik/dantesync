@@ -163,12 +163,28 @@ There is no per-box latency calibration; add one only if the canary shows the sp
 - **A follower must be able to STOP following.** After 30 s with no applicable reply it forgets
   the authority and returns to the local NTP date path. Otherwise a silent master leaves it
   drifting at the GM-vs-UTC rate while it still reports "follower".
-- **A local step cancels a pending coordinated step** (`DateAuthority::local_step` +
-  `DateFollower::cancel_pending`). If PTP drops during the 5 s lead, both would otherwise land:
-  a double step.
-- **A failed step on the master re-syncs the authority** to the master's actual `D`. The
-  authority must never publish an offset its own wall does not follow, or the next announce
-  double-counts.
+- **Take PTP "now" from the D IN EFFECT, never from the published D (round 2).** The published D
+  carries a pending step, and an announced step is larger than the step bound by construction
+  with no upper limit. A master whose boot NTP failed announces seconds. So the extension carries
+  the replier's own `now_ptp_ns = wall − D in effect`, and `same_time_base` compares that. The
+  bench's `3 s first step` scenario was RED with the published D.
+- **One box's fault never moves the fleet D (round 2).** While ONLY the master lacks PTP, it
+  runs the local NTP path on its own wall and D. The authority keeps publishing the unchanged
+  fleet D, so followers hold the fleet line and nothing reaches them as a step. Once its PTP is
+  back, the master steps its OWN wall onto the fleet line (`realign_master_to_fleet`: one Join,
+  which also removes the phase error the outage left, measured on a window taken after PTP
+  returned). A failed step on the master works the same way: the fleet D stays, the master
+  feeds no UTC reading while it is off the line, and it retries after a 10 s backoff. A
+  re-engagement > 1 ms off `D` is `Realigned` (same base, the wall wandered) and is never
+  `Rebased` (which is a new time base, and the only event that moves the fleet D without a
+  step). An earlier fix moved the fleet D with the master's local steps; the `master-only
+  outage` scenario showed it reaching every follower as a late step (walls 821 µs apart).
+- **A local step drops a SCHEDULED coordinated step** on that box (`cancel_pending`), since
+  that step already corrected the error. `DateFollower::forget` (authority loss) KEEPS it: the
+  rest of the fleet applies it at its instant.
+- The follower still publishes its adaptive `ntp_step_threshold_us`. Its `ntp_offset_us` is now
+  a µs-level health signal against the master, and ≥ 500 µs is the right envelope to grade it.
+  Only the master's UTC error uses the 50 ms authority bound.
 
 **Consequences for code and tests here:**
 

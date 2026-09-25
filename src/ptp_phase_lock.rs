@@ -95,8 +95,17 @@ pub enum AnchorEvent {
     Anchored {
         anchor_ns: i64,
     },
-    /// Re-anchored from the continuous wall: a grandmaster change, or a time-base jump.
+    /// Re-anchored from the continuous wall because the TIME BASE changed: a grandmaster change
+    /// (`request_rebase`), or a > 1 s jump of the grandmaster's time (a reboot under the same
+    /// UUID). The fleet date offset follows (the authority rebases).
     Rebased {
+        old_ns: i64,
+        new_ns: i64,
+    },
+    /// Re-anchored on (re-)engagement more than [`REANCHOR_ON_ENGAGE_NS`] off `D` in the SAME time
+    /// base: this box's wall wandered (it free-ran through a lock loss, or took local NTP steps).
+    /// The fleet date offset must NOT follow — this box re-aligns its own wall to it with one step.
+    Realigned {
         old_ns: i64,
         new_ns: i64,
     },
@@ -216,11 +225,17 @@ impl PhaseLockCore {
             }
             Some(a) => {
                 let off = median_diff_ns.wrapping_sub(a).abs();
-                let reengaging_far_off = ptp_locked && !self.engaged && off > REANCHOR_ON_ENGAGE_NS;
-                if self.rebase_pending || off > DISCONTINUITY_NS || reengaging_far_off {
+                if self.rebase_pending || off > DISCONTINUITY_NS {
                     self.rebase_pending = false;
                     self.anchor_ns = Some(median_diff_ns);
                     event = AnchorEvent::Rebased {
+                        old_ns: a,
+                        new_ns: median_diff_ns,
+                    };
+                    median_diff_ns
+                } else if ptp_locked && !self.engaged && off > REANCHOR_ON_ENGAGE_NS {
+                    self.anchor_ns = Some(median_diff_ns);
+                    event = AnchorEvent::Realigned {
                         old_ns: a,
                         new_ns: median_diff_ns,
                     };
@@ -464,10 +479,11 @@ mod tests {
         let out = c.on_window(D + 3_000_000, true, 5.0, DT);
         assert_eq!(
             out.event,
-            AnchorEvent::Rebased {
+            AnchorEvent::Realigned {
                 old_ns: D,
                 new_ns: D + 3_000_000
-            }
+            },
+            "same time base: a re-alignment, not a rebase of the fleet offset"
         );
         assert_eq!(out.error_ns, Some(0));
         assert!(
