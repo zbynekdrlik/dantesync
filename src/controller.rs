@@ -6581,6 +6581,8 @@ mod tests {
 
     fn slew_config() -> SystemConfig {
         let mut config = SystemConfig::default();
+        // #117: phase_slew (NTP in the rate path) exists only under the legacy discipline.
+        config.clock_discipline = crate::config::CLOCK_DISCIPLINE_LEGACY.to_string();
         config.phase_slew.enabled = true;
         config.filters.calibration_samples = 0;
         config.filters.warmup_secs = 0.0;
@@ -6911,6 +6913,8 @@ mod tests {
         // chases the full 50ppm — the exact fight the decoupling exists to prevent.
         fn smoothed_after(decoupled: bool) -> f64 {
             let mut config = SystemConfig::default();
+            // #117: phase_slew exists only under the legacy discipline.
+            config.clock_discipline = crate::config::CLOCK_DISCIPLINE_LEGACY.to_string();
             config.phase_slew.enabled = decoupled;
             config.filters.calibration_samples = 0;
             config.filters.warmup_secs = 0.0;
