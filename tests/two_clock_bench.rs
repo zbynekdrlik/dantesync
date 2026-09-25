@@ -69,7 +69,7 @@ struct Scenario {
     /// The master's wall error vs UTC at boot (the followers' are fixed, ms-level).
     master_boot_err_ns: i64,
     /// Windows `[from, to)` in which ONLY the master hears no PTP.
-    master_ptp_offline: Option<(u64, u64)>,
+    master_ptp_offline: Vec<(u64, u64)>,
 }
 
 impl Scenario {
@@ -79,12 +79,13 @@ impl Scenario {
             utc_vs_gm_ppm,
             grace,
             master_boot_err_ns: 0,
-            master_ptp_offline: None,
+            master_ptp_offline: Vec::new(),
         }
     }
     fn master_offline_at(&self, w: u64) -> bool {
         self.master_ptp_offline
-            .is_some_and(|(from, to)| (from..to).contains(&w))
+            .iter()
+            .any(|&(from, to)| (from..to).contains(&w))
     }
 }
 
@@ -239,6 +240,7 @@ struct RunResult {
     /// simultaneity is judged by the landing-time spread instead.
     in_flight_samples: u32,
     max_utc_error_ns: i64,
+    max_fleet_utc_error_ns: i64,
     rate_errors_ppm: Vec<f64>,
     rebases: Vec<u32>,
     late_steps: Vec<u32>,
@@ -349,6 +351,8 @@ fn run(sc: &Scenario) -> RunResult {
     let mut max_dis = 0i64;
     let mut in_flight = 0u32;
     let mut max_utc = 0i64;
+    // The FLEET LINE's UTC error, read on a follower (box 1): what every genlocked box shows.
+    let mut max_fleet_utc = 0i64;
     let mut refused = 0u32;
     // Windows (30 s) after which every box has joined — the join happens within seconds.
     let all_joined_after = 60;
@@ -539,6 +543,9 @@ fn run(sc: &Scenario) -> RunResult {
         }
 
         // 6. metrics.
+        if w > 240 {
+            max_fleet_utc = max_fleet_utc.max((utc.ns - boxes[1].wall_ns()).abs());
+        }
         if w > all_joined_after {
             // Raw wall disagreement at the same true instant, INCLUDING each box's own PTP path
             // delay (a box holds `t2 − t1 = D`, so its wall sits `delay` behind the GM line) —
@@ -591,7 +598,8 @@ fn run(sc: &Scenario) -> RunResult {
                 let master_outage = i == 0
                     && sc
                         .master_ptp_offline
-                        .is_some_and(|(from, to)| from < w && to + 600 > w.saturating_sub(7_200));
+                        .iter()
+                        .any(|&(from, to)| from < w && to + 600 > w.saturating_sub(7_200));
                 if w > 7_200 && !near_event(w) && !master_outage {
                     // The continuous clock (the wall without its steps) against the GM's time.
                     let d_wall = (b.wall.ns - w0) as f64;
@@ -609,6 +617,7 @@ fn run(sc: &Scenario) -> RunResult {
         max_disagreement_ns: max_dis,
         in_flight_samples: in_flight,
         max_utc_error_ns: max_utc,
+        max_fleet_utc_error_ns: max_fleet_utc,
         rate_errors_ppm: rate_errors,
         rebases: boxes.iter().map(|b| b.rebases).collect(),
         late_steps: boxes.iter().map(|b| b.follower.late_steps()).collect(),
@@ -645,7 +654,7 @@ impl Box_ {
 
 fn check(sc: &Scenario, r: &RunResult) {
     let label = sc.label;
-    let offline_scenario = sc.master_ptp_offline.is_some();
+    let offline_scenario = !sc.master_ptp_offline.is_empty();
     let n = r.words.len();
     println!(
         "[{label}] max wall disagreement {} µs, master |UTC − wall| max {} ms, rebases {:?}, \
@@ -780,6 +789,12 @@ fn check(sc: &Scenario, r: &RunResult) {
         "[{label}] master drifted {} ms from UTC",
         r.max_utc_error_ns / MS
     );
+    // … and so does the FLEET (read on a follower), whatever happens to the master's own wall.
+    assert!(
+        r.max_fleet_utc_error_ns < DEFAULT_STEP_BOUND_NS + 2 * MS,
+        "[{label}] the fleet line drifted {} ms from UTC",
+        r.max_fleet_utc_error_ns / MS
+    );
     assert_eq!(n, 6);
 }
 
@@ -836,7 +851,7 @@ fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_8
         utc_vs_gm_ppm: 8.0,
         grace: true,
         master_boot_err_ns: -3 * S,
-        master_ptp_offline: Some((6 * 3600 * 2, 6 * 3600 * 2 + 1_200)),
+        master_ptp_offline: vec![(6 * 3600 * 2, 6 * 3600 * 2 + 1_200)],
     };
     let r = run(&sc);
     check(&sc, &r);
@@ -844,4 +859,25 @@ fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_8
         r.announced.iter().any(|a| a.1.abs() > 2 * S),
         "the multi-second first step was actually exercised"
     );
+}
+
+#[test]
+fn a_long_master_outage_and_a_grandmaster_change_during_one_keep_the_fleet_on_utc_117_88() {
+    // ONLY the master loses PTP for 3 hours (the fleet line would drift ~86 ms from UTC at +8 ppm
+    // if its date froze), and later for 30 minutes that END 10 s after the grandmaster changed —
+    // the master comes back on the new grandmaster while its own wall is off the fleet line. The
+    // fleet must stay within the bound of UTC, coordinated, and never take the master's own
+    // offset as a step.
+    let sc = Scenario {
+        label: "3 h master outage + GM change at the end of a 30 min one, with grace",
+        utc_vs_gm_ppm: 8.0,
+        grace: true,
+        master_boot_err_ns: 0,
+        master_ptp_offline: vec![
+            (2 * 3600 * 2, 5 * 3600 * 2),
+            (GM_CHANGE_AT_WINDOW - 3_600, GM_CHANGE_AT_WINDOW + 20),
+        ],
+    };
+    let r = run(&sc);
+    check(&sc, &r);
 }
