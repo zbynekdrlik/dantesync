@@ -11,12 +11,15 @@
 
 use crate::clock::SystemClock;
 use crate::clock_alarm::{self, ClockAlarm, ClockAlarmNotifier, ClockHealth, DesktopNotifier};
-use crate::config::SystemConfig;
+use crate::config::{SystemConfig, CLOCK_DISCIPLINE_LEGACY, CLOCK_DISCIPLINE_PTP_PHASE_LOCK};
+use crate::date_offset::{DateAnnounce, DateAuthority, DateFollower, FollowAction, StepKind};
 use crate::gm_filter::{GmAllowlist, ResolveOutcome, Resolver, StdResolver};
 use crate::phase_slew::{self, PhaseSlewOutput, PhaseSlewServo};
 use crate::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header, PtpV1SyncMessageBody};
+use crate::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 use crate::spike_filter::{FilterMode, JitterEstimator, SpikeFilter};
 use crate::status::SyncStatus;
+use crate::time_server::{DateAuthoritySource, NoAuthority};
 use crate::traits::{NtpSource, PtpNetwork};
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -27,6 +30,27 @@ use std::time::{Duration, Instant, SystemTime};
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/// dantesync#117/#88 — the wall clock now, ns since the Unix epoch. `t2` (the PTP receive time)
+/// is on this same clock, so `wall − D` is this box's view of the grandmaster's PTP time.
+fn wall_now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// dantesync#88 — a reply from the date-offset authority older than this is not acted on (the
+/// poller asks once per second; a stale reply means the master went quiet).
+const AUTHORITY_REPLY_MAX_AGE: Duration = Duration::from_secs(5);
+
+fn step_kind_label(kind: StepKind) -> &'static str {
+    match kind {
+        StepKind::Join => "join",
+        StepKind::Coordinated => "coordinated",
+        StepKind::Late => "late",
+    }
+}
 
 /// Format a 6-byte UUID/MAC as a readable string (e.g., "00:1D:C1:AB:CD:EF")
 fn format_mac(uuid: &[u8; 6]) -> String {
@@ -816,6 +840,44 @@ where
     /// persistent not-locked spell, e.g. a GM changeover where the true DC may have changed) the
     /// controller does a FULL reset instead of preserving. Reset to 0 whenever a slew succeeds.
     phase_slew_preserve_streak: u32,
+
+    // ==========================================================================
+    // PTP PHASE LOCK + FLEET DATE OFFSET (dantesync#117 / #88)
+    // ==========================================================================
+    /// #117: the owner contract's discipline (`system.clock_discipline`, default on). False only
+    /// for an explicit `"legacy"`, which keeps every pre-#117 path byte-for-byte.
+    phase_lock_enabled: bool,
+    /// #117: the PI on `e = (t2 − t1) − D` that owns the frequency word once PTP-locked.
+    phase_lock: PhaseLockCore,
+    /// #117: raw `t2 − t1` samples of the current window, filled beside `sample_window` under the
+    /// same gate and cleared with it.
+    phase_window: Vec<i64>,
+    /// #117: the window median handed from `process_sample_window` to `apply_self_tuning_servo`.
+    pending_phase_median_ns: Option<i64>,
+    /// #117: the grandmaster time (`t1`) at the pending window, and at the last phase-lock
+    /// update. The phase error evolves in PTP time, so the PI's `dt` is measured there — immune
+    /// to loop scheduling and to this daemon's own wall steps.
+    pending_phase_t1_ns: i64,
+    last_phase_window_t1_ns: Option<i64>,
+    /// #117: the grandmaster the anchor `D` belongs to — a published `D` is only meaningful in
+    /// that grandmaster's PTP time base.
+    anchor_gm: Option<[u8; 6]>,
+    /// #88: every box's coordinated-step scheduler (the master's own announces go through it too).
+    date_follower: DateFollower,
+    /// #88: the fleet date-offset authority — `Some` only on the NTP master, once anchored.
+    date_authority: Option<DateAuthority>,
+    /// #88: where a follower reads its master's announce (`UdpAuthorityPoller` in production).
+    date_authority_source: Box<dyn DateAuthoritySource>,
+    /// #88: serial of the last authority reply acted on (each reply is handled once).
+    last_authority_serial: u64,
+    /// #88: the announce this follower last aligned with, published for observability.
+    last_date_announce: Option<DateAnnounce>,
+    date_step_bound_ns: i64,
+    date_step_lead_ns: i64,
+    /// #88: (size ns, wall epoch s, kind) of the last date step this node applied.
+    last_date_step: Option<(i64, u64, &'static str)>,
+    /// #88: the master's last `UTC − wall` reading (ns), as fed to the authority.
+    master_utc_error_ns: Option<i64>,
 }
 
 struct PendingSync {
@@ -845,6 +907,40 @@ where
         let calibration_complete = calibration_count == 0;
         // #97: read the flag before `config` is moved into the struct below.
         let config_phase_slew_enabled = config.phase_slew.enabled;
+
+        // #117: the clock discipline. The PTP phase lock is the default; phase_slew (NTP in the
+        // rate path) survives only under an explicit "legacy".
+        let phase_lock_enabled = !config.legacy_clock_discipline();
+        if let Some(bad) = config.unknown_clock_discipline() {
+            warn!(
+                "system.clock_discipline {:?} is not {:?} or {:?} — using {:?}",
+                bad,
+                CLOCK_DISCIPLINE_PTP_PHASE_LOCK,
+                CLOCK_DISCIPLINE_LEGACY,
+                CLOCK_DISCIPLINE_PTP_PHASE_LOCK
+            );
+        }
+        if phase_lock_enabled {
+            info!(
+                "[PHASE-LOCK] clock discipline: {} — rate AND phase from the Dante PTP grandmaster; \
+                 NTP only moves the date, through the fleet date offset (#117/#88)",
+                CLOCK_DISCIPLINE_PTP_PHASE_LOCK
+            );
+            if config_phase_slew_enabled {
+                warn!(
+                    "[PHASE-LOCK] system.phase_slew.enabled is IGNORED under {} — NTP never steers \
+                     the rate (set system.clock_discipline = \"{}\" to get phase_slew back)",
+                    CLOCK_DISCIPLINE_PTP_PHASE_LOCK, CLOCK_DISCIPLINE_LEGACY
+                );
+            }
+        } else {
+            info!(
+                "[PHASE-LOCK] clock discipline: {} — the pre-#117 rate servo + NTP step path",
+                CLOCK_DISCIPLINE_LEGACY
+            );
+        }
+        let date_step_bound_ns = config.date_offset.step_bound_ns();
+        let date_step_lead_ns = config.date_offset.step_lead_ns();
 
         // #114: read the alarm cadence before `config` is moved. The effective
         // (floored) value is published in /status; the raw value is floored again
@@ -988,7 +1084,7 @@ where
             // #679 — throttled drift summary log counter
             drift_log_sample_count: 0,
             // #97 — phase-slew servo; Some only when the flag is set, so None = pre-#97 behaviour
-            phase_slew: if config_phase_slew_enabled {
+            phase_slew: if config_phase_slew_enabled && !phase_lock_enabled {
                 info!("[PHASE-SLEW] enabled — sub-50ms UTC errors will SLEW (bounded PI servo, feed-forward decoupled), not step");
                 Some(PhaseSlewServo::new())
             } else {
@@ -1000,6 +1096,23 @@ where
             last_phase_slew_update: None,
             phase_slew_alarm_active: false,
             phase_slew_preserve_streak: 0,
+            // #117 / #88
+            phase_lock_enabled,
+            phase_lock: PhaseLockCore::new(),
+            phase_window: Vec::with_capacity(window_size),
+            pending_phase_median_ns: None,
+            pending_phase_t1_ns: 0,
+            last_phase_window_t1_ns: None,
+            anchor_gm: None,
+            date_follower: DateFollower::new(),
+            date_authority: None,
+            date_authority_source: Box::new(NoAuthority),
+            last_authority_serial: 0,
+            last_date_announce: None,
+            date_step_bound_ns,
+            date_step_lead_ns,
+            last_date_step: None,
+            master_utc_error_ns: None,
         }
     }
 
@@ -1009,6 +1122,18 @@ where
 
     pub fn get_status_shared(&self) -> Arc<RwLock<SyncStatus>> {
         self.status_shared.clone()
+    }
+
+    /// #117: true unless `system.clock_discipline = "legacy"`.
+    pub fn phase_lock_enabled(&self) -> bool {
+        self.phase_lock_enabled
+    }
+
+    /// #88: where this node reads its master's date-offset announce. `main` wires the UDP poller
+    /// on every non-master node; the master (and a test that wants no authority) keeps the default
+    /// `NoAuthority`.
+    pub fn set_date_authority_source(&mut self, source: Box<dyn DateAuthoritySource>) {
+        self.date_authority_source = source;
     }
 
     /// #68 — record a SUCCESSFUL upstream measurement: publish it to
@@ -1281,6 +1406,13 @@ where
                     self.ntp_offset_samples.pop_front();
                 }
 
+                // #117 / #88: under the PTP phase lock NTP never steers the rate, and once this node
+                // has a date authority it never steps the clock on its own either — the master
+                // turns its UTC error into a coordinated announce, a follower only watches.
+                if self.ntp_under_date_authority(offset_us) {
+                    return;
+                }
+
                 // #97: PHASE SLEW. While genuinely PTP-locked, a small (<50ms) UTC error is
                 // corrected by a bounded frequency slew instead of a discrete step — see
                 // `crate::phase_slew`. The step path below is kept UNCHANGED for: a large/insane
@@ -1509,23 +1641,14 @@ where
                         if !(locked_now && step_us != offset_us) {
                             self.ntp_server_checks_since_step = 0;
                         }
-                        // Clear PTP sample window to discard post-step transient samples
-                        self.sample_window.clear();
-                        // Set grace period to skip PTP samples for 2s after step
-                        self.last_ntp_step = Some(Instant::now());
-                        // Reset drift tracking to avoid false spike from step
-                        self.last_offset_us = None;
-                        self.last_offset_time = None;
-                        // Reset prev timestamps so min_delta filter works correctly after grace period
-                        self.prev_t1_ns = 0;
-                        self.prev_t2_ns = 0;
-                        // Clear spike filter to prevent false positives from step transient
-                        self.spike_filter.clear();
-                        // NOTE: jitter_estimator is NOT cleared on NTP step because
-                        // jitter is a hardware property that persists across steps
-                        // Reset accumulated phase error - we just aligned to UTC
-                        self.accumulated_phase_error_us = 0.0;
-                        self.last_phase_accumulation_time = None;
+                        // Discard the post-step transient from every PTP measurement path.
+                        self.reset_ptp_measurement_after_step();
+                        // #117: a step moves the wall, so D moves with it (the phase lock sees no
+                        // disturbance) — this is the LOCAL date path (no authority heard, or PTP
+                        // offline). On the master it is also a rebase of the fleet offset.
+                        if self.phase_lock_enabled {
+                            self.note_local_date_step(step_us.saturating_mul(1_000));
+                        }
                         // #68: publish what REMAINS, not the error just cancelled
                         // (0 for a full step, the remainder for a bounded one).
                         self.publish_post_step_residual(offset_us - step_us);
@@ -1668,6 +1791,309 @@ where
         // dt stays the real elapsed time.
         // #97 (review 🟡): re-arm the alarm edge so a fresh saturation episode logs its onset again.
         self.phase_slew_alarm_active = false;
+    }
+
+    // ========================================================================
+    // FLEET DATE OFFSET (dantesync#88) + PTP PHASE LOCK ANCHOR (#117)
+    // ========================================================================
+
+    /// Discard the transient a clock step leaves in every PTP measurement path: the sample
+    /// windows, the 2 s grace, the rate tracker, the min-delta filter and the spike filter.
+    /// Shared by the NTP step path and the coordinated date step, so both reset identically.
+    fn reset_ptp_measurement_after_step(&mut self) {
+        // Clear PTP sample windows to discard post-step transient samples
+        self.sample_window.clear();
+        self.phase_window.clear();
+        self.pending_phase_median_ns = None;
+        // Set grace period to skip PTP samples for 2s after step
+        self.last_ntp_step = Some(Instant::now());
+        // Reset drift tracking to avoid false spike from step
+        self.last_offset_us = None;
+        self.last_offset_time = None;
+        // Reset prev timestamps so min_delta filter works correctly after grace period
+        self.prev_t1_ns = 0;
+        self.prev_t2_ns = 0;
+        // Clear spike filter to prevent false positives from step transient
+        self.spike_filter.clear();
+        // NOTE: jitter_estimator is NOT cleared on NTP step because
+        // jitter is a hardware property that persists across steps
+        // Reset accumulated phase error - we just aligned to UTC
+        self.accumulated_phase_error_us = 0.0;
+        self.last_phase_accumulation_time = None;
+    }
+
+    /// #117 — the LOCAL date path stepped the wall by `delta_ns` (the NTP step path, used while no
+    /// authority is heard or PTP is offline). `D` moves with the wall so the phase lock sees no
+    /// disturbance; on the master the fleet offset is rebased (no coordinated step: this one has
+    /// already happened) so followers re-align at their next poll.
+    fn note_local_date_step(&mut self, delta_ns: i64) {
+        self.phase_lock.note_step(delta_ns);
+        if let Some(new_anchor) = self.phase_lock.anchor_ns() {
+            // The PTP time did not move: now in the (unchanged) base = wall − the new D.
+            let now_ptp = wall_now_ns().wrapping_sub(new_anchor);
+            if let Some(a) = self.date_authority.as_mut() {
+                let ann = a.rebase(new_anchor, now_ptp);
+                info!(
+                    "[DATE] authority rebased after a local step of {:+}us (seq {})",
+                    delta_ns / 1_000,
+                    ann.seq
+                );
+            }
+        }
+        self.last_date_step = Some((delta_ns, (wall_now_ns() / 1_000_000_000) as u64, "local"));
+    }
+
+    /// #117 / #88 — the NTP reading under the phase lock. Returns true when it was fully handled
+    /// here (the caller must NOT run the NTP step path):
+    ///
+    /// - the NTP master with an anchor and PTP online feeds `UTC − wall` to the date-offset
+    ///   authority, which may announce a coordinated step (it never steps here);
+    /// - a follower aligned with the authority only reports the reading (its date moves only at
+    ///   announced instants).
+    ///
+    /// Everything else (legacy discipline, not anchored yet, PTP offline, no authority heard)
+    /// returns false and keeps the existing NTP step path — the local date fallback.
+    fn ntp_under_date_authority(&mut self, offset_us: i64) -> bool {
+        if !self.phase_lock_enabled || self.ptp_offline {
+            return false;
+        }
+        let Some(anchor) = self.phase_lock.anchor_ns() else {
+            return false;
+        };
+        if self.ntp_server_mode {
+            self.ensure_date_authority();
+            let now_wall = wall_now_ns();
+            let now_ptp = now_wall.wrapping_sub(anchor);
+            let err_ns = offset_us.saturating_mul(1_000);
+            self.master_utc_error_ns = Some(err_ns);
+            // Log-surface contract: every NTP cycle keeps the exact `[NTP] offset:{:+}us` prefix
+            // the camera-box freshness gates parse.
+            info!(
+                "[NTP] offset:{:+}us (date authority, step bound {}us)",
+                offset_us,
+                self.date_step_bound_ns / 1_000
+            );
+            let announced = self
+                .date_authority
+                .as_mut()
+                .and_then(|a| a.on_utc_error(err_ns, now_ptp));
+            if let Some(ann) = announced {
+                let step_ns = ann.date_offset_ns.wrapping_sub(anchor);
+                info!(
+                    "[DATE] AUTHORITY: UTC − wall = {:+}us exceeds {}us — announcing a fleet date \
+                     step of {:+}us at PTP {} (in {} ms), seq {}",
+                    offset_us,
+                    self.date_step_bound_ns / 1_000,
+                    step_ns / 1_000,
+                    ann.effective_ptp_ns,
+                    ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
+                    ann.seq
+                );
+                let act = self.date_follower.on_announce(ann, anchor, now_wall);
+                debug!("[DATE] master's own scheduler: {:?}", act);
+            }
+            // The NTP step path is bypassed: nothing pending, nothing starved.
+            self.ntp_pending_step = None;
+            self.ntp_server_checks_since_step = 0;
+            self.update_shared_status();
+            return true;
+        }
+        if self.date_follower.adopted() {
+            info!(
+                "[NTP] offset:{:+}us (following the fleet date offset — no NTP step)",
+                offset_us
+            );
+            self.ntp_pending_step = None;
+            return true;
+        }
+        false
+    }
+
+    /// #88 — make the NTP master the fleet date-offset authority once it is anchored, and align
+    /// its own scheduler with itself (so its announces are scheduled like everyone's).
+    fn ensure_date_authority(&mut self) {
+        if !self.phase_lock_enabled || !self.ntp_server_mode || self.date_authority.is_some() {
+            return;
+        }
+        let Some(anchor) = self.phase_lock.anchor_ns() else {
+            return;
+        };
+        let now_wall = wall_now_ns();
+        let authority = DateAuthority::new(
+            anchor,
+            now_wall.wrapping_sub(anchor),
+            self.date_step_bound_ns,
+            self.date_step_lead_ns,
+        );
+        let act = self
+            .date_follower
+            .on_announce(authority.announce(), anchor, now_wall);
+        debug!("[DATE] master aligned with its own authority: {:?}", act);
+        info!(
+            "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns, step bound {} ms, \
+             announce lead {} s — clients step together at the announced PTP instant",
+            anchor,
+            self.date_step_bound_ns / 1_000_000,
+            self.date_step_lead_ns / 1_000_000_000
+        );
+        self.date_authority = Some(authority);
+    }
+
+    /// #117 — react to the phase lock's anchor lifecycle.
+    fn handle_phase_anchor_event(&mut self, event: AnchorEvent) {
+        match event {
+            AnchorEvent::None => {}
+            AnchorEvent::Anchored { anchor_ns } => {
+                self.anchor_gm = self.current_gm_uuid;
+                info!(
+                    "[PHASE-LOCK] anchored: wall = PTP time + D, D={}ns (grandmaster {})",
+                    anchor_ns,
+                    self.current_gm_uuid
+                        .as_ref()
+                        .map(format_mac)
+                        .unwrap_or_else(|| "?".to_string())
+                );
+                self.ensure_date_authority();
+            }
+            AnchorEvent::Rebased { old_ns, new_ns } => {
+                self.anchor_gm = self.current_gm_uuid;
+                info!(
+                    "[PHASE-LOCK] re-anchored on the grandmaster's time base, wall continuous \
+                     (no step): D {} -> {} ns (grandmaster {})",
+                    old_ns,
+                    new_ns,
+                    self.current_gm_uuid
+                        .as_ref()
+                        .map(format_mac)
+                        .unwrap_or_else(|| "?".to_string())
+                );
+                if let Some(a) = self.date_authority.as_mut() {
+                    // "now" in the OLD base: the wall did not move, the base did.
+                    let ann = a.rebase(new_ns, wall_now_ns().wrapping_sub(old_ns));
+                    info!(
+                        "[DATE] authority rebased onto the new time base (seq {})",
+                        ann.seq
+                    );
+                }
+            }
+        }
+    }
+
+    /// #88 — every loop iteration: apply a coordinated step whose instant has come, and (a
+    /// follower) act once on each new announce from the master.
+    fn service_date_offset(&mut self) {
+        if !self.phase_lock_enabled || self.phase_lock.anchor_ns().is_none() {
+            return;
+        }
+        if let Some(due) = self.date_follower.due(wall_now_ns()) {
+            self.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
+        }
+        if self.ntp_server_mode {
+            self.ensure_date_authority();
+            return;
+        }
+        let Some(reply) = self.date_authority_source.latest() else {
+            return;
+        };
+        if reply.serial == self.last_authority_serial {
+            return;
+        }
+        self.last_authority_serial = reply.serial;
+        if reply.received.elapsed() > AUTHORITY_REPLY_MAX_AGE {
+            return;
+        }
+        let Some(ext) = reply.ext.filter(|e| e.authority) else {
+            return;
+        };
+        // D belongs to the master's PTP time base: adopt it only on the same grandmaster, and
+        // only while this box's own anchor is in that base (not mid re-anchor, PTP online).
+        if self.ptp_offline || reply.gm_uuid.is_none() || reply.gm_uuid != self.anchor_gm {
+            debug!(
+                "[DATE] authority announce seq {} not applicable here (master GM {:?}, ours {:?}, \
+                 ptp_offline {})",
+                ext.announce.seq, reply.gm_uuid, self.anchor_gm, self.ptp_offline
+            );
+            return;
+        }
+        let Some(anchor) = self.phase_lock.anchor_ns() else {
+            return;
+        };
+        let now_wall = wall_now_ns();
+        let first = !self.date_follower.adopted();
+        self.last_date_announce = Some(ext.announce);
+        match self
+            .date_follower
+            .on_announce(ext.announce, anchor, now_wall)
+        {
+            FollowAction::None => {}
+            FollowAction::Absorb { new_anchor_ns } => {
+                self.phase_lock.set_anchor(new_anchor_ns);
+                if first {
+                    info!(
+                        "[DATE] aligned with the fleet date offset (seq {}): D adopted, \
+                         {:+}ns inside the absorb tolerance — no step",
+                        ext.announce.seq,
+                        new_anchor_ns.wrapping_sub(anchor)
+                    );
+                }
+            }
+            FollowAction::Scheduled {
+                delta_ns,
+                effective_wall_ns,
+            } => info!(
+                "[DATE] coordinated date step {:+}us scheduled (seq {}) in {} ms",
+                delta_ns / 1_000,
+                ext.announce.seq,
+                effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
+            ),
+            FollowAction::Step { delta_ns, kind } => {
+                self.apply_date_step(delta_ns, kind, ext.announce.seq)
+            }
+        }
+    }
+
+    /// #88 — step the wall by `delta_ns` for the fleet date offset and move `D` with it.
+    fn apply_date_step(&mut self, delta_ns: i64, kind: StepKind, seq: u32) {
+        if delta_ns == 0 {
+            return;
+        }
+        let label = step_kind_label(kind);
+        let dur = Duration::from_nanos(delta_ns.unsigned_abs());
+        let sign: i8 = if delta_ns > 0 { 1 } else { -1 };
+        if let Err(e) = self.clock.step_clock(dur, sign) {
+            // D is NOT moved: the next authority poll sees the difference and re-joins.
+            warn!(
+                "[DATE] {} date step {:+}us (seq {}) FAILED: {} — re-aligning at the next poll",
+                label,
+                delta_ns / 1_000,
+                seq,
+                e
+            );
+            return;
+        }
+        self.phase_lock.note_step(delta_ns);
+        self.reset_ptp_measurement_after_step();
+        self.ntp_offset_samples.clear();
+        self.ntp_pending_step = None;
+        self.last_date_step = Some((delta_ns, (wall_now_ns() / 1_000_000_000) as u64, label));
+        if kind == StepKind::Late {
+            warn!(
+                "[DATE] LATE date step {:+}us (seq {}): the announce was first heard after its \
+                 instant — this box stepped out of sync with the fleet",
+                delta_ns / 1_000,
+                seq
+            );
+        } else {
+            info!(
+                "[DATE] stepped {:+}us ({}, seq {})",
+                delta_ns / 1_000,
+                label,
+                seq
+            );
+        }
+        // #91: a date step is this node's NTP-driven step; count it for the storm alarm.
+        self.record_ntp_step_and_check_storm();
+        self.update_shared_status();
     }
 
     /// True while this node is the fleet's NTP server (#68).
@@ -2023,6 +2449,11 @@ where
         // Check PTP status first (handles timeout detection for NTP-only fallback)
         self.check_ptp_status();
 
+        // #88: apply a coordinated date step the moment its instant arrives, and follow the
+        // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
+        // step lands within one loop period of the announced instant on every box.
+        self.service_date_offset();
+
         let (buf, size, t2, source_ip) = match self.network.recv_packet()? {
             Some(res) => res,
             None => {
@@ -2147,8 +2578,12 @@ where
                 // synchronized to the same grandmaster time
                 self.pending_syncs.clear();
                 self.sample_window.clear();
+                self.phase_window.clear();
                 self.prev_t1_ns = 0;
                 self.prev_t2_ns = 0;
+                // #117: a different sender may carry a different time base — re-anchor D from
+                // the next window so the wall stays continuous (never a wall step).
+                self.phase_lock.request_rebase();
                 // Keep: applied_freq_ppm, drift_baseline_ppm (learned values)
                 // Stay in production mode - let servo naturally adjust if needed
                 info!(
@@ -2196,6 +2631,9 @@ where
                     );
                     self.current_gm_uuid = Some(new_uuid);
                     // Note: sync source change already did soft reset if needed
+                    // #117: the grandmaster's uptime is a different time base — re-anchor D.
+                    self.phase_window.clear();
+                    self.phase_lock.request_rebase();
                 }
                 None => {
                     info!("Grandmaster UUID: {}", format_mac(&new_uuid));
@@ -2345,6 +2783,11 @@ where
         // Collect sample if enough time has passed
         if self.should_add_sample(t1_ns) {
             self.sample_window.push(phase_offset_ns);
+            // #117: the RAW offset between the two time bases (not the mod-1 s display phase,
+            // not calibration-corrected) — what the phase lock holds equal to D.
+            if self.phase_lock_enabled {
+                self.phase_window.push(t2_ns.wrapping_sub(t1_ns));
+            }
         }
 
         // Process window when full - pass master time for drift calculation
@@ -2388,7 +2831,7 @@ where
     //
     // ========================================================================
 
-    fn process_sample_window(&mut self, _master_time_ns: i64) {
+    fn process_sample_window(&mut self, master_time_ns: i64) {
         let mut sorted = self.sample_window.clone();
         sorted.sort();
 
@@ -2406,6 +2849,17 @@ where
         );
 
         self.last_phase_offset_ns = offset_ns;
+
+        // #117: the median of the raw `t2 − t1` window, for the phase lock.
+        self.pending_phase_median_ns = if self.phase_window.is_empty() {
+            None
+        } else {
+            let mut raw = self.phase_window.clone();
+            raw.sort_unstable();
+            Some(raw[raw.len() / 2])
+        };
+        self.pending_phase_t1_ns = master_time_ns;
+        self.phase_window.clear();
 
         // Apply self-tuning servo
         self.apply_self_tuning_servo(offset_us);
@@ -2433,6 +2887,11 @@ where
         // - If offset is shrinking → local clock is too slow
         //
         // NTP handles UTC alignment separately. PTP only matches frequency.
+        //
+        // #117: under the PTP phase lock (the default) this rate servo only ACQUIRES; once
+        // PTP-locked, `crate::ptp_phase_lock` takes the frequency word from the phase error
+        // below. Taken first so a grace-period return discards it with the window.
+        let phase_median_ns = self.pending_phase_median_ns.take();
 
         // Skip correction during post-step grace period
         if let Some(step_time) = self.last_ntp_step {
@@ -2684,10 +3143,67 @@ where
             }
         }
 
-        // Apply correction. `total_correction` is f_ptp — the PTP servo's own frequency word,
-        // computed from the DECOUPLED rate above (so its meaning, and `drift_ppm`, are unchanged).
-        self.last_adj_ppm = total_correction;
-        self.applied_freq_ppm = total_correction;
+        // #117: THE PTP PHASE LOCK. Once PTP-locked it owns the frequency word: a PI on
+        // e = (t2 − t1) − D, taken over bumplessly from the rate servo's word. Its inputs are the
+        // PTP window median, the lock verdict and the rate servo's word — no NTP term exists in
+        // this path (the contract: rate = the Dante tick only).
+        let mut applied_word = total_correction;
+        if self.phase_lock_enabled {
+            if let Some(median_ns) = phase_median_ns {
+                // dt in GRANDMASTER time (t1): the plant's own time base. A GM change jumps it,
+                // and `on_window` clamps dt to a sane range for that one window.
+                let t1 = self.pending_phase_t1_ns;
+                let dt = self
+                    .last_phase_window_t1_ns
+                    .map(|prev| t1.wrapping_sub(prev) as f64 / 1e9)
+                    .unwrap_or(dt_secs);
+                self.last_phase_window_t1_ns = Some(t1);
+                let was_engaged = self.phase_lock.engaged();
+                let out = self.phase_lock.on_window(
+                    median_ns,
+                    self.is_locked && !self.ptp_offline,
+                    total_correction,
+                    dt,
+                );
+                self.handle_phase_anchor_event(out.event);
+                match out.freq_ppm {
+                    Some(word) => {
+                        if !was_engaged {
+                            info!(
+                                "[PHASE-LOCK] engaged: the frequency word now follows the PTP \
+                                 phase error (e={:+.1}us, word {:+.3}ppm)",
+                                out.error_ns.unwrap_or(0) as f64 / 1_000.0,
+                                word
+                            );
+                        }
+                        applied_word = word;
+                        // Keep the rate servo's baseline on the learned frequency, so a hand-back
+                        // (lock loss) is bumpless.
+                        self.drift_baseline_ppm = self.phase_lock.integrator_ppm();
+                    }
+                    None => {
+                        if was_engaged {
+                            self.drift_baseline_ppm = self.phase_lock.integrator_ppm();
+                            info!(
+                                "[PHASE-LOCK] disengaged (PTP lock lost) — the rate servo holds \
+                                 the learned {:+.3}ppm",
+                                self.drift_baseline_ppm
+                            );
+                        }
+                    }
+                }
+            } else if self.phase_lock.engaged() {
+                // A window without raw samples (never expected: both windows fill under one gate)
+                // must not bump the word back to the rate servo's — hold the phase lock's.
+                applied_word = self.phase_lock.last_freq_ppm();
+            }
+        }
+
+        // Apply correction. `applied_word` is f_ptp — the PTP servo's own frequency word (the rate
+        // servo's `total_correction`, computed from the DECOUPLED rate above, or the #117 phase
+        // lock's word once engaged).
+        self.last_adj_ppm = applied_word;
+        self.applied_freq_ppm = applied_word;
 
         // #97: compose the ONE frequency word actually applied to the clock — f_total = f_ptp +
         // f_phase — through the SAME `adjust_frequency` path on every platform (so the Windows
@@ -2695,9 +3211,9 @@ where
         // Then remember the applied f_phase for the NEXT interval's decoupling. When the servo is
         // disabled this is exactly `total_correction` and `last_applied_f_phase_ppm` stays 0.
         let f_total = if self.phase_slew.is_some() {
-            phase_slew::compose_frequency(total_correction, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
+            phase_slew::compose_frequency(applied_word, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
         } else {
-            total_correction
+            applied_word
         };
         self.last_applied_f_phase_ppm = if self.phase_slew.is_some() {
             self.pending_f_phase_ppm
@@ -2730,12 +3246,23 @@ where
                 let drift_ns = rate_ppm * 1000.0; // Convert µs/s to ns/s
                 info!(
                     "[PTP] {:4}  Drift:{:+7.0}ns/s  Adj:{:+6.2}ppm",
-                    status, drift_ns, total_correction
+                    status, drift_ns, applied_word
                 );
             } else {
                 info!(
                     "[PTP] {:4}  Drift:{:+6.1}us/s  Adj:{:+6.1}ppm",
-                    status, rate_ppm, total_correction
+                    status, rate_ppm, applied_word
+                );
+            }
+            if self.phase_lock.engaged() {
+                info!(
+                    "[PHASE-LOCK] e={:+.1}us word={:+.3}ppm D-seq={}",
+                    self.phase_lock.last_error_ns().unwrap_or(0) as f64 / 1_000.0,
+                    applied_word,
+                    self.date_follower
+                        .adopted_seq()
+                        .map(|q| q.to_string())
+                        .unwrap_or_else(|| "-".to_string())
                 );
             }
         }
@@ -2853,7 +3380,15 @@ where
             // #83: the currently-active step threshold, server mode only -- lets a
             // consumer grade ntp_offset_us against the box's OWN current tolerance
             // (a large deadband while genuinely PTP-locked) instead of a fixed bound.
-            status.ntp_deadband_us = if self.ntp_server_mode {
+            // #88: while this master is the date-offset authority its only step threshold is the
+            // authority's bound (it never steps on the tight NTP thresholds then).
+            let authority_active = self.phase_lock_enabled
+                && self.ntp_server_mode
+                && self.date_authority.is_some()
+                && !self.ptp_offline;
+            status.ntp_deadband_us = if authority_active {
+                Some(self.date_step_bound_ns / 1_000)
+            } else if self.ntp_server_mode {
                 Some(server_step_threshold_us(self.is_locked, self.ptp_offline))
             } else {
                 None
@@ -2865,7 +3400,9 @@ where
             // deliberately does NOT publish on a client (#83). Lets a HTTP-only consumer (a Windows
             // camera-box client with no journald) read its own step envelope for the step-aware
             // median+spread gate widening instead of falling back to a fixed guess (camera-box #1129).
-            status.ntp_step_threshold_us = Some(if self.ntp_server_mode {
+            status.ntp_step_threshold_us = Some(if authority_active {
+                self.date_step_bound_ns / 1_000
+            } else if self.ntp_server_mode {
                 server_step_threshold_us(self.is_locked, self.ptp_offline)
             } else {
                 self.calculate_ntp_adaptive_threshold()
@@ -2918,6 +3455,72 @@ where
                 status.f_phase_i_ppm = self.pending_f_phase_ppm;
                 status.phase_slew_saturated = false;
             }
+
+            // #117: the discipline and what steers the rate.
+            status.clock_discipline = if self.phase_lock_enabled {
+                CLOCK_DISCIPLINE_PTP_PHASE_LOCK
+            } else {
+                CLOCK_DISCIPLINE_LEGACY
+            }
+            .to_string();
+            status.rate_source = if self.phase_slew.is_some() {
+                "ptp+ntp"
+            } else {
+                "ptp"
+            }
+            .to_string();
+            status.ptp_phase_locked = self.phase_lock.engaged();
+            status.ptp_phase_error_us = if self.phase_lock_enabled {
+                self.phase_lock.last_error_ns().map(|e| e as f64 / 1_000.0)
+            } else {
+                None
+            };
+
+            // #88: the fleet date offset. `date_offset_ns` is D IN EFFECT; a scheduled step is
+            // published beside it (anchor and pending in this ONE write, so the 31900 extension
+            // never counts a step twice).
+            let anchor = if self.phase_lock_enabled {
+                self.phase_lock.anchor_ns()
+            } else {
+                None
+            };
+            let now_wall = wall_now_ns();
+            status.date_offset_ns = anchor;
+            status.date_authority = match anchor {
+                None => String::new(),
+                Some(_) if self.date_authority.is_some() => "master".to_string(),
+                Some(_) if self.date_follower.adopted() => "follower".to_string(),
+                Some(_) => "local".to_string(),
+            };
+            let published = match self.date_authority.as_ref() {
+                Some(a) => Some(a.announce()),
+                None => self.last_date_announce,
+            };
+            status.date_offset_seq = anchor.and(published.map(|p| p.seq));
+            status.date_offset_effective_ptp_ns = anchor.and(published.map(|p| p.effective_ptp_ns));
+            status.date_step_pending_ns = self.date_follower.pending().map(|p| p.delta_ns);
+            status.date_step_due_in_ms = self
+                .date_follower
+                .time_to_due_ns(now_wall)
+                .map(|n| n / 1_000_000);
+            let master = self.date_authority.is_some();
+            status.date_offset_error_ms = if master {
+                self.master_utc_error_ns.map(|e| e as f64 / 1e6)
+            } else {
+                None
+            };
+            status.date_step_bound_ms = if master {
+                Some(self.date_step_bound_ns as f64 / 1e6)
+            } else {
+                None
+            };
+            status.last_date_step_ns = self.last_date_step.map(|s| s.0);
+            status.last_date_step_ts = self.last_date_step.map(|s| s.1);
+            status.last_date_step_kind = self
+                .last_date_step
+                .map(|s| s.2.to_string())
+                .unwrap_or_default();
+            status.date_steps_late = self.date_follower.late_steps();
         }
     }
 }
@@ -6958,5 +7561,356 @@ mod tests {
             decoupled,
             raw
         );
+    }
+
+    // ========================================================================
+    // PTP PHASE LOCK + FLEET DATE OFFSET WIRING (dantesync#117 / #88)
+    // ========================================================================
+    //
+    // The laws themselves (the PI, the authority, the scheduler) are proven in their own modules
+    // and end-to-end by `tests/two_clock_bench.rs`; these tests pin the CONTROLLER wiring: who
+    // owns the frequency word, which path may step the clock, and what /status publishes.
+
+    struct ScriptedAuthority(Arc<std::sync::Mutex<Option<crate::time_server::AuthorityReply>>>);
+
+    impl crate::time_server::DateAuthoritySource for ScriptedAuthority {
+        fn latest(&self) -> Option<crate::time_server::AuthorityReply> {
+            *self.0.lock().expect("scripted authority lock")
+        }
+    }
+
+    const PL_GM: [u8; 6] = [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c];
+    const PL_PTP_NOW_NS: i64 = 10_000_000_000;
+
+    fn phase_lock_config() -> SystemConfig {
+        let mut config = SystemConfig::default();
+        config.filters.calibration_samples = 0;
+        config.filters.warmup_secs = 0.0;
+        config
+    }
+
+    /// A controller anchored on the phase lock (first lock) at `D = wall − 10 s`, so its view of
+    /// the grandmaster's PTP time is 10 s. `master` configures NTP server mode FIRST, so the
+    /// anchor makes it the date-offset authority.
+    fn anchored_controller(
+        mut clock: MockSystemClock,
+        ntp: MockNtpSource,
+        master: bool,
+    ) -> (
+        PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
+        i64,
+    ) {
+        clock.expect_adjust_frequency().returning(|_| Ok(()));
+        let mut c = PtpController::new(
+            clock,
+            MockPtpNetwork::new(),
+            ntp,
+            Arc::new(RwLock::new(SyncStatus::default())),
+            phase_lock_config(),
+        );
+        if master {
+            c.configure_ntp_server_mode(100_000);
+        }
+        c.current_gm_uuid = Some(PL_GM);
+        c.is_locked = true;
+        let d = wall_now_ns() - PL_PTP_NOW_NS;
+        c.pending_phase_median_ns = Some(d);
+        c.pending_phase_t1_ns = PL_PTP_NOW_NS;
+        c.apply_self_tuning_servo(0.0);
+        assert_eq!(
+            c.phase_lock.anchor_ns(),
+            Some(d),
+            "the first lock anchors D"
+        );
+        assert!(c.phase_lock.engaged());
+        (c, d)
+    }
+
+    fn authority_reply(
+        serial: u64,
+        gm: [u8; 6],
+        date_offset_ns: i64,
+        effective_ptp_ns: i64,
+        seq: u32,
+    ) -> crate::time_server::AuthorityReply {
+        crate::time_server::AuthorityReply {
+            serial,
+            gm_uuid: Some(gm),
+            is_locked: true,
+            ext: Some(crate::date_offset::DateExtension {
+                version: crate::date_offset::EXT_VERSION,
+                authority: true,
+                announce: DateAnnounce {
+                    date_offset_ns,
+                    effective_ptp_ns,
+                    seq,
+                },
+            }),
+            received: Instant::now(),
+        }
+    }
+
+    fn with_authority(
+        c: &mut PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
+    ) -> Arc<std::sync::Mutex<Option<crate::time_server::AuthorityReply>>> {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        c.set_date_authority_source(Box::new(ScriptedAuthority(slot.clone())));
+        slot
+    }
+
+    #[test]
+    fn the_phase_lock_is_the_default_and_phase_slew_survives_only_under_legacy_117() {
+        let mut config = phase_lock_config();
+        config.phase_slew.enabled = true;
+        let c = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            config.clone(),
+        );
+        assert!(c.phase_lock_enabled());
+        assert!(
+            c.phase_slew.is_none(),
+            "NTP must never steer the rate under the phase lock"
+        );
+
+        config.clock_discipline = CLOCK_DISCIPLINE_LEGACY.to_string();
+        let legacy = PtpController::new(
+            MockSystemClock::new(),
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            config,
+        );
+        assert!(!legacy.phase_lock_enabled());
+        assert!(legacy.phase_slew.is_some(), "legacy keeps phase_slew");
+    }
+
+    #[test]
+    fn once_locked_the_phase_lock_owns_the_frequency_word_117() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let cap = captured.clone();
+        let mut clock = MockSystemClock::new();
+        clock.expect_adjust_frequency().returning(move |factor| {
+            cap.lock().expect("cap").push((factor - 1.0) * 1e6);
+            Ok(())
+        });
+        let mut c = PtpController::new(
+            clock,
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            phase_lock_config(),
+        );
+        c.current_gm_uuid = Some(PL_GM);
+        c.is_locked = true;
+        c.drift_baseline_ppm = 12.0;
+        let d = 1_790_000_000_000_000_000_i64;
+        c.pending_phase_median_ns = Some(d);
+        c.pending_phase_t1_ns = PL_PTP_NOW_NS;
+        c.apply_self_tuning_servo(0.0);
+        // Bumpless: the first word is the rate servo's (12 ppm, rate 0).
+        // A +500 µs phase error half a second later (grandmaster time) pulls the word DOWN.
+        c.pending_phase_median_ns = Some(d + 500_000);
+        c.pending_phase_t1_ns = PL_PTP_NOW_NS + 500_000_000;
+        c.apply_self_tuning_servo(0.0);
+        let words = captured.lock().expect("cap").clone();
+        assert!(
+            (words[0] - 12.0).abs() < 1e-6,
+            "bumpless hand-over, got {}",
+            words[0]
+        );
+        let expect = 12.0
+            - crate::ptp_phase_lock::K_I_PER_S2 * 500.0 * 0.5
+            - crate::ptp_phase_lock::K_P_PER_S * 500.0;
+        assert!(
+            (words[1] - expect).abs() < 1e-6,
+            "the PI word from the PTP error, got {} want {}",
+            words[1],
+            expect
+        );
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert!(st.ptp_phase_locked);
+        assert_eq!(st.ptp_phase_error_us, Some(500.0));
+        assert_eq!(st.clock_discipline, "ptp_phase_lock");
+        assert_eq!(st.rate_source, "ptp");
+        assert!(
+            (st.drift_ppm - expect).abs() < 1e-6,
+            "drift_ppm is the applied word"
+        );
+    }
+
+    #[test]
+    fn a_follower_joins_the_masters_offset_with_one_step_and_acts_once_per_reply_88() {
+        let mut clock = MockSystemClock::new();
+        clock
+            .expect_step_clock()
+            .times(1)
+            .withf(|d, sign| *d == Duration::from_micros(3_000) && *sign == 1)
+            .returning(|_, _| Ok(()));
+        let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), false);
+        let slot = with_authority(&mut c);
+        *slot.lock().unwrap() = Some(authority_reply(1, PL_GM, d + 3_000_000, 5_000_000_000, 7));
+        c.service_date_offset();
+        assert_eq!(
+            c.phase_lock.anchor_ns(),
+            Some(d + 3_000_000),
+            "D moved with the wall"
+        );
+        c.service_date_offset(); // the same reply again: acted on once only
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(st.date_authority, "follower");
+        assert_eq!(st.last_date_step_kind, "join");
+        assert_eq!(st.last_date_step_ns, Some(3_000_000));
+        assert_eq!(st.date_offset_ns, Some(d + 3_000_000));
+        assert_eq!(st.date_offset_seq, Some(7));
+    }
+
+    #[test]
+    fn a_follower_applies_an_announced_step_only_at_its_instant_88() {
+        let mut clock = MockSystemClock::new();
+        clock
+            .expect_step_clock()
+            .times(1)
+            .withf(|d, sign| *d == Duration::from_millis(60) && *sign == 1)
+            .returning(|_, _| Ok(()));
+        let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), false);
+        let slot = with_authority(&mut c);
+        // Aligned already (same D): adopted with no step.
+        *slot.lock().unwrap() = Some(authority_reply(1, PL_GM, d, 1_000_000_000, 3));
+        c.service_date_offset();
+        // The master announces +60 ms, 150 ms ahead of now (in PTP time).
+        let now_ptp = wall_now_ns() - d;
+        *slot.lock().unwrap() = Some(authority_reply(
+            2,
+            PL_GM,
+            d + 60_000_000,
+            now_ptp + 150_000_000,
+            4,
+        ));
+        c.service_date_offset();
+        c.update_shared_status();
+        {
+            let st = c.get_status_shared();
+            let st = st.read().expect("status");
+            assert_eq!(
+                st.date_step_pending_ns,
+                Some(60_000_000),
+                "scheduled, not applied"
+            );
+        }
+        c.service_date_offset(); // still before the instant: nothing
+        std::thread::sleep(Duration::from_millis(200));
+        c.service_date_offset(); // at/after the instant: the step lands
+        assert_eq!(c.phase_lock.anchor_ns(), Some(d + 60_000_000));
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(st.last_date_step_kind, "coordinated");
+        assert_eq!(st.date_step_pending_ns, None);
+        assert_eq!(st.date_steps_late, 0);
+    }
+
+    #[test]
+    fn a_follower_ignores_an_offset_from_another_grandmasters_time_base_88() {
+        // No step_clock expectation: any step panics the mock.
+        let (mut c, d) = anchored_controller(MockSystemClock::new(), MockNtpSource::new(), false);
+        let slot = with_authority(&mut c);
+        let other_gm = [0x00, 0x1d, 0xc1, 0x99, 0x99, 0x99];
+        *slot.lock().unwrap() = Some(authority_reply(1, other_gm, d + 3_000_000, 1, 1));
+        c.service_date_offset();
+        assert_eq!(c.phase_lock.anchor_ns(), Some(d));
+        c.update_shared_status();
+        let st = c.get_status_shared();
+        assert_eq!(st.read().expect("status").date_authority, "local");
+    }
+
+    #[test]
+    fn a_follower_never_steps_on_its_own_ntp_reading_88() {
+        let mut ntp = MockNtpSource::new();
+        ntp.expect_get_offset()
+            .returning(|| Ok(one_offset(5_000, 1)));
+        // No step_clock expectation: an NTP-driven step would panic the mock.
+        let (mut c, d) = anchored_controller(MockSystemClock::new(), ntp, false);
+        let slot = with_authority(&mut c);
+        *slot.lock().unwrap() = Some(authority_reply(1, PL_GM, d, 1_000_000_000, 3));
+        c.service_date_offset();
+        for _ in 0..3 {
+            c.last_ntp_check = Instant::now() - Duration::from_secs(120);
+            c.check_ntp_utc_tracking();
+        }
+        let st = c.get_status_shared();
+        assert_eq!(
+            st.read().expect("status").ntp_offset_us,
+            5_000,
+            "the reading is still published — it is a health signal now"
+        );
+    }
+
+    #[test]
+    fn the_master_announces_a_utc_error_past_the_bound_instead_of_stepping_88() {
+        let mut ntp = MockNtpSource::new();
+        ntp.expect_get_offset()
+            .returning(|| Ok(one_offset(60_000, 1)));
+        // No step_clock expectation: the master never steps at NTP time under the authority.
+        let (mut c, d) = anchored_controller(MockSystemClock::new(), ntp, true);
+        assert!(
+            c.date_authority.is_some(),
+            "the anchored master is the authority"
+        );
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        {
+            let st = c.get_status_shared();
+            let st = st.read().expect("status");
+            assert_eq!(
+                st.date_step_pending_ns, None,
+                "one reading is never trusted"
+            );
+            assert_eq!(st.date_authority, "master");
+            assert_eq!(
+                st.ntp_deadband_us,
+                Some(50_000),
+                "graded on the authority bound"
+            );
+        }
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(st.date_step_pending_ns, Some(60_000_000));
+        let due = st.date_step_due_in_ms.expect("scheduled");
+        assert!(
+            (4_000..=5_000).contains(&due),
+            "announced 5 s ahead, due in {due} ms"
+        );
+        assert_eq!(st.date_offset_seq, Some(2));
+        assert_eq!(
+            st.date_offset_ns,
+            Some(d),
+            "still in effect until the instant"
+        );
+        assert_eq!(st.date_offset_error_ms, Some(60.0));
+    }
+
+    #[test]
+    fn a_grandmaster_change_re_anchors_and_rebases_the_authority_without_a_step_117() {
+        // No step_clock expectation: a re-anchor must never step the wall.
+        let (mut c, d) = anchored_controller(MockSystemClock::new(), MockNtpSource::new(), true);
+        let seq_before = c.date_authority.as_ref().unwrap().seq();
+        let new_gm = [0x00, 0x1d, 0xc1, 0x44, 0x55, 0x66];
+        c.current_gm_uuid = Some(new_gm);
+        c.phase_lock.request_rebase();
+        // The new grandmaster's uptime is 5 days behind: t2 − t1 grows by 5 days.
+        let five_days: i64 = 5 * 86_400 * 1_000_000_000;
+        c.pending_phase_median_ns = Some(d + five_days);
+        c.pending_phase_t1_ns = PL_PTP_NOW_NS - five_days;
+        c.apply_self_tuning_servo(0.0);
+        assert_eq!(c.phase_lock.anchor_ns(), Some(d + five_days));
+        assert_eq!(c.anchor_gm, Some(new_gm));
+        assert_eq!(c.date_authority.as_ref().unwrap().seq(), seq_before + 1);
+        assert_eq!(c.phase_lock.last_error_ns(), Some(0));
     }
 }

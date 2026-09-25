@@ -815,6 +815,17 @@ fn run_sync_loop(
         }
     }
 
+    // dantesync#88: every node that is NOT the NTP master follows the master's fleet date offset,
+    // polled once per second from the master's 31900 time server on a background thread (DNS and
+    // socket waits never touch this loop). An older master simply answers without the extension,
+    // and the node keeps its local NTP date path.
+    if controller.phase_lock_enabled() && !controller.ntp_server_mode() && !args.skip_ntp {
+        controller.set_date_authority_source(Box::new(time_server::UdpAuthorityPoller::spawn(
+            ntp_server.to_string(),
+            running.clone(),
+        )));
+    }
+
     info!("Starting PTP Loop...");
 
     // Notify systemd we are ready and loop is running

@@ -319,7 +319,7 @@ fn run(utc_vs_gm_ppm: f64) -> RunResult {
             }
             if !m.follower.adopted() {
                 // The authority is aligned with itself from the start.
-                let ann = a.announce(now_ptp);
+                let ann = a.announce();
                 let act = m.follower.on_announce(ann, anchor, m.wall_ns());
                 assert_eq!(act, FollowAction::None);
             }
@@ -330,10 +330,8 @@ fn run(utc_vs_gm_ppm: f64) -> RunResult {
 
         // 5. followers poll the master's 31900 every second (10 % of polls lost).
         if w % POLL_INTERVAL_WINDOWS == 0 {
-            let m_anchor = boxes[0].core.anchor_ns().unwrap();
-            let m_now_ptp = boxes[0].wall_ns() - m_anchor;
             let master_gm = boxes[0].core_gm;
-            let ann: DateAnnounce = authority.as_mut().unwrap().announce(m_now_ptp);
+            let ann: DateAnnounce = authority.as_ref().unwrap().announce();
             for b in boxes.iter_mut().skip(1) {
                 if net_rng.uniform() < POLL_LOSS {
                     continue;

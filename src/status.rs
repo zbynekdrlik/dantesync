@@ -298,6 +298,32 @@ pub struct SyncStatus {
     /// healthy fleet this stays 0 — every step lands at the announced instant on every box.
     #[serde(default)]
     pub date_steps_late: u32,
+
+    // ========================================================================
+    // PTP phase lock (dantesync#117) — additive.
+    // ========================================================================
+    /// dantesync#117: `"ptp_phase_lock"` (rate AND phase from the Dante grandmaster, NTP only
+    /// moves the date) or `"legacy"` (the pre-#117 rate-only servo + NTP steps / phase_slew).
+    /// Empty in a pre-#117 blob.
+    #[serde(default)]
+    pub clock_discipline: String,
+
+    /// dantesync#117: what steers the frequency word. `"ptp"` whenever NTP has no term in it (the
+    /// phase lock, or legacy with phase_slew off); `"ptp+ntp"` for legacy with phase_slew on (the
+    /// contract violation #117 removes). Empty in a pre-#117 blob.
+    #[serde(default)]
+    pub rate_source: String,
+
+    /// dantesync#117: true while the PTP phase lock owns the frequency word (engaged after PTP
+    /// lock; the rate servo holds it during acquisition).
+    #[serde(default)]
+    pub ptp_phase_locked: bool,
+
+    /// dantesync#117: the phase-lock error `e = (t2 − t1) − D` (µs) of the last PTP window;
+    /// `null` until anchored. This — not `ntp_offset_us` — is the node's lock quality against the
+    /// fleet time line.
+    #[serde(default)]
+    pub ptp_phase_error_us: Option<f64>,
 }
 
 fn default_clock_alarm_interval_s() -> u64 {
@@ -371,6 +397,11 @@ impl Default for SyncStatus {
             last_date_step_ts: None,
             last_date_step_kind: String::new(),
             date_steps_late: 0,
+            // #117: unknown until the controller publishes
+            clock_discipline: String::new(),
+            rate_source: String::new(),
+            ptp_phase_locked: false,
+            ptp_phase_error_us: None,
         }
     }
 }
@@ -765,6 +796,10 @@ mod tests {
         assert_eq!(restored.date_step_pending_ns, None);
         assert_eq!(restored.last_date_step_ts, None);
         assert_eq!(restored.date_steps_late, 0);
+        assert_eq!(restored.clock_discipline, "");
+        assert_eq!(restored.rate_source, "");
+        assert!(!restored.ptp_phase_locked);
+        assert_eq!(restored.ptp_phase_error_us, None);
 
         let master = SyncStatus {
             date_authority: "master".to_string(),

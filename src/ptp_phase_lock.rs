@@ -168,11 +168,6 @@ impl PhaseLockCore {
         }
     }
 
-    /// Forget everything (a new session). The next lock anchors afresh.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
     /// Feed one PTP sample window.
     ///
     /// - `median_diff_ns` — the median of `t2 − t1` over the window (raw, NOT the mod-1 s display
