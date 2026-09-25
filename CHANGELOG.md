@@ -33,10 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `date_offset_effective_ptp_ns`, `date_step_pending_ns`, `date_step_due_in_ms`,
   `date_offset_error_ms`, `date_step_bound_ms`, `last_date_step_{ns,ts,kind}`, `date_steps_late`.
   On the master, `ntp_deadband_us` / `ntp_step_threshold_us` report the authority bound.
-- `tests/two_clock_bench.rs`: 6 boxes, a grandmaster change, UTC at +8 / −15 ppm vs the GM, 24
-  simulated hours, run on the production pure modules. Walls agree within 42 µs; the rate matches
-  the current GM within 0.002 ppm per hour; every date step is coordinated (landing spread ≤ 41 µs,
-  0 late); the frequency commands are bit-identical across the two UTC scenarios.
+- `tests/two_clock_bench.rs`: 6 boxes, a grandmaster change (the master notices it last) and a
+  reboot of the new grandmaster under the same UUID (the master notices it first), UTC at +8 /
+  −15 ppm vs the GM, 24 simulated hours, with and without the controller's 2 s post-step grace,
+  run on the production pure modules. Walls agree within 43 µs (with a 33 µs path-delay spread;
+  the live latency spread is still to be measured by the canary). The rate matches the current GM
+  within 0.002 ppm per hour. Every date step is coordinated (landing spread ≤ 41 µs, 0 late), no
+  step happens at a grandmaster change or reboot, and replies in another time base are refused.
+  The frequency LAW's commands are bit-identical across the two UTC scenarios.
+- Safety of the announce: the extension names the anchor's grandmaster; a follower adopts only in
+  the same PTP time base (`same_time_base`), and only replies from the polled address with an
+  unpredictable request id are accepted. A follower returns to the local NTP path after 30 s
+  without an applicable reply. A local step cancels a pending coordinated step, and a failed
+  master step re-syncs the authority.
 
 ## [1.8.47] - 2026-08-19
 

@@ -132,10 +132,43 @@ is no second loop to decouple: the phase lock is the only frequency law once loc
 argument of `PhaseLockCore::on_window` carries NTP. The only NTP-derived quantity is `D`. `D`
 changes either by a STEP of the wall of exactly the same size at the same instant (`note_step`,
 which leaves `e` untouched) or by an absorb of ≤ 100 µs at join time. So NTP contributes nothing
-to the rate. It is PROVEN, not argued: `tests/two_clock_bench.rs` runs the same PTP world under
-two different UTC drifts (+8 / −15 ppm vs the GM) and asserts every box's frequency command
-sequence is **bit-identical** between the two runs. A future change that leaks any NTP term into
-the rate path fails that assertion.
+to the rate. For the frequency LAW this is shown by running, not argued: `tests/two_clock_bench.rs`
+runs the same PTP world under two different UTC drifts (+8 / −15 ppm vs the GM) and asserts every
+box's frequency command sequence is **bit-identical** between the two runs. A future change that
+leaks any NTP term into the law fails that assertion. Scope it honestly: the bench drives the
+pure modules with the controller's glue mirrored. The controller additionally drops 2 s of PTP
+windows after every step (holding the word). Those holds fall at UTC-dependent times, so the
+controller's words are NOT bit-identical across UTC scenarios. The hold carries no NTP value,
+though, and the bench's `with_grace` variant shows every envelope still holds.
+
+**Cross-box agreement = per-box receive-latency ASYMMETRY.** Every box holds the raw `t2 − t1`
+equal to the same `D`, so each wall sits its own one-way PTP latency (network + software
+timestamp) behind the grandmaster line. The bench's < 100 µs uses a 25-58 µs delay spread.
+The live Windows-Npcap vs Linux-kernel timestamp-latency spread is NOT measured yet. The
+canary must read it: compare the boxes' 31900 wall readings, or the camera-box genlock audit.
+There is no per-box latency calibration; add one only if the canary shows the spread matters.
+
+**Lessons from the #117 review (each is a test now):**
+
+- **A published `D` must name its time base.** The extension carries the ANCHOR's grandmaster,
+  never "the one I hear now". During a GM change those differ for a window, and a box that
+  re-anchored first would otherwise adopt a days-wrong offset. Nothing is published while a
+  re-anchor is pending.
+- **The UUID is not enough: check the time base.** A grandmaster that REBOOTS keeps its UUID and
+  restarts its uptime. `date_offset::same_time_base` compares both nodes' PTP "now"
+  (`wall − D`, independent of either wall's error). The bench's negative control, with the check
+  removed, shows walls ~11.7 days apart.
+- **Offsets that take effect "now" are backdated 1 s** (`IMMEDIATE_BACKDATE_NS`). Otherwise a
+  follower whose PTP view trails by µs reads a rebase as a pending step and schedules a µs step.
+- **A follower must be able to STOP following.** After 30 s with no applicable reply it forgets
+  the authority and returns to the local NTP date path. Otherwise a silent master leaves it
+  drifting at the GM-vs-UTC rate while it still reports "follower".
+- **A local step cancels a pending coordinated step** (`DateAuthority::local_step` +
+  `DateFollower::cancel_pending`). If PTP drops during the 5 s lead, both would otherwise land:
+  a double step.
+- **A failed step on the master re-syncs the authority** to the master's actual `D`. The
+  authority must never publish an offset its own wall does not follow, or the next announce
+  double-counts.
 
 **Consequences for code and tests here:**
 
