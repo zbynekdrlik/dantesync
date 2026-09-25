@@ -21,6 +21,36 @@ use std::time::{Duration, SystemTime};
 // - NTP handles UTC alignment separately
 // ============================================================================
 
+// --- Deterministic noise ---
+
+/// Fixed seed of the simulated PTP jitter. Every test thread starts from it, so a test's noise
+/// sequence does not depend on test order or on the run.
+///
+/// Why not `rand::random()`: the servo metrics these tests assert (e.g. the steady-state average
+/// drift rate under 1 ms jitter) are statistics of the noise, and an unseeded run draws a fresh
+/// sample every CI run. Measured over 60 seeds on a replica of this harness, the high-jitter
+/// average rate has an RMS of ~50 us/s against its 150 us/s bound, identical on master and with the
+/// PTP phase lock (it never engages there: that servo never reports locked under 1 ms jitter), so
+/// roughly one run in a few hundred went red for no code change (seen on CI run 36182967772).
+/// A fixed seed keeps every bound as strict as before and makes a red run reproducible.
+const SIM_NOISE_SEED: u64 = 0x5EED_0117_0088_2026;
+
+thread_local! {
+    static SIM_NOISE_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(SIM_NOISE_SEED) };
+}
+
+/// Uniform sample in [0, 1) from a xorshift64* generator (53-bit mantissa).
+fn sim_uniform() -> f64 {
+    SIM_NOISE_STATE.with(|state| {
+        let mut x = state.get();
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        state.set(x);
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
 // --- Physics Engine ---
 
 struct PhysicsEngine {
@@ -115,9 +145,9 @@ impl PtpNetwork for StatefulNetwork {
         // Calculate T2 (Local Receive Time)
         let offset = phys.offset_ns + phys.step_offset_ns;
 
-        // Box-Muller Noise
-        let u1: f64 = rand::random();
-        let u2: f64 = rand::random();
+        // Box-Muller Noise, from the per-test deterministic generator (see `sim_uniform`).
+        let u1: f64 = sim_uniform();
+        let u2: f64 = sim_uniform();
         let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
         let noise = z0 * self.jitter_sigma_ns;
 
