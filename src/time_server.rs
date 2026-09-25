@@ -28,19 +28,41 @@
 //! - `[60-61]` Accumulated phase drift since last NTP step (microseconds, signed i16)
 //! - `[62]`    Flags: bit 0 = ntp_failed, bit 1 = settled
 //! - `[63]`    Reserved (zero)
+//!
+//! # dantesync#88 — the date-offset extension (versioned, opt-in by the REQUEST)
+//!
+//! A request whose magic is `"DSYX"` (0x44535958) instead of `"DSYN"` asks for the reply's
+//! versioned extension: the same 64-byte base, then — when this node has a date-offset state —
+//! the [`crate::date_offset`] extension (`[64]` version, `[65]` flags with bit 0 = the fleet's
+//! date-offset AUTHORITY, `[68-75]` `date_offset_ns`, `[76-83]` `effective_ptp_ns`, `[84-87]`
+//! `seq`). Compatibility, both directions:
+//!
+//! - an OLD client sends `"DSYN"` and gets the byte-identical 64-byte reply it always got — it
+//!   never sees extra bytes (a 64-byte receive buffer on Windows would otherwise fail the whole
+//!   datagram with `WSAEMSGSIZE`, not truncate it);
+//! - an OLD server ignores `"DSYX"` as an invalid magic (debug-logged, no reply), so a new client
+//!   talking to it simply hears no authority and keeps its local date fallback.
+//!
+//! A new client reads the extension with [`parse_reply`]; [`UdpAuthorityPoller`] polls the NTP
+//! master once per second on a background thread so the sync loop never blocks on DNS or I/O.
 
+use crate::date_offset::{decode_extension, encode_extension, DateAnnounce, DateExtension};
 use crate::status::SyncStatus;
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::net::UdpSocket;
-use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// UDP port for time query server
 pub const TIME_SERVER_PORT: u16 = 31900;
 
 /// Request magic bytes: "DSYN"
 const REQUEST_MAGIC: u32 = 0x4453594E;
+
+/// dantesync#88 — request magic "DSYX": the base reply PLUS the versioned date-offset extension.
+const REQUEST_MAGIC_EXT: u32 = 0x44535958;
 
 /// Response magic bytes: "DSYR"
 const RESPONSE_MAGIC: u32 = 0x44535952;
@@ -50,6 +72,10 @@ const REQUEST_SIZE: usize = 8;
 
 /// Response packet size
 const RESPONSE_SIZE: usize = 64;
+
+/// dantesync#88 — receive buffer for requests. Larger than any request we accept so a stray
+/// oversized datagram never fails the whole `recv_from` on Windows (`WSAEMSGSIZE`).
+const REQUEST_BUF_SIZE: usize = 64;
 
 /// UDP Time Query Server for network time verification.
 ///
@@ -81,7 +107,7 @@ impl TimeServer {
     /// This is designed to be called from the main sync loop. It processes
     /// all pending requests without blocking.
     pub fn handle_requests(&self, status: &Arc<RwLock<SyncStatus>>) {
-        let mut buf = [0u8; REQUEST_SIZE];
+        let mut buf = [0u8; REQUEST_BUF_SIZE];
 
         // Process all pending requests (non-blocking)
         loop {
@@ -89,7 +115,7 @@ impl TimeServer {
                 Ok((size, src)) => {
                     if size >= REQUEST_SIZE {
                         let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        if magic == REQUEST_MAGIC {
+                        if magic == REQUEST_MAGIC || magic == REQUEST_MAGIC_EXT {
                             let request_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
                             // Read status (handle poisoned lock gracefully)
@@ -101,7 +127,11 @@ impl TimeServer {
                                 }
                             };
 
-                            let response = build_response(request_id, &sync_status);
+                            let response = if magic == REQUEST_MAGIC_EXT {
+                                build_response_ext(request_id, &sync_status)
+                            } else {
+                                build_response(request_id, &sync_status).to_vec()
+                            };
                             if let Err(e) = self.socket.send_to(&response, src) {
                                 debug!("[TimeServer] Failed to send response to {}: {}", src, e);
                             } else {
@@ -205,6 +235,204 @@ fn build_response(request_id: u32, status: &SyncStatus) -> [u8; RESPONSE_SIZE] {
     // [63] Reserved (already zero)
 
     resp
+}
+
+/// dantesync#88 — the date-offset extension this node publishes, from its status. `None` until
+/// the node has a date-offset state (not PTP-phase-locked yet, or the legacy discipline). The
+/// AUTHORITY flag is set only on the master — a follower mirrors its state for observability but
+/// must never be adopted by anyone.
+fn date_extension_from_status(status: &SyncStatus) -> Option<DateExtension> {
+    Some(DateExtension {
+        version: crate::date_offset::EXT_VERSION,
+        authority: status.date_authority == "master",
+        announce: DateAnnounce {
+            date_offset_ns: status.date_offset_ns?,
+            effective_ptp_ns: status.date_offset_effective_ptp_ns?,
+            seq: status.date_offset_seq?,
+        },
+    })
+}
+
+/// dantesync#88 — the reply to a `"DSYX"` request: the unchanged 64-byte base, then the
+/// extension when this node has a date-offset state (else just the base).
+fn build_response_ext(request_id: u32, status: &SyncStatus) -> Vec<u8> {
+    let mut out = build_response(request_id, status).to_vec();
+    if let Some(ext) = date_extension_from_status(status) {
+        out.extend_from_slice(&encode_extension(&ext));
+    }
+    out
+}
+
+/// dantesync#88 — a `"DSYX"` request (8 bytes, same layout as `"DSYN"`).
+pub fn build_ext_request(request_id: u32) -> [u8; REQUEST_SIZE] {
+    let mut req = [0u8; REQUEST_SIZE];
+    req[0..4].copy_from_slice(&REQUEST_MAGIC_EXT.to_be_bytes());
+    req[4..8].copy_from_slice(&request_id.to_be_bytes());
+    req
+}
+
+/// dantesync#88 — what a follower learns from one reply of its NTP master.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AuthorityReply {
+    /// Increments on every reply the poller stores, so a consumer acts on each reply once.
+    pub serial: u64,
+    /// The replying node's grandmaster UUID (base bytes 42-47); `None` when it has none. The
+    /// published `D` is only meaningful in THIS grandmaster's PTP time base.
+    pub gm_uuid: Option<[u8; 6]>,
+    /// The replying node's PTP lock (base byte 41).
+    pub is_locked: bool,
+    /// The date-offset extension; `None` from an older server or a node without date state.
+    pub ext: Option<DateExtension>,
+    /// When the reply arrived (monotonic).
+    pub received: Instant,
+}
+
+/// dantesync#88 — parse a reply to `build_ext_request(request_id)`. `None` for a short packet,
+/// a wrong magic, or a stale reply to a different request.
+pub fn parse_reply(buf: &[u8], request_id: u32, received: Instant) -> Option<AuthorityReply> {
+    if buf.len() < RESPONSE_SIZE {
+        return None;
+    }
+    if u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) != RESPONSE_MAGIC {
+        return None;
+    }
+    if u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) != request_id {
+        return None;
+    }
+    let mut uuid = [0u8; 6];
+    uuid.copy_from_slice(&buf[42..48]);
+    Some(AuthorityReply {
+        serial: 0,
+        gm_uuid: if uuid == [0u8; 6] { None } else { Some(uuid) },
+        is_locked: buf[41] != 0,
+        ext: decode_extension(&buf[RESPONSE_SIZE..]),
+        received,
+    })
+}
+
+/// dantesync#88 — where the controller reads the latest reply of the date-offset authority.
+/// Boxed in the controller so a test injects a scripted authority; the real one is
+/// [`UdpAuthorityPoller`].
+pub trait DateAuthoritySource: Send {
+    fn latest(&self) -> Option<AuthorityReply>;
+}
+
+/// No authority at all (the NTP master itself, and the default before `main` wires a poller).
+pub struct NoAuthority;
+
+impl DateAuthoritySource for NoAuthority {
+    fn latest(&self) -> Option<AuthorityReply> {
+        None
+    }
+}
+
+/// Poll cadence of the authority. The shortest announce lead is 5 s, so every follower gets
+/// several chances to hear a pending step before its instant.
+pub const AUTHORITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long one poll waits for its reply.
+const AUTHORITY_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// dantesync#88 — polls the NTP master's 31900 with `"DSYX"` once per second on its own thread
+/// and keeps the latest valid reply. DNS resolution and socket waits happen on that thread, so
+/// the sync loop only ever takes a short mutex.
+pub struct UdpAuthorityPoller {
+    latest: Arc<Mutex<Option<AuthorityReply>>>,
+}
+
+impl UdpAuthorityPoller {
+    /// Start polling `host` (the configured NTP server — the fleet's master) until `running`
+    /// clears.
+    pub fn spawn(host: String, running: Arc<AtomicBool>) -> Self {
+        let latest = Arc::new(Mutex::new(None));
+        let shared = latest.clone();
+        std::thread::spawn(move || poll_loop(host, running, shared));
+        UdpAuthorityPoller { latest }
+    }
+}
+
+impl DateAuthoritySource for UdpAuthorityPoller {
+    fn latest(&self) -> Option<AuthorityReply> {
+        self.latest.lock().ok().and_then(|g| *g)
+    }
+}
+
+fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<AuthorityReply>>>) {
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                "[DATE] authority poller: cannot bind a UDP socket: {} — no date authority",
+                e
+            );
+            return;
+        }
+    };
+    if let Err(e) = socket.set_read_timeout(Some(AUTHORITY_REPLY_TIMEOUT)) {
+        error!(
+            "[DATE] authority poller: cannot set the read timeout: {} — no date authority",
+            e
+        );
+        return;
+    }
+    info!(
+        "[DATE] polling the date-offset authority at {}:{} every {:?}",
+        host, TIME_SERVER_PORT, AUTHORITY_POLL_INTERVAL
+    );
+    let mut request_id: u32 = 0;
+    let mut serial: u64 = 0;
+    let mut had_ext: Option<bool> = None;
+    let mut buf = [0u8; 256];
+    while running.load(Ordering::SeqCst) {
+        let started = Instant::now();
+        request_id = request_id.wrapping_add(1);
+        let target = (host.as_str(), TIME_SERVER_PORT)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.find(|a| a.is_ipv4()));
+        match target {
+            None => debug!("[DATE] authority poller: cannot resolve {}", host),
+            Some(addr) => {
+                if let Err(e) = socket.send_to(&build_ext_request(request_id), addr) {
+                    debug!("[DATE] authority poller: send to {} failed: {}", addr, e);
+                } else {
+                    // Drain until the reply to THIS request (a late reply to an earlier one is
+                    // skipped by the request-id check) or the timeout.
+                    while let Ok((n, _src)) = socket.recv_from(&mut buf) {
+                        if let Some(mut reply) = parse_reply(&buf[..n], request_id, Instant::now())
+                        {
+                            serial += 1;
+                            reply.serial = serial;
+                            let has_ext = reply.ext.map(|e| e.authority).unwrap_or(false);
+                            if had_ext != Some(has_ext) {
+                                if has_ext {
+                                    info!(
+                                        "[DATE] {} publishes the fleet date offset (authority)",
+                                        host
+                                    );
+                                } else {
+                                    info!(
+                                        "[DATE] {} answers but publishes no date-offset authority \
+                                         (older dantesync or not phase-locked) — keeping the local date path",
+                                        host
+                                    );
+                                }
+                                had_ext = Some(has_ext);
+                            }
+                            if let Ok(mut g) = shared.lock() {
+                                *g = Some(reply);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let spent = started.elapsed();
+        if spent < AUTHORITY_POLL_INTERVAL {
+            std::thread::sleep(AUTHORITY_POLL_INTERVAL - spent);
+        }
+    }
 }
 
 /// Get the monotonic counter value (platform-specific).
@@ -483,6 +711,186 @@ mod tests {
         let response = build_response(0, &status);
         let ntp_off = i32::from_be_bytes([response[56], response[57], response[58], response[59]]);
         assert_eq!(ntp_off, -42000);
+    }
+
+    // ---- dantesync#88: the versioned date-offset extension ------------------------------
+
+    fn master_status() -> SyncStatus {
+        let mut status = SyncStatus::default();
+        status.is_locked = true;
+        status.mode = "LOCK".to_string();
+        status.gm_uuid = Some([0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c]);
+        status.ntp_offset_us = -1234;
+        status.date_authority = "master".to_string();
+        status.date_offset_ns = Some(1_790_000_000_000_000_000);
+        status.date_offset_effective_ptp_ns = Some(12_345_000_000_000);
+        status.date_offset_seq = Some(3);
+        status
+    }
+
+    #[test]
+    fn test_ext_request_magic() {
+        assert_eq!(&REQUEST_MAGIC_EXT.to_be_bytes(), b"DSYX");
+        let req = build_ext_request(0xDEADBEEF);
+        assert_eq!(&req[0..4], b"DSYX");
+        assert_eq!(&req[4..8], &0xDEADBEEFu32.to_be_bytes());
+    }
+
+    #[test]
+    fn an_old_dsyn_client_still_gets_exactly_the_64_byte_reply_88() {
+        // The base reply is the same function; an old DSYN request never gets the extension.
+        let status = master_status();
+        let base = build_response(7, &status);
+        assert_eq!(base.len(), RESPONSE_SIZE);
+        assert_eq!(base[63], 0, "byte 63 stays reserved/zero");
+    }
+
+    #[test]
+    fn the_extended_reply_is_the_same_base_plus_the_extension_88() {
+        let status = master_status();
+        let ext_reply = build_response_ext(7, &status);
+        assert_eq!(
+            ext_reply.len(),
+            RESPONSE_SIZE + crate::date_offset::EXT_SIZE
+        );
+        let base = build_response(7, &status);
+        // Every base field an old client reads is identical in the extended reply, except the
+        // two clock READINGS (system time [8-15], monotonic counter [16-23]) which are sampled
+        // anew by each call.
+        assert_eq!(&ext_reply[0..8], &base[0..8]);
+        assert_eq!(&ext_reply[24..RESPONSE_SIZE], &base[24..RESPONSE_SIZE]);
+        let ext = decode_extension(&ext_reply[RESPONSE_SIZE..]).expect("extension present");
+        assert!(ext.authority);
+        assert_eq!(ext.announce.date_offset_ns, 1_790_000_000_000_000_000);
+        assert_eq!(ext.announce.effective_ptp_ns, 12_345_000_000_000);
+        assert_eq!(ext.announce.seq, 3);
+    }
+
+    #[test]
+    fn an_old_client_reading_only_64_bytes_of_the_extended_reply_decodes_the_same_fields_88() {
+        // Older-client compatibility of the payload itself: a parser that knows only the base
+        // layout and reads the first 64 bytes sees exactly the fields it always saw.
+        let status = master_status();
+        let reply = build_response_ext(99, &status);
+        let old_view = &reply[..RESPONSE_SIZE];
+        assert_eq!(&old_view[0..4], b"DSYR");
+        assert_eq!(
+            u32::from_be_bytes([old_view[4], old_view[5], old_view[6], old_view[7]]),
+            99
+        );
+        assert_eq!(old_view[40], 3, "mode LOCK");
+        assert_eq!(old_view[41], 1, "is_locked");
+        assert_eq!(&old_view[42..48], &[0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c]);
+        assert_eq!(
+            i32::from_be_bytes([old_view[56], old_view[57], old_view[58], old_view[59]]),
+            -1234
+        );
+    }
+
+    #[test]
+    fn a_node_without_date_state_answers_dsyx_with_the_base_only_88() {
+        let reply = build_response_ext(1, &SyncStatus::default());
+        assert_eq!(reply.len(), RESPONSE_SIZE);
+        let parsed = parse_reply(&reply, 1, Instant::now()).expect("valid base reply");
+        assert_eq!(parsed.ext, None);
+    }
+
+    #[test]
+    fn a_follower_mirrors_its_state_without_the_authority_flag_88() {
+        let mut status = master_status();
+        status.date_authority = "follower".to_string();
+        let reply = build_response_ext(1, &status);
+        let parsed = parse_reply(&reply, 1, Instant::now()).unwrap();
+        assert!(
+            !parsed.ext.unwrap().authority,
+            "only the master is an authority"
+        );
+    }
+
+    #[test]
+    fn parse_reply_reads_gm_lock_and_extension_and_rejects_strangers_88() {
+        let status = master_status();
+        let reply = build_response_ext(42, &status);
+        let t = Instant::now();
+        let parsed = parse_reply(&reply, 42, t).expect("valid");
+        assert_eq!(parsed.gm_uuid, Some([0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c]));
+        assert!(parsed.is_locked);
+        assert_eq!(parsed.ext.unwrap().announce.seq, 3);
+        assert_eq!(parsed.received, t);
+
+        assert_eq!(
+            parse_reply(&reply, 41, t),
+            None,
+            "a reply to another request id"
+        );
+        assert_eq!(parse_reply(&reply[..63], 42, t), None, "short");
+        let mut bad = reply.clone();
+        bad[0] = b'X';
+        assert_eq!(parse_reply(&bad, 42, t), None, "wrong magic");
+        // An older server's 64-byte reply: valid, no authority.
+        let old = build_response(42, &status);
+        assert_eq!(parse_reply(&old, 42, t).unwrap().ext, None);
+        // A node with no grandmaster reports None, not an all-zero UUID.
+        let mut no_gm = master_status();
+        no_gm.gm_uuid = None;
+        assert_eq!(
+            parse_reply(&build_response_ext(1, &no_gm), 1, t)
+                .unwrap()
+                .gm_uuid,
+            None
+        );
+    }
+
+    /// Run the server's non-blocking dispatch until the client has its reply (bounded: 5 s).
+    fn serve_until_reply(
+        server: &TimeServer,
+        status: &Arc<RwLock<SyncStatus>>,
+        client: &UdpSocket,
+        buf: &mut [u8],
+    ) -> usize {
+        for _ in 0..250 {
+            server.handle_requests(status);
+            if let Ok((n, _)) = client.recv_from(buf) {
+                return n;
+            }
+        }
+        panic!("no reply from the time server within 5 s");
+    }
+
+    #[test]
+    fn the_server_answers_dsyn_with_64_bytes_and_dsyx_with_the_extension_over_real_udp_88() {
+        // End-to-end over loopback through the real `handle_requests` dispatch. Bind the server
+        // on an ephemeral port (not 31900, which a running daemon may hold).
+        let server = TimeServer {
+            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
+        };
+        server.socket.set_nonblocking(true).unwrap();
+        let addr = server.socket.local_addr().unwrap();
+        let status = Arc::new(RwLock::new(master_status()));
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+
+        let mut old_req = [0u8; 8];
+        old_req[0..4].copy_from_slice(b"DSYN");
+        old_req[4..8].copy_from_slice(&5u32.to_be_bytes());
+        client.send_to(&old_req, addr).unwrap();
+        let mut buf = [0u8; 256];
+        let n = serve_until_reply(&server, &status, &client, &mut buf);
+        assert_eq!(
+            n, RESPONSE_SIZE,
+            "an old DSYN request gets exactly 64 bytes"
+        );
+
+        client.send_to(&build_ext_request(6), addr).unwrap();
+        let n = serve_until_reply(&server, &status, &client, &mut buf);
+        assert_eq!(n, RESPONSE_SIZE + crate::date_offset::EXT_SIZE);
+        let parsed = parse_reply(&buf[..n], 6, Instant::now()).unwrap();
+        assert_eq!(
+            parsed.ext.unwrap().announce.date_offset_ns,
+            1_790_000_000_000_000_000
+        );
     }
 
     #[test]

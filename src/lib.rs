@@ -2,6 +2,7 @@ pub mod clock;
 pub mod clock_alarm;
 pub mod config;
 pub mod controller;
+pub mod date_offset;
 pub mod dscp;
 pub mod gm_filter;
 pub mod http_status;
