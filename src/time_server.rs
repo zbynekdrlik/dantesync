@@ -35,7 +35,8 @@
 //! versioned extension: the same 64-byte base, then — when this node has a date-offset state —
 //! the [`crate::date_offset`] extension (`[64]` version, `[65]` flags with bit 0 = the fleet's
 //! date-offset AUTHORITY, `[68-75]` `date_offset_ns`, `[76-83]` `effective_ptp_ns`, `[84-87]`
-//! `seq`). Compatibility, both directions:
+//! `seq`, `[88-93]` the anchor's grandmaster UUID, `[96-103]` the replier's PTP "now"). See
+//! `date_offset::EXT_SIZE` for the authoritative layout. Compatibility, both directions:
 //!
 //! - an OLD client sends `"DSYN"` and gets the byte-identical 64-byte reply it always got — it
 //!   never sees extra bytes (a 64-byte receive buffer on Windows would otherwise fail the whole

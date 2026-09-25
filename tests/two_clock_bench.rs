@@ -70,6 +70,10 @@ struct Scenario {
     master_boot_err_ns: i64,
     /// Windows `[from, to)` in which ONLY the master hears no PTP.
     master_ptp_offline: Vec<(u64, u64)>,
+    /// The grandmaster changes DURING one of those outages (a double fault). The master then
+    /// re-bases the fleet D with its own untracked free-run error (it had no PTP to measure it),
+    /// which followers take as one small late step: allowed, bounded to < 1 ms.
+    gm_change_in_master_outage: bool,
 }
 
 impl Scenario {
@@ -80,6 +84,7 @@ impl Scenario {
             grace,
             master_boot_err_ns: 0,
             master_ptp_offline: Vec::new(),
+            gm_change_in_master_outage: false,
         }
     }
     fn master_offline_at(&self, w: u64) -> bool {
@@ -136,11 +141,31 @@ fn master_local_step(m: &mut Box_, _a: &mut DateAuthority, delta_ns: i64) {
     m.follower.cancel_pending();
 }
 
-/// Whether the master feeds its UTC reading to the authority (`ntp_under_date_authority`): only
-/// while its wall is on the fleet line.
-fn master_feeds_utc(m: &Box_, a: &DateAuthority) -> bool {
+/// The master's UTC reading → the authority (`ntp_under_date_authority`): the FLEET line's error
+/// (`reading + anchor − fleet`), fed also while the master has no PTP or is off the line, so the
+/// fleet stays on UTC. Returns the announce, whether the master schedules it for its own wall
+/// (only on the line), and the fleet D it replaces.
+fn master_feed_authority(
+    m: &Box_,
+    a: &mut DateAuthority,
+    utc_err_ns: i64,
+    ptp_offline: bool,
+) -> Option<(DateAnnounce, bool, i64)> {
     let anchor = m.core.anchor_ns().expect("anchored");
-    a.in_effect_ns(m.wall_ns() - anchor) == anchor
+    let now_ptp = m.wall_ns() - anchor;
+    let fleet = a.in_effect_ns(now_ptp);
+    let fleet_err = utc_err_ns + (anchor - fleet);
+    let on_line = anchor == fleet && !ptp_offline;
+    a.on_utc_error(fleet_err, now_ptp)
+        .map(|ann| (ann, on_line, fleet))
+}
+
+/// The master re-anchored on a new time base (`handle_phase_anchor_event`): the fleet D moves by
+/// the observed base shift, never onto the master's own (possibly off-line) anchor.
+fn master_rebases_fleet(a: &mut DateAuthority, master_wall_ns: i64, old_ns: i64, new_ns: i64) {
+    let now_ptp_old = master_wall_ns - old_ns;
+    let fleet_old = a.in_effect_ns(now_ptp_old);
+    a.rebase(fleet_old + (new_ns - old_ns), now_ptp_old);
 }
 
 /// The master's own re-alignment to the fleet line once its PTP is back
@@ -148,6 +173,10 @@ fn master_feeds_utc(m: &Box_, a: &DateAuthority) -> bool {
 /// phase error the outage left, measured by a window taken after PTP came back), nothing while a
 /// step is pending.
 fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u64, grace: bool) {
+    // (The controller also gates on its step-failure backoff; the bench's clocks never fail.)
+    if !m.core.engaged() || m.core.rebase_pending() {
+        return;
+    }
     let anchor = m.core.anchor_ns().expect("anchored");
     let now_ptp = m.wall_ns() - anchor;
     if a.pending_step_ns(now_ptp).is_some() || m.follower.pending().is_some() {
@@ -438,7 +467,9 @@ fn run(sc: &Scenario) -> RunResult {
             }
             if w < b.grace_until || (i == 0 && sc.master_offline_at(w)) {
                 if i == 0 && sc.master_offline_at(w) {
+                    // No PTP, no phase lock (the controller's `service_date_offset`).
                     b.fresh = false;
+                    b.core.disengage();
                 }
                 b.words.push(b.word_ppm);
                 continue;
@@ -473,8 +504,8 @@ fn run(sc: &Scenario) -> RunResult {
             }
             let a = authority.as_mut().unwrap();
             if let Some((old_ns, new_ns)) = master_rebase {
-                // The master's re-anchor IS a rebase of the fleet offset (no step).
-                a.rebase(new_ns, m.wall_ns() - old_ns);
+                // The master's re-anchor on a new time base rebases the fleet offset (no step).
+                master_rebases_fleet(a, m.wall_ns(), old_ns, new_ns);
             }
             let offline = sc.master_offline_at(w);
             if !offline {
@@ -482,8 +513,19 @@ fn run(sc: &Scenario) -> RunResult {
             }
             if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 {
                 let err = utc.ns - m.wall_ns() + (ntp_rng.gauss() * NTP_NOISE_NS).round() as i64;
+                if let Some((ann, own, before)) = master_feed_authority(m, a, err, offline) {
+                    announced.push((ann.seq, ann.date_offset_ns - before));
+                    if own {
+                        let anchor = m.core.anchor_ns().unwrap();
+                        let act = m.follower.on_announce(ann, anchor, m.wall_ns());
+                        assert!(
+                            matches!(act, FollowAction::Scheduled { .. }),
+                            "master schedules its own step: {act:?}"
+                        );
+                    }
+                }
                 if offline {
-                    // The master's local NTP date path (the legacy step gate: two agreeing
+                    // Its OWN wall: the local NTP date path (the legacy step gate, two agreeing
                     // over-threshold readings).
                     let over = err.abs() > MASTER_LOCAL_THRESHOLD_NS;
                     if over
@@ -493,18 +535,6 @@ fn run(sc: &Scenario) -> RunResult {
                         master_local_candidate = None;
                     } else {
                         master_local_candidate = over.then_some(err);
-                    }
-                } else if master_feeds_utc(m, a) {
-                    let anchor = m.core.anchor_ns().unwrap();
-                    let now_ptp = m.wall_ns() - anchor;
-                    let before = a.in_effect_ns(now_ptp);
-                    if let Some(ann) = a.on_utc_error(err, now_ptp) {
-                        announced.push((ann.seq, ann.date_offset_ns - before));
-                        let act = m.follower.on_announce(ann, anchor, m.wall_ns());
-                        assert!(
-                            matches!(act, FollowAction::Scheduled { .. }),
-                            "master schedules its own step: {act:?}"
-                        );
                     }
                 }
             }
@@ -717,8 +747,15 @@ fn check(sc: &Scenario, r: &RunResult) {
         );
     }
     for (i, steps) in r.steps.iter().enumerate().skip(1) {
+        let (lates, steps): (Vec<&Step>, Vec<&Step>) = steps
+            .iter()
+            .partition(|s| sc.gm_change_in_master_outage && s.2 == StepKind::Late);
+        assert!(
+            lates.len() <= 1 && lates.iter().all(|s| s.1.abs() < MS),
+            "[{label}] box {i}: the double-fault re-basing may cost one late step < 1 ms: {lates:?}"
+        );
         let (joins, rest): (Vec<&Step>, Vec<&Step>) =
-            steps.iter().partition(|s| s.2 == StepKind::Join);
+            steps.into_iter().partition(|s| s.2 == StepKind::Join);
         assert!(
             joins.len() <= 1,
             "[{label}] box {i} joined {} times",
@@ -765,8 +802,9 @@ fn check(sc: &Scenario, r: &RunResult) {
         worst_spread / 1_000.0,
         r.in_flight_samples
     );
+    let late_allowed = if sc.gm_change_in_master_outage { 1 } else { 0 };
     assert!(
-        r.late_steps.iter().all(|&l| l == 0),
+        r.late_steps.iter().all(|&l| l <= late_allowed),
         "[{label}] late steps {:?}",
         r.late_steps
     );
@@ -852,6 +890,7 @@ fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_8
         grace: true,
         master_boot_err_ns: -3 * S,
         master_ptp_offline: vec![(6 * 3600 * 2, 6 * 3600 * 2 + 1_200)],
+        gm_change_in_master_outage: false,
     };
     let r = run(&sc);
     check(&sc, &r);
@@ -877,6 +916,7 @@ fn a_long_master_outage_and_a_grandmaster_change_during_one_keep_the_fleet_on_ut
             (2 * 3600 * 2, 5 * 3600 * 2),
             (GM_CHANGE_AT_WINDOW - 3_600, GM_CHANGE_AT_WINDOW + 20),
         ],
+        gm_change_in_master_outage: true,
     };
     let r = run(&sc);
     check(&sc, &r);

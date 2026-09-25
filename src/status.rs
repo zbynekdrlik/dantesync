@@ -277,14 +277,19 @@ pub struct SyncStatus {
     pub date_offset_effective_ptp_ns: Option<i64>,
 
     /// dantesync#88: a coordinated date step scheduled on this node: its size (ns) and the time
-    /// left until it applies (ms, negative = overdue). `null` when none is scheduled.
+    /// left until it applies (ms, negative = overdue). `null` when none is scheduled. On the
+    /// MASTER this is "the announced fleet D minus my own D": the pending step, or — while the
+    /// master's own wall is off the fleet line (its own PTP outage, a failed step) — the way back
+    /// to it, with a negative (overdue) due time until it re-aligns. `date_offset_ns +
+    /// date_step_pending_ns` is therefore always the D the 31900 extension publishes.
     #[serde(default)]
     pub date_step_pending_ns: Option<i64>,
     #[serde(default)]
     pub date_step_due_in_ms: Option<i64>,
 
-    /// dantesync#88: the master's own UTC error (UTC − wall, ms) as it feeds the authority, and
-    /// the bound (ms) past which it announces a step. `null` on a non-master.
+    /// dantesync#88: the FLEET line's UTC error (ms) as the master feeds its authority — its own
+    /// reading plus how far its own wall is off the fleet line (equal to its reading while on the
+    /// line) — and the bound (ms) past which it announces a step. `null` on a non-master.
     #[serde(default)]
     pub date_offset_error_ms: Option<f64>,
     #[serde(default)]

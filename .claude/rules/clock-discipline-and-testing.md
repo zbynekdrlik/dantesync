@@ -169,8 +169,9 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   the replier's own `now_ptp_ns = wall − D in effect`, and `same_time_base` compares that. The
   bench's `3 s first step` scenario was RED with the published D.
 - **One box's fault never moves the fleet D (round 2).** While ONLY the master lacks PTP, it
-  runs the local NTP path on its own wall and D. The authority keeps publishing the unchanged
-  fleet D, so followers hold the fleet line and nothing reaches them as a step. Once its PTP is
+  runs the local NTP path on its own wall and D. The authority keeps publishing the fleet D,
+  moved only by coordinated announces (see the round-3 fleet-line feed below). Followers hold the
+  fleet line, and none of the master's own steps reaches them. Once its PTP is
   back, the master steps its OWN wall onto the fleet line (`realign_master_to_fleet`: one Join,
   which also removes the phase error the outage left, measured on a window taken after PTP
   returned). A failed step on the master works the same way: the fleet D stays, the master
@@ -179,9 +180,31 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   `Rebased` (which is a new time base, and the only event that moves the fleet D without a
   step). An earlier fix moved the fleet D with the master's local steps; the `master-only
   outage` scenario showed it reaching every follower as a late step (walls 821 µs apart).
-- **A local step drops a SCHEDULED coordinated step** on that box (`cancel_pending`), since
-  that step already corrected the error. `DateFollower::forget` (authority loss) KEEPS it: the
-  rest of the fleet applies it at its instant.
+- **The authority is fed the FLEET line's UTC error, not the master's own (round 3).** It is
+  `reading + (anchor − fleet)`, fed even while ONLY the master lacks PTP. Otherwise a long outage
+  freezes the fleet D: +8 ppm is 29 ms/h, and the 3 h bench scenario breached the bound (a
+  94 ms catch-up). An off-line master announces for the fleet but does not schedule the step
+  for its own wall (it re-aligns later). The only error left is its free-run drift, ≪ the bound.
+- **A rebase shifts the fleet D by the observed BASE SHIFT** (`fleet_old + (new − old)`), never
+  onto the master's own anchor. That anchor may be off the fleet line, and folding its offset in
+  reached followers as a step (round 3, RED).
+  - **Known double-fault limit:** if the grandmaster changes DURING the master's own PTP outage,
+    the observed shift also contains the master's untracked free-run error; it had no PTP to
+    measure it. Followers take that as one small late step (bench: < 1 ms, asserted). Only a
+    follower's continuous line knows the exact shift.
+- **A master's local step drops its own SCHEDULED step** (`cancel_pending`, it re-aligns
+  anyway). A FOLLOWER's local step keeps it: its NTP source is the master, whose wall has not
+  stepped yet. `DateFollower::forget` (authority loss) also KEEPS a scheduled step, since the
+  rest of the fleet applies it.
+- **No PTP, no phase lock:** a PTP-offline box disengages the core and hands the learned
+  frequency to the rate servo. The next locked window re-engages and is `Realigned` if the wall
+  free-ran > 1 ms.
+- **Whole-fleet PTP loss (accepted):** every box runs the local NTP path against the master. When
+  PTP returns, each re-joins the fleet line at its own poll: an uncoordinated step of at most
+  the fleet's UTC error (≤ 50 ms), then coherent again.
+- **"late" counts real misses only in normal operation.** It also counts the double fault above
+  and a GM-change re-anchor residual > 100 µs. It is a health counter, and over-counting is the
+  conservative side.
 - The follower still publishes its adaptive `ntp_step_threshold_us`. Its `ntp_offset_us` is now
   a µs-level health signal against the master, and ≥ 500 µs is the right envelope to grade it.
   Only the master's UTC error uses the 50 ms authority bound.

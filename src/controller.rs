@@ -1557,7 +1557,7 @@ where
                         self.reset_ptp_measurement_after_step();
                         // #117: a step moves the wall, so D moves with it (the phase lock sees no
                         // disturbance) — this is the LOCAL date path (no authority heard, or PTP
-                        // offline). On the master it is also a rebase of the fleet offset.
+                        // offline). It never moves the FLEET date offset (see date_sync.rs).
                         if self.date_sync.enabled {
                             self.note_local_date_step(step_us.saturating_mul(1_000));
                         }

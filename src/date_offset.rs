@@ -322,9 +322,8 @@ impl DateAuthority {
         Some(self.announce())
     }
 
-    /// Move `D` WITHOUT a coordinated step, effective immediately: a re-anchor after a
-    /// grandmaster change (the wall is continuous, only the PTP time base moved), or a local
-    /// step the master already applied outside the coordinated path (PTP-offline fallback).
+    /// Move `D` WITHOUT a coordinated step, effective immediately: the time base changed (a
+    /// grandmaster change or reboot), so the same wall line has a new `D` in the new base.
     ///
     /// `now_ptp_old_ns` is "now" in the time base the authority is in BEFORE this call
     /// (`wall − old D`): it is used to promote a due step first, and then converted into the new

@@ -97,7 +97,8 @@ pub enum AnchorEvent {
     },
     /// Re-anchored from the continuous wall because the TIME BASE changed: a grandmaster change
     /// (`request_rebase`), or a > 1 s jump of the grandmaster's time (a reboot under the same
-    /// UUID). The fleet date offset follows (the authority rebases).
+    /// UUID). The fleet date offset follows it into the new base (the authority shifts it by the
+    /// same base shift), with no wall step anywhere.
     Rebased {
         old_ns: i64,
         new_ns: i64,
@@ -180,6 +181,13 @@ impl PhaseLockCore {
         if let Some(a) = self.anchor_ns.as_mut() {
             *a = a.wrapping_add(delta_ns);
         }
+    }
+
+    /// This box lost PTP: stop owning the frequency word (the integrator and the anchor are kept).
+    /// The next locked window re-engages bumplessly from the rate servo's word, and re-anchors
+    /// (`Realigned`) if the wall free-ran more than [`REANCHOR_ON_ENGAGE_NS`] meanwhile.
+    pub fn disengage(&mut self) {
+        self.engaged = false;
     }
 
     /// The grandmaster (or the sync source) changed: re-anchor `D` from the next window, so the
@@ -495,6 +503,21 @@ mod tests {
         let out = c.on_window(D + 3_000_000 + 400_000, true, 5.0, DT);
         assert_eq!(out.event, AnchorEvent::None);
         assert_eq!(out.error_ns, Some(400_000));
+    }
+
+    #[test]
+    fn disengage_keeps_the_anchor_and_the_learned_frequency() {
+        let mut c = PhaseLockCore::new();
+        let mut p = Plant::new(-18.0, 1, 18.0);
+        run(&mut c, &mut p, 2_000, 18.0);
+        c.disengage();
+        assert!(!c.engaged());
+        assert_eq!(c.anchor_ns(), Some(D));
+        assert!((c.integrator_ppm() - 18.0).abs() < 0.05);
+        // After a 3 ms free-run the next locked window re-aligns instead of slewing.
+        let out = c.on_window(D + 3_000_000, true, 18.0, DT);
+        assert!(matches!(out.event, AnchorEvent::Realigned { .. }));
+        assert!(c.engaged());
     }
 
     #[test]
