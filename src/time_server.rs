@@ -42,8 +42,12 @@
 //! - an OLD client sends `"DSYN"` and gets the byte-identical 64-byte reply it always got — it
 //!   never sees extra bytes (a 64-byte receive buffer on Windows would otherwise fail the whole
 //!   datagram with `WSAEMSGSIZE`, not truncate it);
-//! - an OLD server ignores `"DSYX"` as an invalid magic (debug-logged, no reply), so a new client
-//!   talking to it simply hears no authority and keeps its local date fallback.
+//! - an OLD server never answers `"DSYX"`, so a new client talking to it simply hears no
+//!   authority and keeps its local date fallback. On Linux the old server reads the first 8
+//!   bytes and ignores the unknown magic (debug-logged). On WINDOWS its 8-byte receive buffer is
+//!   smaller than the padded request, so the read fails (`WSAEMSGSIZE`) and it logs a socket
+//!   error per poll: 60 in the poller's first minute, then 2 a minute. Upgrade a master before
+//!   its followers (the canary-first fleet order does).
 //!
 //! A new client reads the extension with [`parse_reply`]; [`UdpAuthorityPoller`] polls the NTP
 //! master once per second on a background thread so the sync loop never blocks on DNS or I/O.
@@ -375,24 +379,29 @@ const AUTHORITY_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 /// How long one poll waits for its reply.
 const AUTHORITY_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Consecutive unanswered polls after which the poller slows down: its NTP server does not
-/// speak `"DSYX"` (an older dantesync, a public NTP pool, a firewall) or is down.
+/// Consecutive unanswered polls after which a poller whose host has NEVER answered slows down:
+/// that host does not speak `"DSYX"` (an older dantesync, a public NTP server, a firewall).
 pub const AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF: u32 = 60;
 
-/// Poll cadence while backed off. Any reply restores the 1 s cadence.
+/// Poll cadence while backed off. The first reply restores the 1 s cadence for good.
 pub const AUTHORITY_BACKOFF_INTERVAL: Duration = Duration::from_secs(30);
 
-/// dantesync#88 — the poller's cadence: 1 s while the authority answers, slower after a minute
-/// of silence.
+/// dantesync#88 — the poller's cadence. 1 s, except for a host that has never answered `"DSYX"`
+/// since this poller started: after a minute of silence that one is polled every 30 s. A host that
+/// answered once is a real authority, and a silence from it (a reboot, a network blip) never slows
+/// the poll: an announce it makes when it is back is at most 5 s ahead of its instant, and a
+/// follower polling every 30 s would hear it too late.
 #[derive(Debug, Default)]
 pub struct PollBackoff {
     silent: u32,
+    answered_once: bool,
 }
 
 impl PollBackoff {
     /// A reply to this poll arrived.
     pub fn on_reply(&mut self) {
         self.silent = 0;
+        self.answered_once = true;
     }
 
     /// This poll went unanswered.
@@ -402,7 +411,7 @@ impl PollBackoff {
 
     /// True once the poller runs at the slow cadence.
     pub fn backed_off(&self) -> bool {
-        self.silent >= AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF
+        !self.answered_once && self.silent >= AUTHORITY_SILENT_POLLS_BEFORE_BACKOFF
     }
 
     /// How long until the next poll.
@@ -416,7 +425,8 @@ impl PollBackoff {
 }
 
 /// dantesync#88 — polls the NTP master's 31900 with `"DSYX"` once per second on its own thread
-/// (every 30 s after a minute of silence, see [`PollBackoff`]) and keeps the latest valid reply. DNS resolution and socket waits happen on that thread, so
+/// (every 30 s while a host that never answered stays silent, see [`PollBackoff`]) and keeps the
+/// latest valid reply. DNS resolution and socket waits happen on that thread, so
 /// the sync loop only ever takes a short mutex.
 pub struct UdpAuthorityPoller {
     latest: Arc<Mutex<Option<AuthorityReply>>>,
@@ -554,7 +564,7 @@ fn poll_loop(host: String, running: Arc<AtomicBool>, shared: Arc<Mutex<Option<Au
         if backoff.backed_off() != was_backed_off {
             if was_backed_off {
                 info!(
-                    "[DATE] {} answers again — polling every {:?}",
+                    "[DATE] {} answers DSYX now — polling every {:?}",
                     host, AUTHORITY_POLL_INTERVAL
                 );
             } else {

@@ -218,11 +218,15 @@ There is no per-box latency calibration; add one only if the canary shows the sp
 - **A `"DSYX"` request is padded to 64 bytes; a shorter one is ignored (round 5).** The extended
   reply is 104 bytes. Answering an 8-byte request would make every spoofed one a 13x amplifier;
   a request the size of the base reply keeps the ratio at ~1.6. `"DSYN"` is unchanged (8 bytes,
-  64-byte reply, the pre-existing 8x).
-- **The authority poller backs off (round 5).** After 60 unanswered polls it polls every 30 s;
-  any reply restores 1 s. A follower whose `ntp_server` is not a dantesync master (a public pool,
-  an older master, a firewall) then sends 2 requests a minute instead of 60. A master restart
-  (seconds of silence) never reaches the backoff.
+  64-byte reply, the pre-existing 8x). The cost (round 6): an OLD Windows server reads into an
+  8-byte buffer, so the padded datagram fails its `recv_from` with `WSAEMSGSIZE` and it logs a
+  socket error per poll. Upgrade a master before its followers.
+- **The authority poller backs off only for a host that NEVER answered (rounds 5-6).** After 60
+  unanswered polls such a host (a public NTP server, an older master, a firewall) is polled every
+  30 s; its first reply restores 1 s for good. A host that answered once is never slowed: after a
+  reboot it may announce a step 5 s ahead, and a 30 s poll would hear it after the instant (a
+  late step). Pinned: `PollBackoff` tests assert the poll stays ≤ `MIN_STEP_LEAD_NS / 2` once
+  answered.
 - **Whole-fleet PTP loss (accepted):** every box runs the local NTP path against the master. When
   PTP returns, each re-joins the fleet line at its own poll: an uncoordinated step of at most
   the fleet's UTC error (≤ 50 ms), then coherent again.
