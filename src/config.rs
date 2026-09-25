@@ -72,6 +72,104 @@ pub struct SystemConfig {
     /// `crate::clock_alarm`.
     #[serde(default = "default_clock_alarm_interval_s")]
     pub clock_alarm_interval_s: u64,
+
+    /// dantesync#117 — how this node disciplines its clock.
+    ///
+    /// - `"ptp_phase_lock"` (DEFAULT): the owner contract. RATE and PHASE come from the Dante PTP
+    ///   grandmaster only (`crate::ptp_phase_lock`); NTP only moves the DATE, through the fleet
+    ///   date offset the NTP master announces (`crate::date_offset`, #88). `phase_slew` is never
+    ///   engaged in this mode.
+    /// - `"legacy"`: the pre-#117 behaviour, kept only for the rollout — the rate-only PTP servo
+    ///   plus the NTP step path, with `phase_slew` honoured when enabled.
+    ///
+    /// A String (not an enum) on purpose: an unknown value must degrade to the default with a
+    /// loud warning, never fail the whole config parse (see `config-migration.md`). Read it
+    /// through [`SystemConfig::legacy_clock_discipline`].
+    #[serde(default = "default_clock_discipline")]
+    pub clock_discipline: String,
+
+    /// dantesync#88 — the fleet date-offset authority's tuning (read by the NTP master only).
+    #[serde(default)]
+    pub date_offset: DateOffsetConfig,
+}
+
+/// The `system.clock_discipline` value that selects the new default.
+pub const CLOCK_DISCIPLINE_PTP_PHASE_LOCK: &str = "ptp_phase_lock";
+/// The `system.clock_discipline` value that restores the pre-#117 behaviour.
+pub const CLOCK_DISCIPLINE_LEGACY: &str = "legacy";
+
+fn default_clock_discipline() -> String {
+    CLOCK_DISCIPLINE_PTP_PHASE_LOCK.to_string()
+}
+
+impl SystemConfig {
+    /// True only for an explicit `"legacy"` (case-insensitive, trimmed). Anything else — the
+    /// default, or a typo — is the PTP phase lock; `unknown_clock_discipline` reports a typo so
+    /// the controller can warn about it.
+    pub fn legacy_clock_discipline(&self) -> bool {
+        self.clock_discipline
+            .trim()
+            .eq_ignore_ascii_case(CLOCK_DISCIPLINE_LEGACY)
+    }
+
+    /// `Some(value)` when `clock_discipline` is neither known value (it then means the default).
+    pub fn unknown_clock_discipline(&self) -> Option<&str> {
+        let v = self.clock_discipline.trim();
+        if v.eq_ignore_ascii_case(CLOCK_DISCIPLINE_LEGACY)
+            || v.eq_ignore_ascii_case(CLOCK_DISCIPLINE_PTP_PHASE_LOCK)
+        {
+            None
+        } else {
+            Some(self.clock_discipline.as_str())
+        }
+    }
+}
+
+/// dantesync#88 — the date-offset authority's tuning (ROZHODNUTÉ Q3 defaults).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DateOffsetConfig {
+    /// The master announces a date step only when |UTC − wall| exceeds this (ms). Default 50.
+    /// `0` means the default (a zero bound would announce on every reading).
+    #[serde(default = "default_date_step_bound_ms")]
+    pub step_bound_ms: u64,
+    /// How far ahead a step is announced (ms). Default 5000; floored at 5000 (every follower
+    /// polls once per second and needs several chances to hear it).
+    #[serde(default = "default_date_step_lead_ms")]
+    pub step_lead_ms: u64,
+}
+
+fn default_date_step_bound_ms() -> u64 {
+    50
+}
+
+fn default_date_step_lead_ms() -> u64 {
+    5_000
+}
+
+impl Default for DateOffsetConfig {
+    fn default() -> Self {
+        DateOffsetConfig {
+            step_bound_ms: default_date_step_bound_ms(),
+            step_lead_ms: default_date_step_lead_ms(),
+        }
+    }
+}
+
+impl DateOffsetConfig {
+    /// The effective bound in ns (`0` → the default).
+    pub fn step_bound_ns(&self) -> i64 {
+        let ms = if self.step_bound_ms == 0 {
+            default_date_step_bound_ms()
+        } else {
+            self.step_bound_ms
+        };
+        (ms.min(3_600_000) as i64) * 1_000_000
+    }
+
+    /// The effective lead in ns (floored at 5 s).
+    pub fn step_lead_ns(&self) -> i64 {
+        (self.step_lead_ms.clamp(5_000, 3_600_000) as i64) * 1_000_000
+    }
 }
 
 fn default_ntp_stale_secs() -> u64 {
@@ -310,6 +408,12 @@ impl Default for SystemConfig {
 
             // dantesync#114: loud NO-DANTE-CLOCK alarm every 60 s while unlocked.
             clock_alarm_interval_s: default_clock_alarm_interval_s(),
+
+            // dantesync#117: the PTP phase lock is the default; "legacy" restores the old path.
+            clock_discipline: default_clock_discipline(),
+
+            // dantesync#88: 50 ms step bound, 5 s announce lead.
+            date_offset: DateOffsetConfig::default(),
         }
     }
 }
@@ -770,5 +874,58 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize failed");
         let restored: SystemConfig = serde_json::from_str(&json).expect("deserialize failed");
         assert!(restored.phase_slew.enabled);
+    }
+
+    // ---- dantesync#117 / #88 ---------------------------------------------------------------
+
+    #[test]
+    fn clock_discipline_defaults_to_the_ptp_phase_lock_117() {
+        let c = SystemConfig::default();
+        assert_eq!(c.clock_discipline, "ptp_phase_lock");
+        assert!(!c.legacy_clock_discipline());
+        assert_eq!(c.unknown_clock_discipline(), None);
+    }
+
+    #[test]
+    fn a_pre_117_config_parses_into_the_phase_lock_with_default_date_tuning_117() {
+        // Today's live shape: phase_slew enabled, no clock_discipline / date_offset keys.
+        let json = r#"{"servo":{"kp":0.0005,"ki":0.00005,"max_freq_adj_ppm":500.0,"max_integral_ppm":100.0},
+            "filters":{"sample_window_size":4,"min_delta_ns":1000000,"calibration_samples":0,"warmup_secs":3.0},
+            "ntp_stale_secs":180,"gm_allowlist":["10.77.9.0/24"],"phase_slew":{"enabled":true}}"#;
+        let c: SystemConfig = serde_json::from_str(json).expect("pre-#117 config must parse");
+        assert!(!c.legacy_clock_discipline());
+        assert_eq!(c.date_offset.step_bound_ns(), 50_000_000);
+        assert_eq!(c.date_offset.step_lead_ns(), 5_000_000_000);
+        assert!(c.phase_slew.enabled, "kept, but ignored by the phase lock");
+    }
+
+    #[test]
+    fn legacy_is_an_explicit_opt_in_and_a_typo_means_the_default_117() {
+        let legacy: SystemConfig =
+            serde_json::from_str(r#"{"clock_discipline":" Legacy "}"#).expect("parses");
+        assert!(legacy.legacy_clock_discipline());
+        assert_eq!(legacy.unknown_clock_discipline(), None);
+
+        let typo: SystemConfig = serde_json::from_str(r#"{"clock_discipline":"legcy"}"#)
+            .expect("a typo must not fail the parse");
+        assert!(!typo.legacy_clock_discipline());
+        assert_eq!(typo.unknown_clock_discipline(), Some("legcy"));
+    }
+
+    #[test]
+    fn date_offset_tuning_is_floored_and_zero_means_default_88() {
+        let c: SystemConfig =
+            serde_json::from_str(r#"{"date_offset":{"step_bound_ms":0,"step_lead_ms":100}}"#)
+                .expect("parses");
+        assert_eq!(c.date_offset.step_bound_ns(), 50_000_000);
+        assert_eq!(
+            c.date_offset.step_lead_ns(),
+            5_000_000_000,
+            "lead floored at 5 s"
+        );
+        let c: SystemConfig =
+            serde_json::from_str(r#"{"date_offset":{"step_bound_ms":20}}"#).expect("parses");
+        assert_eq!(c.date_offset.step_bound_ns(), 20_000_000);
+        assert_eq!(c.date_offset.step_lead_ns(), 5_000_000_000);
     }
 }
