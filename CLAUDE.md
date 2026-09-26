@@ -115,7 +115,7 @@ is running.
   additive-only `/status` contract) → `.claude/rules/clock-discipline-and-testing.md`
 - PTP phase lock + fleet date offset (#117/#88 — rate AND phase from PTP, the NTP master's
   coordinated date announce on 31900, the #119 backward correction as a decoupled coordinated
-  SLEW (never a backward step), the decoupling proof by the bit-identical two-clock bench,
+  SLEW up to 2 × the step bound (a larger one is a loud coordinated step), the decoupling proof by the bit-identical two-clock bench,
   the local fallback, seeding every simulated noise source, the standalone-`rustc` replica as a
   second local net) → `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /

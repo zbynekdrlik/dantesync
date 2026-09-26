@@ -457,8 +457,11 @@ impl DateAuthority {
             return None;
         }
         if let Some(s) = running {
-            // An extension beyond the slew cap is not slewed: it waits for the end and is then
-            // stepped (`TooLargeToSlew`), like any correction that large.
+            // An extension LARGER THAN the slew cap is not slewed: it waits for the running slew's
+            // end and is then stepped (`TooLargeToSlew`), like any correction that large. (The cap
+            // bounds each extension, not the slew's total; the wait is up to the rest of the running
+            // slew — ≤ 100 ms at the configured rate, 2.8 h only at the 10 ppm floor — a double
+            // fault: a UTC jump during a slew.)
             let extendable = sign < 0
                 && correction_kind(error_ns, self.step_bound_ns) == CorrectionKind::Slew
                 && s.active_at(now_ptp_ns)

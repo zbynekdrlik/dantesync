@@ -711,10 +711,12 @@ where
         info!(
             "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns, step bound {} ms, \
              announce lead {} s — clients step forward together at the announced PTP instant, \
-             and slew backward corrections at {} ppm (never a backward step)",
+             and slew backward corrections up to {} ms at {} ppm (a larger one is an abnormal state \
+             and a coordinated step)",
             anchor,
             self.date_sync.step_bound_ns / 1_000_000,
             self.date_sync.step_lead_ns / 1_000_000_000,
+            crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000,
             authority.slew_ppm()
         );
         self.date_sync.authority = Some(authority);
@@ -890,17 +892,27 @@ where
                     );
                 }
             }
-            // #119 ROZHODNUTÉ: the authority schedules a backward step only beyond the slew cap.
+            // #119 ROZHODNUTÉ: a 1.10+ authority schedules a backward step only beyond the slew
+            // cap. A smaller one comes from an older master that never slews (the rollout upgrades
+            // the master LAST) — loud too, but not blamed on the cap.
             FollowAction::Scheduled {
                 delta_ns,
                 effective_wall_ns,
-            } if delta_ns < 0 => warn!(
-                "[DATE] date correction too large to slew: coordinated BACKWARD date step {:+}us \
-                 scheduled (seq {}) in {} ms",
-                delta_ns / 1_000,
-                ext.announce.seq,
-                effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
-            ),
+            } if delta_ns < 0 => {
+                let cap = crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns);
+                let cause = if delta_ns < -cap {
+                    "date correction too large to slew"
+                } else {
+                    "the authority does not slew (an older dantesync?)"
+                };
+                warn!(
+                    "[DATE] {}: coordinated BACKWARD date step {:+}us scheduled (seq {}) in {} ms",
+                    cause,
+                    delta_ns / 1_000,
+                    ext.announce.seq,
+                    effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
+                )
+            }
             FollowAction::Scheduled {
                 delta_ns,
                 effective_wall_ns,

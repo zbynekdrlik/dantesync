@@ -91,6 +91,9 @@ struct Scenario {
     /// so a backward correction (or an extension of a running slew) follows. The master's UTC
     /// bound is not judged for `UTC_JUMP_SETTLE_WINDOWS` after each jump.
     utc_jumps: Vec<(u64, i64)>,
+    /// #119 ROZHODNUTÉ: this scenario MEANS to cause a backward correction beyond the slew cap
+    /// (a master booting seconds ahead); only then does `check()` accept a backward step.
+    expects_too_large_step: bool,
 }
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the slew has paid it. Two chained
@@ -108,6 +111,7 @@ impl Scenario {
             master_ptp_offline: Vec::new(),
             gm_change_in_master_outage: false,
             utc_jumps: Vec::new(),
+            expects_too_large_step: false,
         }
     }
     fn settling_after_a_utc_jump(&self, w: u64) -> bool {

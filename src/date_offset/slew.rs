@@ -49,7 +49,7 @@ pub const SLEW_CAP_STEP_BOUNDS: i64 = 2;
 
 /// dantesync#119 — the largest backward correction that is slewed, for a step bound (ns).
 pub fn slew_cap_ns(step_bound_ns: i64) -> i64 {
-    step_bound_ns.saturating_mul(SLEW_CAP_STEP_BOUNDS)
+    step_bound_ns.max(0).saturating_mul(SLEW_CAP_STEP_BOUNDS)
 }
 
 /// dantesync#119 — THE direction decision. `correction_ns` is the change of `D` (`UTC − wall`):

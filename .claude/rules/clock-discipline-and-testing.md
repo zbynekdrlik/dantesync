@@ -317,8 +317,11 @@ of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera
 - **The slew cap (ROZHODNUTÉ issuecomment-5842590141):** a backward correction beyond
   `slew_cap_ns` = 2 × the step bound (100 ms by default, ~17 min at 100 ppm) is an ABNORMAL state
   (typically a master booted on a bad NTP reading) and is a coordinated STEP on every box
-  (`CorrectionKind::TooLargeToSlew`), logged `date correction too large to slew`; a running slew
-  is never extended past the cap either (the rest is stepped after it). A bench scenario must keep
+  (`CorrectionKind::TooLargeToSlew`), logged `date correction too large to slew`. An EXTENSION
+  larger than the cap is not slewed either: it waits for the running slew's end and is then
+  stepped (the cap bounds each increment, not a slew's total; the wait is up to the rest of the
+  running slew). The bench's `check()` allows a backward step only in a scenario that opts in
+  (`expects_too_large_step`), so no other scenario can hide a correction that grew past the cap. A bench scenario must keep
   its own corrections under the cap if it means to exercise slews (the UTC-jump one uses 60/70/60
   ms jumps with UTC at 0 ppm vs GM A: 80 ms jumps on −15 ppm drift reached −130 ms).
 - **Only a BACKWARD slew is a slew** (`DateAnnounce::as_slew` ignores `to ≥ from`): the fixed-

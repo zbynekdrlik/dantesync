@@ -64,10 +64,10 @@ fn check(sc: &Scenario, r: &RunResult) {
     // forward, or backward beyond the slew cap (an abnormal state: ROZHODNUTÉ 5842590141), every
     // other backward correction is a slew, and no box applied any other backward step.
     let cap = slew_cap_ns(DEFAULT_STEP_BOUND_NS);
-    let beyond_cap = |d: i64| d > 0 || d < -cap;
+    let beyond_cap = |d: i64| d > 0 || (sc.expects_too_large_step && d < -cap);
     assert!(
         r.announced.iter().all(|a| beyond_cap(a.1)),
-        "[{label}] a backward step within the slew cap was announced: {:?}",
+        "[{label}] a backward step was announced (allowed only beyond the cap, in a scenario that expects one): {:?}",
         r.announced
     );
     assert!(
@@ -362,6 +362,7 @@ fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_8
         master_ptp_offline: vec![(6 * 3600 * 2, 6 * 3600 * 2 + 1_200)],
         gm_change_in_master_outage: false,
         utc_jumps: Vec::new(),
+        expects_too_large_step: false,
     };
     let r = run(&sc);
     check(&sc, &r);
@@ -389,6 +390,7 @@ fn a_long_master_outage_and_a_grandmaster_change_during_one_keep_the_fleet_on_ut
         ],
         gm_change_in_master_outage: true,
         utc_jumps: Vec::new(),
+        expects_too_large_step: false,
     };
     let r = run(&sc);
     check(&sc, &r);
@@ -401,6 +403,7 @@ fn a_master_booted_3_s_ahead_is_stepped_back_once_60_ms_ahead_is_slewed_119() {
     // step on every box (an hours-long slew would keep the fleet date wrong). A normal one slews.
     let mut big = Scenario::plain("master boots 3 s AHEAD of UTC: stepped", 8.0, true);
     big.master_boot_err_ns = 3 * S;
+    big.expects_too_large_step = true;
     let r = run(&big);
     check(&big, &r);
     let back: Vec<&(u32, i64)> = r.announced.iter().filter(|a| a.1 < 0).collect();

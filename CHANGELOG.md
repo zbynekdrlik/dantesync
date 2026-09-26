@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A backward fleet date correction is SLEWED, never stepped (issue #119).** A backward step
+- **A backward fleet date correction is SLEWED, not stepped, up to 2 × the step bound (issue #119).** A backward step
   runs wall time back on every box at once, and wall-time consumers lose audio: the camera-box
   stream OBS lost 43.7 ms of Dante audio at the −51 ms fleet step (camera-box#1372), while the
   forward steps lost nothing. Now only a positive correction (the fleet behind UTC) is a
