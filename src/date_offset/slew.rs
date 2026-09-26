@@ -182,7 +182,7 @@ impl HeldSlew {
     }
 
     /// The same displacement, frozen where it is at `ptp_ns`: a zero-length slew, complete at
-    /// once, that carries it (the next [`DateFollower::take_completed_slew`] folds it).
+    /// once, that carries it (the next [`super::DateFollower::take_completed_slew`] folds it).
     pub(super) fn frozen_at(&self, ptp_ns: i64) -> Self {
         HeldSlew {
             slew: DateSlew {
@@ -202,7 +202,8 @@ impl HeldSlew {
 ///
 /// Iterated until it stops changing. For a backward slew the map is non-decreasing in `d` with a
 /// slope ≤ 500 ppm, so the iterates are monotone and settle on an exact fixed point within a few
-/// rounds; the cap only bounds a pathological input. At a nanosecond boundary of the floored
+/// rounds (measured: ≤ 5 for 50 ms at 500 ppm, ≤ 7 for amounts of seconds); the cap only bounds
+/// a pathological input. Only backward slews reach it (`DateAnnounce::as_slew`). At a nanosecond boundary of the floored
 /// schedule two adjacent PTP instants can give the same wall; the solve then settles on one of
 /// them, and since every box and the authority evaluate that SAME instant, their `D` agree to
 /// the nanosecond.
@@ -219,7 +220,7 @@ pub fn solve_displacement(h: &HeldSlew, anchor_ns: i64, wall_ns: i64) -> i64 {
     d
 }
 
-/// A bound on the fixed-point rounds of [`solve_displacement`] (it settles in ≤ 4 at 500 ppm).
+/// A bound on the fixed-point rounds of [`solve_displacement`] (it settles in ≤ 7).
 const SOLVE_MAX_ROUNDS: usize = 16;
 
 #[cfg(test)]

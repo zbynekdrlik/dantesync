@@ -91,9 +91,13 @@ pub(super) struct DateSync {
     /// dantesync#119 — slews already folded into the anchor, as the RATE servo's measurement still
     /// needs them removed (mod 1 s): its phase is continuous across a fold only this way.
     pub(super) rate_folded_ns: i64,
-    /// dantesync#119 — when a slew warning (a failed word write, a saturated word) was last logged;
-    /// the loop runs every 1 ms / 50 µs, so these are throttled.
-    pub(super) slew_warned_at: Option<Instant>,
+    /// dantesync#119 — when a failed slew-edge write, and a saturated word, were last warned
+    /// about (each throttled on its own: the loop runs every 1 ms / 50 µs).
+    pub(super) slew_write_warned_at: Option<Instant>,
+    pub(super) slew_saturation_warned_at: Option<Instant>,
+    /// dantesync#119 — the slew whose START was logged (one line per slew, however often its
+    /// word is re-applied).
+    pub(super) slew_start_logged: Option<crate::date_offset::DateSlew>,
 }
 
 impl DateSync {
@@ -152,7 +156,9 @@ impl DateSync {
             slew_ppm: config.date_offset.slew_ppm(),
             applied_slew_ppm: 0.0,
             rate_folded_ns: 0,
-            slew_warned_at: None,
+            slew_write_warned_at: None,
+            slew_saturation_warned_at: None,
+            slew_start_logged: None,
         }
     }
 

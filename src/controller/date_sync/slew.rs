@@ -75,14 +75,14 @@ impl DateSync {
         Some(fold)
     }
 
-    /// True when a throttled slew warning may be logged now (and records it).
-    pub(in crate::controller) fn slew_warn_due(&mut self) -> bool {
-        let due = match self.slew_warned_at {
+    /// True when a throttled slew warning may be logged now (and records it in `last`).
+    pub(in crate::controller) fn slew_warn_due(last: &mut Option<Instant>) -> bool {
+        let due = match *last {
             None => true,
             Some(t) => t.elapsed() >= SLEW_WARN_INTERVAL,
         };
         if due {
-            self.slew_warned_at = Some(Instant::now());
+            *last = Some(Instant::now());
         }
         due
     }
@@ -100,14 +100,16 @@ where
     pub(in crate::controller) fn compose_slew_word(&mut self, pi_word: f64) -> f64 {
         let now_wall = wall_now_ns();
         let term = self.date_sync.slew_rate_ppm(now_wall);
-        let was = self.date_sync.applied_slew_ppm;
         self.date_sync.applied_slew_ppm = term;
         if term == 0.0 {
             return pi_word;
         }
         let total = (pi_word + term).clamp(-DRIFT_MAX_PPM, DRIFT_MAX_PPM);
-        if was == 0.0 {
-            // Logged here, whichever path (the loop's edge or a PTP window) switches it on.
+        let held = self.date_sync.follower.held_slew().map(|h| h.slew);
+        if held.is_some() && held != self.date_sync.slew_start_logged {
+            // One START line per slew, whichever path (the loop's edge or a PTP window) switches
+            // the term on first, however often the word is re-applied after that.
+            self.date_sync.slew_start_logged = held;
             let remaining = self
                 .date_sync
                 .core
@@ -123,7 +125,9 @@ where
                 total
             );
         }
-        if total != pi_word + term && self.date_sync.slew_warn_due() {
+        if total != pi_word + term
+            && DateSync::slew_warn_due(&mut self.date_sync.slew_saturation_warned_at)
+        {
             warn!(
                 "[DATE] the word {:+.3}ppm + the slew {:+.0}ppm leaves the ±{}ppm envelope — \
                  clamped to {:+.3}ppm, the slew runs slower than scheduled here",
@@ -142,14 +146,15 @@ where
         if term == self.date_sync.applied_slew_ppm {
             return;
         }
+        let was = self.date_sync.applied_slew_ppm;
         let total = self.compose_slew_word(self.applied_freq_ppm);
         if let Err(e) = self.clock.adjust_frequency(1.0 + total / 1_000_000.0) {
-            // The next PTP window writes the same composed word again (the servo path); warned
-            // at most every few seconds, never once per loop iteration.
-            if self.date_sync.slew_warn_due() {
+            // Not in the word: retried on the next loop iteration (no PTP window may follow —
+            // PTP offline); warned at most every few seconds.
+            self.date_sync.applied_slew_ppm = was;
+            if DateSync::slew_warn_due(&mut self.date_sync.slew_write_warned_at) {
                 warn!(
-                    "[DATE] applying the slew rate {:+.1}ppm failed: {} — the next PTP window \
-                     re-applies it",
+                    "[DATE] applying the slew rate {:+.1}ppm failed: {} — retrying",
                     term, e
                 );
             }
@@ -185,6 +190,7 @@ where
             return;
         }
         let ann = a.announce();
+        let before = self.date_sync.follower.held_slew();
         match self.date_sync.follower.on_announce(ann, base, now_wall) {
             FollowAction::Absorb { new_anchor_ns } => {
                 self.date_sync.core.set_anchor(new_anchor_ns);
@@ -195,11 +201,13 @@ where
             }
             _ => {}
         }
-        info!(
-            "[DATE] the master's own scheduler caught up with the fleet slew (seq {}), {:+}ns off \
-             the line — no step",
-            ann.seq, gap
-        );
+        if self.date_sync.follower.held_slew() != before {
+            info!(
+                "[DATE] the master's own scheduler caught up with the fleet slew (seq {}), {:+}ns \
+                 off the line — no step",
+                ann.seq, gap
+            );
+        }
     }
 }
 

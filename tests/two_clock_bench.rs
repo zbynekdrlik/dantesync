@@ -734,14 +734,11 @@ impl<'s> Bench<'s> {
                     // An extension starts NOW: the master's own slew continues (at most a ns off).
                     let extension = ann.as_slew().is_some_and(|sl| sl.start_ptp_ns <= now_ptp);
                     let act = m.follower.on_announce(ann, anchor, m.wall_ns());
+                    // On the line, D and the authority agree to the ns at the same instant: an
+                    // extension changes nothing but the end (no absorb, not even of a ns).
                     match act {
                         FollowAction::Scheduled { .. } | FollowAction::SlewScheduled { .. } => {}
                         FollowAction::None if extension => {}
-                        FollowAction::Absorb { new_anchor_ns }
-                            if extension && (new_anchor_ns - anchor).abs() <= 1 =>
-                        {
-                            m.core.set_anchor(new_anchor_ns)
-                        }
                         other => panic!("master schedules its own step / slew: {other:?}"),
                     }
                     if extension {

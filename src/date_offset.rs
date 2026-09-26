@@ -160,14 +160,19 @@ pub struct DateAnnounce {
 }
 
 impl DateAnnounce {
-    /// The slew this announce describes, if it is one.
+    /// The slew this announce describes, if it is one. Only a BACKWARD slew (`to < from`) is:
+    /// no authority slews forward, and one read off the wire is taken as the plain announce (a
+    /// forward step at its instant) — the displacement solve needs the backward direction to
+    /// settle on a fixed point.
     pub fn as_slew(&self) -> Option<DateSlew> {
-        self.slew.map(|s| DateSlew {
-            from_ns: s.from_ns,
-            to_ns: self.date_offset_ns,
-            start_ptp_ns: self.effective_ptp_ns,
-            ppm: clamp_slew_ppm(s.ppm),
-        })
+        self.slew
+            .filter(|s| self.date_offset_ns < s.from_ns)
+            .map(|s| DateSlew {
+                from_ns: s.from_ns,
+                to_ns: self.date_offset_ns,
+                start_ptp_ns: self.effective_ptp_ns,
+                ppm: clamp_slew_ppm(s.ppm),
+            })
     }
 }
 

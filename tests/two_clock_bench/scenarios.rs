@@ -252,6 +252,10 @@ fn a_fleet_ahead_of_utc_slews_back_never_steps_back_and_keeps_its_relative_phase
     );
     assert!(r.announced.is_empty(), "no step at all: {:?}", r.announced);
     assert_eq!(r.wall_went_back, 0);
+    assert_eq!(
+        r.master_catch_ups, 0,
+        "the master never missed its own slew"
+    );
     assert!(r.slew_windows > 10_000, "the fleet actually slewed");
     assert!(
         r.max_relative_phase_in_slew_ns <= 50 * US,
@@ -312,6 +316,10 @@ fn a_slew_is_extended_and_runs_through_a_grandmaster_change_and_reboot_119() {
         r.master_catch_ups
     );
     assert!(r.extensions >= 1, "the running slew was extended");
+    assert_eq!(
+        r.master_catch_ups, 0,
+        "on the line the master's own scheduler never misses a slew (exact D)"
+    );
     assert_eq!(
         r.gm_events_in_slew, 2,
         "both grandmaster events fell inside a slew"

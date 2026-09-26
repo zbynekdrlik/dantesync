@@ -308,9 +308,15 @@ of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera
   step. The promoted form of the slew a box still runs, heard a hair before its own end, is
   ignored: freezing there would schedule a µs step BACKWARDS.
 - **Known limits (accepted):** a box that first hears a slew after its whole lead catches up
-  with a counted LATE step, which can be backward (as any late step); the master re-aligns to
-  the fleet only after a running slew ends; the local NTP fallback path (no authority heard) is
-  uncoordinated and unchanged.
+  with a counted LATE step, which can be backward (as any late step). A master more than the
+  absorb tolerance off the fleet line when a slew runs (its own PTP outage, a failed step) does
+  not join the slew; it re-aligns only after the slew ends, with ONE Join of its own wall that
+  then includes the slew's whole amount — a backward step of that size on the master alone
+  (never on a follower). The local NTP fallback path (no authority heard) is uncoordinated and
+  unchanged.
+- **Only a BACKWARD slew is a slew** (`DateAnnounce::as_slew` ignores `to ≥ from`): the fixed-
+  point solve has no fixed point for a forward slew at some walls (a 2-cycle), and no authority
+  sends one. A failed slew-edge write is retried from the loop (no PTP window may follow).
 - **Rollout (v1.10.0): the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of
   the v2 extension and would step back at the slew's start.
 
