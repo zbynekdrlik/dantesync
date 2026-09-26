@@ -42,6 +42,7 @@ use crate::date_offset::{
 };
 use crate::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 use crate::time_server::NoAuthority;
+use daily::log_daily_authority;
 
 /// A reply from the date-offset authority older than this is not acted on (the poller asks once
 /// per second; a stale reply means the master went quiet).
@@ -544,49 +545,6 @@ where
         self.date_sync.master_outage_realign = false;
     }
 
-    /// #119 (1.12, review round 2) — a DAILY-mode master without PTP whose own D is off the fleet
-    /// D (a step of its own failed) steps its wall back onto the fleet line once the failure's
-    /// backoff has passed: one Join of the difference. With no PTP there is no phase error to
-    /// measure and no re-alignment window ([`Self::realign_master_to_fleet`] waits for PTP), so
-    /// without this it would stay a whole nightly step off the fleet until PTP returns. Nothing
-    /// while a change is in flight, and nothing in micro mode (its local NTP path runs instead).
-    fn realign_offline_daily_master(&mut self) {
-        if !self.date_sync.daily()
-            || !self.ptp_offline
-            || self.in_step_backoff()
-            || self.date_sync.core.rebase_pending()
-        {
-            return;
-        }
-        let (Some(base), Some(a)) = (
-            self.date_sync.core.anchor_ns(),
-            self.date_sync.authority.as_ref(),
-        ) else {
-            return;
-        };
-        let now_wall = wall_now_ns();
-        let own = self.date_sync.follower.in_effect_ns(base, now_wall);
-        let now_ptp = now_wall.wrapping_sub(own);
-        if a.pending_step_ns(now_ptp).is_some()
-            || a.slew_in_progress(now_ptp).is_some()
-            || self.date_sync.follower.pending().is_some()
-            || self.date_sync.follower.held_slew().is_some()
-        {
-            return;
-        }
-        let delta = a.in_effect_ns(now_ptp).wrapping_sub(own);
-        if delta == 0 {
-            return;
-        }
-        let seq = a.seq();
-        warn!(
-            "[DATE] the off-line master is {:+}us off the fleet date offset (a failed step) — \
-             stepping its OWN wall back to the fleet line",
-            delta / 1_000
-        );
-        self.apply_date_step(delta, StepKind::Join, seq);
-    }
-
     /// #117 / #88 — the NTP reading under the phase lock. Returns true when it was fully handled
     /// here (the caller must NOT run the NTP step path):
     ///
@@ -753,21 +711,7 @@ where
             .on_announce(authority.announce(), base, now_wall);
         debug!("[DATE] master aligned with its own authority: {:?}", act);
         if let CorrectionMode::Daily(cfg) = self.date_sync.correction {
-            let tod_s = cfg.step_tod_ns / 1_000_000_000;
-            info!(
-                "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date \
-                 runs at the Dante tick all day and is corrected ONCE A NIGHT: one coordinated \
-                 step of the whole UTC error, either direction, when the window opens at \
-                 {:02}:{:02}:{:02} UTC (up to {} min while UTC is unavailable), announced {} s \
-                 ahead; only an error beyond {} ms is stepped at once (correction = \"daily\")",
-                anchor,
-                tod_s / 3_600,
-                tod_s % 3_600 / 60,
-                tod_s % 60,
-                crate::date_offset::DAILY_WINDOW_NS / 60_000_000_000,
-                authority.lead_ns() * crate::date_offset::MICRO_LEAD_FACTOR / 1_000_000_000,
-                cfg.emergency_ns / 1_000_000
-            );
+            log_daily_authority(anchor, &authority, cfg);
             self.date_sync.authority = Some(authority);
             return;
         }
@@ -1009,6 +953,7 @@ where
     }
 }
 
+mod daily;
 mod follow;
 mod micro;
 mod publish;
