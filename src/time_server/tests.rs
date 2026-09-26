@@ -398,6 +398,31 @@ fn a_slew_is_published_as_the_slew_never_as_a_backward_step_119() {
 }
 
 #[test]
+fn a_micro_correction_is_published_with_its_micro_flag_119() {
+    // A master whose published change is a micro step (+500 µs pending).
+    let mut status = master_status();
+    status.date_step_pending_ns = Some(500_000);
+    status.date_offset_micro = true;
+    let reply = build_response_ext(12, &status);
+    assert_eq!(reply.len(), RESPONSE_SIZE + crate::date_offset::EXT_SIZE_V2);
+    assert_eq!(reply[RESPONSE_SIZE], 3, "extension v3");
+    let ext = parse_reply(&reply, 12, Instant::now(), 0)
+        .unwrap()
+        .ext
+        .expect("extension");
+    assert!(ext.announce.micro);
+    assert_eq!(ext.announce.slew, None);
+    assert_eq!(
+        ext.announce.date_offset_ns,
+        status.date_offset_ns.unwrap() + 500_000
+    );
+    // Without the flag it is an ordinary change.
+    status.date_offset_micro = false;
+    let e = date_extension_from_status(&status, 1_790_000_100_000_000_000).unwrap();
+    assert!(!e.announce.micro);
+}
+
+#[test]
 fn no_extension_is_published_without_the_anchor_grandmaster_88() {
     // The controller clears the anchor GM while a re-anchor is pending: no D may be
     // published in a time base nobody can identify.

@@ -12,6 +12,7 @@ pub(super) fn ext(offset: i64, eff: i64, seq: u32, authority: bool) -> DateExten
             effective_ptp_ns: eff,
             seq,
             slew: None,
+            micro: false,
         },
         gm_uuid: [0x00, 0x1d, 0xc1, 0x01, 0x02, (seq & 0xff) as u8],
         now_ptp_ns: eff.wrapping_add(7),
@@ -42,7 +43,10 @@ fn extension_layout_is_the_documented_big_endian_one() {
         true,
     ));
     assert_eq!(bytes[0], EXT_VERSION, "version byte");
-    assert_eq!(EXT_VERSION, 2, "#119 bumped the extension to v2");
+    assert_eq!(
+        EXT_VERSION, 3,
+        "the #119 micro-corrections bumped the extension to v3"
+    );
     assert_eq!(bytes[1], EXT_FLAG_AUTHORITY, "authority flag");
     assert_eq!(&bytes[2..4], &[0, 0], "no slew: slew_ppm is zero");
     assert_eq!(&bytes[4..12], &[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -102,16 +106,16 @@ fn a_rebooted_or_different_grandmaster_is_a_different_base() {
 #[test]
 fn pending_step_and_in_effect_views_do_not_mutate() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(55 * MS, S);
-    a.on_utc_error(55 * MS, 2 * S);
-    assert_eq!(a.pending_step_ns(6 * S), Some(55 * MS));
+    a.on_utc_error(155 * MS, S);
+    a.on_utc_error(155 * MS, 2 * S);
+    assert_eq!(a.pending_step_ns(6 * S), Some(155 * MS));
     assert_eq!(a.in_effect_ns(6 * S), 0);
     assert_eq!(
         a.pending_step_ns(7 * S),
         None,
         "at the instant it is no longer pending"
     );
-    assert_eq!(a.in_effect_ns(7 * S), 55 * MS);
+    assert_eq!(a.in_effect_ns(7 * S), 155 * MS);
 }
 
 #[test]
@@ -150,17 +154,20 @@ fn authority_publishes_its_anchor_in_effect_at_seq_1() {
             effective_ptp_ns: 10 * S - IMMEDIATE_BACKDATE_NS,
             seq: 1,
             slew: None,
+            micro: false,
         }
     );
     assert!(!a.has_pending(11 * S));
 }
 
 #[test]
-fn authority_ignores_errors_within_the_bound() {
+fn a_reading_within_the_cap_never_announces_by_itself_119() {
+    // #119 follow-up: a reading up to the abnormal cap (2 × the 50 ms bound) only feeds the
+    // micro-correction estimate; the increments come from `on_tick`.
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
     for i in 0..100 {
         assert_eq!(
-            a.on_utc_error(if i % 2 == 0 { 49 * MS } else { -50 * MS }, i * S),
+            a.on_utc_error(if i % 2 == 0 { 99 * MS } else { -100 * MS }, i * S),
             None
         );
     }
@@ -180,9 +187,9 @@ fn authority_never_announces_on_a_single_over_bound_reading() {
         None,
         "back within bound clears the candidate"
     );
-    assert_eq!(a.on_utc_error(-60 * MS, 3 * S), None);
+    assert_eq!(a.on_utc_error(-160 * MS, 3 * S), None);
     assert_eq!(
-        a.on_utc_error(60 * MS, 4 * S),
+        a.on_utc_error(160 * MS, 4 * S),
         None,
         "opposite sign restarts the count"
     );
@@ -191,36 +198,40 @@ fn authority_never_announces_on_a_single_over_bound_reading() {
 
 #[test]
 fn authority_announces_the_full_correction_lead_ahead_on_two_agreeing_readings() {
+    // #119 follow-up: only an ABNORMAL error (beyond 2 × the bound) is corrected at once.
     let mut a = DateAuthority::new(1_000 * S, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    assert_eq!(a.on_utc_error(51 * MS, 100 * S), None);
+    assert_eq!(a.on_utc_error(151 * MS, 100 * S), None);
     let got = a
-        .on_utc_error(52 * MS, 110 * S)
+        .on_utc_error(152 * MS, 110 * S)
         .expect("second agreeing reading announces");
     assert_eq!(
         got,
         DateAnnounce {
-            date_offset_ns: 1_000 * S + 52 * MS,
+            date_offset_ns: 1_000 * S + 152 * MS,
             effective_ptp_ns: 110 * S + MIN_STEP_LEAD_NS,
             seq: 2,
             slew: None,
+            micro: false,
         }
     );
     // Until the instant the OLD offset stays in effect.
     assert_eq!(a.current_offset_ns(114 * S), 1_000 * S);
     assert!(a.has_pending(114 * S));
     // At the instant it takes over.
-    assert_eq!(a.current_offset_ns(115 * S), 1_000 * S + 52 * MS);
+    assert_eq!(a.current_offset_ns(115 * S), 1_000 * S + 152 * MS);
     assert!(!a.has_pending(115 * S));
 }
 
 #[test]
 fn authority_holds_one_step_at_a_time() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-70 * MS, S);
-    assert!(a.on_utc_error(-70 * MS, 2 * S).is_some());
-    // Readings during the lead describe a wall that is about to move: ignored.
-    assert_eq!(a.on_utc_error(-70 * MS, 3 * S), None);
-    assert_eq!(a.on_utc_error(-70 * MS, 4 * S), None);
+    a.on_utc_error(-170 * MS, S);
+    assert!(a.on_utc_error(-170 * MS, 2 * S).is_some());
+    // Readings during the lead describe a wall that is about to move: judged by the error left
+    // once it has landed, so nothing more is announced.
+    assert_eq!(a.on_utc_error(-170 * MS, 3 * S), None);
+    assert_eq!(a.on_utc_error(-170 * MS, 4 * S), None);
+    assert_eq!(a.on_tick(4 * S), None);
     assert_eq!(a.seq(), 2);
 }
 
@@ -237,8 +248,8 @@ fn authority_lead_is_floored_and_bound_defaults() {
 #[test]
 fn rebase_moves_d_immediately_and_keeps_a_pending_step_at_the_same_wall_instant() {
     let mut a = DateAuthority::new(1_000 * S, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(80 * MS, 100 * S);
-    let pend = a.on_utc_error(80 * MS, 101 * S).unwrap();
+    a.on_utc_error(180 * MS, 100 * S);
+    let pend = a.on_utc_error(180 * MS, 101 * S).unwrap();
     let wall_instant = pend.effective_ptp_ns + 1_000 * S;
     let size = pend.date_offset_ns - 1_000 * S;
 
@@ -267,6 +278,7 @@ fn rebase_without_pending_is_in_effect_now() {
             effective_ptp_ns: 48 * S - IMMEDIATE_BACKDATE_NS,
             seq: 2,
             slew: None,
+            micro: false,
         }
     );
     assert_eq!(
@@ -285,6 +297,7 @@ pub(super) fn in_effect(offset: i64, seq: u32) -> DateAnnounce {
         effective_ptp_ns: 0,
         seq,
         slew: None,
+        micro: false,
     }
 }
 
@@ -335,6 +348,7 @@ fn an_unjoined_follower_ignores_a_pending_step_until_it_is_in_effect() {
         effective_ptp_ns: 50 * S,
         seq: 9,
         slew: None,
+        micro: false,
     };
     assert_eq!(f.on_announce(pending, d, d + 45 * S), FollowAction::None);
     assert_eq!(f.pending(), None);
@@ -358,6 +372,7 @@ fn a_joined_follower_schedules_and_applies_at_the_wall_instant() {
         effective_ptp_ns: 20 * S,
         seq: 2,
         slew: None,
+        micro: false,
     };
     assert_eq!(
         f.on_announce(pending, d, d + 15 * S),
@@ -418,6 +433,7 @@ fn a_scheduled_step_survives_a_local_re_anchor_in_the_wall_domain() {
             effective_ptp_ns: 20 * S,
             seq: 2,
             slew: None,
+            micro: false,
         },
         d,
         d + 15 * S,
@@ -460,6 +476,7 @@ fn cancel_pending_keeps_the_alignment() {
             effective_ptp_ns: 10 * S,
             seq: 2,
             slew: None,
+            micro: false,
         },
         S,
         6 * S,
@@ -479,6 +496,7 @@ fn forget_drops_the_alignment_but_keeps_a_scheduled_step() {
             effective_ptp_ns: 10 * S,
             seq: 2,
             slew: None,
+            micro: false,
         },
         S,
         6 * S,
@@ -493,4 +511,189 @@ fn forget_drops_the_alignment_but_keeps_a_scheduled_step() {
             delta_ns: 60 * MS
         })
     );
+}
+
+// ---- dantesync#119 follow-up: the MICRO kind ------------------------------------------------
+
+const US: i64 = 1_000;
+
+#[test]
+fn a_micro_correction_rides_the_extension_as_v3_and_a_v2_reader_ignores_the_flag_119() {
+    let mut e = ext(5 * S + 500 * US, 123 * S, 9, true);
+    e.announce.micro = true;
+    let bytes = encode_extension(&e);
+    assert_eq!(bytes.len(), EXT_SIZE_V2, "v3 keeps the v2 size");
+    assert_eq!(bytes[0], 3);
+    assert_eq!(bytes[1], EXT_FLAG_AUTHORITY | EXT_FLAG_MICRO);
+    assert_eq!(decode_extension(&bytes), Some(e));
+    // A micro SLEW carries both flags.
+    let mut sl = ext(5 * S - 500 * US, 123 * S, 10, true);
+    sl.announce.micro = true;
+    sl.announce.slew = Some(SlewSpec {
+        from_ns: 5 * S,
+        ppm: 100,
+    });
+    let bytes_sl = encode_extension(&sl);
+    assert_eq!(
+        bytes_sl[1],
+        EXT_FLAG_AUTHORITY | EXT_FLAG_SLEW | EXT_FLAG_MICRO
+    );
+    assert_eq!(decode_extension(&bytes_sl), Some(sl));
+    // A version-2 writer never set bit 2: a v2 extension is never micro, and everything else in
+    // it is what a 1.10 follower reads (the same D, instant, seq and slew).
+    let mut v2 = bytes_sl;
+    v2[0] = 2;
+    let old = decode_extension(&v2).unwrap().announce;
+    assert!(!old.micro);
+    assert_eq!(old.as_slew(), sl.announce.as_slew());
+    assert_eq!(old.seq, 10);
+    // A plain announce never sets it.
+    assert_eq!(encode_extension(&ext(1, 2, 3, true))[1], EXT_FLAG_AUTHORITY);
+}
+
+#[test]
+fn a_follower_knows_a_micro_step_is_in_flight_until_it_lands_119() {
+    let mut f = DateFollower::new();
+    let d = 100 * S;
+    f.on_announce(in_effect(d, 1), d, d + 10 * S);
+    let micro_step = DateAnnounce {
+        date_offset_ns: d + 500 * US,
+        effective_ptp_ns: 20 * S,
+        seq: 2,
+        slew: None,
+        micro: true,
+    };
+    assert_eq!(
+        f.on_announce(micro_step, d, d + 15 * S),
+        FollowAction::Scheduled {
+            delta_ns: 500 * US,
+            effective_wall_ns: d + 20 * S
+        },
+        "applied exactly like any coordinated step"
+    );
+    assert!(f.is_micro_seq(2));
+    assert!(!f.is_micro_seq(1));
+    assert!(f.micro_in_flight(d, d + 15 * S));
+    let due = f.due(d + 20 * S).unwrap();
+    assert_eq!(due.delta_ns, 500 * US);
+    assert!(f.is_micro_seq(due.seq));
+    assert!(!f.micro_in_flight(d + 500 * US, d + 20 * S + 500 * US));
+    // A later plain announce (a rebase, a large correction) is not micro.
+    let plain = DateAnnounce {
+        date_offset_ns: d + 3 * S,
+        effective_ptp_ns: 40 * S,
+        seq: 3,
+        slew: None,
+        micro: false,
+    };
+    f.on_announce(plain, d + 500 * US, d + 30 * S);
+    assert!(!f.is_micro_seq(3));
+    assert!(!f.micro_in_flight(d + 500 * US, d + 30 * S));
+}
+
+#[test]
+fn a_follower_knows_a_held_micro_slew_until_it_is_complete_119() {
+    let mut f = DateFollower::new();
+    let d = 100 * S;
+    f.on_announce(in_effect(d, 1), d, d + 10 * S);
+    let micro_slew = DateAnnounce {
+        date_offset_ns: d - 500 * US,
+        effective_ptp_ns: 20 * S,
+        seq: 2,
+        slew: Some(SlewSpec {
+            from_ns: d,
+            ppm: 100,
+        }),
+        micro: true,
+    };
+    assert!(matches!(
+        f.on_announce(micro_slew, d, d + 15 * S),
+        FollowAction::SlewScheduled {
+            amount_ns: -500_000,
+            ..
+        }
+    ));
+    assert!(f.held_slew_is_micro());
+    assert!(f.micro_in_flight(d, d + 15 * S), "scheduled");
+    assert!(f.micro_in_flight(d, d + 22 * S), "running");
+    // Complete at PTP 25 s (wall d + 25 s − 500 µs, + 1 µs past the ns-floored schedule's last
+    // instant): no longer in flight, folded once.
+    let end_wall = d + 25 * S - 500 * US + US;
+    assert!(!f.micro_in_flight(d, end_wall));
+    assert_eq!(f.take_completed_slew(d, end_wall), Some(-500 * US));
+    assert!(!f.held_slew_is_micro());
+}
+
+#[test]
+fn the_effective_micro_interval_covers_the_increment_in_flight_119() {
+    let c = MicroConfig::default();
+    // Two 5 s leads (+ a 5 s slew of 500 µs at 100 ppm backwards) < 20 s: unchanged.
+    assert_eq!(effective_micro(c, MIN_STEP_LEAD_NS, 100), c);
+    // A 30 s lead: a step is in flight 60 s, a slew 60 s + 5 s — the capacity is honest about it.
+    let long = effective_micro(c, 30 * S, 100);
+    assert_eq!(long.interval_ns, 60 * S);
+    assert_eq!(long.backward_interval_ns, 65 * S);
+    assert!(long.capacity_ns_per_min() < c.capacity_ns_per_min());
+    assert!(long.backward_capacity_ns_per_min() < long.capacity_ns_per_min());
+    // A 10 ppm slew: 500 µs take 50 s backwards; forward steps are not slowed by it.
+    let slow = effective_micro(c, MIN_STEP_LEAD_NS, 10);
+    assert_eq!(slow.interval_ns, 20 * S);
+    assert_eq!(slow.backward_interval_ns, 60 * S);
+    assert_eq!(slow.capacity_ns_per_min(), 1_500_000);
+    assert_eq!(slow.backward_capacity_ns_per_min(), 500_000);
+    // The authority runs on it, whichever builder comes last.
+    assert_eq!(
+        DateAuthority::new(0, 0, 50 * MS, 30 * S)
+            .micro()
+            .config()
+            .backward_interval_ns,
+        65 * S
+    );
+    let a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
+        .with_micro(MicroConfig::new(500, 20))
+        .with_slew_ppm(10);
+    assert_eq!(a.micro().config().backward_interval_ns, 60 * S);
+    let b = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
+        .with_slew_ppm(10)
+        .with_micro(MicroConfig::new(500, 20));
+    assert_eq!(b.micro().config(), a.micro().config());
+}
+
+#[test]
+fn a_backward_increment_waits_for_the_backward_spacing_a_forward_one_does_not_119() {
+    // 10 ppm: a backward increment is in flight 10 s + 50 s, so the next backward one waits 60 s;
+    // forward ones keep the 20 s spacing.
+    let mut back = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS).with_slew_ppm(10);
+    for i in 0..6 {
+        back.on_utc_error(-7 * MS, 10 * S + i * 10 * S);
+    }
+    assert!(back.on_tick(60 * S).unwrap().as_slew().is_some());
+    back.on_utc_error(-6_500 * US, 115 * S);
+    assert_eq!(back.on_tick(119 * S), None, "the slew runs until 120 s");
+    assert!(back.on_tick(120 * S).is_some(), "60 s after the last one");
+    let mut fwd = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS).with_slew_ppm(10);
+    for i in 0..6 {
+        fwd.on_utc_error(7 * MS, 10 * S + i * 10 * S);
+    }
+    assert!(fwd.on_tick(60 * S).is_some());
+    fwd.on_utc_error(6_500 * US, 75 * S);
+    assert!(fwd.on_tick(80 * S).is_some(), "20 s after the last one");
+}
+
+#[test]
+fn a_rebase_re_announces_an_in_flight_micro_correction_as_micro_119() {
+    let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
+    for i in 0..6 {
+        a.on_utc_error(7 * MS, 10 * S + i * 10 * S);
+    }
+    assert!(a.on_tick(60 * S).unwrap().micro);
+    let r = a.rebase(5 * S, 61 * S);
+    assert!(
+        r.micro,
+        "the pending micro step keeps its kind in the new base"
+    );
+    assert_eq!(r.date_offset_ns - 5 * S, 500 * US, "same size");
+    // Once it has landed, a rebase is its own (non-micro) change of D.
+    let r2 = a.rebase(10 * S, 100 * S);
+    assert!(!r2.micro);
 }

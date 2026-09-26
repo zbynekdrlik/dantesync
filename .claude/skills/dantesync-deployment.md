@@ -82,6 +82,16 @@ own user login password). Windows boxes are reached via MCP only in this procedu
      the next backward correction the journal shows `[DATE] slew START` then `[DATE] slew DONE`
      on every box and no `[DATE] stepped -…` (a backward step appears only after a
      `date correction too large to slew` warning: a correction beyond 2 × the step bound).
+   - **From v1.11.0 (issue #119 follow-up, MICRO-corrections) the NTP master still goes LAST.**
+     A 1.11.0 master corrects the date in increments of ≤ 500 µs (a step forward, a slew backward,
+     about three a minute while the date is beyond its 2 ms dead band) and marks them MICRO in
+     extension v3; a 1.10.0 follower ignores the flag and applies them as plain steps / slews (it
+     only logs each one at info). Verify on the master after it: `/status` shows
+     `date_correction_rate_ms_per_min` (≈ the grandmaster-vs-UTC drift once settled, e.g. ≈ 1.06),
+     `date_micro_last_us` within ±500 and `date_correction_falling_behind: false`; the journal of
+     every box shows `[DATE] stepped +…us (micro, seq N)` / `[DATE] micro-slew done` and never a
+     `[DATE] stepped` above 500 µs (only after a `date correction too large …` warning: an error
+     beyond 2 × the step bound).
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

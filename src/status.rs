@@ -326,6 +326,34 @@ pub struct SyncStatus {
     pub date_slew_from_ns: Option<i64>,
     #[serde(default)]
     pub date_slew_to_ns: Option<i64>,
+    /// dantesync#119 follow-up: the published date change (`date_offset_seq`) is a
+    /// MICRO-correction — what the 31900 extension's MICRO flag carries.
+    #[serde(default)]
+    pub date_offset_micro: bool,
+    /// dantesync#119 follow-up: a date micro-correction is in flight on this node now (its step is
+    /// scheduled, or its slew scheduled or running).
+    #[serde(default)]
+    pub date_micro_active: bool,
+    /// dantesync#119 follow-up: the last micro-correction this node APPLIED (µs, signed: a forward
+    /// step or a backward slew); `null` before the first.
+    #[serde(default)]
+    pub date_micro_last_us: Option<i64>,
+    /// dantesync#119 follow-up (the NTP master only): the fleet date correction actually made per
+    /// minute over the last 10 minutes (ms/min, signed) — in steady state the grandmaster-vs-UTC
+    /// drift. The capacity is `micro_step_us / micro_interval_s` (1.5 ms/min by default).
+    #[serde(default)]
+    pub date_correction_rate_ms_per_min: Option<f64>,
+    /// dantesync#119 follow-up (the NTP master only): the micro-corrections cannot hold the fleet
+    /// date (the drift outruns their capacity, or the error is beyond 10 ms) — journal line
+    /// `date correction falling behind`. Never a large step: that exists only beyond 2 × the step
+    /// bound.
+    #[serde(default)]
+    pub date_correction_falling_behind: bool,
+    /// dantesync#119 follow-up (the NTP master only): the micro-corrections are paused — no UTC
+    /// reading for over a minute (journal line `micro-corrections paused`); the fleet date runs
+    /// free at the grandmaster's rate until UTC is back.
+    #[serde(default)]
+    pub date_micro_paused: bool,
 
     // ========================================================================
     // PTP phase lock (dantesync#117) — additive.
@@ -431,6 +459,12 @@ impl Default for SyncStatus {
             date_slew_ppm: None,
             date_slew_from_ns: None,
             date_slew_to_ns: None,
+            date_offset_micro: false,
+            date_micro_active: false,
+            date_micro_last_us: None,
+            date_correction_rate_ms_per_min: None,
+            date_correction_falling_behind: false,
+            date_micro_paused: false,
             // #117: unknown until the controller publishes
             clock_discipline: String::new(),
             rate_source: String::new(),
@@ -894,6 +928,52 @@ mod tests {
         assert_eq!(back.date_slew_ppm, Some(100));
         assert_eq!(back.date_slew_from_ns, Some(1_790_000_000_000_000_000));
         assert_eq!(back.date_slew_to_ns, Some(1_789_999_999_949_000_000));
+    }
+
+    /// dantesync#119 follow-up: the micro-correction fields are additive. A v1.10.0 blob (with the
+    /// slew fields) must deserialize to "no micro-correction", and a master's state round-trips.
+    #[test]
+    fn test_sync_status_date_micro_fields_are_additive_119() {
+        let v1100 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "clock_discipline":"ptp_phase_lock","rate_source":"ptp","ptp_phase_locked":true,
+            "date_authority":"master","date_offset_ns":1790000000123456789,"date_offset_seq":7,
+            "date_slew_active":false,"date_slew_remaining_ms":null,"date_slew_ppm":null,
+            "date_steps_late":0}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(v1100).expect("v1.10.0 JSON must still deserialize");
+        assert!(!restored.date_offset_micro);
+        assert!(!restored.date_micro_active);
+        assert_eq!(restored.date_micro_last_us, None);
+        assert_eq!(restored.date_correction_rate_ms_per_min, None);
+        assert!(!restored.date_correction_falling_behind);
+        assert!(!restored.date_micro_paused);
+        assert_eq!(restored.date_offset_seq, Some(7));
+
+        let master = SyncStatus {
+            date_offset_micro: true,
+            date_micro_active: true,
+            date_micro_last_us: Some(-500),
+            date_correction_rate_ms_per_min: Some(1.06),
+            date_correction_falling_behind: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&master).expect("serialize failed");
+        for key in [
+            "\"date_micro_active\":true",
+            "\"date_micro_last_us\":-500",
+            "\"date_correction_rate_ms_per_min\":1.06",
+            "\"date_correction_falling_behind\":true",
+        ] {
+            assert!(json.contains(key), "{key} in {json}");
+        }
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert!(back.date_offset_micro);
+        assert!(back.date_micro_active);
+        assert_eq!(back.date_micro_last_us, Some(-500));
+        assert_eq!(back.date_correction_rate_ms_per_min, Some(1.06));
+        assert!(back.date_correction_falling_behind);
     }
 
     #[test]

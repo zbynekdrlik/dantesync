@@ -152,68 +152,82 @@ fn a_received_slew_rate_is_clamped_like_a_configured_one_119() {
     );
 }
 
+/// #119 follow-up: six readings of `error`, ten seconds apart, ending at `end` — enough for the
+/// micro estimate. The corrections themselves come from `on_tick`.
+fn feed(a: &mut DateAuthority, error: i64, end: i64) {
+    for i in 0..6 {
+        assert_eq!(a.on_utc_error(error, end - (5 - i) * 10 * S), None);
+    }
+}
+
 #[test]
-fn a_negative_correction_is_announced_as_a_slew_never_a_backward_step_119() {
+fn a_negative_correction_is_announced_as_a_micro_slew_never_a_backward_step_119() {
     let d = 1_000 * S;
     let mut a = DateAuthority::new(d, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    assert_eq!(a.on_utc_error(-51 * MS, 100 * S), None);
+    feed(&mut a, -7 * MS, 110 * S);
     let ann = a
-        .on_utc_error(-52 * MS, 110 * S)
-        .expect("two agreeing readings announce");
+        .on_tick(110 * S)
+        .expect("beyond the dead band: an increment");
     assert_eq!(
         ann,
         DateAnnounce {
-            date_offset_ns: d - 52 * MS,
-            effective_ptp_ns: 110 * S + MIN_STEP_LEAD_NS,
+            date_offset_ns: d - 500 * US,
+            effective_ptp_ns: 110 * S + MICRO_LEAD_FACTOR * MIN_STEP_LEAD_NS,
             seq: 2,
             slew: Some(SlewSpec {
                 from_ns: d,
                 ppm: DEFAULT_SLEW_PPM
             }),
+            micro: true,
         }
     );
     // No step is ever pending for it …
-    for p in [111 * S, 114 * S, 115 * S, 200 * S, 700 * S] {
+    for p in [111 * S, 114 * S, 115 * S, 118 * S, 200 * S] {
         assert_eq!(a.pending_step_ns(p), None);
     }
-    // … D follows the slew: unchanged until the start, then 100 µs/s down, then the target.
-    assert_eq!(a.in_effect_ns(114 * S), d);
-    assert_eq!(a.in_effect_ns(125 * S), d - MS);
-    assert!(a.slew_in_progress(125 * S).is_some());
-    let end = 115 * S + 520 * S;
-    assert_eq!(a.in_effect_ns(end), d - 52 * MS);
-    assert_eq!(a.current_offset_ns(end), d - 52 * MS);
+    // … D follows the slew: unchanged until the start (two leads ahead), then 100 µs/s down,
+    // then the target.
+    assert_eq!(a.in_effect_ns(119 * S), d);
+    assert_eq!(a.in_effect_ns(122 * S), d - 200 * US);
+    assert!(a.slew_in_progress(122 * S).is_some());
+    let end = 120 * S + 5 * S;
+    assert_eq!(a.in_effect_ns(end), d - 500 * US);
+    assert_eq!(a.current_offset_ns(end), d - 500 * US);
     assert!(a.slew_in_progress(end).is_none());
-    // Promoted: the plain offset in effect, same seq (D did not change again).
+    // Promoted: the plain offset in effect, same seq (D did not change again), still micro.
     assert_eq!(
         a.announce(),
         DateAnnounce {
-            date_offset_ns: d - 52 * MS,
+            date_offset_ns: d - 500 * US,
             effective_ptp_ns: end,
             seq: 2,
             slew: None,
+            micro: true,
         }
     );
 }
 
 #[test]
-fn a_positive_correction_is_still_a_coordinated_step_119() {
+fn a_positive_correction_is_a_micro_step_119() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(60 * MS, S);
-    let ann = a.on_utc_error(60 * MS, 2 * S).unwrap();
+    feed(&mut a, 7 * MS, 60 * S);
+    let ann = a.on_tick(60 * S).unwrap();
     assert_eq!(ann.slew, None);
-    assert_eq!(a.pending_step_ns(3 * S), Some(60 * MS));
-    assert!(a.slew_in_progress(3 * S).is_none());
+    assert!(ann.micro);
+    assert_eq!(a.pending_step_ns(61 * S), Some(500 * US));
+    assert!(a.slew_in_progress(61 * S).is_none());
+    assert_eq!(a.in_effect_ns(69 * S), 0, "two leads ahead");
+    assert_eq!(a.in_effect_ns(70 * S), 500 * US);
 }
 
 #[test]
 fn the_authority_slews_at_its_configured_rate_119() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS).with_slew_ppm(250);
     assert_eq!(a.slew_ppm(), 250);
-    a.on_utc_error(-60 * MS, S);
-    let ann = a.on_utc_error(-60 * MS, 2 * S).unwrap();
+    feed(&mut a, -7 * MS, 60 * S);
+    let ann = a.on_tick(60 * S).unwrap();
     assert_eq!(ann.slew.unwrap().ppm, 250);
-    assert_eq!(ann.as_slew().unwrap().duration_ns(), 240 * S);
+    assert_eq!(ann.as_slew().unwrap().duration_ns(), 2 * S);
     assert_eq!(
         DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
             .with_slew_ppm(3)
@@ -223,115 +237,114 @@ fn the_authority_slews_at_its_configured_rate_119() {
 }
 
 #[test]
-fn a_slew_in_progress_absorbs_the_readings_it_is_already_paying_119() {
-    let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-60 * MS, S);
-    a.on_utc_error(-60 * MS, 2 * S).unwrap();
-    // The wall has not moved yet (scheduled) or is part-way down: the error left once the slew
-    // has paid is ≈ 0, so nothing new is announced.
-    for (k, p) in [3 * S, 7 * S, 100 * S, 300 * S, 500 * S].iter().enumerate() {
-        let paid = a.in_effect_ns(*p); // ≤ 0
-        let reading = -60 * MS - paid + (k as i64) * 100 * US;
-        assert_eq!(a.on_utc_error(reading, *p), None);
-    }
-    assert_eq!(a.seq(), 2);
+fn the_authority_takes_its_configured_micro_step_and_interval_119() {
+    let mut a =
+        DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS).with_micro(MicroConfig::new(200, 30));
+    feed(&mut a, 7 * MS, 60 * S);
+    assert_eq!(a.on_tick(60 * S).unwrap().date_offset_ns, 200 * US);
+    assert_eq!(a.on_tick(89 * S), None, "30 s apart");
+    assert_eq!(a.on_tick(90 * S).unwrap().date_offset_ns, 400 * US);
+    assert_eq!(a.micro().config(), MicroConfig::new(200, 30));
 }
 
 #[test]
-fn a_further_backward_need_extends_the_running_slew_continuously_119() {
+fn a_micro_slew_in_progress_absorbs_the_readings_it_is_already_paying_119() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-60 * MS, S);
-    let first = a.on_utc_error(-60 * MS, 2 * S).unwrap().as_slew().unwrap();
-    // 100 s into the slew (10 ms paid) UTC jumps back by another 80 ms: the error left once
-    // the slew has paid is −80 ms, twice.
-    let p1 = first.start_ptp_ns + 100 * S;
-    let paid = a.in_effect_ns(p1);
-    assert_eq!(paid, -10 * MS);
-    let reading = -60 * MS - paid - 80 * MS;
-    assert_eq!(a.on_utc_error(reading, p1), None);
-    let p2 = p1 + 10 * S;
-    let reading2 = -60 * MS - a.in_effect_ns(p2) - 80 * MS;
-    let ext = a
-        .on_utc_error(reading2, p2)
-        .expect("extension")
-        .as_slew()
-        .unwrap();
+    feed(&mut a, -3 * MS, 60 * S);
+    let first = a.on_tick(60 * S).unwrap().as_slew().unwrap();
+    // The wall has not moved yet (scheduled) or is part-way down: the reading still shows the
+    // −3 ms, minus what is already paid; judged by the error left once the slew has paid
+    // (−2.5 ms), nothing new is announced while it runs.
+    for p in [61 * S, 63 * S, 66 * S, 68 * S, 69 * S] {
+        let reading = -3 * MS - a.in_effect_ns(p);
+        assert_eq!(a.on_utc_error(reading, p), None);
+        assert_eq!(a.on_tick(p), None);
+    }
+    assert_eq!(a.seq(), 2);
+    assert_eq!(
+        a.micro().estimate(first.end_ptp_ns()).unwrap().error_ns,
+        -2_500 * US,
+        "the kept readings describe the error left after the increment"
+    );
+}
+
+#[test]
+fn the_next_increment_waits_for_the_running_one_and_the_interval_119() {
+    let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
+    feed(&mut a, -9 * MS, 60 * S);
+    let first = a.on_tick(60 * S).unwrap().as_slew().unwrap();
+    assert_eq!(first.end_ptp_ns(), 75 * S);
+    assert_eq!(
+        a.on_tick(76 * S),
+        None,
+        "the slew ended, the 20 s interval did not"
+    );
+    let second = a.on_tick(80 * S).unwrap().as_slew().unwrap();
+    assert_eq!(
+        second.from_ns,
+        -500 * US,
+        "continues from where the first ended"
+    );
+    assert_eq!(second.to_ns, -MS);
+    assert_eq!(second.start_ptp_ns, 90 * S);
     assert_eq!(a.seq(), 3);
-    // Continuous: it starts NOW from D now, at the same rate, and ends 80 ms lower.
-    assert_eq!(ext.start_ptp_ns, p2);
-    assert_eq!(ext.from_ns, first.offset_at(p2));
-    assert_eq!(ext.to_ns, -140 * MS);
-    assert_eq!(ext.ppm, first.ppm);
-    for p in [p2, p2 + S, p2 + 3 * S, p2 + 100 * S] {
-        assert!(
-            (ext.offset_at(p) - first.offset_at(p)).abs() <= 1,
-            "a box that still runs the old slew is on the new one until it hears it"
-        );
-    }
-    assert_eq!(a.in_effect_ns(ext.end_ptp_ns()), -140 * MS);
 }
 
 #[test]
-fn a_slew_too_close_to_its_end_is_not_extended_the_next_one_follows_it_119() {
+fn a_forward_need_beyond_the_cap_during_a_slew_waits_for_its_end_and_is_stepped_119() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-60 * MS, S);
-    let first = a.on_utc_error(-60 * MS, 2 * S).unwrap().as_slew().unwrap();
-    let end = first.end_ptp_ns();
-    // 3 s before its end (< the 5 s lead): a follower might not hear an extension in time.
-    let p = end - 3 * S;
-    let r = -60 * MS - a.in_effect_ns(p) - 80 * MS;
+    feed(&mut a, -3 * MS, 60 * S);
+    let first = a.on_tick(60 * S).unwrap().as_slew().unwrap();
+    let p = first.start_ptp_ns + S;
+    // UTC jumped FORWARD by 200 ms: an abnormal error, beyond the 100 ms cap.
+    let r = -3 * MS - a.in_effect_ns(p) + 200 * MS;
     assert_eq!(a.on_utc_error(r, p), None);
-    assert_eq!(a.on_utc_error(r, p + S), None);
-    assert_eq!(a.seq(), 2);
-    // After the end the agreed need is a fresh slew, lead ahead.
-    let next = a
-        .on_utc_error(-80 * MS, end + 2 * S)
-        .expect("announced right after the end")
-        .as_slew()
-        .unwrap();
-    assert_eq!(next.from_ns, -60 * MS);
-    assert_eq!(next.to_ns, -140 * MS);
-    assert_eq!(next.start_ptp_ns, end + 2 * S + MIN_STEP_LEAD_NS);
-}
-
-#[test]
-fn a_forward_need_during_a_slew_waits_for_its_end_and_is_stepped_119() {
-    let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-60 * MS, S);
-    let first = a.on_utc_error(-60 * MS, 2 * S).unwrap().as_slew().unwrap();
-    let p = first.start_ptp_ns + 100 * S;
-    // UTC jumped FORWARD by 200 ms: once the slew has paid the wall would be 140 ms behind.
-    let r = -60 * MS - a.in_effect_ns(p) + 200 * MS;
-    assert_eq!(a.on_utc_error(r, p), None);
-    assert_eq!(a.on_utc_error(r, p + 10 * S), None, "no step during a slew");
+    assert_eq!(a.on_utc_error(r, p + S), None, "no step during a slew");
+    assert_eq!(
+        a.on_tick(p + S),
+        None,
+        "no micro increment while it is confirmed"
+    );
     assert_eq!(a.seq(), 2);
     let end = first.end_ptp_ns();
-    let ann = a.on_utc_error(140 * MS, end + S).expect("stepped after it");
+    let ann = a
+        .on_utc_error(197 * MS + 500 * US, end + S)
+        .expect("stepped after it");
     assert_eq!(ann.slew, None);
-    assert_eq!(ann.date_offset_ns, -60 * MS + 140 * MS);
+    assert!(!ann.micro, "the abnormal correction is not a micro one");
+    assert_eq!(ann.date_offset_ns, -500 * US + 197 * MS + 500 * US);
 }
 
 #[test]
 fn a_rebase_moves_a_running_slew_into_the_new_base_119() {
     let d = 1_000 * S;
     let mut a = DateAuthority::new(d, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-60 * MS, S);
-    let first = a.on_utc_error(-60 * MS, 2 * S).unwrap().as_slew().unwrap();
-    let p_old = first.start_ptp_ns + 200 * S;
+    feed(&mut a, -3 * MS, 60 * S);
+    let first = a.on_tick(60 * S).unwrap().as_slew().unwrap();
+    let p_old = first.start_ptp_ns + 2 * S;
     let wall = p_old + a.in_effect_ns(p_old);
     let shift = 500 * S;
     let r = a.rebase(a.in_effect_ns(p_old) + shift, p_old);
     let moved = r.as_slew().expect("still the slew");
     assert_eq!(r.seq, 3);
+    assert!(
+        r.micro,
+        "the micro-slew still in flight stays a micro-correction in the new base"
+    );
     assert_eq!(moved, first.shifted(shift));
     // Same wall line now and at every later instant.
-    for dt in [0, 10 * S, 100 * S, 400 * S] {
+    for dt in [0, S, 3 * S, 10 * S] {
         let p_old_t = p_old + dt;
         let wall_t = p_old_t + first.offset_at(p_old_t);
         let p_new_t = p_old_t - shift;
         assert_eq!(p_new_t + a.in_effect_ns(p_new_t), wall_t, "dt {dt}");
     }
     assert_eq!(wall, p_old + first.offset_at(p_old));
+    // The micro estimate moved into the new base with it.
+    assert_eq!(
+        a.micro().estimate(p_old - shift).unwrap().error_ns,
+        -2_500 * US
+    );
 }
 
 // ---- dantesync#119: every box follows the slew -----------------------------------------------
@@ -395,7 +408,8 @@ fn a_joined_follower_schedules_a_slew_and_moves_d_only_from_its_start_119() {
                 date_offset_ns: d - 50 * MS,
                 effective_ptp_ns: 520 * S,
                 seq: 2,
-                slew: None
+                slew: None,
+                micro: false,
             },
             d - 50 * MS,
             wall_end + S
@@ -607,6 +621,7 @@ fn the_promoted_form_heard_just_before_this_boxs_own_end_changes_nothing_119() {
         effective_ptp_ns: sl.end_ptp_ns(),
         seq: 2,
         slew: None,
+        micro: false,
     };
     let p = sl.end_ptp_ns() - 3 * US;
     let wall = p + sl.offset_at(p);
@@ -662,23 +677,30 @@ fn a_backward_correction_beyond_twice_the_bound_is_too_large_to_slew_119() {
 }
 
 #[test]
-fn a_master_booted_3_s_ahead_steps_the_fleet_back_60_ms_ahead_slews_119() {
-    // −3 s (a boot-time NTP failure): an abnormal state, one coordinated step, never 8 h of slew.
+fn a_master_booted_3_s_ahead_steps_the_fleet_back_60_ms_ahead_is_micro_slewed_119() {
+    // −3 s (a boot-time NTP failure): an abnormal state, one coordinated step, never hours of
+    // micro-corrections.
     let d = 1_000 * S;
     let mut a = DateAuthority::new(d, 0, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS);
     a.on_utc_error(-3 * S, 10 * S);
     let ann = a.on_utc_error(-3 * S, 20 * S).expect("announced");
     assert_eq!(ann.slew, None, "not a slew");
+    assert!(!ann.micro);
     assert_eq!(ann.date_offset_ns, d - 3 * S);
     assert_eq!(ann.effective_ptp_ns, 20 * S + MIN_STEP_LEAD_NS);
     assert_eq!(a.pending_step_ns(21 * S), Some(-3 * S));
     assert!(a.slew_in_progress(21 * S).is_none());
-    // −60 ms (normal drift): a slew.
+    assert_eq!(
+        a.micro().estimate(21 * S),
+        None,
+        "the micro history starts again"
+    );
+    // −60 ms (within the cap): only ever micro-slewed, 500 µs at a time.
     let mut b = DateAuthority::new(d, 0, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS);
-    b.on_utc_error(-60 * MS, 10 * S);
-    let ann = b.on_utc_error(-60 * MS, 20 * S).expect("announced");
-    assert!(ann.as_slew().is_some());
-    assert_eq!(b.pending_step_ns(21 * S), None);
+    feed(&mut b, -60 * MS, 60 * S);
+    let ann = b.on_tick(60 * S).expect("announced");
+    assert_eq!(ann.as_slew().unwrap().amount_ns(), -500 * US);
+    assert_eq!(b.pending_step_ns(61 * S), None);
     // A joined follower schedules the too-large one as a coordinated step at its instant.
     let mut f = DateFollower::new();
     f.on_announce(in_effect(d, 1), d, d + 15 * S);
@@ -687,6 +709,7 @@ fn a_master_booted_3_s_ahead_steps_the_fleet_back_60_ms_ahead_slews_119() {
         effective_ptp_ns: 25 * S,
         seq: 2,
         slew: None,
+        micro: false,
     };
     assert_eq!(
         f.on_announce(big, d, d + 21 * S),
@@ -698,24 +721,20 @@ fn a_master_booted_3_s_ahead_steps_the_fleet_back_60_ms_ahead_slews_119() {
 }
 
 #[test]
-fn a_running_slew_is_not_extended_past_the_cap_the_rest_is_stepped_after_it_119() {
+fn a_backward_need_beyond_the_cap_during_a_slew_is_stepped_after_it_119() {
     let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
-    a.on_utc_error(-60 * MS, S);
-    let first = a.on_utc_error(-60 * MS, 2 * S).unwrap().as_slew().unwrap();
-    // 100 s in, UTC jumps back 250 ms: the need left once the slew has paid is −250 ms.
-    let p = first.start_ptp_ns + 100 * S;
-    let r = -60 * MS - a.in_effect_ns(p) - 250 * MS;
+    feed(&mut a, -3 * MS, 60 * S);
+    let first = a.on_tick(60 * S).unwrap().as_slew().unwrap();
+    // 1 s in, UTC jumps back 250 ms: the need left once the slew has paid is beyond the cap.
+    let p = first.start_ptp_ns + S;
+    let r = -3 * MS - a.in_effect_ns(p) - 250 * MS;
     assert_eq!(a.on_utc_error(r, p), None);
-    assert_eq!(
-        a.on_utc_error(r, p + 10 * S),
-        None,
-        "never extended past the cap"
-    );
+    assert_eq!(a.on_utc_error(r, p + S), None, "never slewed");
     assert_eq!(a.seq(), 2);
     let end = first.end_ptp_ns();
     let ann = a
-        .on_utc_error(-250 * MS, end + S)
+        .on_utc_error(-252_500 * US, end + S)
         .expect("stepped after it");
     assert_eq!(ann.slew, None);
-    assert_eq!(ann.date_offset_ns, -60 * MS - 250 * MS);
+    assert_eq!(ann.date_offset_ns, -500 * US - 252_500 * US);
 }

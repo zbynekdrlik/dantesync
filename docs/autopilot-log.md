@@ -687,3 +687,37 @@ canary evidence before continuing.
   and runs slews through the GM change + reboot. CI green on `2d96200` (run 36212565243).
 - Not merged, released or deployed. Rollout: the NTP master LAST (a ≤ 1.9.0 follower reads a slew
   as a backward step).
+
+## #119 follow-up — the fleet date in sub-threshold MICRO-corrections (v1.11.0, draft PR #121, branch `issue-119-micro`)
+
+- Design: main's Approach 1 (dantesync issuecomment-5845387690). `date_offset::MicroScheduler`
+  (20 min target-relative readings, Theil–Sen drift over 1 min bin medians, 5 min projected
+  median level, 2 ms dead band / 0.5 ms exit / 4 ms reversal, noise-widened bands, capacity
+  `micro_step_us / micro_interval_s` = 1.5 ms/min, falling-behind alarm, correction rate);
+  `DateAuthority::on_tick` decides on the loop (two leads ahead), `on_utc_error` records or
+  confirms the abnormal > 2 × bound step; extension v3 MICRO flag; `/status`
+  `date_micro_active` / `date_micro_last_us` / `date_correction_rate_ms_per_min` /
+  `date_correction_falling_behind` / `date_offset_micro`; micro steps out of the #91 storm count.
+- Commits: bump `5cb33b3`; RED `68af26d` → GREEN `6803bca`.
+- Proof (rustc replica): RED 26/84 pure + 9/9 bench red → GREEN 84/84 + 9/9. Bench 24 h with grace:
+  +17.6 ppm 2785 corrections ≤ 500 µs, 2.40 ms off UTC, relative phase 19 µs, 0 reversals, 0 large
+  steps; −15 ppm 2844 micro-slews, 2.66 ms, no step; ±5 ms asymmetric jitter: no correction
+  without drift, no reversal.
+- Finding (issuecomment-5845464425): the +1.06 ms/min drift since 25.9. is a grandmaster frequency
+  change at 23:32–23:35 UTC (every box's word moved ~−25 ppm, dev1 included, before strih-lx's
+  23:39 restart; same NTP server 162.159.200.1, same sync source) — not the restart, not the UTC path.
+- Review round 1 (fresh context, 0 🔴 7 🟡 5 🔵), all fixed in-lane: no decision without a fresh
+  UTC reading (no holdover); `effective_micro` (honest capacity from lead + slew); a rebase keeps
+  an in-flight micro kind; step bound floored at 5 ms; glue split into `date_sync/micro.rs` +
+  `date_sync/publish.rs`, the codec into `date_offset/wire.rs`, the bench world into
+  `two_clock_bench/world.rs` (every touched file ≤ 1000 lines); the bench's step-size tolerance
+  only within 5 min after a GM event, a ≤ 1 ppm word bound there (measured 0.37), renamed seqs in
+  the in-flight detection, every micro statistic over 3 bench / 4 pure seeds; doc fixes.
+- Review round 2 (fresh context, 0 🔴 2 🟡 5 🔵): the camera-box consumer follow-up is a supervisor
+  filing (no worker filing authority; documented in CHANGELOG); fixed in-lane: a loud pause
+  (`micro-corrections paused` / `date_micro_paused`), a per-direction effective capacity
+  (`backward_interval_ns`: a slow slew no longer throttles forward steps), a debug-assert against
+  a builder after the first reading, both sides of the bench's in-flight seq mapping, the
+  announce handling moved to `date_sync/follow.rs` and the slew fold/log to `date_sync/slew.rs`
+  (`service_date_offset` 193 → 85 lines), doc leftovers.
+- Not merged, released or deployed. Rollout: followers first, the NTP master last.

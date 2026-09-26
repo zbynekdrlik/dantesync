@@ -137,7 +137,14 @@ where
             .anchor_ns()
             .and_then(|a| self.date_sync.follower.slew_remaining_ns(a, now_wall))
             .unwrap_or(0);
-        info!(
+        // #119 follow-up: a micro-slew logs only its end (`micro-slew done`).
+        let level = if self.date_sync.follower.held_slew_is_micro() {
+            log::Level::Debug
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            level,
             "[DATE] slew START: D moves {:+}us at {:+.0} ppm (~{} s), the wall never steps back — \
              word {:+.3}ppm",
             (if term < 0.0 { -remaining } else { remaining }) / 1_000,
@@ -180,6 +187,40 @@ where
         }
         self.date_sync.slew_write_failed_at = None;
         self.slew_word_written(term, total);
+        self.update_shared_status();
+    }
+
+    /// #119 — every loop iteration: a slew whose amount is paid is folded into the anchor (then the
+    /// rate term follows the slew's schedule at this very instant: its start and end land within
+    /// one loop iteration on every box, like a coordinated step). One line per fold — a quiet
+    /// `micro-slew done` for a backward micro-correction (#119 follow-up), which it also records
+    /// as this box's last micro-correction.
+    pub(super) fn fold_completed_slew_and_log(&mut self, now_wall: i64) {
+        let micro_slew = self.date_sync.follower.held_slew_is_micro();
+        let Some(fold) = self.date_sync.fold_completed_slew(now_wall) else {
+            return;
+        };
+        self.date_sync.slew_start_logged = false;
+        let seq = self
+            .date_sync
+            .follower
+            .adopted_seq()
+            .map(|q| q.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        if micro_slew {
+            self.date_sync.last_micro_ns = Some(fold);
+            info!(
+                "[DATE] micro-slew done: D moved {:+}us, no wall step (seq {})",
+                fold / 1_000,
+                seq
+            );
+        } else {
+            info!(
+                "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
+                fold / 1_000,
+                seq
+            );
+        }
         self.update_shared_status();
     }
 

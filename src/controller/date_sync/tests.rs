@@ -41,7 +41,7 @@ pub(super) fn phase_lock_config() -> SystemConfig {
 /// A controller anchored on the phase lock (first lock) at `D = wall − 10 s`, so its view of
 /// the grandmaster's PTP time is 10 s. `master` configures NTP server mode FIRST, so the
 /// anchor makes it the date-offset authority.
-fn anchored_controller(
+pub(super) fn anchored_controller(
     mut clock: MockSystemClock,
     ntp: MockNtpSource,
     master: bool,
@@ -73,6 +73,18 @@ fn anchored_controller(
     );
     assert!(c.date_sync.core.engaged());
     (c, d)
+}
+
+/// #119 follow-up: six UTC readings (the micro estimate's minimum), then one loop iteration — the
+/// master's micro clock announces the increment.
+pub(super) fn readings_then_tick(
+    c: &mut PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
+) {
+    for _ in 0..6 {
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+    }
+    c.service_date_offset();
 }
 
 pub(super) fn authority_reply(
@@ -117,6 +129,7 @@ fn authority_reply_in_effect(
                 effective_ptp_ns,
                 seq,
                 slew: None,
+                micro: false,
             },
             gm_uuid: gm,
             now_ptp_ns: now - in_effect_ns,
@@ -325,10 +338,12 @@ fn a_follower_never_steps_on_its_own_ntp_reading_88() {
 }
 
 #[test]
-fn the_master_announces_a_utc_error_past_the_bound_instead_of_stepping_88() {
+fn the_master_announces_a_utc_error_past_the_cap_instead_of_stepping_88() {
+    // #119 follow-up: from a reading only an ABNORMAL error (beyond 2 × the 50 ms bound) is
+    // announced at once; a normal one is a micro-correction (`micro_tests`).
     let mut ntp = MockNtpSource::new();
     ntp.expect_get_offset()
-        .returning(|| Ok(one_offset(60_000, 1)));
+        .returning(|| Ok(one_offset(160_000, 1)));
     // No step_clock expectation: the master never steps at NTP time under the authority.
     let (mut c, d) = anchored_controller(MockSystemClock::new(), ntp, true);
     assert!(
@@ -355,7 +370,11 @@ fn the_master_announces_a_utc_error_past_the_bound_instead_of_stepping_88() {
     c.check_ntp_utc_tracking();
     let st = c.get_status_shared();
     let st = st.read().expect("status");
-    assert_eq!(st.date_step_pending_ns, Some(60_000_000));
+    assert_eq!(st.date_step_pending_ns, Some(160_000_000));
+    assert!(
+        !st.date_offset_micro,
+        "the abnormal correction is not a micro one"
+    );
     let due = st.date_step_due_in_ms.expect("scheduled");
     assert!(
         (4_000..=5_000).contains(&due),
@@ -367,7 +386,7 @@ fn the_master_announces_a_utc_error_past_the_bound_instead_of_stepping_88() {
         Some(d),
         "still in effect until the instant"
     );
-    assert_eq!(st.date_offset_error_ms, Some(60.0));
+    assert_eq!(st.date_offset_error_ms, Some(160.0));
 }
 
 #[test]
@@ -583,15 +602,17 @@ fn a_master_without_ptp_still_keeps_the_fleet_line_on_utc_88() {
     // off the fleet line already). Its UTC reading still disciplines the FLEET line: the
     // authority is fed `reading + (anchor − fleet)` and announces for the fleet, while the
     // master neither schedules that step for itself nor stops its own local path.
+    // #119 follow-up: 160 ms, an abnormal error the authority announces at once.
     let mut ntp = MockNtpSource::new();
     ntp.expect_get_offset()
-        .returning(|| Ok(one_offset(60_000, 1)));
+        .returning(|| Ok(one_offset(160_000, 1)));
     let mut clock = MockSystemClock::new();
-    // Its own wall: the legacy server step path steps the full 60 ms on the 2nd reading.
+    // Its own wall: the legacy server step path steps on the 2nd reading, bounded to the
+    // configured 100 ms (`ntp_server_max_step_us`, PTP offline).
     clock
         .expect_step_clock()
         .times(1)
-        .withf(|dur, sign| *dur == Duration::from_millis(60) && *sign == 1)
+        .withf(|dur, sign| *dur == Duration::from_millis(100) && *sign == 1)
         .returning(|_, _| Ok(()));
     let (mut c, d) = anchored_controller(clock, ntp, true);
     c.note_local_date_step(-250_000);
@@ -607,7 +628,7 @@ fn a_master_without_ptp_still_keeps_the_fleet_line_on_utc_88() {
     assert_eq!(a.seq(), seq + 1, "the fleet line's error was announced");
     assert_eq!(
         a.announce().date_offset_ns,
-        d + 60_000_000 - 250_000,
+        d + 160_000_000 - 250_000,
         "fleet D + (reading + anchor − fleet)"
     );
     assert!(
@@ -616,7 +637,7 @@ fn a_master_without_ptp_still_keeps_the_fleet_line_on_utc_88() {
     );
     assert_eq!(
         c.date_sync.core.anchor_ns(),
-        Some(d - 250_000 + 60_000_000),
+        Some(d - 250_000 + 100_000_000),
         "its own wall took the local NTP step"
     );
 }
@@ -682,7 +703,7 @@ fn an_off_line_masters_announce_is_published_at_once_not_at_the_next_tick_88() {
     // must be in it immediately, or followers hear it after its 5 s lead (a late step).
     let mut ntp = MockNtpSource::new();
     ntp.expect_get_offset()
-        .returning(|| Ok(one_offset(60_000, 1)));
+        .returning(|| Ok(one_offset(160_000, 1)));
     let mut clock = MockSystemClock::new();
     clock.expect_step_clock().returning(|_, _| Ok(()));
     let (mut c, _d) = anchored_controller(clock, ntp, true);

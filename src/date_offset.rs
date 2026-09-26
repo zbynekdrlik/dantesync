@@ -47,70 +47,54 @@
 //! and removes the scheduled displacement from every PTP measurement, so neither servo reads it as
 //! grandmaster disagreement (`controller/date_sync.rs`).
 //!
-//! The slew is for normal drift corrections. A backward correction larger than
-//! [`slew_cap_ns`] (2 × the step bound, 100 ms by default) is an abnormal state — typically a master
-//! that booted on a bad NTP reading — and an hours-long slew would keep the fleet date wrong, so it
-//! is a coordinated step, logged loudly (ROZHODNUTÉ issuecomment-5842590141).
+//! Since v1.11 every normal correction is a micro one (below), so a slew is ≤ 1 ms. A backward
+//! correction larger than [`slew_cap_ns`] (2 × the step bound, 100 ms by default) is an abnormal
+//! state — typically a master that booted on a bad NTP reading — and is a coordinated step, logged
+//! loudly (ROZHODNUTÉ issuecomment-5842590141).
+//!
+//! # dantesync#119 follow-up — the correction is spread into MICRO-corrections (v1.11)
+//!
+//! Correcting the whole error once it reached 50 ms made a 50 ms event every ~47 minutes at the
+//! rig's drift — 1.5 video frames that every wall-anchored consumer saw. Now the authority corrects
+//! continuously, in sub-threshold increments decided by [`MicroScheduler`] (default ≤ 500 µs, at
+//! most one per 20 s, beyond a 2 ms dead band): a forward increment is a coordinated step, a
+//! backward one a coordinated slew. The announce carries the MICRO kind (extension v3), so every
+//! box logs it quietly and keeps it out of the NTP step-storm count. The large correction exists
+//! only for an ABNORMAL error beyond [`slew_cap_ns`] (2 × the step bound): one coordinated step,
+//! either direction, logged loudly. The step bound itself no longer triggers anything.
 
+mod micro;
 mod slew;
+mod wire;
+pub use micro::{
+    clamp_micro_interval_s, clamp_micro_step_us, MicroConfig, MicroEstimate, MicroScheduler,
+    DEFAULT_MICRO_INTERVAL_S, DEFAULT_MICRO_STEP_US, FALLING_BEHIND_ERROR_NS, MAX_MICRO_INTERVAL_S,
+    MAX_MICRO_STEP_US, MICRO_DEAD_BAND_NS, MICRO_EXIT_BAND_NS, MICRO_READING_MAX_AGE_NS,
+    MICRO_REVERSAL_BAND_NS, MICRO_TURNED_TREND_NS_PER_S, MICRO_WINDOW_NS, MIN_MICRO_INTERVAL_S,
+    MIN_MICRO_STEP_US,
+};
 pub use slew::{
     clamp_slew_ppm, correction_kind, slew_cap_ns, solve_displacement, CorrectionKind, DateSlew,
     HeldSlew, SlewSpec, DEFAULT_SLEW_PPM, MAX_SLEW_PPM, MIN_SLEW_PPM, SLEW_CAP_STEP_BOUNDS,
 };
+pub use wire::{
+    decode_extension, encode_extension, DateExtension, EXT_FLAG_AUTHORITY, EXT_FLAG_MICRO,
+    EXT_FLAG_SLEW, EXT_SIZE, EXT_SIZE_V2, EXT_VERSION,
+};
 
-/// Version of the 31900 reply extension carried by this build (2 = v1 + the #119 slew fields).
-pub const EXT_VERSION: u8 = 2;
-
-/// Size of the v1 extension appended after the 64-byte base reply.
-///
-/// Layout (big-endian, offsets relative to the start of the extension = byte 64 of the reply):
-///
-/// ```text
-/// [0]      version (1)
-/// [1]      flags: bit 0 = this node is the date-offset AUTHORITY (the NTP master)
-/// [2-3]    reserved (zero)
-/// [4-11]   date_offset_ns   (i64) — D, where wall = PTP time + D
-/// [12-19]  effective_ptp_ns (i64) — the PTP instant D takes effect (future = a pending step)
-/// [20-23]  seq              (u32) — bumped on every change of D
-/// [24-29]  gm_uuid          (6 bytes) — the grandmaster whose PTP time base D belongs to
-/// [30-31]  reserved (zero)
-/// [32-39]  now_ptp_ns       (i64) — the replying node's PTP time when it built the reply
-///                            (its wall − its D IN EFFECT), for the follower's time-base check
-/// ```
-///
-/// `gm_uuid` is the grandmaster of the authority's ANCHOR, not "the grandmaster I hear right now":
-/// during a grandmaster change those differ for a window, and publishing the new UUID beside an
-/// old-base `D` would let a follower that already re-anchored adopt a days-wrong offset.
-///
-/// A future version APPENDS fields; a v1 reader decodes the first 40 bytes of any version ≥ 1.
-///
-/// Version 2 (dantesync#119) keeps those 40 bytes and uses two of them that v1 writes as zero, so a
-/// v1 reader simply sees a step (the pre-#119 behaviour):
-///
-/// ```text
-/// [1]      flags: bit 1 = the announce is a SLEW (`date_offset_ns` is where it ends,
-///                          `effective_ptp_ns` where it starts)
-/// [2-3]    slew_ppm         (u16) — the slew rate, 0 unless bit 1 is set
-/// [40-47]  slew_from_ns     (i64) — D where the slew starts
-/// ```
-pub const EXT_SIZE: usize = 40;
-
-/// Size of the v2 extension (dantesync#119): the v1 fields plus `slew_from_ns`. This build writes
-/// it; a reply is only read as a slew when the version is ≥ 2 AND all of it is present.
-pub const EXT_SIZE_V2: usize = 48;
-
-/// Extension flag: the replying node is the fleet's date-offset authority.
-pub const EXT_FLAG_AUTHORITY: u8 = 0x01;
-
-/// Extension flag (v2, dantesync#119): the announce is a coordinated SLEW, not a step.
-pub const EXT_FLAG_SLEW: u8 = 0x02;
-
-/// Default step bound: the master changes `D` only when |UTC − wall| exceeds this (ROZHODNUTÉ Q3).
+/// Default step bound (ROZHODNUTÉ Q3). Since the micro-corrections (v1.11) it only sets the
+/// abnormal cap: an error beyond [`slew_cap_ns`] (2 × this) is corrected in one coordinated step.
 pub const DEFAULT_STEP_BOUND_NS: i64 = 50_000_000;
 
 /// Minimum announce lead: a step takes effect at least this far in the future (ROZHODNUTÉ Q3).
 /// Every client polls the authority once per second, so 5 s gives ≥ 4 chances to hear it.
 pub const MIN_STEP_LEAD_NS: i64 = 5_000_000_000;
+
+/// dantesync#119 follow-up — a micro-correction is announced this many leads ahead. There are
+/// ~3 a minute instead of one an hour, so the few-in-10⁴ chance that a box misses every poll of
+/// one lead (and takes it late, out of step with the fleet) would recur several times a day; two
+/// leads (≥ 9 polls) make it vanish, and the landing is still far inside the 20 s spacing.
+pub const MICRO_LEAD_FACTOR: i64 = 2;
 
 /// An offset that takes effect IMMEDIATELY (the first anchor, a rebase onto a new time base) is
 /// published with its effective instant this far in the PAST. It marks no wall step to meet — the
@@ -118,9 +102,10 @@ pub const MIN_STEP_LEAD_NS: i64 = 5_000_000_000;
 /// µs (path delay, re-anchor noise) must read it as in effect, never as a pending step to schedule.
 pub const IMMEDIATE_BACKDATE_NS: i64 = 1_000_000_000;
 
-/// Consecutive same-sign over-bound UTC readings the master needs before it announces. The bound
-/// is 50 ms, far above any real NTP noise (WAN bursts scatter by ~1 ms), so this only guards
-/// against a single wild reading (a mis-set upstream answering once) moving the whole fleet.
+/// Consecutive same-sign readings beyond the abnormal cap the master needs before it announces the
+/// large correction. The cap is 100 ms, far above any real NTP noise (WAN bursts scatter by ~1 ms),
+/// so this only guards against a single wild reading (a mis-set upstream answering once) moving the
+/// whole fleet.
 pub const AUTHORITY_AGREEMENT_N: u32 = 2;
 
 /// A reply is only applicable when the replying node's PTP time "now" and this node's agree within
@@ -162,6 +147,10 @@ pub struct DateAnnounce {
     pub seq: u32,
     /// dantesync#119 — `Some` when this change is a coordinated SLEW (a backward correction).
     pub slew: Option<SlewSpec>,
+    /// dantesync#119 follow-up — this change is a MICRO-correction (a sub-threshold increment):
+    /// applied exactly like any step or slew, only logged quietly and kept out of the NTP
+    /// step-storm count. Read only from an extension of version ≥ 3.
+    pub micro: bool,
 }
 
 impl DateAnnounce {
@@ -181,80 +170,30 @@ impl DateAnnounce {
     }
 }
 
-/// The decoded 31900 reply extension.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DateExtension {
-    pub version: u8,
-    /// True only on the fleet's date-offset authority. A client that is not the authority still
-    /// mirrors its own state here (observability), with this flag clear — a follower must never
-    /// adopt it.
-    pub authority: bool,
-    pub announce: DateAnnounce,
-    /// The grandmaster whose PTP time base `announce.date_offset_ns` belongs to.
-    pub gm_uuid: [u8; 6],
-    /// The replying node's PTP time when it built the reply (its wall − its `D` in effect).
-    pub now_ptp_ns: i64,
-}
-
-/// Encode the v2 extension (see [`EXT_SIZE`] for the layout).
-pub fn encode_extension(ext: &DateExtension) -> [u8; EXT_SIZE_V2] {
-    let mut out = [0u8; EXT_SIZE_V2];
-    out[0] = EXT_VERSION;
-    out[1] = if ext.authority { EXT_FLAG_AUTHORITY } else { 0 };
-    out[4..12].copy_from_slice(&ext.announce.date_offset_ns.to_be_bytes());
-    out[12..20].copy_from_slice(&ext.announce.effective_ptp_ns.to_be_bytes());
-    out[20..24].copy_from_slice(&ext.announce.seq.to_be_bytes());
-    out[24..30].copy_from_slice(&ext.gm_uuid);
-    out[32..40].copy_from_slice(&ext.now_ptp_ns.to_be_bytes());
-    if let Some(slew) = ext.announce.slew {
-        out[1] |= EXT_FLAG_SLEW;
-        let ppm = clamp_slew_ppm(slew.ppm).min(u16::MAX as u32) as u16;
-        out[2..4].copy_from_slice(&ppm.to_be_bytes());
-        out[40..48].copy_from_slice(&slew.from_ns.to_be_bytes());
-    }
-    out
-}
-
-/// Decode an extension. `None` when it is absent (fewer than [`EXT_SIZE`] bytes — an older
-/// server's plain 64-byte reply) or when the version byte is 0 (never a valid extension).
-/// Any version ≥ 1 is accepted and read as v1: later versions only append fields. The #119 slew
-/// is read only from a version ≥ 2 extension that carries all [`EXT_SIZE_V2`] bytes; its rate is
-/// clamped like a configured one.
-pub fn decode_extension(bytes: &[u8]) -> Option<DateExtension> {
-    if bytes.len() < EXT_SIZE || bytes[0] == 0 {
-        return None;
-    }
-    let i64_at = |at: usize| {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&bytes[at..at + 8]);
-        i64::from_be_bytes(b)
-    };
-    let slew =
-        (bytes[0] >= 2 && bytes.len() >= EXT_SIZE_V2 && bytes[1] & EXT_FLAG_SLEW != 0).then(|| {
-            SlewSpec {
-                from_ns: i64_at(40),
-                ppm: clamp_slew_ppm(u16::from_be_bytes([bytes[2], bytes[3]]) as u32),
-            }
-        });
-    Some(DateExtension {
-        version: bytes[0],
-        authority: bytes[1] & EXT_FLAG_AUTHORITY != 0,
-        announce: DateAnnounce {
-            date_offset_ns: i64_at(4),
-            effective_ptp_ns: i64_at(12),
-            seq: u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
-            slew,
-        },
-        gm_uuid: [
-            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29],
-        ],
-        now_ptp_ns: i64_at(32),
-    })
-}
-
 // ============================================================================
 // THE AUTHORITY (the NTP master)
 // ============================================================================
+
+/// dantesync#119 follow-up — the micro-correction tuning as it can actually run: one correction
+/// is in flight at a time and each is announced [`MICRO_LEAD_FACTOR`] × `lead_ns` ahead, so the
+/// interval is at least that; a backward one is in flight for its slew of one step at `slew_ppm`
+/// too, so the BACKWARD interval is at least lead + slew (a forward step is not slowed by it). The
+/// capacity (and the falling-behind alarm that compares against it) is then the honest one — a
+/// long configured lead or a slow slew rate can no longer hide a drift the corrections cannot hold.
+pub fn effective_micro(requested: MicroConfig, lead_ns: i64, slew_ppm: u32) -> MicroConfig {
+    let lead = lead_ns.saturating_mul(MICRO_LEAD_FACTOR);
+    let slew_ns = requested.step_ns.saturating_mul(1_000_000) / clamp_slew_ppm(slew_ppm) as i64;
+    let interval_ns = requested.interval_ns.max(lead);
+    MicroConfig {
+        interval_ns,
+        // A backward increment is in flight for its slew too; a forward one is a step.
+        backward_interval_ns: requested
+            .backward_interval_ns
+            .max(interval_ns)
+            .max(lead.saturating_add(slew_ns)),
+        ..requested
+    }
+}
 
 /// The master's date-offset policy. Owns `D` for the whole fleet.
 #[derive(Clone, Debug)]
@@ -273,14 +212,21 @@ pub struct DateAuthority {
     /// running). While it exists it IS the published announce, and `current_ns` is its `from`.
     slew: Option<DateSlew>,
     seq: u32,
-    /// Consecutive same-sign over-bound readings: (sign, count).
+    /// Consecutive same-sign readings beyond the abnormal cap: (sign, count).
     over_bound: Option<(i8, u32)>,
+    /// dantesync#119 follow-up — the micro-correction tuning as configured …
+    micro_requested: MicroConfig,
+    /// … and the decision, on the EFFECTIVE tuning ([`effective_micro`]).
+    micro: MicroScheduler,
+    /// The change that made the current `seq` was a micro-correction (published with it).
+    micro_kind: bool,
 }
 
 impl DateAuthority {
     /// Establish the authority with the master's own PTP-phase-lock anchor as `D`.
     /// `step_bound_ns` ≤ 0 falls back to the default; `lead_ns` is floored at [`MIN_STEP_LEAD_NS`].
-    /// Backward corrections slew at [`DEFAULT_SLEW_PPM`] unless [`with_slew_ppm`](Self::with_slew_ppm).
+    /// Backward corrections slew at [`DEFAULT_SLEW_PPM`] unless [`with_slew_ppm`](Self::with_slew_ppm);
+    /// the micro-corrections use [`MicroConfig::default`] unless [`with_micro`](Self::with_micro).
     pub fn new(anchor_ns: i64, now_ptp_ns: i64, step_bound_ns: i64, lead_ns: i64) -> Self {
         DateAuthority {
             step_bound_ns: if step_bound_ns > 0 {
@@ -296,17 +242,48 @@ impl DateAuthority {
             slew: None,
             seq: 1,
             over_bound: None,
+            micro_requested: MicroConfig::default(),
+            micro: MicroScheduler::new(MicroConfig::default()),
+            micro_kind: false,
         }
+        .rebuild_micro()
+    }
+
+    /// Build the micro scheduler on the effective tuning. A builder runs before any reading: a
+    /// rebuild would drop the kept readings.
+    fn rebuild_micro(mut self) -> Self {
+        debug_assert_eq!(
+            self.micro.readings(),
+            0,
+            "a builder after the first UTC reading"
+        );
+        self.micro = MicroScheduler::new(effective_micro(
+            self.micro_requested,
+            self.lead_ns,
+            self.slew_ppm,
+        ));
+        self
     }
 
     /// dantesync#119 — the slew rate of backward corrections (clamped by [`clamp_slew_ppm`]).
     pub fn with_slew_ppm(mut self, ppm: u32) -> Self {
         self.slew_ppm = clamp_slew_ppm(ppm);
-        self
+        self.rebuild_micro()
+    }
+
+    /// dantesync#119 follow-up — the micro-correction tuning (applied as [`effective_micro`]).
+    pub fn with_micro(mut self, cfg: MicroConfig) -> Self {
+        self.micro_requested = cfg;
+        self.rebuild_micro()
     }
 
     pub fn slew_ppm(&self) -> u32 {
         self.slew_ppm
+    }
+
+    /// dantesync#119 follow-up — the micro-correction scheduler (its estimate, rate and alarm).
+    pub fn micro(&self) -> &MicroScheduler {
+        &self.micro
     }
 
     /// dantesync#119 — the announced slew while it is not yet complete at `now_ptp_ns` (scheduled
@@ -368,25 +345,30 @@ impl DateAuthority {
     ///
     /// dantesync#119: while a slew is scheduled or running (and after it, until it is promoted)
     /// the announce IS the slew; read after its end it gives `to` in effect — the same `D` the
-    /// promoted form publishes.
+    /// promoted form publishes. The MICRO kind belongs to the `seq`: it stays on the promoted form.
     pub fn announce(&self) -> DateAnnounce {
-        if let Some(s) = self.slew {
-            return s.announce(self.seq);
-        }
-        match self.pending {
-            Some((offset, eff)) => DateAnnounce {
-                date_offset_ns: offset,
-                effective_ptp_ns: eff,
-                seq: self.seq,
-                slew: None,
-            },
-            None => DateAnnounce {
-                date_offset_ns: self.current_ns,
-                effective_ptp_ns: self.current_since_ptp_ns,
-                seq: self.seq,
-                slew: None,
-            },
-        }
+        let mut ann = if let Some(s) = self.slew {
+            s.announce(self.seq)
+        } else {
+            match self.pending {
+                Some((offset, eff)) => DateAnnounce {
+                    date_offset_ns: offset,
+                    effective_ptp_ns: eff,
+                    seq: self.seq,
+                    slew: None,
+                    micro: false,
+                },
+                None => DateAnnounce {
+                    date_offset_ns: self.current_ns,
+                    effective_ptp_ns: self.current_since_ptp_ns,
+                    seq: self.seq,
+                    slew: None,
+                    micro: false,
+                },
+            }
+        };
+        ann.micro = self.micro_kind;
+        ann
     }
 
     /// The size of the pending step (`pending D − D in effect`) while it is still ahead of
@@ -410,41 +392,34 @@ impl DateAuthority {
         }
     }
 
+    /// What the announced change still has to move `D` at `now_ptp_ns` (the target minus `D` in
+    /// effect): a pending step's size, or what a slew has left to pay; 0 with nothing announced.
+    fn outstanding_ns(&self, now_ptp_ns: i64) -> i64 {
+        if let Some(s) = self.slew {
+            return s.to_ns.wrapping_sub(s.offset_at(now_ptp_ns));
+        }
+        self.pending_step_ns(now_ptp_ns).unwrap_or(0)
+    }
+
     /// Feed one UTC measurement: `utc_error_ns = UTC − wall` on the master (the NTP offset).
     ///
-    /// Announces a new `D = D + utc_error_ns` when the error has exceeded the bound on
-    /// [`AUTHORITY_AGREEMENT_N`] consecutive same-sign readings and no step is already pending.
-    /// Returns the new announce when it made one.
+    /// Correct because the master's own wall is `ptp + D`: `UTC − ptp = D + (UTC − wall)`. The
+    /// reading is judged by the error that REMAINS once the change already announced has landed
+    /// (`utc_error − (target D − D now)`).
     ///
-    /// Correct because the master's own wall is `ptp + D`: `UTC − ptp = D + (UTC − wall)`.
-    ///
-    /// dantesync#119 — the DIRECTION decides how (see [`correction_kind`]): a positive correction
-    /// is a coordinated STEP taking effect `lead` from now; a negative one is a coordinated SLEW
-    /// at `slew_ppm` starting `lead` from now, up to [`slew_cap_ns`] (2 bounds); a larger backward
-    /// one is an abnormal state and is a coordinated step too (`TooLargeToSlew`).
-    ///
-    /// A slew in progress absorbs a new correction: readings are judged by the error that will
-    /// REMAIN once it has paid (`utc_error − (to − D now)`). A further backward need extends the
-    /// running slew — re-announced from the current `D` at the same rate, so `D` stays continuous
-    /// and a follower that hears it late sees no change — but only while at least one `lead` of
-    /// it is left, so a follower hears the extension before the old slew ends. A forward need
-    /// waits for the slew to end and is then stepped.
+    /// dantesync#119 follow-up: a normal reading only feeds the micro-correction estimate — the
+    /// corrections themselves are decided by [`on_tick`](Self::on_tick). A reading beyond
+    /// [`slew_cap_ns`] (2 × the step bound) is an ABNORMAL error (typically a master that booted on
+    /// a bad NTP reading, seconds off): on [`AUTHORITY_AGREEMENT_N`] consecutive same-sign ones it
+    /// is corrected in ONE coordinated step taking effect `lead` from now, forward or backward
+    /// (`TooLargeToSlew`), once no other change is in flight. Returns that announce.
     pub fn on_utc_error(&mut self, utc_error_ns: i64, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
-        if self.pending.is_some() {
-            // One step at a time. Readings taken while a step is pending describe the wall that
-            // is about to move; they must not start a second, stale candidate.
+        let error_ns = utc_error_ns.wrapping_sub(self.outstanding_ns(now_ptp_ns));
+        if error_ns.unsigned_abs() <= slew_cap_ns(self.step_bound_ns).unsigned_abs() {
             self.over_bound = None;
-            return None;
-        }
-        let running = self.slew;
-        let error_ns = match running {
-            // The error left once the slew has paid: the wall still moves by `to − D now`.
-            Some(s) => utc_error_ns.wrapping_sub(s.to_ns.wrapping_sub(s.offset_at(now_ptp_ns))),
-            None => utc_error_ns,
-        };
-        if error_ns.abs() <= self.step_bound_ns {
-            self.over_bound = None;
+            self.micro.record(error_ns, now_ptp_ns);
+            self.micro.update_falling_behind(now_ptp_ns);
             return None;
         }
         let sign: i8 = if error_ns > 0 { 1 } else { -1 };
@@ -452,54 +427,53 @@ impl DateAuthority {
             Some((s, n)) if s == sign => n + 1,
             _ => 1,
         };
-        if count < AUTHORITY_AGREEMENT_N {
+        if count < AUTHORITY_AGREEMENT_N || self.pending.is_some() || self.slew.is_some() {
+            // Not agreed yet, or one change at a time: the large correction is made once the
+            // change in flight has landed (keeping the agreement).
             self.over_bound = Some((sign, count));
             return None;
         }
-        if let Some(s) = running {
-            // An extension LARGER THAN the slew cap is not slewed: it waits for the running slew's
-            // end and is then stepped (`TooLargeToSlew`), like any correction that large. (The cap
-            // bounds each extension, not the slew's total; the wait is up to the rest of the running
-            // slew — ≤ 100 ms at the configured rate, 2.8 h only at the 10 ppm floor — a double
-            // fault: a UTC jump during a slew.)
-            let extendable = sign < 0
-                && correction_kind(error_ns, self.step_bound_ns) == CorrectionKind::Slew
-                && s.active_at(now_ptp_ns)
-                && s.end_ptp_ns().saturating_sub(now_ptp_ns) >= self.lead_ns;
-            if !extendable {
-                // Keep the agreement: the correction is made once the slew allows it.
-                self.over_bound = Some((sign, count));
-                return None;
-            }
-            self.over_bound = None;
-            let from = s.offset_at(now_ptp_ns);
-            self.current_ns = from;
-            self.current_since_ptp_ns = now_ptp_ns;
-            self.slew = Some(DateSlew {
-                from_ns: from,
-                to_ns: s.to_ns.saturating_add(error_ns),
-                start_ptp_ns: now_ptp_ns,
-                ppm: s.ppm,
-            });
-            self.seq = self.seq.wrapping_add(1);
-            return Some(self.announce());
-        }
         self.over_bound = None;
-        let eff = now_ptp_ns.saturating_add(self.lead_ns);
-        let target = self.current_ns.saturating_add(error_ns);
-        match correction_kind(error_ns, self.step_bound_ns) {
-            CorrectionKind::Step | CorrectionKind::TooLargeToSlew => {
-                self.pending = Some((target, eff))
-            }
+        self.pending = Some((
+            self.current_ns.saturating_add(error_ns),
+            now_ptp_ns.saturating_add(self.lead_ns),
+        ));
+        self.micro_kind = false;
+        // The kept readings described the abnormal state; the micro estimate starts again.
+        self.micro.clear();
+        self.seq = self.seq.wrapping_add(1);
+        Some(self.announce())
+    }
+
+    /// dantesync#119 follow-up — the micro-correction clock: called on every loop iteration of the
+    /// master (so the spacing is exact, not tied to the NTP cadence). Announces the next increment
+    /// when [`MicroScheduler::decide`] makes one, [`MICRO_LEAD_FACTOR`] × `lead` from now: forward
+    /// a coordinated STEP,
+    /// backward a coordinated SLEW at `slew_ppm` ([`correction_kind`]). Nothing while another
+    /// change is in flight or an abnormal correction is being confirmed.
+    pub fn on_tick(&mut self, now_ptp_ns: i64) -> Option<DateAnnounce> {
+        self.promote(now_ptp_ns);
+        if self.pending.is_some() || self.slew.is_some() || self.over_bound.is_some() {
+            return None;
+        }
+        let land = now_ptp_ns.saturating_add(self.lead_ns.saturating_mul(MICRO_LEAD_FACTOR));
+        let amount = self.micro.decide(now_ptp_ns, land)?;
+        let target = self.current_ns.saturating_add(amount);
+        match correction_kind(amount, self.step_bound_ns) {
             CorrectionKind::Slew => {
                 self.slew = Some(DateSlew {
                     from_ns: self.current_ns,
                     to_ns: target,
-                    start_ptp_ns: eff,
+                    start_ptp_ns: land,
                     ppm: self.slew_ppm,
                 })
             }
+            // A micro increment is ≤ 1 ms, far inside the cap: backward it is always a slew.
+            CorrectionKind::Step | CorrectionKind::TooLargeToSlew => {
+                self.pending = Some((target, land))
+            }
         }
+        self.micro_kind = true;
         self.seq = self.seq.wrapping_add(1);
         Some(self.announce())
     }
@@ -515,7 +489,9 @@ impl DateAuthority {
     /// pending offset and its effective PTP instant are shifted into the new base.
     ///
     /// dantesync#119: `new_offset_ns` is the `D` IN EFFECT in the new base. A slew in progress is
-    /// shifted the same way, so it keeps running at the same wall instants and the same rate.
+    /// shifted the same way, so it keeps running at the same wall instants and the same rate. The
+    /// micro-correction history moves into the new base too (the wall, and so every reading, is
+    /// continuous).
     pub fn rebase(&mut self, new_offset_ns: i64, now_ptp_old_ns: i64) -> DateAnnounce {
         self.promote(now_ptp_old_ns);
         let shift = new_offset_ns.wrapping_sub(self.in_effect_ns(now_ptp_old_ns));
@@ -534,6 +510,9 @@ impl DateAuthority {
         if let Some((offset, eff)) = self.pending {
             self.pending = Some((offset.wrapping_add(shift), eff.wrapping_sub(shift)));
         }
+        self.micro.rebase(shift);
+        // A micro-correction still in flight is re-announced in the new base as what it is.
+        self.micro_kind = self.micro_kind && (self.pending.is_some() || self.slew.is_some());
         self.over_bound = None;
         self.seq = self.seq.wrapping_add(1);
         self.announce()
@@ -612,6 +591,8 @@ pub struct DateFollower {
     /// dantesync#119 — the slew this box follows (scheduled, running, or complete but not yet
     /// folded into the anchor).
     held: Option<HeldSlew>,
+    /// dantesync#119 follow-up — the `seq` of the last MICRO-correction announce heard.
+    micro_seq: Option<u32>,
 }
 
 impl DateFollower {
@@ -640,6 +621,23 @@ impl DateFollower {
     /// dantesync#119 — the slew this box follows, if any.
     pub fn held_slew(&self) -> Option<HeldSlew> {
         self.held
+    }
+
+    /// dantesync#119 follow-up — was the announce `seq` a MICRO-correction?
+    pub fn is_micro_seq(&self, seq: u32) -> bool {
+        self.micro_seq == Some(seq)
+    }
+
+    /// dantesync#119 follow-up — the slew this box holds is a micro-correction.
+    pub fn held_slew_is_micro(&self) -> bool {
+        self.held.is_some() && self.adopted_seq.is_some_and(|q| self.is_micro_seq(q))
+    }
+
+    /// dantesync#119 follow-up — a micro-correction is in flight on this box at `wall_ns`: its
+    /// step is scheduled, or its slew is scheduled or running.
+    pub fn micro_in_flight(&self, anchor_ns: i64, wall_ns: i64) -> bool {
+        self.pending.is_some_and(|p| self.is_micro_seq(p.seq))
+            || (self.held_slew_is_micro() && self.slew_remaining_ns(anchor_ns, wall_ns).is_some())
     }
 
     /// dantesync#119 — the displacement of `D` from `anchor_ns` at the wall reading `wall_ns`: 0
@@ -739,6 +737,9 @@ impl DateFollower {
         own_anchor_ns: i64,
         now_wall_ns: i64,
     ) -> FollowAction {
+        if a.micro {
+            self.micro_seq = Some(a.seq);
+        }
         let own_d = self.in_effect_ns(own_anchor_ns, now_wall_ns);
         let own_now_ptp = now_wall_ns.wrapping_sub(own_d);
         if let Some(slew) = a.as_slew() {

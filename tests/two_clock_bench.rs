@@ -38,10 +38,17 @@
 //! or runs its wall backwards, the relative phase of the fleet (each wall plus its own PTP path
 //! delay) stays within 50 µs through every slew, and the phase lock's law is untouched (the
 //! words differ from a forward-only run by numerical noise only).
+//!
+//! dantesync#119 follow-up: the fleet date is corrected in MICRO-corrections — at most 500 µs, at
+//! most one per 20 s, beyond a 2 ms dead band, decided on the master's loop tick. The bench drives
+//! that tick every window and proves, over 24 h at +17.6 ppm (the rig's drift) and at −15 ppm:
+//! no single correction above 500 µs, the fleet date within 3 ms of UTC, the relative phase within
+//! 50 µs, no large step; and that ±5 ms asymmetric UTC jitter never makes the corrections
+//! oscillate.
 
 use dantesync::date_offset::{
     same_time_base, slew_cap_ns, DateAnnounce, DateAuthority, DateFollower, FollowAction, SlewSpec,
-    StepKind, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
+    StepKind, DEFAULT_SLEW_PPM, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
 };
 use dantesync::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 
@@ -49,6 +56,9 @@ const NS: i64 = 1;
 const US: i64 = 1_000 * NS;
 const MS: i64 = 1_000 * US;
 const S: i64 = 1_000 * MS;
+
+/// #119 follow-up: the largest micro-correction (the default `micro_step_us`).
+const MICRO_STEP_NS: i64 = dantesync::date_offset::DEFAULT_MICRO_STEP_US as i64 * US;
 
 /// PTP sample window: 4 Sync messages at 8/s (the controller's `sample_window_size` = 4).
 const WINDOW_S: f64 = 0.5;
@@ -88,17 +98,29 @@ struct Scenario {
     /// which followers take as one small late step: allowed, bounded to < 1 ms.
     gm_change_in_master_outage: bool,
     /// #119: UTC jumps (window, ns) — an upstream stepping back makes the fleet run ahead at once,
-    /// so a backward correction (or an extension of a running slew) follows. The master's UTC
+    /// so backward (micro-)corrections follow. The master's UTC
     /// bound is not judged for `UTC_JUMP_SETTLE_WINDOWS` after each jump.
     utc_jumps: Vec<(u64, i64)>,
     /// #119 ROZHODNUTÉ: this scenario MEANS to cause a backward correction beyond the slew cap
     /// (a master booting seconds ahead); only then does `check()` accept a backward step.
     expects_too_large_step: bool,
+    /// #119: the rate of a backward correction's slew (the config's `slew_ppm`).
+    slew_ppm: u32,
+    /// #119 follow-up: the master's and the fleet's UTC error are judged only after this many
+    /// windows (the join and the first micro estimate; longer where a boot error is worked off
+    /// in micro-corrections).
+    settle_windows: u64,
+    /// #119 follow-up: the master's UTC reading noise.
+    ntp_noise: NtpNoise,
+    /// #119 follow-up: mixed into every noise source's seed (0 = the historical noise), so a
+    /// statistic can be asserted over several noise samples (the "seed every noise source" rule).
+    seed: u64,
 }
 
-/// #119: after a UTC jump the fleet is off UTC by the jump until the slew has paid it. Two chained
-/// 80 ms jumps on top of a fleet error of up to 50 ms extend one slew to ~210 ms, i.e. 2 100 s
-/// at 100 ppm (measured: 201.7 ms) plus the agreement and the lead: 50 minutes covers it.
+/// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
+/// Since the micro-corrections (v1.11) a jump of up to 30 ms is worked off at the capacity (the
+/// jumps scenario's 25 ppm slews are 30 s apart — two 5 s leads + a 20 s slew — so ~1 ms/min:
+/// 30 ms in ~30 min): 50 minutes covers it.
 const UTC_JUMP_SETTLE_WINDOWS: u64 = 6_000;
 
 impl Scenario {
@@ -112,6 +134,10 @@ impl Scenario {
             gm_change_in_master_outage: false,
             utc_jumps: Vec::new(),
             expects_too_large_step: false,
+            slew_ppm: DEFAULT_SLEW_PPM,
+            settle_windows: 240,
+            ntp_noise: NtpNoise::Gauss,
+            seed: 0,
         }
     }
     fn settling_after_a_utc_jump(&self, w: u64) -> bool {
@@ -126,185 +152,14 @@ impl Scenario {
     }
 }
 
-// ----------------------------------------------------------------------------------------------
-// The controller glue this bench mirrors (`src/controller/date_sync.rs`). Kept in these few
-// functions so a change to the controller's glue has exactly one place to be mirrored.
-// ----------------------------------------------------------------------------------------------
-
-/// The master's published STATUS snapshot (`publish_date_status`): the FLEET D (its authority's
-/// announce, even while its own wall is off the fleet line), and its own D in effect. It is only
-/// refreshed at the controller's publish points (a PTP window, an NTP cycle, a step, the 10 s
-/// tick), and the time server reads it at REPLY time — so a stale snapshot is visible here.
-#[derive(Clone, Copy)]
-struct Published {
-    date_offset_ns: i64,
-    effective_ptp_ns: i64,
-    seq: u32,
-    slew: Option<SlewSpec>,
-    gm: u8,
-    /// The master's D IN EFFECT at the publish (anchor + its slew's displacement): the time
-    /// server derives the replier's PTP now from it.
-    master_anchor_ns: i64,
-}
-
-fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
-    let ann = a.announce();
-    Published {
-        date_offset_ns: ann.date_offset_ns,
-        effective_ptp_ns: ann.effective_ptp_ns,
-        seq: ann.seq,
-        slew: ann.slew,
-        gm: m.core_gm,
-        master_anchor_ns: m.d_in_effect(),
-    }
-}
-
-/// Whether an NTP cycle refreshes the master's published status (`ntp_under_date_authority`):
-/// always — also off line, or an announce would wait for the next 10 s tick.
-fn master_publishes_after_ntp(_ptp_offline: bool) -> bool {
-    true
-}
-
-/// Whether the master's local NTP step refreshes it (`note_local_date_step`).
-const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = true;
-
-/// A follower's applicability checks (`service_date_offset`); the time server computes the
-/// replier's PTP now from the SNAPSHOT's D in effect and the live wall.
-fn follower_accepts(b: &Box_, p: &Published, master_wall_now: i64) -> bool {
-    if b.core.anchor_ns().is_none() {
-        return false;
-    }
-    let now_ptp = master_wall_now - p.master_anchor_ns;
-    !b.core.rebase_pending()
-        && b.core_gm == p.gm
-        && same_time_base(now_ptp, b.wall_ns(), b.d_in_effect())
-}
-
-/// The master's local NTP step while it has no PTP (`note_local_date_step`): its own wall and D
-/// only — the fleet D never moves for one box's fault.
-fn master_local_step(m: &mut Box_, _a: &mut DateAuthority, delta_ns: i64) {
-    m.stepped += delta_ns;
-    m.core.note_step(delta_ns);
-    m.fresh = false;
-    m.follower.cancel_pending();
-    let anchor = m.core.anchor_ns().expect("anchored");
-    m.follower.freeze_slew(anchor, m.wall_ns());
-}
-
-/// The master's UTC reading → the authority (`ntp_under_date_authority`): the FLEET line's error
-/// (`reading + anchor − fleet`), fed also while the master has no PTP or is off the line, so the
-/// fleet stays on UTC. Returns the announce, whether the master schedules it for its own wall
-/// (only on the line), and the fleet D it replaces.
-fn master_feed_authority(
-    m: &Box_,
-    a: &mut DateAuthority,
-    utc_err_ns: i64,
-    ptp_offline: bool,
-) -> Option<(DateAnnounce, bool, i64)> {
-    let d = m.d_in_effect();
-    let now_ptp = m.wall_ns() - d;
-    let fleet = a.in_effect_ns(now_ptp);
-    let fleet_err = utc_err_ns + (d - fleet);
-    let on_line = d == fleet && !ptp_offline;
-    a.on_utc_error(fleet_err, now_ptp)
-        .map(|ann| (ann, on_line, fleet))
-}
-
-/// The master re-anchored on a new time base (`handle_phase_anchor_event`): the fleet D moves by
-/// the observed base shift, never onto the master's own (possibly off-line) anchor.
-fn master_rebases_fleet(
-    a: &mut DateAuthority,
-    master_wall_ns: i64,
-    old_ns: i64,
-    new_ns: i64,
-    displacement_ns: i64,
-) {
-    // "now" in the OLD base, from the D IN EFFECT (anchor + the slew's displacement).
-    let now_ptp_old = master_wall_ns - old_ns - displacement_ns;
-    let fleet_old = a.in_effect_ns(now_ptp_old);
-    a.rebase(fleet_old + (new_ns - old_ns), now_ptp_old);
-}
-
-/// The master's own re-alignment to the fleet line once its PTP is back
-/// (`realign_master_to_fleet`): one Join step that lands its wall ON the fleet line (removing the
-/// phase error the outage left, measured by a window taken after PTP came back), nothing while a
-/// step is pending.
-fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u64, grace: bool) {
-    // (The controller also gates on its step-failure backoff; the bench's clocks never fail.)
-    if !m.core.engaged() || m.core.rebase_pending() {
-        return;
-    }
-    let d = m.d_in_effect();
-    let now_ptp = m.wall_ns() - d;
-    // #119: while the fleet slews the master only catches up with a slew its own scheduler
-    // missed, within the absorb tolerance (`catch_up_fleet_slew`); nothing else.
-    if let Some(fleet_slew) = a.slew_in_progress(now_ptp) {
-        let anchor = m.core.anchor_ns().expect("anchored");
-        let gap = a.in_effect_ns(now_ptp) - d;
-        if m.follower.held_slew().map(|h| h.slew) != Some(fleet_slew)
-            && gap.abs() <= dantesync::date_offset::ABSORB_TOLERANCE_NS
-        {
-            if let FollowAction::Absorb { new_anchor_ns } =
-                m.follower.on_announce(a.announce(), anchor, m.wall_ns())
-            {
-                m.core.set_anchor(new_anchor_ns);
-            }
-            m.catch_ups += 1;
-        }
-        return;
-    }
-    if a.pending_step_ns(now_ptp).is_some()
-        || m.follower.pending().is_some()
-        || m.follower.held_slew().is_some()
-    {
-        return;
-    }
-    let fleet = a.in_effect_ns(now_ptp);
-    if fleet == d || !m.fresh {
-        return;
-    }
-    let e = m.core.last_error_ns().unwrap_or(0);
-    let delta = fleet - d - e;
-    if delta.abs() > dantesync::date_offset::ABSORB_TOLERANCE_NS {
-        m.apply_step(a.seq(), delta, StepKind::Join, t_ns, w, grace);
-    }
-    m.core.set_anchor(fleet);
-}
-
-/// xorshift64* — deterministic, dependency-free.
-struct Rng(u64);
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn uniform(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-    fn gauss(&mut self) -> f64 {
-        let u1 = self.uniform().max(1e-300);
-        let u2 = self.uniform();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
-}
-
-/// A clock whose reading is an integer ns + a fractional carry (a wall of 1.79e18 ns does not fit
-/// an f64 at ns resolution).
-#[derive(Clone, Copy)]
-struct Clock {
-    ns: i64,
-    frac: f64,
-}
-impl Clock {
-    fn advance(&mut self, true_dt_ns: f64, rate_ppm: f64) {
-        let d = true_dt_ns * (1.0 + rate_ppm * 1e-6) + self.frac;
-        let whole = d.floor();
-        self.frac = d - whole;
-        self.ns += whole as i64;
-    }
-}
+// The controller glue this bench mirrors lives in `two_clock_bench/glue.rs` (one place to mirror a
+// change of `src/controller/date_sync.rs`).
+#[path = "two_clock_bench/glue.rs"]
+mod glue;
+use glue::*;
+#[path = "two_clock_bench/world.rs"]
+mod world;
+use world::*;
 
 struct Box_ {
     osc_ppm: f64,
@@ -365,6 +220,8 @@ struct RunResult {
     announced: Vec<(u32, i64)>,
     /// #119: every coordinated slew it announced: (seq, amount).
     announced_slews: Vec<(u32, i64)>,
+    /// #119 follow-up: (announced seq, the rebase seq it was re-announced under).
+    renamed_steps: Vec<(u32, u32)>,
     /// Follower polls refused as another time base (another GM, or a GM that rebooted).
     refused_replies: u32,
     /// #119: the fleet's worst RELATIVE phase — the spread of (wall + own PTP path delay), i.e.
@@ -376,7 +233,8 @@ struct RunResult {
     slew_windows: u32,
     /// #119: times any box's wall read less than at the previous window boundary.
     wall_went_back: u32,
-    extensions: u32,
+    /// #119 follow-up: every announced correction in order: (window, size).
+    corrections: Vec<(u64, i64)>,
     gm_events_in_slew: u32,
     /// The master's catch-ups with a fleet slew its own scheduler missed.
     master_catch_ups: u32,
@@ -423,8 +281,11 @@ struct Bench<'s> {
     /// Every coordinated step the authority announced: (seq, size).
     announced: Vec<(u32, i64)>,
     announced_slews: Vec<(u32, i64)>,
-    /// #119: slews the authority extended while they ran.
-    extensions: u32,
+    /// #119 follow-up: (announced seq, the rebase seq it was re-announced under).
+    renamed_steps: Vec<(u32, u32)>,
+    /// #119 follow-up: every correction the authority announced, in order: (window, size) — a
+    /// step's size or a slew's amount.
+    corrections: Vec<(u64, i64)>,
     /// #119: grandmaster events (change, reboot) that happened while the fleet slewed.
     gm_events_in_slew: u32,
     ntp_rng: Rng,
@@ -498,7 +359,10 @@ impl<'s> Bench<'s> {
                 lag: (change_lags[i], reboot_lags[i]),
                 grace_until: 0,
                 fresh: false,
-                rng: Rng(0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1) * 0x1000_0000_01B3),
+                rng: Rng(
+                    (0x9E37_79B9_7F4A_7C15 ^ ((i as u64 + 1) * 0x1000_0000_01B3))
+                        ^ sc.seed.wrapping_mul(0x2545_F491_4F6C_DD1D),
+                ),
                 words: Vec::new(),
                 steps: Vec::new(),
                 rebases: 0,
@@ -534,10 +398,11 @@ impl<'s> Bench<'s> {
             master_local_candidate: None,
             announced: Vec::new(),
             announced_slews: Vec::new(),
-            extensions: 0,
+            renamed_steps: Vec::new(),
+            corrections: Vec::new(),
             gm_events_in_slew: 0,
-            ntp_rng: Rng(0xD1B5_4A32_D192_ED03),
-            net_rng: Rng(0xABCD_EF01_2345_6789),
+            ntp_rng: Rng(0xD1B5_4A32_D192_ED03 ^ sc.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            net_rng: Rng(0xABCD_EF01_2345_6789 ^ sc.seed.wrapping_mul(0xD6E8_FEB8_6659_FD93)),
             max_dis: 0,
             max_settling_dis: 0,
             in_flight: 0,
@@ -579,9 +444,17 @@ impl<'s> Bench<'s> {
             // window (the controller re-applies the word from its 1 ms loop at those instants).
             b.advance_slew(TRUE_DT_NS);
             let start = b.wall_ns();
+            // The crossing is judged on the integer wall this window ENDS on (#119 follow-up: an
+            // instant exactly at the end — the master's own announce lands on its window grid, and
+            // the wall can advance exactly the lead — is reached in this window, as the
+            // controller's `due` fires at `wall >= instant`; a float comparison missed it).
+            let mut end = b.wall;
+            end.advance(TRUE_DT_NS, rate);
+            let end_wall = end.ns + b.stepped + b.slewed_ns;
             let crossing = b.follower.pending().and_then(|p| {
-                let to_cross = (p.effective_wall_ns - start) as f64 / scale;
-                (p.effective_wall_ns > start && to_cross <= TRUE_DT_NS).then_some((p, to_cross))
+                let to_cross = ((p.effective_wall_ns - start) as f64 / scale).min(TRUE_DT_NS);
+                (p.effective_wall_ns > start && p.effective_wall_ns <= end_wall)
+                    .then_some((p, to_cross))
             });
             b.wall.advance(TRUE_DT_NS, rate);
             if let Some((p, to_cross)) = crossing {
@@ -695,7 +568,8 @@ impl<'s> Bench<'s> {
         let anchor = m.core.anchor_ns().unwrap();
         let now_ptp = m.wall_ns() - anchor;
         if self.authority.is_none() {
-            let a = DateAuthority::new(anchor, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS);
+            let a = DateAuthority::new(anchor, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS)
+                .with_slew_ppm(self.sc.slew_ppm);
             let act = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
             assert_eq!(
                 act,
@@ -708,7 +582,14 @@ impl<'s> Bench<'s> {
         if let Some((old_ns, new_ns)) = window.rebase {
             // The master's re-anchor on a new time base rebases the fleet offset (no step).
             let disp = m.follower.displacement_at_wall(new_ns, m.wall_ns());
+            let seq_before = a.seq();
             master_rebases_fleet(a, m.wall_ns(), old_ns, new_ns, disp);
+            // #119 follow-up: a step still pending is re-announced in the new base under the
+            // rebase's seq (same wall instant, same size); a box that re-anchored first takes it
+            // under that seq. With a micro step pending a quarter of the time, this now happens.
+            if a.pending_step_ns(m.wall_ns() - m.d_in_effect()).is_some() {
+                self.renamed_steps.push((seq_before, a.seq()));
+            }
         }
         if window.ran {
             self.snapshot = Some(master_publishes(m, a)); // the status write ending the window
@@ -720,35 +601,29 @@ impl<'s> Bench<'s> {
                 self.snapshot = Some(master_publishes(m, a)); // `apply_date_step`
             }
         }
+        // #119 follow-up: the micro-correction clock, every loop iteration.
+        if let Some(fed) = master_tick_authority(m, a, offline) {
+            Self::master_takes(
+                m,
+                fed,
+                w,
+                &mut self.announced,
+                &mut self.announced_slews,
+                &mut self.corrections,
+            );
+            self.snapshot = Some(master_publishes(m, a)); // published at once
+        }
         if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 {
-            let err =
-                self.utc.ns - m.wall_ns() + (self.ntp_rng.gauss() * NTP_NOISE_NS).round() as i64;
-            let fed = master_feed_authority(m, a, err, offline);
-            if let Some((ann, own, before)) = fed {
-                if ann.slew.is_some() {
-                    let sl = ann.as_slew().unwrap();
-                    // An extension re-announces from the running slew's current D.
-                    self.announced_slews.push((ann.seq, sl.amount_ns()));
-                } else {
-                    self.announced.push((ann.seq, ann.date_offset_ns - before));
-                }
-                if own {
-                    let anchor = m.core.anchor_ns().unwrap();
-                    let now_ptp = m.wall_ns() - m.d_in_effect();
-                    // An extension starts NOW: the master's own slew continues (at most a ns off).
-                    let extension = ann.as_slew().is_some_and(|sl| sl.start_ptp_ns <= now_ptp);
-                    let act = m.follower.on_announce(ann, anchor, m.wall_ns());
-                    // On the line, D and the authority agree to the ns at the same instant: an
-                    // extension changes nothing but the end (no absorb, not even of a ns).
-                    match act {
-                        FollowAction::Scheduled { .. } | FollowAction::SlewScheduled { .. } => {}
-                        FollowAction::None if extension => {}
-                        other => panic!("master schedules its own step / slew: {other:?}"),
-                    }
-                    if extension {
-                        self.extensions += 1;
-                    }
-                }
+            let err = self.utc.ns - m.wall_ns() + self.sc.ntp_noise.sample(&mut self.ntp_rng);
+            if let Some(fed) = master_feed_authority(m, a, err, offline) {
+                Self::master_takes(
+                    m,
+                    fed,
+                    w,
+                    &mut self.announced,
+                    &mut self.announced_slews,
+                    &mut self.corrections,
+                );
             }
             if master_publishes_after_ntp(offline) {
                 self.snapshot = Some(master_publishes(m, a));
@@ -777,8 +652,38 @@ impl<'s> Bench<'s> {
         if w % 20 == 13 {
             self.snapshot = Some(master_publishes(m, a));
         }
-        if w > 240 && !self.sc.settling_after_a_utc_jump(w) {
+        if w > self.sc.settle_windows && !self.sc.settling_after_a_utc_jump(w) {
             self.max_utc = self.max_utc.max((self.utc.ns - m.wall_ns()).abs());
+        }
+    }
+
+    /// The master's glue for an announce its authority made: recorded, and scheduled by its own
+    /// scheduler when it is on the fleet line — where D and the authority agree to the ns, so a
+    /// step or a slew is always scheduled (the controller's `master_schedules_own`).
+    fn master_takes(
+        m: &mut Box_,
+        (ann, own, before): (DateAnnounce, bool, i64),
+        w: u64,
+        announced: &mut Vec<(u32, i64)>,
+        announced_slews: &mut Vec<(u32, i64)>,
+        corrections: &mut Vec<(u64, i64)>,
+    ) {
+        match ann.as_slew() {
+            Some(sl) => {
+                announced_slews.push((ann.seq, sl.amount_ns()));
+                corrections.push((w, sl.amount_ns()));
+            }
+            None => {
+                announced.push((ann.seq, ann.date_offset_ns - before));
+                corrections.push((w, ann.date_offset_ns - before));
+            }
+        }
+        if own {
+            let anchor = m.core.anchor_ns().unwrap();
+            match m.follower.on_announce(ann, anchor, m.wall_ns()) {
+                FollowAction::Scheduled { .. } | FollowAction::SlewScheduled { .. } => {}
+                other => panic!("master schedules its own step / slew: {other:?}"),
+            }
         }
     }
 
@@ -797,6 +702,7 @@ impl<'s> Bench<'s> {
             effective_ptp_ns: published.effective_ptp_ns,
             seq: published.seq,
             slew: published.slew,
+            micro: published.micro,
         };
         for b in self.boxes.iter_mut().skip(1) {
             if self.net_rng.uniform() < POLL_LOSS {
@@ -823,7 +729,7 @@ impl<'s> Bench<'s> {
     ///     delay (a box holds `t2 − t1 = D`, so its wall sits `delay` behind the GM line) — exactly
     ///     what a cross-box genlock grid sees.
     fn measure_disagreement(&mut self, w: u64, t0_ns: f64) {
-        if w > 240 && !self.sc.settling_after_a_utc_jump(w) {
+        if w > self.sc.settle_windows && !self.sc.settling_after_a_utc_jump(w) {
             self.max_fleet_utc = self
                 .max_fleet_utc
                 .max((self.utc.ns - self.boxes[1].wall_ns()).abs());
@@ -860,11 +766,25 @@ impl<'s> Bench<'s> {
             .filter(|(i, _)| *i != 0 || master_on_line)
             .map(|(_, b)| b)
             .collect();
-        let landed: Vec<u32> = judged.iter().flat_map(|b| landed_now(b)).collect();
+
+        // (#119 follow-up: a step a grandmaster rebase re-announced is pending under the rebase's
+        // seq on a box that re-anchored first, while the master lands it under the original one.)
+        let original_seq = |seq: u32| {
+            self.renamed_steps
+                .iter()
+                .find(|(_, new)| *new == seq)
+                .map_or(seq, |(old, _)| *old)
+        };
+        // Both sides in the ORIGINAL seq: a box may land the step under either.
+        let landed: Vec<u32> = judged
+            .iter()
+            .flat_map(|b| landed_now(b))
+            .map(original_seq)
+            .collect();
         let straddling = judged.iter().any(|b| {
             b.follower
                 .pending()
-                .is_some_and(|p| landed.contains(&p.seq))
+                .is_some_and(|p| landed.contains(&original_seq(p.seq)))
         });
         // The documented double fault: when the master returns on a new grandmaster it re-bases
         // the fleet D with its own free-run error (~100 µs here). Followers take it at their next
@@ -938,7 +858,18 @@ impl<'s> Bench<'s> {
         }
     }
 
-    fn into_result(self) -> RunResult {
+    fn into_result(mut self) -> RunResult {
+        // #119 follow-up: an announce whose instant is still ahead when the run ends (at a step
+        // every 20 s, the last one often is) was taken by no box yet: it is not judged.
+        let m = &self.boxes[0];
+        let now_ptp = m.wall_ns() - m.d_in_effect();
+        if let Some(a) = self.authority.as_ref() {
+            if a.pending_step_ns(now_ptp).is_some()
+                && self.announced.last().map(|l| l.0) == Some(a.seq())
+            {
+                self.announced.pop();
+            }
+        }
         RunResult {
             words: self.boxes.iter().map(|b| b.words.clone()).collect(),
             steps: self.boxes.iter().map(|b| b.steps.clone()).collect(),
@@ -952,12 +883,13 @@ impl<'s> Bench<'s> {
             late_steps: self.boxes.iter().map(|b| b.follower.late_steps()).collect(),
             announced: self.announced,
             announced_slews: self.announced_slews,
+            renamed_steps: self.renamed_steps,
             refused_replies: self.refused,
             max_relative_phase_ns: self.max_rel,
             max_relative_phase_in_slew_ns: self.max_rel_slew,
             slew_windows: self.slew_windows,
             wall_went_back: self.wall_back,
-            extensions: self.extensions,
+            corrections: self.corrections,
             gm_events_in_slew: self.gm_events_in_slew,
             master_catch_ups: self.boxes[0].catch_ups,
         }

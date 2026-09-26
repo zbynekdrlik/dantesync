@@ -5,6 +5,43 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-09-26
+
+### Changed
+
+- **The fleet date is corrected in sub-threshold MICRO-corrections (issue #119 follow-up).** Until
+  now the NTP master let the fleet date drift up to the 50 ms step bound and then corrected it in
+  ONE event: at the grandmaster's +1.06 ms/min drift that was a 50 ms event every ~47 minutes,
+  1.5 video frames that every wall-anchored consumer saw (OBS senders re-gridded, SongPlayer
+  slewed it in over minutes). Now, beyond a 2 ms dead band, the master corrects in increments of
+  at most `system.date_offset.micro_step_us` (new key, default 500 µs, clamped 50–1000) no more
+  than once per `system.date_offset.micro_interval_s` (new key, default 20 s, clamped 10–600):
+  a capacity of 1.5 ms/min. A forward increment is a coordinated step, a backward one a
+  coordinated slew at `slew_ppm`, announced two leads (10 s) ahead from the master's loop. The
+  error is estimated robustly from the last 20 minutes of UTC readings (a Theil–Sen drift over
+  one-minute medians, the level the median of the last 5 minutes projected along it), every band
+  is widened by the readings' measured noise, and a correction against the last one needs twice
+  the dead band unless the drift itself turned — so a jittery UTC path (±5 ms asymmetric in the
+  bench) never makes the date oscillate. A drift beyond the capacity logs
+  `date correction falling behind` loudly and sets `/status.date_correction_falling_behind`,
+  never a large step; the only large correction left is an abnormal error beyond 2 × the step
+  bound (100 ms: one coordinated step, either direction, logged loudly). The step bound no longer
+  triggers anything else, and the slew extension is gone. Every box logs a micro-correction
+  quietly (`[DATE] stepped +500us (micro, seq N)`, `[DATE] micro-slew done`) and keeps it out of
+  the NTP step-storm count. `/status` adds `date_micro_active`, `date_micro_last_us`,
+  `date_correction_rate_ms_per_min`, `date_correction_falling_behind` and `date_offset_micro`. The
+  31900 extension is v3: flags bit 2 = MICRO (same 48 bytes; a 1.10 follower ignores the bit and
+  applies the increment as a plain step or slew). Rollout: followers first, the NTP master last.
+  Nothing is decided without a UTC reading in the last minute (no silent holdover: the journal says
+  `micro-corrections paused` / `resumed`, `/status.date_micro_paused`); the interval is raised to
+  the in-flight time of one increment (two leads; a backward one also its slew), so the capacity
+  and the alarm are honest per direction; `date_offset.step_bound_ms` is floored at 5 ms.
+  **Consumers:** the step bound now only sets the abnormal cap. The journal's
+  `[NTP] offset: … step bound 50000us)` line and `/status.ntp_deadband_us` /
+  `ntp_step_threshold_us` on the master still carry it unchanged (byte-compatible), but they no
+  longer say how far the fleet date may sit off UTC — that is now the 2 ms dead band, with
+  `date_correction_falling_behind` as the alarm to grade on.
+
 ## [1.10.0] - 2026-09-26
 
 ### Changed
