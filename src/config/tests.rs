@@ -640,3 +640,97 @@ fn date_step_bound_is_floored_so_the_cap_stays_above_the_micro_dead_band_119() {
             >= 5 * crate::date_offset::MICRO_DEAD_BAND_NS
     );
 }
+
+#[test]
+fn the_date_is_corrected_once_a_night_by_default_119() {
+    use crate::date_offset::{CorrectionMode, DailyConfig};
+    // A 1.11 config has no correction keys: the new default, daily at 02:00 UTC, 5 s emergency.
+    let c: SystemConfig = serde_json::from_str(
+        r#"{"date_offset":{"step_bound_ms":50,"micro_step_us":500,"micro_interval_s":20}}"#,
+    )
+    .expect("parses");
+    let (mode, warnings) = c.date_offset.correction_mode();
+    assert_eq!(mode, CorrectionMode::Daily(DailyConfig::default()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let CorrectionMode::Daily(cfg) = mode else {
+        unreachable!()
+    };
+    assert_eq!(cfg.step_tod_ns, 2 * 3_600 * 1_000_000_000);
+    assert_eq!(cfg.emergency_ns, 5_000_000_000);
+    assert_eq!(
+        SystemConfig::default().date_offset.correction_mode().0,
+        mode,
+        "SystemConfig::default() is daily too"
+    );
+}
+
+#[test]
+fn micro_stays_selectable_and_a_bad_correction_means_daily_loudly_119() {
+    use crate::date_offset::{CorrectionMode, DailyConfig};
+    for raw in [r#""micro""#, r#"" MICRO ""#] {
+        let json = format!(r#"{{"date_offset":{{"correction":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("parses");
+        assert_eq!(
+            c.date_offset.correction_mode(),
+            (CorrectionMode::Micro, vec![]),
+            "{raw}"
+        );
+    }
+    for raw in [r#""Daily""#, r#""daily""#] {
+        let json = format!(r#"{{"date_offset":{{"correction":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("parses");
+        let (mode, warnings) = c.date_offset.correction_mode();
+        assert_eq!(mode, CorrectionMode::Daily(DailyConfig::default()), "{raw}");
+        assert!(warnings.is_empty(), "{raw}: {warnings:?}");
+    }
+    // The removed step-bound mode, a typo, a non-string: daily, with a warning naming the value.
+    for (raw, needle) in [
+        (r#""bound""#, "removed in 1.11.0"),
+        (r#""nightly""#, "\"nightly\""),
+        ("true", "not a string"),
+        ("null", "not a string"),
+    ] {
+        let json = format!(r#"{{"date_offset":{{"correction":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        let (mode, warnings) = c.date_offset.correction_mode();
+        assert_eq!(mode, CorrectionMode::Daily(DailyConfig::default()), "{raw}");
+        assert_eq!(warnings.len(), 1, "{raw}: {warnings:?}");
+        assert!(warnings[0].contains(needle), "{raw}: {warnings:?}");
+    }
+}
+
+#[test]
+fn daily_step_utc_and_the_emergency_cap_are_lenient_119() {
+    use crate::date_offset::{CorrectionMode, DailyConfig};
+    let c: SystemConfig = serde_json::from_str(
+        r#"{"date_offset":{"daily_step_utc":" 3:30 ","daily_emergency_ms":8000}}"#,
+    )
+    .expect("parses");
+    assert_eq!(
+        c.date_offset.correction_mode(),
+        (
+            CorrectionMode::Daily(DailyConfig::new(3 * 3_600 + 30 * 60, 8_000)),
+            vec![]
+        )
+    );
+    // A bad time of day: 02:00, with a warning; the emergency cap clamped, 0 = the default.
+    for (raw_tod, raw_ms, want_ms) in [
+        (r#""25:00""#, "0", 5_000),
+        (r#""02h00""#, "1", 1_000),
+        ("7", "\"x\"", 5_000),
+        ("null", "-5", 5_000),
+    ] {
+        let json = format!(
+            r#"{{"date_offset":{{"daily_step_utc":{raw_tod},"daily_emergency_ms":{raw_ms}}}}}"#
+        );
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        let (mode, warnings) = c.date_offset.correction_mode();
+        assert_eq!(
+            mode,
+            CorrectionMode::Daily(DailyConfig::new(2 * 3_600, want_ms)),
+            "{raw_tod} {raw_ms}"
+        );
+        assert_eq!(warnings.len(), 1, "{raw_tod}: {warnings:?}");
+        assert!(warnings[0].contains("daily_step_utc"), "{warnings:?}");
+    }
+}

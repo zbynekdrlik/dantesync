@@ -92,6 +92,29 @@ own user login password). Windows boxes are reached via MCP only in this procedu
      every box shows `[DATE] stepped +…us (micro, seq N)` / `[DATE] micro-slew done` and never a
      `[DATE] stepped` above 500 µs (only after a `date correction too large …` warning: an error
      beyond 2 × the step bound).
+   - **From v1.12.0 (issue #119, the NIGHTLY step, `correction = "daily"` by default).** Only
+     the master's behaviour changed. The nightly step is a plain coordinated step (extension v3,
+     not micro), which every ≥ 1.9.0 follower applies in either direction. The order does not
+     matter; keep the master LAST as for 1.11. Leave `system.date_offset.correction` out of the
+     master's config (daily is the default). `"micro"` restores 1.11.
+     - **Roll check on the master:** `/status` shows `date_correction_mode: "daily"`,
+       `date_daily_next_utc` = the next `…T02:00:00Z`, and `date_correction_falling_behind` and
+       `date_micro_paused` both `false`. The journal shows `[DATE] this NTP master is the fleet
+       DATE-OFFSET AUTHORITY … corrected ONCE A NIGHT`, and no `[DATE] AUTHORITY:
+       micro-correction` line.
+     - **By day:** no `[DATE] stepped` on any box. The master's `date_offset_error_ms` grows at
+       the grandmaster's drift (≈ +1.06 ms/min on the rig) and is no longer a health bound.
+     - **After the first night:** the master's journal shows ONE `[DATE] AUTHORITY: nightly date
+       step ±… ms` at the window. Every box shows one `[DATE] stepped ±…us (coordinated, seq N)`
+       with the same seq. `date_steps_late` is 0, and `date_daily_last_step_ts` /
+       `date_daily_last_step_ms` are set.
+     - **Pre-announce check:** before the step lands, `date_step_pending_ns` (signed) and
+       `date_step_due_in_ms` are set during its 10 s lead.
+     - **A `nightly date step SKIPPED` line** means there were not enough fresh UTC readings (six
+       in 5 minutes) for the whole window. The next night steps both days.
+     - **A `nightly date step MISSED` line** means another date change was in flight all window,
+       or the daemon stalled. An emergency step that jumps over a window is not reported. Only an error beyond `daily_emergency_ms` (5 s) is stepped by
+       day, and it logs `date correction beyond the emergency cap`.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

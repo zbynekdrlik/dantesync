@@ -774,3 +774,16 @@ canary evidence before continuing.
 - Follow-up candidate for the supervisor: `src/controller.rs` is 7082 lines and
   `check_ntp_utc_tracking` about 369 lines. This slice touched 2 lines of it. Filing needs
   supervisor authority.
+
+## #119 nightly step — the fleet date corrected ONCE A NIGHT (v1.12.0, draft PR #123, branch `issue-119-daily`)
+
+- Owner decision: issue comment 5849932587. Main design: 5849935752 (Approach 1). My anchors: 5849977609.
+- `correction = "daily"` is the new default; `"micro"` is byte-identical 1.11.1; `"bound"` (gone since 1.11.0) means daily with a warning.
+- The pure `DailyScheduler` decides on the fleet wall from the `MicroScheduler`'s settled estimate: one step of the whole error when the 02:00 UTC window opens, 30 min of waiting for UTC, then SKIPPED. An emergency step beyond 5 s is made at once. The authority's glue is in `authority_daily.rs`.
+- A daily master without PTP skips the local NTP path and takes the fleet's steps on its own wall. It re-joins on its measured free-run error, and retries after a failed step.
+- Bench, 48 h at +17.6 ppm: 2 steps, 746.47 / 1520.59 ms, both at 02:00:00.0–.3. Relative phase is at most 19 µs.
+- Commits:
+  - bump `6ddd3e9`, RED `14d0180`, GREEN `ea1cb98`, docs `b5153a1`, string fix `48ea78b`;
+  - round 1: refactor `c9cc06e`, RED `a59a661`, GREEN `2eb79d9`, docs `719bd99`;
+  - round 2: RED `bd81692` + `8133b32`, test fix `1f4966f`, GREEN `ee52c21`, refactor `7f86b69`, ci `c644b54` (tarpaulin `--timeout 300`), docs `fc8341e`.
+- CI run 36275731361: all green.

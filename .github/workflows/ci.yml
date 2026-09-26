@@ -338,8 +338,12 @@ jobs:
       - name: Install tarpaulin
         run: cargo install cargo-tarpaulin --locked
 
+      # --timeout: tarpaulin's ptrace engine kills a test binary that sends it no event for this
+      # long (default 60 s). Once every line is covered, the two-clock bench computes for minutes
+      # on already-covered code, so a stretch with no test ending and no thread starting (dantesync
+      # issue 119 CI run 36274688463: 61 s) is not a hang. The coverage threshold is unchanged.
       - name: Generate coverage
-        run: cargo tarpaulin --out xml --output-dir coverage --verbose
+        run: cargo tarpaulin --out xml --output-dir coverage --verbose --timeout 300
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4

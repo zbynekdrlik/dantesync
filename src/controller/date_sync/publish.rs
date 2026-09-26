@@ -108,9 +108,24 @@ where
             _ => None,
         };
         status.date_micro_paused = match (ds.authority.as_ref(), anchor) {
-            (Some(a), Some(d)) => a.micro().paused(now_wall.wrapping_sub(d)),
+            (Some(a), Some(d)) if !ds.daily() => a.micro().paused(now_wall.wrapping_sub(d)),
             _ => false,
         };
+        // #119 (1.12): the correction mode and the nightly step (the master only).
+        status.date_correction_mode = match (ds.authority.as_ref(), anchor) {
+            (Some(a), Some(_)) => a.correction_mode().label().to_string(),
+            _ => String::new(),
+        };
+        status.date_daily_next_utc = match (ds.authority.as_ref(), anchor) {
+            (Some(a), Some(d)) => a
+                .daily_next_window_wall_ns(now_wall.wrapping_sub(d))
+                .map(crate::date_offset::format_utc_rfc3339),
+            _ => None,
+        };
+        let last_daily = anchor.and(ds.authority.as_ref().and_then(|a| a.daily_last_step()));
+        status.date_daily_last_step_ts =
+            last_daily.map(|(wall, _)| wall.div_euclid(1_000_000_000).max(0) as u64);
+        status.date_daily_last_step_ms = last_daily.map(|(_, n)| n as f64 / 1e6);
         status.date_correction_falling_behind = ds
             .authority
             .as_ref()

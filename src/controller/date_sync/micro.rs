@@ -6,6 +6,7 @@
 //! slew glue), labelled `micro` and kept out of the NTP step-storm count.
 
 use super::*;
+use crate::date_offset::DailyDecision;
 
 /// While the micro-corrections fall behind, the loud line is repeated this often.
 const FALLING_BEHIND_WARN_INTERVAL: Duration = Duration::from_secs(300);
@@ -49,12 +50,34 @@ where
         };
         let fleet = a.in_effect_ns(now_ptp);
         let announced = a.on_tick(now_ptp);
+        let daily_event = a.take_daily_event();
         self.report_falling_behind(now_ptp);
         self.report_micro_paused(now_ptp);
+        self.report_daily_event(daily_event);
         let Some(ann) = announced else {
             return;
         };
-        let on_line = own == fleet && !self.ptp_offline && !self.in_step_backoff();
+        let daily = self.date_sync.daily();
+        // #119 (1.12): a daily-mode master without PTP keeps the fleet D (no local NTP steps), so
+        // it takes the fleet's steps on its own wall too.
+        let on_line = own == fleet && (!self.ptp_offline || daily) && !self.in_step_backoff();
+        if daily {
+            // #119 (1.12): the nightly step — one a night, loud.
+            info!(
+                "[DATE] AUTHORITY: nightly date step {:+.3} ms (the whole UTC error, a coordinated \
+                 step) at PTP {} (in {} s), seq {}{}",
+                ann.date_offset_ns.wrapping_sub(fleet) as f64 / 1e6,
+                ann.effective_ptp_ns,
+                ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000_000,
+                ann.seq,
+                if on_line { "" } else { " (off the fleet line)" }
+            );
+            if on_line {
+                self.master_schedules_own(ann, base, now_wall);
+            }
+            self.update_shared_status();
+            return;
+        }
         debug!(
             "[DATE] AUTHORITY: micro-correction {:+}us ({}) at PTP {}, seq {}{}",
             ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
@@ -79,6 +102,10 @@ where
     /// resume — the fleet date then runs free at the grandmaster's rate, and /status says
     /// `date_micro_paused`.
     fn report_micro_paused(&mut self, now_ptp: i64) {
+        if self.date_sync.daily() {
+            // #119 (1.12): no micro-corrections run; the nightly step reports its own UTC wait.
+            return;
+        }
         let Some(a) = self.date_sync.authority.as_ref() else {
             return;
         };
@@ -97,6 +124,46 @@ where
         }
         self.date_sync.micro_paused_logged = paused;
         self.update_shared_status();
+    }
+
+    /// #119 (1.12) — the nightly scheduler's decisions other than the step itself (logged with its
+    /// announce): the step not needed, waiting for UTC at the window, the night skipped.
+    fn report_daily_event(&mut self, event: Option<DailyDecision>) {
+        let fmt = crate::date_offset::format_utc_rfc3339;
+        match event {
+            Some(DailyDecision::NoStep { error_ns }) => info!(
+                "[DATE] AUTHORITY: nightly date step not needed: the fleet line is {:+.3} ms off UTC",
+                error_ns as f64 / 1e6
+            ),
+            Some(DailyDecision::Waiting { window_end_wall_ns }) => warn!(
+                "[DATE] AUTHORITY: nightly date step waiting: not enough fresh UTC readings at the \
+                 window — it is made once UTC is back (see ntp_age_s), until {} (fleet time)",
+                fmt(window_end_wall_ns)
+            ),
+            Some(DailyDecision::Skipped {
+                next_window_wall_ns,
+            }) => {
+                warn!(
+                    "[DATE] AUTHORITY: nightly date step SKIPPED: not enough fresh UTC readings \
+                     through the whole window — the fleet date runs free at the grandmaster's \
+                     rate until the next window at {} (fleet time)",
+                    fmt(next_window_wall_ns)
+                );
+                self.update_shared_status();
+            }
+            Some(DailyDecision::Missed {
+                next_window_wall_ns,
+            }) => {
+                warn!(
+                    "[DATE] AUTHORITY: nightly date step MISSED: the window closed while another \
+                     date change was in flight (or the daemon stalled) — the fleet date runs free \
+                     until the next window at {} (fleet time)",
+                    fmt(next_window_wall_ns)
+                );
+                self.update_shared_status();
+            }
+            _ => {}
+        }
     }
 
     /// #119 follow-up — log the micro-corrections' falling-behind alarm: loudly when it is raised

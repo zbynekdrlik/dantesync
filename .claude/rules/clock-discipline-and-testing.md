@@ -31,6 +31,14 @@ paths:
   - "src/clock/windows.rs"
   - "src/clock/linux.rs"
   - "tests/two_clock_bench/windows.rs"
+  - "src/date_offset/daily.rs"
+  - "src/date_offset/daily/tests.rs"
+  - "src/date_offset/authority_daily.rs"
+  - "src/date_offset/authority_daily_tests.rs"
+  - "src/controller/date_sync/daily.rs"
+  - "src/controller/date_sync/daily_tests.rs"
+  - "tests/two_clock_bench/daily.rs"
+  - "tests/two_clock_bench/measure.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -484,6 +492,98 @@ The bench's Windows day showed two gotchas:
 - µs step residuals are paid through the rate, so a Windows day's hourly rate error is ~0.011 ppm
   against ~0.002 for ideal steps. `check()`'s bound is a Scenario field for that.
 
+## #119 (1.12) — the fleet date is corrected ONCE A NIGHT (`correction = "daily"`, the default)
+
+The owner ruled one coordinated step per night (issue comment 5849932587). Each 1.11 micro-step
+(`NtSetSystemTime` every 20 s) starved the Dante Virtual Soundcard's ASIO input on the stream box,
+and OBS ratcheted its audio buffering from 85 to 405 ms. Rare steps starve nothing. The
+grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must still be stepped.
+
+**What it does:**
+- The authority keeps recording UTC readings into the SAME `MicroScheduler` estimate (Theil–Sen
+  line), but `DateAuthority::on_tick` hands the decision to `DailyScheduler`
+  (`src/date_offset/daily.rs`).
+- Nothing happens by day. When the window opens at `daily_step_utc` (02:00 UTC), the whole
+  estimated error at the landing instant is announced as ONE coordinated step, either direction,
+  never a slew, `MICRO_LEAD_FACTOR` leads ahead.
+- The window is read on the FLEET wall (`ptp + D`). A grandmaster rebase moves PTP time, never
+  that wall, so the scheduler keeps no PTP state and needs no rebase.
+- A decision needs a SETTLED estimate (`MicroScheduler::settled`): at least `MICRO_MIN_READINGS`
+  readings in the 5 min level window, the newest within 60 s. After a UTC gap the first reading
+  back is alone in the level window, and its noise reads as 0. One WAN outlier would then set the
+  whole step (review round 1). Without a settled estimate the window waits up to 30 minutes, then
+  the night is SKIPPED and the next night steps both days.
+- A window that opened and closed between two asks is reported `Missed`, loudly (review round 1).
+  That happens when the authority had another change in flight all window, or the daemon
+  stalled. Only a window already past at the FIRST ask (a boot) closes silently.
+- A window at or before the last handled one counts as handled (review round 1). A backward step
+  larger than the landing's distance from the window start moves the fleet wall back before it.
+  The scheduler then saw the night as new: a second decision, and a false SKIPPED 30 min later.
+- An EMERGENCY step re-judges the windows from the wall it will leave (review round 2,
+  `DailyScheduler::on_emergency_step`, called by `on_utc_error`): a window closed there is handled,
+  one open there is still to decide, and the asks are reset. Without it, a master booted 6 h ahead
+  (the case the emergency exists for) marked the 02:00 it first saw as handled, and the emergency
+  step back to 22:00 then hid the next 02:00, SILENTLY (the `<=` handled check extends that to
+  several nights). A forward emergency jump over a window is not reported MISSED either.
+- No step for |error| ≤ 2 ms + 3 σ, for example after a restart right after the night's step.
+
+**What changes by mode:**
+- `on_utc_error`'s abnormal cap is `daily_emergency_ms` (5 s) in daily mode, 2 × the step bound
+  in micro. A day's drift is recorded, never stepped by day.
+- The falling-behind alarm is never evaluated in daily mode: the error is corrected at night by
+  design. `date_micro_paused` is micro-only too.
+
+**Keep `micro` byte-identical.** The pure `DateAuthority::new` still runs micro (the bench's
+pre-1.12 scenarios and the date_offset tests rely on it). The CONFIG default is daily, and the
+controller passes it with `with_correction`. The controller test helper `phase_lock_config()`
+pins `"micro"`; the daily controller tests use their own config.
+
+**The master's own PTP outage (found while building 1.12).** In micro mode the master's local NTP
+path steps its OWN wall to UTC while it has no PTP. That is fine within 3 ms of UTC, but in daily
+mode it would move the master up to a day's drift (~1.5 s) off the fleet line and back at its
+re-join. So in daily mode:
+- `ntp_under_date_authority` returns true while the master is offline: it still feeds the
+  authority, and it still logs the `[NTP] offset:` line the camera-box freshness gates parse.
+- The master free-runs on the learned frequency.
+- It stays ON the fleet line (`on_line` ignores `ptp_offline` in daily mode). Its D is the fleet
+  D, so it takes the fleet's nightly and emergency steps on its own wall (review round 1).
+  Otherwise a long outage would leave it a day's drift off, with one large daytime Join at the
+  end.
+- Its landing is off by its free-run error, like the rest of its wall. The bench's
+  simultaneity check leaves out a master landing inside its own outage, and the daily scenario
+  bounds that landing directly: within its re-join size + 50 µs of the fleet's median landing.
+- A failed own step while off-line is retried (review round 2, `realign_offline_daily_master`,
+  `src/controller/date_sync/daily.rs`): after the backoff, one Join of `fleet − own`. There is no
+  phase error to measure without PTP, and `realign_master_to_fleet` waits for PTP. The controller
+  test models the failure's aftermath directly (D behind the fleet, the backoff running): no time
+  passes in a controller test, so an announce's instant is never reached there.
+- `master_outage_realign` makes `realign_master_to_fleet` re-join on the measured error even
+  though its `D` never left the fleet line. The bench measured −323 µs after 30 min.
+- Without the re-join the bench showed the master 377 µs off for minutes while the PI pulled it
+  in: that breaks the 100 µs envelope.
+
+**Bench (`tests/two_clock_bench/daily.rs`, 48 h):**
+- `Scenario::gm_b_ppm = 0` keeps UTC at the same drift across the grandmaster change, so a full
+  day really is +17.6 ppm (the default grandmaster B at +3 ppm makes the second day 14.6 ppm).
+- `utc_outages` removes the master's readings.
+- `check()` skips the micro-era direction, size and UTC-bound assertions in daily mode, where the
+  date runs free by day and a backward step is allowed. The daily file asserts the window, the
+  count and the size instead.
+- Measured at +17.6 ppm: 746.47 ms and 1520.59 ms (the true error: 746.42 / 1520.64). Announced
+  at 02:00:00.000 and 02:00:00.246 fleet time. Relative phase max 19 µs, hourly rate ≤ 0.0023 ppm.
+- A master outage over the window must END before the grandmaster change (~02:23 bench time).
+  Otherwise it is the documented double fault (the master publishes an old-base D until it
+  returns: thousands of refused replies, 929 µs of settling). Round 1 hit that by accident.
+
+**Status for consumers:**
+- `date_step_pending_ns` / `date_step_due_in_ms` show the nightly step during its lead and clear
+  once it lands, the same fields as every other step.
+- Also published: `date_correction_mode`, `date_daily_next_utc` (RFC 3339, fleet wall),
+  `date_daily_last_step_ts` (epoch s, fleet wall, where it lands) and `date_daily_last_step_ms`.
+
+**The 1.10 `"bound"` mode is gone** (since 1.11.0 the step bound only sets the micro cap). The
+value reads as daily with a warning.
+
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
 `tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, and its high-jitter test
@@ -777,6 +877,17 @@ dead_code` reproduces the Lint job on the pure modules (give `-o` a writable pat
 fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the crate root
 (`tests/x.rs`, which cargo would also build as its own target): use
 `#[path = "<bench>/x.rs"] mod x;` for a submodule of a `tests/*.rs` bench.
+
+**Two gotchas from a worktree-isolated camera-box lane (#119 1.12):**
+- The lane's isolation guard refuses a Bash call it cannot prove stays inside the camera-box
+  worktree. That includes heredocs, `$VAR` in a command position, and compound `gh ... -q`
+  expressions. Put each edit and each runner in a script file in the scratchpad and run
+  `python3 /abs/script.py` or `bash /abs/run.sh`. Simple `cd <dantesync worktree> && git …`
+  chains pass.
+- In such a Python edit script, a Rust string continuation (`\` + newline) inside a NON-raw
+  Python string is itself a Python line continuation. Python eats it, and the Rust literal gains
+  a run of spaces. CI caught one in a config warning. Write `\\` or use a raw string, then grep
+  the result for 8+ spaces inside a string literal.
 
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually

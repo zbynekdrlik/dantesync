@@ -62,10 +62,29 @@
 //! box logs it quietly and keeps it out of the NTP step-storm count. The large correction exists
 //! only for an ABNORMAL error beyond [`slew_cap_ns`] (2 × the step bound): one coordinated step,
 //! either direction, logged loudly. The step bound itself no longer triggers anything.
+//!
+//! # dantesync#119 (1.12) — ONE coordinated step per NIGHT (the default)
+//!
+//! Each micro-step disturbs the Dante Virtual Soundcard on a Windows box; one rare step does not
+//! (owner decision, issue comment 5849932587). In [`CorrectionMode::Daily`] the authority keeps
+//! reading UTC and fitting the same robust estimate all day but announces nothing; when the nightly
+//! window opens ([`DailyScheduler`], 02:00 UTC by default) it announces ONE coordinated step of the
+//! whole estimated error, in either direction, [`MICRO_LEAD_FACTOR`] leads ahead. The abnormal cap
+//! becomes the emergency cap (`daily_emergency_ms`, 5 s): only an error beyond it is stepped by
+//! day. [`CorrectionMode::Micro`] is the 1.11 behaviour, byte for byte (and what a bare
+//! [`DateAuthority::new`] runs). The step bound's 1.10 correction ("bound") no longer exists.
 
+mod daily;
 mod micro;
 mod slew;
 mod wire;
+pub use daily::{
+    clamp_daily_emergency_ms, format_utc_rfc3339, parse_daily_step_utc, CorrectionMode,
+    DailyConfig, DailyDecision, DailyScheduler, CORRECTION_DAILY, CORRECTION_MICRO,
+    DAILY_MIN_STEP_NS, DAILY_WINDOW_NS, DAY_NS, DEFAULT_DAILY_EMERGENCY_MS,
+    DEFAULT_DAILY_STEP_TOD_S, DEFAULT_DAILY_STEP_UTC, MAX_DAILY_EMERGENCY_MS,
+    MIN_DAILY_EMERGENCY_MS,
+};
 pub use micro::{
     clamp_micro_interval_s, clamp_micro_step_us, MicroConfig, MicroEstimate, MicroScheduler,
     DEFAULT_MICRO_INTERVAL_S, DEFAULT_MICRO_STEP_US, FALLING_BEHIND_ERROR_NS, MAX_MICRO_INTERVAL_S,
@@ -220,6 +239,15 @@ pub struct DateAuthority {
     micro: MicroScheduler,
     /// The change that made the current `seq` was a micro-correction (published with it).
     micro_kind: bool,
+    /// dantesync#119 (1.12) — how the date is corrected: one step per night (`Daily`, the
+    /// config's default) or the 1.11 micro-corrections (`Micro`, the pure constructor's default,
+    /// so a bare `DateAuthority::new` keeps the 1.11 behaviour byte for byte).
+    mode: CorrectionMode,
+    /// dantesync#119 (1.12) — the nightly scheduler (`Daily` mode only).
+    daily: Option<DailyScheduler>,
+    /// dantesync#119 (1.12) — the last nightly decision worth a log line, until the controller
+    /// takes it ([`take_daily_event`](Self::take_daily_event)).
+    daily_event: Option<DailyDecision>,
 }
 
 impl DateAuthority {
@@ -245,6 +273,9 @@ impl DateAuthority {
             micro_requested: MicroConfig::default(),
             micro: MicroScheduler::new(MicroConfig::default()),
             micro_kind: false,
+            mode: CorrectionMode::Micro,
+            daily: None,
+            daily_event: None,
         }
         .rebuild_micro()
     }
@@ -413,13 +444,20 @@ impl DateAuthority {
     /// a bad NTP reading, seconds off): on [`AUTHORITY_AGREEMENT_N`] consecutive same-sign ones it
     /// is corrected in ONE coordinated step taking effect `lead` from now, forward or backward
     /// (`TooLargeToSlew`), once no other change is in flight. Returns that announce.
+    ///
+    /// dantesync#119 (1.12): in daily mode the cap is the EMERGENCY cap (`daily_emergency_ms`): a
+    /// day's drift (~1.5 s on the rig) is recorded for the nightly step, never stepped by day, and
+    /// the micro-corrections' falling-behind alarm is never raised (there is nothing to fall
+    /// behind: the error is corrected at night by design).
     pub fn on_utc_error(&mut self, utc_error_ns: i64, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
         let error_ns = utc_error_ns.wrapping_sub(self.outstanding_ns(now_ptp_ns));
-        if error_ns.unsigned_abs() <= slew_cap_ns(self.step_bound_ns).unsigned_abs() {
+        if error_ns.unsigned_abs() <= self.abnormal_cap_ns().unsigned_abs() {
             self.over_bound = None;
             self.micro.record(error_ns, now_ptp_ns);
-            self.micro.update_falling_behind(now_ptp_ns);
+            if self.mode == CorrectionMode::Micro {
+                self.micro.update_falling_behind(now_ptp_ns);
+            }
             return None;
         }
         let sign: i8 = if error_ns > 0 { 1 } else { -1 };
@@ -434,10 +472,12 @@ impl DateAuthority {
             return None;
         }
         self.over_bound = None;
-        self.pending = Some((
+        let (target, land) = (
             self.current_ns.saturating_add(error_ns),
             now_ptp_ns.saturating_add(self.lead_ns),
-        ));
+        );
+        self.pending = Some((target, land));
+        self.daily_after_emergency(land, target);
         self.micro_kind = false;
         // The kept readings described the abnormal state; the micro estimate starts again.
         self.micro.clear();
@@ -451,12 +491,18 @@ impl DateAuthority {
     /// a coordinated STEP,
     /// backward a coordinated SLEW at `slew_ppm` ([`correction_kind`]). Nothing while another
     /// change is in flight or an abnormal correction is being confirmed.
+    ///
+    /// dantesync#119 (1.12): in daily mode the nightly scheduler decides instead
+    /// ([`daily_tick`](Self::daily_tick)).
     pub fn on_tick(&mut self, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
         if self.pending.is_some() || self.slew.is_some() || self.over_bound.is_some() {
             return None;
         }
         let land = now_ptp_ns.saturating_add(self.lead_ns.saturating_mul(MICRO_LEAD_FACTOR));
+        if let CorrectionMode::Daily(_) = self.mode {
+            return self.daily_tick(now_ptp_ns, land);
+        }
         let amount = self.micro.decide(now_ptp_ns, land)?;
         let target = self.current_ns.saturating_add(amount);
         match correction_kind(amount, self.step_bound_ns) {
@@ -911,5 +957,9 @@ impl DateFollower {
     }
 }
 
+mod authority_daily;
+
+#[cfg(test)]
+mod authority_daily_tests;
 #[cfg(test)]
 mod tests;

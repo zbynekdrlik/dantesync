@@ -40,6 +40,17 @@ what caught, on the local `x86_64-pc-windows-gnu` proxy target, that #58's new F
 NEW clippy findings — the pre-existing `field_reassign_with_default` (time_server.rs) and
 `useless_vec` (net_pcap.rs's own older test) hits were identical on both sides (23 == 23).
 
+## Coverage (`cargo tarpaulin`) needs `--timeout` above the bench's silent stretches (issue 119)
+
+tarpaulin's default (ptrace) engine kills a test binary that sends it NO event for `--timeout`
+seconds (default 60). Once every line is covered, the two-clock bench computes for minutes on
+covered code, so the only events are thread starts and ends. A stretch of 61 s with no test ending
+(issue 119 run 36274688463, after four new 48 h daily scenarios reshuffled the schedule) failed
+Coverage with `Timed out waiting for test response`, although every test passed. `ci.yml` runs it
+with `--timeout 300`. That is a harness limit, not a quality gate: the coverage thresholds are
+unchanged. Read the log's test timeline before you blame a hang: a test printing `... ok` just after
+the timeout line is the tell.
+
 ## A YAML/logic fix is not proof the job actually WORKS — the runtime environment can still surprise you
 
 actionlint (and `python3 -c "import yaml; yaml.safe_load(...)"` for pure syntax) only prove the

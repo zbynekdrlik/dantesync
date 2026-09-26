@@ -362,6 +362,24 @@ pub struct SyncStatus {
     /// would have paid back through the rate. `null` before the first step measured.
     #[serde(default)]
     pub date_step_phase_jump_us: Option<f64>,
+    /// dantesync#119 (1.12, the NTP master only): how it corrects the fleet date — `"daily"` (one
+    /// coordinated step per night, the default) or `"micro"` (the 1.11 micro-corrections). Empty
+    /// on a follower (it applies whatever the master announces) and in a pre-1.12 blob.
+    #[serde(default)]
+    pub date_correction_mode: String,
+    /// dantesync#119 (1.12, daily mode on the master only): where the next nightly window opens,
+    /// as an RFC 3339 UTC second on the fleet wall (`"2026-09-27T02:00:00Z"`) — the window open
+    /// NOW while it has not stepped yet. `null` otherwise.
+    #[serde(default)]
+    pub date_daily_next_utc: Option<String>,
+    /// dantesync#119 (1.12, daily mode on the master only): the last nightly step announced — the
+    /// fleet-wall epoch second it lands on, and its size (ms, signed: + = the fleet stepped
+    /// forward). `null` before the first nightly step since the master started. An emergency step
+    /// is not a nightly step: see `last_date_step_*`.
+    #[serde(default)]
+    pub date_daily_last_step_ts: Option<u64>,
+    #[serde(default)]
+    pub date_daily_last_step_ms: Option<f64>,
 
     // ========================================================================
     // PTP phase lock (dantesync#117) — additive.
@@ -474,6 +492,10 @@ impl Default for SyncStatus {
             date_correction_falling_behind: false,
             date_micro_paused: false,
             date_step_phase_jump_us: None,
+            date_correction_mode: String::new(),
+            date_daily_next_utc: None,
+            date_daily_last_step_ts: None,
+            date_daily_last_step_ms: None,
             // #117: unknown until the controller publishes
             clock_discipline: String::new(),
             rate_source: String::new(),

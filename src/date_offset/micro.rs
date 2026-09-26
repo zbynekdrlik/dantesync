@@ -435,11 +435,7 @@ impl MicroScheduler {
                 return None;
             }
         }
-        let fresh = self
-            .readings
-            .back()
-            .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) <= MICRO_READING_MAX_AGE_NS);
-        if !fresh {
+        if !self.fresh(now_ptp_ns) {
             self.correcting = false;
             return None;
         }
@@ -536,6 +532,32 @@ impl MicroScheduler {
         self.readings
             .back()
             .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) > MICRO_READING_MAX_AGE_NS)
+    }
+
+    /// dantesync#119 (1.12) — a UTC reading arrived within [`MICRO_READING_MAX_AGE_NS`] of
+    /// `now_ptp_ns` (the nightly step is decided only then, like a micro-correction).
+    pub fn fresh(&self, now_ptp_ns: i64) -> bool {
+        self.readings
+            .back()
+            .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) <= MICRO_READING_MAX_AGE_NS)
+    }
+
+    /// dantesync#119 (1.12) — the level rests on enough FRESH readings: at least
+    /// [`MICRO_MIN_READINGS`] within [`MICRO_LEVEL_WINDOW_NS`] of the newest, which is fresh. After
+    /// a UTC gap the first reading back is alone in the level window (its noise reads as 0), and
+    /// one WAN outlier must not set a whole nightly step.
+    pub fn settled(&self, now_ptp_ns: i64) -> bool {
+        let Some(&(newest, _)) = self.readings.back() else {
+            return false;
+        };
+        self.fresh(now_ptp_ns)
+            && self
+                .readings
+                .iter()
+                .rev()
+                .take_while(|&&(t, _)| newest.saturating_sub(t) <= MICRO_LEVEL_WINDOW_NS)
+                .count()
+                >= MICRO_MIN_READINGS
     }
 
     /// How many readings are kept.

@@ -119,7 +119,9 @@ is running.
   master's loop from a robust drift+level estimate; a large step only beyond 2 × the step bound),
   the decoupling proof by the bit-identical two-clock bench,
   the local fallback, seeding every simulated noise source, the standalone-`rustc` replica as a
-  second local net) → `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
+  second local net; v1.12: the date corrected ONCE A NIGHT by default, `correction = "daily"`,
+  the micro mode kept byte-identical, the master's own PTP outage in daily mode) →
+  `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
   `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)
 - Phase-slew PI servo (#97, LEGACY discipline only since #117 — the feed-forward decoupling sign invariant, the deadbeat gain cap for
