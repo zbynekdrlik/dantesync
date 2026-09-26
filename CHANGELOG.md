@@ -5,6 +5,36 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.1] - 2026-09-26
+
+### Fixed
+
+- **A date step no longer moves the rate (issue #119, a 1.11.0 regression on Windows).** Every
+  clock step lands exactly, so the PTP phase lock sees no phase error from it and the frequency
+  word stays on the Dante tick.
+  - **The bug.** Windows stepped the clock as "read now, set now + offset", reading "now" with
+    `GetSystemTimeAsFileTime`. That clock only updates on the clock interrupt, while
+    `NtSetSystemTime` sets the precise time. So every step landed short by the interrupt lag
+    (0 … 0.5 ms). The phase lock paid the shortfall back through the rate: on stream the error
+    after each +500 µs micro-step was −170 … −860 µs, and the word sat +8 … +13 ppm off its
+    baseline.
+  - **Why it only showed now.** Since the 1.11.0 micro-corrections steps come every 20 s instead
+    of every ~47 minutes, so the rate was never clean. The Windows media clocks that follow the
+    adjustment rate (the camera-box OBS audio) left the Dante tick.
+  - **The fix, on both operating systems.** Read the precise wall and a clock that no step moves
+    (Windows: QPC at the system-time rate; Linux: `CLOCK_MONOTONIC`). Set the target from that
+    read plus the learned read→set latency. Measure what the set actually did, and correct a
+    residual beyond 10 µs (at most 3 sets, never backwards).
+  - **The step's log line** is now `[StepClock] stepped +500.0us (requested +500.0us, residual
+    +0.0us, 1 set(s), learned set latency …, coarse clock lag …)`. The coarse lag shows what the
+    old path would have lost. The old `Actual step: X (expected: Y)` line compared the coarse
+    clock with itself, so it could not see the shortfall.
+  - **Bench.** The two-clock bench models the Windows clock and a micro-step every 20 s for an
+    hour. The learned rate stays within 0.16 ppm of the truth (it was 24 ppm) and the relative
+    phase within 21 µs.
+- **`/status` adds `date_step_phase_jump_us`**: how far the phase-lock error moved across the last
+  step (the first window after it minus the last before it). An exact step reads a few µs.
+
 ## [1.11.0] - 2026-09-26
 
 ### Changed
