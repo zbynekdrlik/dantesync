@@ -734,7 +734,8 @@ canary evidence before continuing.
   - read the precise wall and a step-immune reference (QPC at `inc/adj` / `CLOCK_MONOTONIC`);
   - set with the learned read→set latency;
   - measure Δwall − Δreference;
-  - correct beyond 10 µs, at most 3 sets, never backwards.
+  - correct beyond 10 µs, at most 3 sets, never backwards (round 2: at most 4 sets, forward
+    always, back only for a backward step).
 - `/status.date_step_phase_jump_us` is added for the on-rig check.
 - Commits: bump `d19e025`; RED `199c704` → GREEN `d49d643`.
 - Proof (rustc replica of the pure modules + the bench): RED 7/10 step tests red and the Windows
@@ -742,3 +743,34 @@ canary evidence before continuing.
   GREEN 10/10 and 10/10 bench. On the Windows model (a micro-step every 20 s, 1 h judged,
   3 seeds): learned rate ≤ 0.164 ppm, 20 s mean word ≤ 0.339 ppm, step residual ≤ 9.7 µs,
   relative phase ≤ 21 µs. The controller probe tests are CI-only.
+- CI (run 36246334887): the Linux clock test failed under tarpaulin. Precise and reference read
+  508 µs apart over 200 ms because one read was preempted between its two clock reads. Readings
+  are now sandwiched (`ClockReading::sandwiched`, `read_tight`).
+- Review round 1 (fresh context, 2 🔴 5 🟡 8 🔵), all fixed in-lane:
+  - status tests moved to `src/status/tests.rs`; the bench Box_ ops to
+    `two_clock_bench/box_ops.rs`;
+  - the probe is void when `D` moved again, or across an outage;
+  - a 2 ms bound on chasing;
+  - a failed correction keeps the step, via `StepOutcome.stopped`;
+  - best-of-5 OS clock tests;
+  - claims softened and the on-rig acceptance written down;
+  - tick variants and a no-grace run;
+  - the step residual is asserted.
+  - Declined: moving D by the realized amount, because the next absorb re-snaps it.
+  - Commits: refactor `0a38db1`, RED `7f053e8`, test fix `0879c78`, GREEN `129b085`.
+- Review round 2 (fresh context, 0 🔴 4 🟡 5 🔵; 10 of its mutants all killed):
+  - a late set of a backward step is corrected forward (a fix runs forward always, back only for
+    a backward step);
+  - the learned latency is the lower median of the last 8 sets. The 1 µs/set rise was too slow
+    for a steady 200 µs, and a minimum is biased low: it measured 0.026 ppm hourly on a Windows
+    day;
+  - a set latency outside [−10 µs, 2 ms] is late or foreign;
+  - the REAL NTP step path is tested;
+  - a preempted after-read is tested;
+  - docs.
+  - Bench corrections, each in its own commit: the zero-step no-op mirror, and a Scenario hourly
+    rate bound (0.02 for the Windows day, whose µs step jitter is paid through the rate).
+  - Commits: RED `87d40ec`, test fixes `9782a92` + `ac9a251`, GREEN (this round).
+- Follow-up candidate for the supervisor: `src/controller.rs` is 7082 lines and
+  `check_ntp_utc_tracking` about 369 lines. This slice touched 2 lines of it. Filing needs
+  supervisor authority.

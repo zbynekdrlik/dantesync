@@ -88,8 +88,9 @@ impl WindowsStepOps {
 impl StepOps for WindowsStepOps {
     fn read(&mut self) -> ClockReading {
         let (mut qpc_before, mut qpc_after) = (0i64, 0i64);
-        // QueryPerformanceCounter cannot fail since Windows XP (documented); a failed read would
-        // leave 0, a reading the step law's window check and correction bound refuse to act on.
+        // QueryPerformanceCounter cannot fail since Windows XP (documented). A failed read would
+        // leave 0 on both sides (a window of 0 passes the window check): the step law then sees a
+        // set "latency" of minus the whole call, and refuses to act on it or learn from it.
         // The coarse read before the precise one, so it can never be ahead of it.
         let (coarse, precise) = unsafe {
             let _ = QueryPerformanceCounter(&mut qpc_before);

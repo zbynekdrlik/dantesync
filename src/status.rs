@@ -355,10 +355,11 @@ pub struct SyncStatus {
     #[serde(default)]
     pub date_micro_paused: bool,
     /// dantesync#119 (1.11.1): how far the PTP phase-lock error moved across the last clock step
-    /// this node applied (µs: the first phase-lock window after the step minus the last one
-    /// before it). An exact step reads a few µs (the samples' noise); a step that landed short
-    /// reads minus its shortfall — which the phase lock would have paid back through the rate.
-    /// `null` before the first step measured.
+    /// this node could MEASURE (µs: the first phase-lock window after the step minus the last one
+    /// before it; not measured when `D` moved again in between or across a PTP outage, so it may
+    /// belong to an earlier step than `last_date_step_ts`). An exact step reads a few µs (the
+    /// samples' noise); a step that landed short reads minus its shortfall — which the phase lock
+    /// would have paid back through the rate. `null` before the first step measured.
     #[serde(default)]
     pub date_step_phase_jump_us: Option<f64>,
 

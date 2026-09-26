@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The bug.** Windows stepped the clock as "read now, set now + offset", reading "now" with
     `GetSystemTimeAsFileTime`. That clock only updates on the clock interrupt, while
     `NtSetSystemTime` sets the precise time. So every step landed short by the interrupt lag
-    (0 … 0.5 ms). The phase lock paid the shortfall back through the rate: on stream the error
+    (0 … one clock-interrupt tick). The phase lock paid the shortfall back through the rate: on stream the error
     after each +500 µs micro-step was −170 … −860 µs, and the word sat +8 … +13 ppm off its
     baseline.
   - **Why it only showed now.** Since the 1.11.0 micro-corrections steps come every 20 s instead
@@ -24,22 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The fix, on both operating systems.** Read the precise wall and a clock that no step moves
     (Windows: QPC at the system-time rate; Linux: `CLOCK_MONOTONIC`), the latter on both sides of
     the wall; a reading preempted in between is taken again. Set the target from that read plus
-    the learned read→set latency. Measure what the set actually did, and correct a residual beyond
-    10 µs (at most 4 sets, never backwards). A residual beyond 2 ms is never chased, since the
-    measurement is then wrong. A correction set that fails keeps the step as made, so `D` moves
-    with the wall.
+    the learned read→set latency (the median of the last 8 sets, so preempted sets do not count).
+    Measure what the set actually did, and correct a residual beyond 10 µs, at most 4 sets. A fix
+    runs forward always (a late set, either way the step went) and backward only for a backward
+    step, so a forward step never runs the wall back. A move no set can make is never chased:
+    another writer, a failed clock read, or a set stalled for milliseconds. A correction set that
+    fails keeps the step as made, so `D` moves with the wall.
   - **Unconfirmed, and the on-rig check for it.** The stream's timer tick is not measured; a
     0.5 ms tick fits the always-negative error, which accumulated to −860 µs under the pay-back.
-    After the roll, every `[StepClock]` line should show `1 set(s)` and a residual within 10 µs,
-    and `date_step_phase_jump_us` should read a few µs.
+    After the roll, once the learned latency has settled, the `[StepClock]` lines should show
+    `1 set(s)` (an occasional preempted set: 2) and a residual within 10 µs, and
+    `date_step_phase_jump_us` should read a few µs.
   - **The step's log line** is now `[StepClock] stepped +500.0us (requested +500.0us, residual
     +0.0us, 1 set(s), learned set latency …, coarse clock lag …)`. The coarse lag shows what the
     old path would have lost. The old `Actual step: X (expected: Y)` line compared the coarse
     clock with itself, so it could not see the shortfall.
   - **Bench.** The two-clock bench models the Windows clock and a micro-step every 20 s for an
-    hour, at 0.5 ms, 1 ms and 15.625 ms ticks, with and without the post-step grace. The learned
-    rate stays within 0.13 ppm of the truth (it was 24 ppm), the 20 s mean word within 0.28 ppm,
-    every step within 7 µs and the relative phase within 23 µs.
+    hour, at 0.5 ms, 1 ms and 15.625 ms ticks, with and without the post-step grace, plus a
+    Windows day with backward steps (the joins, a 3 s coordinated one). The learned rate stays
+    within 0.13 ppm of the truth (it was 24 ppm), the 20 s mean word within 0.28 ppm, every step
+    within 9 µs and the relative phase within 21 µs.
 - **`/status` adds `date_step_phase_jump_us`**: how far the phase-lock error moved across the last
   step it could measure (the first window after it minus the last before it; not measured when
   `D` moved again in between, or across a PTP outage). An exact step reads a few µs.

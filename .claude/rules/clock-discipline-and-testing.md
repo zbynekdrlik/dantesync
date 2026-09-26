@@ -448,11 +448,15 @@ step with the same coarse clock on both sides, so it could NOT see this. It also
   the wall (`ClockReading::sandwiched`);
 - read again when the reading was preempted (`read_tight`). The first CI run caught this: one
   preempted Linux read put the two clocks 508 µs apart;
-- set from that precise read plus a learned read→set latency. The latency rises by at most 1 µs
-  per set, so preempted sets never make later steps overshoot;
+- set from that precise read plus a learned read→set latency: the lower median of the last 8
+  sets' latencies. A preemption only adds latency, so a burst of them (the bench met three in a
+  row within one step) never makes the next set overshoot. It is not biased low the way a minimum
+  is, so the steps carry no systematic shortfall;
 - measure the realized move as Δwall − Δreference;
-- correct the residual beyond 10 µs, in the requested direction only and up to 2 ms. A larger
-  residual means the measurement is wrong, so it is never chased;
+- correct the residual beyond 10 µs: forward always (a late set, either way the step went), back
+  only for a backward step;
+- never chase a set latency below −10 µs or beyond 2 ms. That is another writer, a failed read,
+  or a stalled set;
 - once a set has landed, the step is made (`stopped` says why it stopped short), so the caller
   moves `D` with it.
 
@@ -470,8 +474,15 @@ step. It should read a few µs.
 - The measurement is void if `D` moved again before the first window (an absorb, the master's
   re-alignment, a slew fold), or across a PTP outage.
 
-The stream tick is unmeasured. The post-roll acceptance is that every `[StepClock]` line shows
-`1 set(s)` with the residual within the tolerance.
+The stream tick is unmeasured. The post-roll acceptance is that, once the learned latency
+settles, the `[StepClock]` lines show `1 set(s)` (an occasional preempted set: 2) with the residual
+within the tolerance.
+
+The bench's Windows day showed two gotchas:
+- a step that lands µs short right at its instant can make a poll schedule the same announce once
+  more as a ZERO step. `apply_date_step` and the bench's `apply_step` ignore it;
+- µs step residuals are paid through the rate, so a Windows day's hourly rate error is ~0.011 ppm
+  against ~0.002 for ideal steps. `check()`'s bound is a Scenario field for that.
 
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 

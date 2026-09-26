@@ -28,16 +28,17 @@
 //! on both sides of the wall, a reading preempted in between read again ([`read_tight`]). It sets
 //! `precise + remaining + lead`, where `lead` is the learned read→set latency ([`StepLead`]), and
 //! measures what the set actually did: `Δprecise − Δreference`, independent of how long the call
-//! took or how the kernel applies it. A residual beyond [`STEP_TOLERANCE_NS`] in the requested
-//! direction is stepped again (at most [`MAX_STEP_ATTEMPTS`] sets); an overshoot is never corrected
-//! backwards (the wall does not run back for a forward step), and a residual beyond
-//! [`MAX_CORRECTION_NS`] is never chased (the measurement is then wrong). Once a set has landed the
-//! step is reported as made, with why it stopped short if it did ([`StepOutcome::stopped`]), so the
-//! caller moves `D` with the wall.
+//! took or how the kernel applies it. A residual beyond [`STEP_TOLERANCE_NS`] is stepped again (at
+//! most [`MAX_STEP_ATTEMPTS`] sets) — forward always (a late set, whichever way the step went), back
+//! only for a backward step: a forward step never runs the wall back. A move no set can make — a
+//! set latency below −[`STEP_TOLERANCE_NS`] or beyond [`MAX_CORRECTION_NS`] (another writer, a failed
+//! clock read, a set stalled for milliseconds) — is never chased nor learned from. Once a set has
+//! landed the step is reported as made, with why it stopped short if it did
+//! ([`StepOutcome::stopped`]), so the caller moves `D` with the wall.
 //!
-//! The on-rig check that the kernel applies a set as modelled: every `[StepClock]` line shows
-//! `1 set(s)` and a residual within the tolerance, and `/status.date_step_phase_jump_us` reads a
-//! few µs.
+//! The on-rig check that the kernel applies a set as modelled: once the learned latency has
+//! settled, the `[StepClock]` lines show `1 set(s)` (an occasional preempted set: 2) and a
+//! residual within the tolerance, and `/status.date_step_phase_jump_us` reads a few µs.
 //!
 //! Pure (the OS behind [`StepOps`]) so the unit tests and the two-clock bench run the same law
 //! against models of both operating systems.
@@ -99,13 +100,17 @@ pub const MAX_STEP_ATTEMPTS: u32 = 4;
 /// The learned read→set latency is clamped to ±this.
 pub const MAX_LEAD_NS: i64 = 1_000_000;
 
-/// One observation lowers the learned latency by at most this …
-pub const LEAD_SLEW_NS: i64 = 5_000;
+/// The learned latency is the (lower) median of this many recent sets' latencies. A preemption
+/// only ever ADDS latency, so the median ignores preempted sets — up to half the window, e.g. a
+/// burst within one step (the bench met three in a row), which must never make the next set
+/// overshoot: an overshoot of a forward step is never stepped back. Unlike the minimum it is not
+/// biased low, so the steps carry no systematic shortfall for the phase lock to pay through the
+/// rate. A genuinely larger steady latency is learned as it fills half the window.
+pub const LEAD_WINDOW: usize = 8;
 
-/// … and raises it by at most this: a preempted set (hundreds of µs, a few % of the calls) is an
-/// outlier, and a run of them must not make the next steps overshoot — an overshoot is never
-/// stepped back. A genuinely larger latency is still learned, a µs per observation.
-pub const LEAD_RISE_NS: i64 = 1_000;
+/// Nothing is aimed ahead until this many sets' latencies are known: one or two alone may all be
+/// preempted.
+pub const LEAD_MIN_KNOWN: usize = 3;
 
 /// A reading whose reference reads are further apart than this was preempted: read again.
 pub const READ_WINDOW_MAX_NS: i64 = 20_000;
@@ -119,29 +124,41 @@ pub const READ_TRIES: u32 = 8;
 /// failed), and chasing it could move the wall by anything.
 pub const MAX_CORRECTION_NS: i64 = 2_000_000;
 
-/// The learned read→set latency (ns) of this clock, carried from step to step.
+/// The learned read→set latency of this clock, carried from step to step: the recent sets'
+/// latencies (ns), newest last.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepLead {
-    lead_ns: i64,
+    recent: [i64; LEAD_WINDOW],
+    known: usize,
 }
 
 impl StepLead {
+    /// The latency to aim ahead by: the lower median of the recent sets' latencies, 0 until
+    /// [`LEAD_MIN_KNOWN`] are known.
     pub fn lead_ns(&self) -> i64 {
-        self.lead_ns
+        if self.known < LEAD_MIN_KNOWN {
+            return 0;
+        }
+        let n = self.known.min(LEAD_WINDOW);
+        let mut recent = self.recent;
+        let known = &mut recent[LEAD_WINDOW - n..];
+        known.sort_unstable();
+        known[(n - 1) / 2].clamp(-MAX_LEAD_NS, MAX_LEAD_NS)
     }
 
     /// A lead that has learned `latency_ns` (tests, and a clock that knows its latency).
     pub fn seeded(latency_ns: i64) -> Self {
         StepLead {
-            lead_ns: latency_ns,
+            recent: [latency_ns; LEAD_WINDOW],
+            known: LEAD_WINDOW,
         }
     }
 
-    /// One set landed `latency_ns` after its read: move the learned latency half-way towards it,
-    /// down by at most [`LEAD_SLEW_NS`], up by at most [`LEAD_RISE_NS`].
+    /// One set landed `latency_ns` after its read.
     fn observe(&mut self, latency_ns: i64) {
-        let pull = ((latency_ns - self.lead_ns) / 2).clamp(-LEAD_SLEW_NS, LEAD_RISE_NS);
-        self.lead_ns = (self.lead_ns + pull).clamp(-MAX_LEAD_NS, MAX_LEAD_NS);
+        self.recent.rotate_left(1);
+        self.recent[LEAD_WINDOW - 1] = latency_ns;
+        self.known = (self.known + 1).min(LEAD_WINDOW);
     }
 }
 
@@ -207,10 +224,11 @@ pub fn step_wall<O: StepOps>(
     out.coarse_lag_ns = before.precise_ns - before.coarse_ns;
     loop {
         let remaining = requested_ns - out.realized_ns;
+        let lead_ns = lead.lead_ns();
         let target = before
             .precise_ns
             .checked_add(remaining)
-            .and_then(|t| t.checked_add(lead.lead_ns))
+            .and_then(|t| t.checked_add(lead_ns))
             .filter(|t| *t > 0)
             .ok_or_else(|| format!("a step of {requested_ns} ns would leave the valid time range"));
         let set = target.and_then(|t| ops.set(t));
@@ -227,27 +245,34 @@ pub fn step_wall<O: StepOps>(
         let moved =
             (after.precise_ns - before.precise_ns) - (after.reference_ns - before.reference_ns);
         out.realized_ns += moved;
-        let residual = requested_ns - out.realized_ns;
-        // Beyond this the residual is not the set's latency: the measurement cannot be explained.
-        if residual.abs() > MAX_CORRECTION_NS {
-            // Another writer moved the clock during the call, or a clock read failed: never chase
-            // it (it could move the wall by anything), and never learn a latency from it.
+        // It aimed at `remaining + lead` ahead of the read and landed `moved` ahead of it: the
+        // difference is how long after the read the kernel applied it. A set cannot land before
+        // it is made, and one later than MAX_CORRECTION_NS is not a latency either: the move is
+        // late or foreign (another writer, a failed clock read) — never chased, never learned.
+        let latency = remaining + lead_ns - moved;
+        if !(-STEP_TOLERANCE_NS..=MAX_CORRECTION_NS).contains(&latency) {
             out.stopped = Some(format!(
-                "the measured move ({moved} ns) cannot be this set's: not corrected"
+                "the measured move ({moved} ns, a set latency of {latency} ns) is late or \
+                 foreign: not corrected"
             ));
             return Ok(out);
         }
-        // It aimed at `remaining + lead` ahead of the read and landed `moved` ahead of it: the
-        // difference is how long after the read the kernel applied it.
-        lead.observe(remaining + lead.lead_ns - moved);
-        // Done within the tolerance; an overshoot is never stepped back (a forward step never runs
-        // the wall backwards, a backward one never forwards).
-        if residual.abs() <= STEP_TOLERANCE_NS || residual.signum() != requested_ns.signum() {
+        lead.observe(latency);
+        let residual = requested_ns - out.realized_ns;
+        if residual.abs() <= STEP_TOLERANCE_NS {
+            return Ok(out);
+        }
+        // A forward fix never runs the wall backwards; a backward fix only for a backward step.
+        if residual < 0 && requested_ns > 0 {
+            out.stopped = Some(format!(
+                "overshot by {} ns: a forward step is never stepped back",
+                -residual
+            ));
             return Ok(out);
         }
         if out.attempts >= MAX_STEP_ATTEMPTS {
             out.stopped = Some(format!(
-                "still {residual} ns short after {} sets",
+                "still {residual} ns off after {} sets",
                 out.attempts
             ));
             return Ok(out);
