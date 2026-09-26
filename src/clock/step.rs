@@ -404,8 +404,14 @@ mod tests {
         // (The set lands its latency after the read's wall sample, half a µs before its end.)
         assert_eq!(out.realized_ns, 500 * US + 50 * US - 3 * US - US / 2);
         assert!(out.residual_ns() < 0);
+        // The learned latency follows the real 3 µs once those are the majority of what it
+        // remembers (one observation against a history is an outlier either way).
+        for _ in 0..8 {
+            os.true_ns += 20_000 * MS;
+            step_wall(&mut os, &mut lead, 500 * US).unwrap();
+        }
         assert!(
-            lead.lead_ns() <= 45 * US,
+            lead.lead_ns() <= 5 * US,
             "learned towards 3 µs: {}",
             lead.lead_ns()
         );
