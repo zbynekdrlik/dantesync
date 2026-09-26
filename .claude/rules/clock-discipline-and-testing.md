@@ -259,6 +259,44 @@ There is no per-box latency calibration; add one only if the canary shows the sp
   50 µs Windows) plus the cross-box wall disagreement (µs). For that window the fleet genuinely
   differs by the step size. It is the only disagreement a coordinated step leaves.
 
+## #119 — a BACKWARD date correction is a coordinated SLEW, never a step
+
+A backward step runs wall time back on every box at once; the camera-box stream OBS lost 43.7 ms
+of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera-box#1372). So:
+
+- **The direction decision is `date_offset::correction_kind`**: `≥ 0` → coordinated step,
+  `< 0` → coordinated slew (`DateSlew`: `from → to` at `ppm` from `start`, a pure function of PTP
+  time, `offset_at` floored to the ns and exact at `end`). The authority's slew is its announce
+  until complete; a slew in progress judges readings by the error LEFT once it has paid, extends
+  (continuous, same rate, re-announced from `D` now) only while ≥ one lead is left, and makes a
+  forward need wait for its end.
+- **Every box holds the slew in `DateFollower`** (`HeldSlew { slew, ref, carry }`):
+  `D = anchor + carry + offset_at(ptp) − ref`. The anchor stays the phase lock's BASE; the paid
+  amount is folded into it when the slew completes (`D` unchanged). Joining mid-way lands once on
+  the fleet's current `D` (join/absorb/late rules) and slews the rest; any replacement keeps the
+  displacement so far as `carry`, so `D` never jumps.
+- **The decoupling statement for the slew** (this rule's standing requirement): the slew enters
+  the clock ONLY as a rate term of the one frequency word (`compose_slew_word`, re-applied from the
+  1 ms loop at the start/end instants by `apply_slew_edge`), and every PTP sample is DE-SLEWED by
+  the scheduled displacement before either servo sees it (`DateSync::deslew_sample`) — so the
+  phase lock and the rate servo read the clock as if no slew ran. Two gotchas: take the
+  displacement at the WALL (`t2`), never at `t1` (a grandmaster change delivers `t1` in another
+  base before the rebase); and the rate servo's phase is continuous across a fold only if the
+  folded amount stays removed from its measurement (`rate_folded_ns`, kept mod 1 s because its
+  phase is mod 1 s).
+- **Bench:** the bit-identity pair is now two FORWARD-only runs (+8 / +20 ppm); a slew adds an
+  NTP-derived rate term by design. The −15 ppm run proves the slew: no backward step, no wall
+  ever running back, relative phase (each wall + its own path delay) ≤ 50 µs while slewing
+  (measured 10 µs), and the words within 0.001 ppm of the forward-only run (measured 0.0004).
+- **Recovering PTP time from the wall is exact to 1 ns, not better:** under the floored
+  schedule two adjacent PTP instants can give the same wall. Tests compare with ± 1 ns.
+- **Known limits (accepted):** a box that first hears a slew after its whole lead catches up
+  with a counted LATE step, which can be backward (as any late step); the master re-aligns to
+  the fleet only after a running slew ends; the local NTP fallback path (no authority heard) is
+  uncoordinated and unchanged.
+- **Rollout: the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of the v2
+  extension and would step back at the slew's start.
+
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
 `tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, and its high-jitter test
