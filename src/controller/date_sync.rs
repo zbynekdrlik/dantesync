@@ -219,6 +219,33 @@ impl DateSync {
         self.window.clear();
     }
 
+    /// #119 (1.11.1) — a clock step is about to reset the measurement: keep the last phase-lock
+    /// error, if the last window describes the wall as it is now (else nothing to compare with).
+    pub(super) fn arm_step_phase_probe(&mut self) {
+        self.step_phase_ref_ns = if self.enabled && self.fresh_window {
+            self.core.last_error_ns()
+        } else {
+            None
+        };
+    }
+
+    /// #119 (1.11.1) — the first phase-lock window after a step measured `error_ns`: the step's
+    /// phase jump is its difference to the error before the step. A re-anchored window (its error
+    /// is 0 by construction) measures nothing.
+    fn measure_step_phase_jump(&mut self, error_ns: Option<i64>, event: AnchorEvent) {
+        let Some(before) = self.step_phase_ref_ns.take() else {
+            return;
+        };
+        if let (Some(after), AnchorEvent::None) = (error_ns, event) {
+            let jump = after.wrapping_sub(before);
+            self.last_step_phase_jump_ns = Some(jump);
+            debug!(
+                "[PHASE-LOCK] the last step moved the phase error by {:+.1}us",
+                jump as f64 / 1_000.0
+            );
+        }
+    }
+
     /// The PTP sender may carry another time base (another grandmaster, or the same one after a
     /// reboot): drop the raw window and re-anchor `D` from the next one, so the wall stays
     /// continuous (never a wall step).
@@ -271,6 +298,8 @@ where
             .core
             .on_window(median_ns, locked, total_correction, dt);
         self.handle_phase_anchor_event(out.event);
+        self.date_sync
+            .measure_step_phase_jump(out.error_ns, out.event);
         self.date_sync.fresh_window = out.error_ns.is_some();
         match out.freq_ppm {
             Some(word) => {
@@ -381,6 +410,8 @@ where
         self.date_sync.pending_median_ns = None;
         self.date_sync.last_t1_ns = None;
         self.date_sync.fresh_window = false;
+        // #119 (1.11.1): no step measured across an outage.
+        self.date_sync.step_phase_ref_ns = None;
         self.pending_syncs.clear();
         self.prev_t1_ns = 0;
         self.prev_t2_ns = 0;

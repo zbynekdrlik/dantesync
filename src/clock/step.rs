@@ -77,6 +77,13 @@ impl StepLead {
     pub fn lead_ns(&self) -> i64 {
         self.lead_ns
     }
+
+    /// One set landed `latency_ns` after its read: move the learned latency half-way towards it,
+    /// by at most [`LEAD_SLEW_NS`].
+    fn observe(&mut self, latency_ns: i64) {
+        let pull = ((latency_ns - self.lead_ns) / 2).clamp(-LEAD_SLEW_NS, LEAD_SLEW_NS);
+        self.lead_ns = (self.lead_ns + pull).clamp(-MAX_LEAD_NS, MAX_LEAD_NS);
+    }
 }
 
 /// What one step did.
@@ -104,22 +111,48 @@ pub fn step_wall<O: StepOps>(
     lead: &mut StepLead,
     requested_ns: i64,
 ) -> Result<StepOutcome, String> {
-    let _ = lead;
-    let r0 = ops.read();
-    let target = r0
-        .coarse_ns
-        .checked_add(requested_ns)
-        .filter(|t| *t > 0)
-        .ok_or_else(|| format!("a step of {requested_ns} ns would leave the valid time range"))?;
-    ops.set(target)?;
-    let r1 = ops.read();
-    let realized = (r1.precise_ns - r0.precise_ns) - (r1.reference_ns - r0.reference_ns);
-    Ok(StepOutcome {
+    let mut out = StepOutcome {
         requested_ns,
-        realized_ns: realized,
-        attempts: 1,
-        coarse_lag_ns: r0.precise_ns - r0.coarse_ns,
-    })
+        realized_ns: 0,
+        attempts: 0,
+        coarse_lag_ns: 0,
+    };
+    if requested_ns == 0 {
+        return Ok(out);
+    }
+    let mut before = ops.read();
+    out.coarse_lag_ns = before.precise_ns - before.coarse_ns;
+    loop {
+        let remaining = requested_ns - out.realized_ns;
+        let target = before
+            .precise_ns
+            .checked_add(remaining)
+            .and_then(|t| t.checked_add(lead.lead_ns))
+            .filter(|t| *t > 0)
+            .ok_or_else(|| {
+                format!("a step of {requested_ns} ns would leave the valid time range")
+            })?;
+        ops.set(target)?;
+        out.attempts += 1;
+        let after = ops.read();
+        // What the set did to the wall: its whole move minus the time that passed meanwhile.
+        let moved =
+            (after.precise_ns - before.precise_ns) - (after.reference_ns - before.reference_ns);
+        // It aimed at `remaining + lead` ahead of the read and landed `moved` ahead of it: the
+        // difference is how long after the read the kernel applied it.
+        lead.observe(remaining + lead.lead_ns - moved);
+        out.realized_ns += moved;
+        let residual = requested_ns - out.realized_ns;
+        // Done within the tolerance; an overshoot is never stepped back (a forward step never runs
+        // the wall backwards, a backward one never forwards); and the sets are bounded.
+        if residual.abs() <= STEP_TOLERANCE_NS
+            || residual.signum() != requested_ns.signum()
+            || out.attempts >= MAX_STEP_ATTEMPTS
+        {
+            return Ok(out);
+        }
+        before = after;
+    }
 }
 
 #[cfg(test)]

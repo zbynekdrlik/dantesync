@@ -1716,6 +1716,8 @@ where
     /// windows, the 2 s grace, the rate tracker, the min-delta filter and the spike filter.
     /// Shared by the NTP step path and the coordinated date step, so both reset identically.
     fn reset_ptp_measurement_after_step(&mut self) {
+        // #119 (1.11.1): the phase-lock error before the step, to measure its jump across it.
+        self.date_sync.arm_step_phase_probe();
         // Clear PTP sample windows to discard post-step transient samples
         self.sample_window.clear();
         self.date_sync.window.clear();
