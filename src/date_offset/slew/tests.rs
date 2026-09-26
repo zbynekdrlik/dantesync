@@ -615,3 +615,19 @@ fn the_promoted_form_heard_just_before_this_boxs_own_end_changes_nothing_119() {
     let wall_end = sl.end_ptp_ns() + sl.to_ns + US;
     assert_eq!(f.take_completed_slew(d, wall_end), Some(-50 * MS));
 }
+
+#[test]
+fn a_forward_slew_from_the_wire_is_not_a_slew_119() {
+    // Only a backward correction is ever slewed. A slew part whose end is not below its start
+    // (not sent by any authority of ours) is read as the plain announce: a forward step.
+    let mut e = ext(5 * S + 51 * MS, 123 * S, 9, true);
+    e.announce.slew = Some(SlewSpec {
+        from_ns: 5 * S,
+        ppm: 100,
+    });
+    assert_eq!(e.announce.as_slew(), None);
+    e.announce.date_offset_ns = 5 * S;
+    assert_eq!(e.announce.as_slew(), None, "a zero-length one neither");
+    e.announce.date_offset_ns = 5 * S - 1;
+    assert!(e.announce.as_slew().is_some());
+}

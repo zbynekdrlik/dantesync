@@ -348,3 +348,56 @@ fn legacy_discipline_never_slews_119() {
     assert_eq!(c.date_sync.slew_rate_ppm(wall_now_ns()), 0.0);
     assert_eq!(c.date_sync.deslew_sample(123_456), (123_456, 123_456));
 }
+
+#[test]
+fn a_failed_edge_write_is_retried_from_the_loop_without_a_ptp_window_119() {
+    // No servo window runs here (as while PTP is offline, when none follows at all): the loop is
+    // the only writer that can apply the slew's rate term. One failed write must not leave the
+    // box without it.
+    let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let (fail, cap) = (fail_next.clone(), captured.clone());
+    let mut clock = MockSystemClock::new();
+    clock.expect_adjust_frequency().returning(move |factor| {
+        if fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow::anyhow!(
+                "simulated SetSystemTimeAdjustmentPrecise failure"
+            ));
+        }
+        cap.lock().expect("cap").push((factor - 1.0) * 1e6);
+        Ok(())
+    });
+    let mut c = PtpController::new(
+        clock,
+        MockPtpNetwork::new(),
+        MockNtpSource::new(),
+        Arc::new(RwLock::new(SyncStatus::default())),
+        phase_lock_config(),
+    );
+    c.current_gm_uuid = Some(PL_GM);
+    c.is_locked = true;
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    c.date_sync.pending_median_ns = Some(d);
+    c.date_sync.pending_t1_ns = PL_PTP_NOW_NS;
+    c.apply_self_tuning_servo(0.0);
+    let pi = c.applied_freq_ppm;
+    // A slew that is already running: the next loop iteration switches the term on.
+    let now_ptp = wall_now_ns() - d;
+    let slew = DateSlew {
+        from_ns: d,
+        to_ns: d - 50_000_000,
+        start_ptp_ns: now_ptp - 100_000_000,
+        ppm: 100,
+    };
+    follow_slew(&mut c, d, slew);
+    captured.lock().unwrap().clear();
+    fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    c.service_date_offset(); // the write fails
+    assert!(captured.lock().unwrap().is_empty());
+    c.service_date_offset(); // retried at once, from the loop
+    let seen = captured.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "retried exactly once: {seen:?}");
+    assert!((seen[0] - (pi - 100.0)).abs() < 1e-9, "{seen:?}");
+    c.service_date_offset(); // applied now: nothing more to write
+    assert_eq!(captured.lock().unwrap().len(), 1);
+}
