@@ -35,6 +35,7 @@ paths:
   - "src/date_offset/daily/tests.rs"
   - "src/date_offset/authority_daily.rs"
   - "src/date_offset/authority_daily_tests.rs"
+  - "src/controller/date_sync/daily.rs"
   - "src/controller/date_sync/daily_tests.rs"
   - "tests/two_clock_bench/daily.rs"
   - "tests/two_clock_bench/measure.rs"
@@ -518,6 +519,12 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
 - A window at or before the last handled one counts as handled (review round 1). A backward step
   larger than the landing's distance from the window start moves the fleet wall back before it.
   The scheduler then saw the night as new: a second decision, and a false SKIPPED 30 min later.
+- An EMERGENCY step re-judges the windows from the wall it will leave (review round 2,
+  `DailyScheduler::on_emergency_step`, called by `on_utc_error`): a window closed there is handled,
+  one open there is still to decide, and the asks are reset. Without it, a master booted 6 h ahead
+  (the case the emergency exists for) marked the 02:00 it first saw as handled, and the emergency
+  step back to 22:00 then hid the next 02:00, SILENTLY (the `<=` handled check extends that to
+  several nights). A forward emergency jump over a window is not reported MISSED either.
 - No step for |error| ≤ 2 ms + 3 σ, for example after a restart right after the night's step.
 
 **What changes by mode:**
@@ -543,7 +550,13 @@ re-join. So in daily mode:
   Otherwise a long outage would leave it a day's drift off, with one large daytime Join at the
   end.
 - Its landing is off by its free-run error, like the rest of its wall. The bench's
-  simultaneity check leaves out a master landing inside its own outage.
+  simultaneity check leaves out a master landing inside its own outage, and the daily scenario
+  bounds that landing directly: within its re-join size + 50 µs of the fleet's median landing.
+- A failed own step while off-line is retried (review round 2, `realign_offline_daily_master`,
+  `src/controller/date_sync/daily.rs`): after the backoff, one Join of `fleet − own`. There is no
+  phase error to measure without PTP, and `realign_master_to_fleet` waits for PTP. The controller
+  test models the failure's aftermath directly (D behind the fleet, the backoff running): no time
+  passes in a controller test, so an announce's instant is never reached there.
 - `master_outage_realign` makes `realign_master_to_fleet` re-join on the measured error even
   though its `D` never left the fleet line. The bench measured −323 µs after 30 min.
 - Without the re-join the bench showed the master 377 µs off for minutes while the PI pulled it

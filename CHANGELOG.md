@@ -32,19 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       one reading after a UTC gap never sets the whole step.
     - A window that opened and closed while another date change was in flight is reported as
       missed (loudly).
+    - An emergency step re-judges the windows from where it lands, so a master that booted
+      hours ahead and was stepped back still steps the next night.
   - **An emergency** (an error beyond `daily_emergency_ms`, default 5000) is stepped at once,
     loudly: a bad boot or a lost UTC reference.
   - **The master's own PTP outage.** In daily mode the master no longer steps its own wall to
     UTC while it has no PTP: that would move it up to a day's drift off the fleet. It free-runs
     on the learned frequency and still takes the fleet's nightly (and emergency) steps on its
-    own wall. Once PTP is back it re-joins the fleet line with one step of the measured
-    free-run error.
+    own wall. If one of those steps fails, it re-joins the fleet line after the 10 s backoff.
+    Once PTP is back it re-joins the fleet line with one step of the measured free-run error.
   - **`system.date_offset.correction`**: `"daily"` (the new default) or `"micro"` (the 1.11
     behaviour, unchanged). The 1.10 step-bound correction (`"bound"`) no longer exists since
     1.11.0; that value, or any other, means `"daily"` with a loud warning. A bad `daily_step_utc`
     means 02:00 with a warning.
   - **Followers need no change.** They apply the nightly step like any announced step,
     counted as `coordinated`.
+
+### Fixed
+
+- CI Coverage: `cargo tarpaulin` runs with `--timeout 300`. Its default 60 s without a ptrace
+  event is shorter than the two-clock bench's quiet stretches on already-covered code.
 
 ### Added
 
