@@ -2791,8 +2791,15 @@ where
         // #119: plus a running date slew's rate term (fleet-common, 0 outside a slew) — composed
         // into the same word, never a second writer (the slew edges re-apply this composition
         // from the loop, `apply_slew_edge`).
-        let f_total = if self.phase_slew.is_some() {
-            phase_slew::compose_frequency(applied_word, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
+        let (f_total, slew_term) = if self.phase_slew.is_some() {
+            (
+                phase_slew::compose_frequency(
+                    applied_word,
+                    self.pending_f_phase_ppm,
+                    DRIFT_MAX_PPM,
+                ),
+                0.0,
+            )
         } else {
             self.compose_slew_word(applied_word)
         };
@@ -2838,8 +2845,10 @@ where
             self.log_phase_lock_word(applied_word);
         }
 
-        if let Err(e) = self.clock.adjust_frequency(factor) {
-            warn!("Clock adjustment failed: {}", e);
+        match self.clock.adjust_frequency(factor) {
+            // #119: the slew's term counts as applied only once the clock carries it.
+            Ok(()) => self.slew_word_written(slew_term, f_total),
+            Err(e) => warn!("Clock adjustment failed: {}", e),
         }
 
         self.update_shared_status();

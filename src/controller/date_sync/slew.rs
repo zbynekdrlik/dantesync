@@ -22,6 +22,10 @@ const RATE_FOLD_MODULUS_NS: i64 = 1_000_000_000;
 /// A slew warning is logged at most this often (the loop runs every 1 ms / 50 µs).
 const SLEW_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// After a failed slew-edge write the loop retries at most this often (a failing clock is not
+/// hammered every 1 ms / 50 µs; a 100 ms late rate term costs ≤ 10 µs at 100 ppm).
+const SLEW_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 impl DateSync {
     /// dantesync#119 — `D` in effect at `wall_ns` (the anchor plus the held slew's displacement).
     pub(in crate::controller) fn d_in_effect(&self, wall_ns: i64) -> Option<i64> {
@@ -95,36 +99,16 @@ where
     S: NtpSource,
 {
     /// #119 — the ONE frequency word with the held slew's rate term added (clamped to the servo's
-    /// envelope), recording which term is in it. `pi_word` is the servo's own word (the phase
-    /// lock's, or the rate servo's), i.e. `applied_freq_ppm`.
-    pub(in crate::controller) fn compose_slew_word(&mut self, pi_word: f64) -> f64 {
-        let now_wall = wall_now_ns();
-        let term = self.date_sync.slew_rate_ppm(now_wall);
-        self.date_sync.applied_slew_ppm = term;
+    /// envelope): `(word, term)`. `pi_word` is the servo's own word (the phase lock's, or the rate
+    /// servo's), i.e. `applied_freq_ppm`. Nothing is recorded here: the caller reports a
+    /// SUCCESSFUL write with [`slew_word_written`](Self::slew_word_written), so a term only counts
+    /// as applied once the clock really carries it.
+    pub(in crate::controller) fn compose_slew_word(&mut self, pi_word: f64) -> (f64, f64) {
+        let term = self.date_sync.slew_rate_ppm(wall_now_ns());
         if term == 0.0 {
-            return pi_word;
+            return (pi_word, 0.0);
         }
         let total = (pi_word + term).clamp(-DRIFT_MAX_PPM, DRIFT_MAX_PPM);
-        let held = self.date_sync.follower.held_slew().map(|h| h.slew);
-        if held.is_some() && held != self.date_sync.slew_start_logged {
-            // One START line per slew, whichever path (the loop's edge or a PTP window) switches
-            // the term on first, however often the word is re-applied after that.
-            self.date_sync.slew_start_logged = held;
-            let remaining = self
-                .date_sync
-                .core
-                .anchor_ns()
-                .and_then(|a| self.date_sync.follower.slew_remaining_ns(a, now_wall))
-                .unwrap_or(0);
-            info!(
-                "[DATE] slew START: D moves {:+}us at {:+.0} ppm (~{} s), the wall never steps \
-                 back — word {:+.3}ppm",
-                (if term < 0.0 { -remaining } else { remaining }) / 1_000,
-                term,
-                (remaining as f64 / (term.abs() * 1_000.0)).round() as i64,
-                total
-            );
-        }
         if total != pi_word + term
             && DateSync::slew_warn_due(&mut self.date_sync.slew_saturation_warned_at)
         {
@@ -134,32 +118,68 @@ where
                 pi_word, term, DRIFT_MAX_PPM, total
             );
         }
-        total
+        (total, term)
+    }
+
+    /// #119 — a word carrying the slew term `term` was written to the clock: record it, and log
+    /// the slew's START once (whichever writer switched the term on first; a rebase or an
+    /// extension of the same running slew does not log it again — the fold resets it).
+    pub(in crate::controller) fn slew_word_written(&mut self, term: f64, total: f64) {
+        self.date_sync.applied_slew_ppm = term;
+        if term == 0.0 || self.date_sync.slew_start_logged {
+            return;
+        }
+        self.date_sync.slew_start_logged = true;
+        let now_wall = wall_now_ns();
+        let remaining = self
+            .date_sync
+            .core
+            .anchor_ns()
+            .and_then(|a| self.date_sync.follower.slew_remaining_ns(a, now_wall))
+            .unwrap_or(0);
+        info!(
+            "[DATE] slew START: D moves {:+}us at {:+.0} ppm (~{} s), the wall never steps back — \
+             word {:+.3}ppm",
+            (if term < 0.0 { -remaining } else { remaining }) / 1_000,
+            term,
+            (remaining as f64 / (term.abs() * 1_000.0)).round() as i64,
+            total
+        );
     }
 
     /// #119 — every loop iteration: when the slew's rate term at this instant differs from the one
-    /// inside the applied word (the slew started, or ended), re-apply the word with it NOW instead
-    /// of at the next PTP window (up to a window late, i.e. up to ~50 µs of relative phase at
-    /// 100 ppm). Same composition, same `adjust_frequency` seam: there is no second frequency path.
+    /// the clock carries (the slew started, or ended, or an earlier write failed), write the word
+    /// with it NOW instead of at the next PTP window (up to a window late, i.e. up to ~50 µs of
+    /// relative phase at 100 ppm; and none follows while PTP is offline). Same composition, same
+    /// `adjust_frequency` seam: there is no second frequency path. After a failed write it is
+    /// retried at most every [`SLEW_RETRY_INTERVAL`], never once per loop iteration.
     pub(in crate::controller) fn apply_slew_edge(&mut self, now_wall: i64) {
         let term = self.date_sync.slew_rate_ppm(now_wall);
         if term == self.date_sync.applied_slew_ppm {
             return;
         }
-        let was = self.date_sync.applied_slew_ppm;
-        let total = self.compose_slew_word(self.applied_freq_ppm);
+        if self
+            .date_sync
+            .slew_write_failed_at
+            .is_some_and(|t| t.elapsed() < SLEW_RETRY_INTERVAL)
+        {
+            return;
+        }
+        let (total, term) = self.compose_slew_word(self.applied_freq_ppm);
         if let Err(e) = self.clock.adjust_frequency(1.0 + total / 1_000_000.0) {
-            // Not in the word: retried on the next loop iteration (no PTP window may follow —
-            // PTP offline); warned at most every few seconds.
-            self.date_sync.applied_slew_ppm = was;
+            self.date_sync.slew_write_failed_at = Some(Instant::now());
             if DateSync::slew_warn_due(&mut self.date_sync.slew_write_warned_at) {
                 warn!(
-                    "[DATE] applying the slew rate {:+.1}ppm failed: {} — retrying",
-                    term, e
+                    "[DATE] applying the slew rate {:+.1}ppm failed: {} — retrying every {} ms",
+                    term,
+                    e,
+                    SLEW_RETRY_INTERVAL.as_millis()
                 );
             }
             return;
         }
+        self.date_sync.slew_write_failed_at = None;
+        self.slew_word_written(term, total);
         self.update_shared_status();
     }
 
@@ -206,6 +226,13 @@ where
                 "[DATE] the master's own scheduler caught up with the fleet slew (seq {}), {:+}ns \
                  off the line — no step",
                 ann.seq, gap
+            );
+        } else if self.date_sync.slew_catch_up_seq != Some(ann.seq) {
+            self.date_sync.slew_catch_up_seq = Some(ann.seq);
+            debug!(
+                "[DATE] the master's own scheduler did not take the fleet slew (seq {}) — it \
+                 re-aligns after the slew",
+                ann.seq
             );
         }
     }

@@ -311,12 +311,17 @@ of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera
   with a counted LATE step, which can be backward (as any late step). A master more than the
   absorb tolerance off the fleet line when a slew runs (its own PTP outage, a failed step) does
   not join the slew; it re-aligns only after the slew ends, with ONE Join of its own wall that
-  then includes the slew's whole amount — a backward step of that size on the master alone
-  (never on a follower). The local NTP fallback path (no authority heard) is uncoordinated and
+  then includes the part of the slew it did not follow — up to the slew's whole amount, a
+  backward step on the master alone (never on a follower). The local NTP fallback path (no authority heard) is uncoordinated and
   unchanged.
 - **Only a BACKWARD slew is a slew** (`DateAnnounce::as_slew` ignores `to ≥ from`): the fixed-
   point solve has no fixed point for a forward slew at some walls (a 2-cycle), and no authority
-  sends one. A failed slew-edge write is retried from the loop (no PTP window may follow).
+  sends one.
+- **The slew's term counts as applied only after a SUCCESSFUL write** (`compose_slew_word`
+  records nothing; every writer — the servo window, the PTP-offline hold, the loop edge — calls
+  `slew_word_written` on `Ok`). A failed write is retried from the loop (no PTP window may
+  follow: PTP offline), at most every 100 ms; START is logged once per slew, after the first
+  successful write, and is not repeated by a rebase or an extension (review rounds 2-3).
 - **Rollout (v1.10.0): the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of
   the v2 extension and would step back at the slew's start.
 

@@ -202,8 +202,9 @@ impl HeldSlew {
 ///
 /// Iterated until it stops changing. For a backward slew the map is non-decreasing in `d` with a
 /// slope ≤ 500 ppm, so the iterates are monotone and settle on an exact fixed point within a few
-/// rounds (measured: ≤ 5 for 50 ms at 500 ppm, ≤ 7 for amounts of seconds); the cap only bounds
-/// a pathological input. Only backward slews reach it (`DateAnnounce::as_slew`). At a nanosecond boundary of the floored
+/// rounds; the cap only bounds a pathological input. Only backward slews reach it
+/// (`DateAnnounce::as_slew`); the exactness is pinned by
+/// `the_solved_d_is_exactly_the_schedule_at_the_solved_ptp_instant_119`. At a nanosecond boundary of the floored
 /// schedule two adjacent PTP instants can give the same wall; the solve then settles on one of
 /// them, and since every box and the authority evaluate that SAME instant, their `D` agree to
 /// the nanosecond.
@@ -220,7 +221,7 @@ pub fn solve_displacement(h: &HeldSlew, anchor_ns: i64, wall_ns: i64) -> i64 {
     d
 }
 
-/// A bound on the fixed-point rounds of [`solve_displacement`] (it settles in ≤ 7).
+/// A bound on the fixed-point rounds of [`solve_displacement`] (it settles within a few).
 const SOLVE_MAX_ROUNDS: usize = 16;
 
 #[cfg(test)]

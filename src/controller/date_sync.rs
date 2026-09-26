@@ -95,9 +95,13 @@ pub(super) struct DateSync {
     /// about (each throttled on its own: the loop runs every 1 ms / 50 µs).
     pub(super) slew_write_warned_at: Option<Instant>,
     pub(super) slew_saturation_warned_at: Option<Instant>,
-    /// dantesync#119 — the slew whose START was logged (one line per slew, however often its
-    /// word is re-applied).
-    pub(super) slew_start_logged: Option<crate::date_offset::DateSlew>,
+    /// dantesync#119 — the running slew's START was logged (one line per slew, however often its
+    /// word is re-applied, rebased or extended; reset when it is folded).
+    pub(super) slew_start_logged: bool,
+    /// dantesync#119 — when the last slew-edge write failed (the retry is rate-bounded).
+    pub(super) slew_write_failed_at: Option<Instant>,
+    /// dantesync#119 — the fleet slew the master's catch-up last failed to take (logged once).
+    pub(super) slew_catch_up_seq: Option<u32>,
 }
 
 impl DateSync {
@@ -158,7 +162,9 @@ impl DateSync {
             rate_folded_ns: 0,
             slew_write_warned_at: None,
             slew_saturation_warned_at: None,
-            slew_start_logged: None,
+            slew_start_logged: false,
+            slew_write_failed_at: None,
+            slew_catch_up_seq: None,
         }
     }
 
@@ -462,10 +468,11 @@ where
             self.last_adj_ppm = word;
             self.applied_freq_ppm = word;
             // #119: a running slew keeps its rate term through the outage (open loop, with the
-            // rest of the fleet).
-            let total = self.compose_slew_word(word);
-            if let Err(e) = self.clock.adjust_frequency(1.0 + total / 1_000_000.0) {
-                warn!("[PHASE-LOCK] holding {:+.3}ppm failed: {}", word, e);
+            // rest of the fleet). Recorded only if written: else the loop retries it.
+            let (total, term) = self.compose_slew_word(word);
+            match self.clock.adjust_frequency(1.0 + total / 1_000_000.0) {
+                Ok(()) => self.slew_word_written(term, total),
+                Err(e) => warn!("[PHASE-LOCK] holding {:+.3}ppm failed: {}", word, e),
             }
             info!(
                 "[PHASE-LOCK] disengaged (PTP offline) — holding the learned {:+.3}ppm",
@@ -630,7 +637,8 @@ where
                 if on_line {
                     let act = self.date_sync.follower.on_announce(ann, base, now_wall);
                     debug!("[DATE] master's own scheduler: {:?}", act);
-                    // #119: an extension heard on the line may land within a ns of D.
+                    // #119: defensive — on the line D and the authority agree to the ns, so an
+                    // extension changes nothing but the end (the bench asserts exactly that).
                     if let FollowAction::Absorb { new_anchor_ns } = act {
                         self.date_sync.core.set_anchor(new_anchor_ns);
                     }
@@ -772,6 +780,7 @@ where
         // iteration on every box, like a coordinated step).
         let now_wall = wall_now_ns();
         if let Some(fold) = self.date_sync.fold_completed_slew(now_wall) {
+            self.date_sync.slew_start_logged = false;
             info!(
                 "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
                 fold / 1_000,
