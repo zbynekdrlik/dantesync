@@ -80,7 +80,8 @@ own user login password). Windows boxes are reached via MCP only in this procedu
      every box applies as today's steps: uniform. Verify on the master after it:
      `date_slew_ppm` / `date_slew_active` / `date_slew_remaining_ms` appear in `/status`, and at
      the next backward correction the journal shows `[DATE] slew START` then `[DATE] slew DONE`
-     on every box and no `[DATE] stepped -…`.
+     on every box and no `[DATE] stepped -…` (a backward step appears only after a
+     `date correction too large to slew` warning: a correction beyond 2 × the step bound).
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

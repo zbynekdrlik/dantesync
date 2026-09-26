@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs wall time back on every box at once, and wall-time consumers lose audio: the camera-box
   stream OBS lost 43.7 ms of Dante audio at the −51 ms fleet step (camera-box#1372), while the
   forward steps lost nothing. Now only a positive correction (the fleet behind UTC) is a
-  coordinated step. A negative one is announced as a coordinated slew: from its start instant
+  coordinated step. A negative one up to 2 × the step bound (100 ms by default) is announced as a
+  coordinated slew (a larger one is an abnormal state — a master booting on a bad NTP reading — and
+  is a coordinated step, logged `date correction too large to slew`): from its start instant
   (the usual ≥ 5 s lead) every box moves the fleet date offset down at `slew_ppm` (new key
   `system.date_offset.slew_ppm`, default 100 = 50 ms in 500 s, clamped 10-500) until it is paid.
   The schedule is a pure function of PTP time, so all boxes move together. The rate term is part

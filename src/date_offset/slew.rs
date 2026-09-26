@@ -59,7 +59,7 @@ pub fn slew_cap_ns(step_bound_ns: i64) -> i64 {
 pub fn correction_kind(correction_ns: i64, step_bound_ns: i64) -> CorrectionKind {
     if correction_ns >= 0 {
         CorrectionKind::Step
-    } else if step_bound_ns == i64::MIN {
+    } else if correction_ns.unsigned_abs() > slew_cap_ns(step_bound_ns).unsigned_abs() {
         CorrectionKind::TooLargeToSlew
     } else {
         CorrectionKind::Slew

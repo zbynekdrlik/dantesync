@@ -460,6 +460,7 @@ impl DateAuthority {
             // An extension beyond the slew cap is not slewed: it waits for the end and is then
             // stepped (`TooLargeToSlew`), like any correction that large.
             let extendable = sign < 0
+                && correction_kind(error_ns, self.step_bound_ns) == CorrectionKind::Slew
                 && s.active_at(now_ptp_ns)
                 && s.end_ptp_ns().saturating_sub(now_ptp_ns) >= self.lead_ns;
             if !extendable {

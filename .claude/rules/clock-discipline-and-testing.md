@@ -314,6 +314,13 @@ of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera
   then includes the part of the slew it did not follow — up to the slew's whole amount, a
   backward step on the master alone (never on a follower). The local NTP fallback path (no authority heard) is uncoordinated and
   unchanged.
+- **The slew cap (ROZHODNUTÉ issuecomment-5842590141):** a backward correction beyond
+  `slew_cap_ns` = 2 × the step bound (100 ms by default, ~17 min at 100 ppm) is an ABNORMAL state
+  (typically a master booted on a bad NTP reading) and is a coordinated STEP on every box
+  (`CorrectionKind::TooLargeToSlew`), logged `date correction too large to slew`; a running slew
+  is never extended past the cap either (the rest is stepped after it). A bench scenario must keep
+  its own corrections under the cap if it means to exercise slews (the UTC-jump one uses 60/70/60
+  ms jumps with UTC at 0 ppm vs GM A: 80 ms jumps on −15 ppm drift reached −130 ms).
 - **Only a BACKWARD slew is a slew** (`DateAnnounce::as_slew` ignores `to ≥ from`): the fixed-
   point solve has no fixed point for a forward slew at some walls (a 2-cycle), and no authority
   sends one.
