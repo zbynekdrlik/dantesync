@@ -264,6 +264,32 @@ fn a_d_moved_by_anything_but_the_step_voids_the_steps_measurement_119() {
 }
 
 #[test]
+fn the_real_ntp_step_path_is_measured_119() {
+    // A follower that has not joined an authority takes the LOCAL NTP step (two agreeing 20 ms
+    // readings) through `check_ntp_utc_tracking` itself. That path moves D before it resets the
+    // measurement, so the probe measures the step instead of voiding it.
+    let mut ntp = MockNtpSource::new();
+    ntp.expect_get_offset()
+        .returning(|| Ok(one_offset(20_000, 1)));
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller(clock, ntp, false);
+    window_at(&mut c, d, 12_000, 1);
+    for _ in 0..6 {
+        if c.date_sync.last_step.is_some() {
+            break;
+        }
+        c.last_ntp_check = Instant::now() - Duration::from_secs(3_600);
+        c.check_ntp_utc_tracking();
+    }
+    let (delta, _, kind) = c.date_sync.last_step.expect("the local NTP path stepped");
+    assert_eq!(kind, "local");
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d + delta));
+    window_at(&mut c, d + delta, 12_000 + 1_000, 6);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, Some(1_000));
+}
+
+#[test]
 fn an_outage_between_the_step_and_its_first_window_voids_the_measurement_119() {
     let mut clock = MockSystemClock::new();
     clock.expect_step_clock().returning(|_, _| Ok(()));

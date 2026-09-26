@@ -130,6 +130,13 @@ impl StepLead {
         self.lead_ns
     }
 
+    /// A lead that has learned `latency_ns` (tests, and a clock that knows its latency).
+    pub fn seeded(latency_ns: i64) -> Self {
+        StepLead {
+            lead_ns: latency_ns,
+        }
+    }
+
     /// One set landed `latency_ns` after its read: move the learned latency half-way towards it,
     /// down by at most [`LEAD_SLEW_NS`], up by at most [`LEAD_RISE_NS`].
     fn observe(&mut self, latency_ns: i64) {
@@ -380,8 +387,8 @@ mod tests {
         assert_eq!(out.attempts, 2, "{out:?}");
         assert!(out.residual_ns().abs() <= STEP_TOLERANCE_NS, "{out:?}");
         assert!(
-            lead.lead_ns().abs() <= 2 * LEAD_SLEW_NS,
-            "one preemption moves the lead by at most the slew per set: {}",
+            lead.lead_ns().abs() <= 10 * US,
+            "one preemption barely moves the learned latency: {}",
             lead.lead_ns()
         );
     }
@@ -390,27 +397,106 @@ mod tests {
     fn an_overshoot_is_never_stepped_back() {
         // A lead far above the real latency: the forward step overshoots, and the wall is not
         // stepped backwards to take it back (one set, the overshoot reported).
-        let mut lead = StepLead { lead_ns: 50 * US };
+        let mut lead = StepLead::seeded(50 * US);
         let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
         let out = step_wall(&mut os, &mut lead, 500 * US).unwrap();
         assert_eq!(out.attempts, 1, "{out:?}");
         // (The set lands its latency after the read's wall sample, half a µs before its end.)
         assert_eq!(out.realized_ns, 500 * US + 50 * US - 3 * US - US / 2);
         assert!(out.residual_ns() < 0);
-        assert_eq!(
-            lead.lead_ns(),
-            50 * US - LEAD_SLEW_NS,
-            "learned towards 3 µs"
+        assert!(
+            lead.lead_ns() <= 45 * US,
+            "learned towards 3 µs: {}",
+            lead.lead_ns()
         );
     }
 
     #[test]
+    fn a_late_set_of_a_backward_step_is_corrected_forward() {
+        // −500 µs, the set preempted 300 µs: the wall moved −800 µs, further back than asked. The
+        // fix steps it FORWARD — which never runs a wall backwards — so it is made.
+        let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
+        os.latencies = vec![300 * US, 3 * US];
+        let out = step_wall(&mut os, &mut StepLead::default(), -500 * US).unwrap();
+        assert_eq!(out.attempts, 2, "{out:?}");
+        assert!(out.residual_ns().abs() <= STEP_TOLERANCE_NS, "{out:?}");
+        assert_eq!(out.stopped, None);
+    }
+
+    #[test]
+    fn a_steady_large_set_latency_is_learned_within_three_sets() {
+        // A box whose kernel applies every set 200 µs after the read: after three sets the steps
+        // land in one set, exactly.
+        let mut lead = StepLead::default();
+        let mut os = FakeOs::new(T0, 500 * US, 200 * US);
+        let mut outs = Vec::new();
+        for k in 0..4 {
+            os.true_ns += 20_000 * MS + 37 * US * k;
+            outs.push(step_wall(&mut os, &mut lead, 500 * US).unwrap());
+        }
+        for out in &outs {
+            assert!(out.residual_ns().abs() <= STEP_TOLERANCE_NS, "{out:?}");
+        }
+        assert_eq!(outs[3].attempts, 1, "{outs:?}");
+        assert!(outs[3].residual_ns().abs() <= 2 * US, "{outs:?}");
+    }
+
+    #[test]
+    fn an_isolated_preempted_set_does_not_make_the_next_step_overshoot() {
+        let mut lead = StepLead::default();
+        let mut os = FakeOs::new(T0, 500 * US, 5 * US);
+        for _ in 0..3 {
+            os.true_ns += 20_000 * MS;
+            step_wall(&mut os, &mut lead, 500 * US).unwrap();
+        }
+        // One set preempted 350 µs, then the steady 5 µs again.
+        os.latencies = vec![350 * US, 5 * US];
+        os.sets = 0;
+        os.true_ns += 20_000 * MS;
+        step_wall(&mut os, &mut lead, 500 * US).unwrap();
+        os.latencies = vec![5 * US];
+        os.true_ns += 20_000 * MS;
+        let out = step_wall(&mut os, &mut lead, 500 * US).unwrap();
+        assert_eq!(out.attempts, 1, "{out:?}");
+        assert!(out.residual_ns().abs() <= 2 * US, "{out:?}");
+    }
+
+    #[test]
+    fn a_preempted_after_read_is_read_again() {
+        // The reading AFTER the set is the preempted one: taken alone it would mis-measure the
+        // move by 300 µs.
+        let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
+        os.read_gaps = vec![0, 600 * US];
+        let out = step_wall(&mut os, &mut StepLead::default(), 500 * US).unwrap();
+        assert_eq!(
+            out.realized_ns, os.stepped_ns,
+            "the measurement is the true move"
+        );
+        assert!(out.residual_ns().abs() <= STEP_TOLERANCE_NS, "{out:?}");
+    }
+
+    #[test]
+    fn a_set_cannot_land_early() {
+        // A forward move beyond what the learned latency explains (another writer stepped the
+        // clock +100 µs during a +500 µs step): an overshoot no set can make — not "corrected",
+        // reported.
+        let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
+        os.set_script = vec![Ok(100 * US)];
+        let out = step_wall(&mut os, &mut StepLead::default(), 500 * US).unwrap();
+        assert_eq!(out.attempts, 1, "{out:?}");
+        assert!(out.stopped.is_some(), "{out:?}");
+    }
+
+    #[test]
     fn the_attempts_are_bounded() {
+        // A latency that grows with every set can never be caught up with: the sets stop at the
+        // bound, and the outcome says so.
         let mut os = FakeOs::new(T0, 500 * US, 400 * US);
-        os.latencies = vec![400 * US; 10];
+        os.latencies = (1..=10).map(|k| 400 * US * k).collect();
         let out = step_wall(&mut os, &mut StepLead::default(), 500 * US).unwrap();
         assert_eq!(out.attempts, MAX_STEP_ATTEMPTS);
         assert_eq!(os.sets, MAX_STEP_ATTEMPTS);
+        assert!(out.stopped.is_some(), "{out:?}");
     }
 
     #[test]

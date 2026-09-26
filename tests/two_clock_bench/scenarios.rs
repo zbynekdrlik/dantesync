@@ -536,6 +536,34 @@ fn a_master_booted_3_s_ahead_is_stepped_back_once_60_ms_ahead_is_slewed_119() {
     assert_eq!(r.wall_went_back, 0);
 }
 
+#[test]
+fn windows_boxes_take_the_backward_steps_exactly_too_119() {
+    // #119 (1.11.1): every BACKWARD step through the Windows step law — the boot joins of boxes
+    // booted ahead, and the master booting 3 s ahead (one coordinated backward step on every box)
+    // — lands within the law's tolerance, and the whole day stays inside every envelope.
+    let mut sc = Scenario::plain("Windows boxes, master boots 3 s AHEAD: stepped", 8.0, true);
+    sc.master_boot_err_ns = 3 * S;
+    sc.expects_too_large_step = true;
+    sc.windows_boxes = &WINDOWS_BOXES;
+    let r = run(&sc);
+    check(&sc, &r);
+    for &i in &WINDOWS_BOXES {
+        assert!(
+            r.steps[i].iter().any(|s| s.1 < -2 * S),
+            "box {i} took the 3 s backward step"
+        );
+        println!(
+            "[windows, backward] box {i}: worst step residual {} µs",
+            r.max_step_residual_ns[i] as f64 / 1e3
+        );
+        assert!(
+            r.max_step_residual_ns[i] <= 2 * dantesync::clock::step::STEP_TOLERANCE_NS,
+            "box {i}: a step landed {} µs off",
+            r.max_step_residual_ns[i] as f64 / 1e3
+        );
+    }
+}
+
 // A crate root resolves `mod x;` beside itself; see the harness's own `#[path]` note.
 #[path = "micro.rs"]
 mod micro;

@@ -613,10 +613,11 @@ mod tests {
                     (45_000_000..1_000_000_000).contains(&d_reference),
                     "the reference advanced {d_reference} ns in a 50 ms sleep"
                 );
-                // The coarse clock is the precise one at the last clock interrupt: never ahead of
-                // it, never more than one (default 15.6 ms) tick behind.
+                // The coarse clock is the precise one at the last clock interrupt: never more than
+                // one (default 15.6 ms) tick behind it (and, read first, not ahead — a 1 ms margin
+                // for an adjustment the runner's own time service may be slewing).
                 assert!(
-                    (0..16_000_000).contains(&(b.precise_ns - b.coarse_ns)),
+                    (-1_000_000..16_000_000).contains(&(b.precise_ns - b.coarse_ns)),
                     "{b:?}"
                 );
                 ((b.precise_ns - a.precise_ns) - d_reference).abs()
