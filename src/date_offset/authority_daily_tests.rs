@@ -190,8 +190,13 @@ fn a_master_booted_6_h_ahead_is_stepped_back_at_once_and_still_steps_the_next_ni
     // From ~22:00 (fleet) to past the next 02:00.
     l.run(5 * 3_600, |_| false);
     assert_eq!(l.steps.len(), 2, "the next night stepped: {:?}", l.steps);
+    // The emergency step (the whole reading) leaves the fleet wall off the loop's whole-second
+    // grid: the window is judged to the second.
     let tod = (l.steps[1].2 - DAY0).rem_euclid(86_400 * S);
-    assert_eq!(tod, 2 * 3_600 * S, "when the window opens");
+    assert!(
+        (2 * 3_600 * S..2 * 3_600 * S + S).contains(&tod),
+        "when the window opens: {tod}"
+    );
     assert!(
         l.events
             .iter()
