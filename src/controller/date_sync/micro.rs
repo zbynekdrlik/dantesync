@@ -144,9 +144,9 @@ where
                 next_window_wall_ns,
             }) => {
                 warn!(
-                    "[DATE] AUTHORITY: nightly date step SKIPPED: no UTC reading through the whole \
-                     window — the fleet date runs free at the grandmaster's rate until the next \
-                     window at {} (fleet time)",
+                    "[DATE] AUTHORITY: nightly date step SKIPPED: not enough fresh UTC readings \
+                     through the whole window — the fleet date runs free at the grandmaster's \
+                     rate until the next window at {} (fleet time)",
                     fmt(next_window_wall_ns)
                 );
                 self.update_shared_status();

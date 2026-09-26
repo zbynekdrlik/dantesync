@@ -472,10 +472,12 @@ impl DateAuthority {
             return None;
         }
         self.over_bound = None;
-        self.pending = Some((
+        let (target, land) = (
             self.current_ns.saturating_add(error_ns),
             now_ptp_ns.saturating_add(self.lead_ns),
-        ));
+        );
+        self.pending = Some((target, land));
+        self.daily_after_emergency(land, target);
         self.micro_kind = false;
         // The kept readings described the abnormal state; the micro estimate starts again.
         self.micro.clear();

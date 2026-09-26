@@ -544,6 +544,49 @@ where
         self.date_sync.master_outage_realign = false;
     }
 
+    /// #119 (1.12, review round 2) — a DAILY-mode master without PTP whose own D is off the fleet
+    /// D (a step of its own failed) steps its wall back onto the fleet line once the failure's
+    /// backoff has passed: one Join of the difference. With no PTP there is no phase error to
+    /// measure and no re-alignment window ([`Self::realign_master_to_fleet`] waits for PTP), so
+    /// without this it would stay a whole nightly step off the fleet until PTP returns. Nothing
+    /// while a change is in flight, and nothing in micro mode (its local NTP path runs instead).
+    fn realign_offline_daily_master(&mut self) {
+        if !self.date_sync.daily()
+            || !self.ptp_offline
+            || self.in_step_backoff()
+            || self.date_sync.core.rebase_pending()
+        {
+            return;
+        }
+        let (Some(base), Some(a)) = (
+            self.date_sync.core.anchor_ns(),
+            self.date_sync.authority.as_ref(),
+        ) else {
+            return;
+        };
+        let now_wall = wall_now_ns();
+        let own = self.date_sync.follower.in_effect_ns(base, now_wall);
+        let now_ptp = now_wall.wrapping_sub(own);
+        if a.pending_step_ns(now_ptp).is_some()
+            || a.slew_in_progress(now_ptp).is_some()
+            || self.date_sync.follower.pending().is_some()
+            || self.date_sync.follower.held_slew().is_some()
+        {
+            return;
+        }
+        let delta = a.in_effect_ns(now_ptp).wrapping_sub(own);
+        if delta == 0 {
+            return;
+        }
+        let seq = a.seq();
+        warn!(
+            "[DATE] the off-line master is {:+}us off the fleet date offset (a failed step) — \
+             stepping its OWN wall back to the fleet line",
+            delta / 1_000
+        );
+        self.apply_date_step(delta, StepKind::Join, seq);
+    }
+
     /// #117 / #88 — the NTP reading under the phase lock. Returns true when it was fully handled
     /// here (the caller must NOT run the NTP step path):
     ///
@@ -828,6 +871,7 @@ where
             self.ensure_date_authority();
             self.tick_date_authority();
             self.realign_master_to_fleet();
+            self.realign_offline_daily_master();
             return;
         }
         let lost = match self.date_sync.last_applicable_reply {

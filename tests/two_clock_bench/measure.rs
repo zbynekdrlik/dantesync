@@ -28,7 +28,8 @@ impl Bench<'_> {
         };
         // The master is judged against the fleet only while it is ON the fleet line (PTP online
         // and its D equal to the authority's): during its own PTP outage it runs the local NTP
-        // date path by design.
+        // date path by design (micro mode) or free-runs with the fleet D (daily mode, #119 1.12:
+        // its free-run error is bounded by the daily scenarios on their own).
         let a = self.authority.as_ref().unwrap();
         let m = &self.boxes[0];
         let m_d = m.d_in_effect();

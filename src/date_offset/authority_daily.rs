@@ -49,6 +49,15 @@ impl DateAuthority {
         }
     }
 
+    /// dantesync#119 (1.12) — an emergency step to `new_offset_ns` was announced to take effect at
+    /// `land_ptp_ns`: the nightly scheduler judges its windows afresh from the wall it will leave
+    /// ([`DailyScheduler::on_emergency_step`]). Nothing in micro mode.
+    pub(super) fn daily_after_emergency(&mut self, land_ptp_ns: i64, new_offset_ns: i64) {
+        if let Some(daily) = self.daily.as_mut() {
+            daily.on_emergency_step(land_ptp_ns.wrapping_add(new_offset_ns));
+        }
+    }
+
     /// dantesync#119 (1.12) — the nightly step: the [`DailyScheduler`] decides on the FLEET wall
     /// (`PTP now + D`; nothing is in flight here, so `D` is `current_ns`) from the micro
     /// estimate at the landing instant — `None` without a UTC reading in the last

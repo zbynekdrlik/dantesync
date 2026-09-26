@@ -277,9 +277,20 @@ impl DailyScheduler {
     }
 
     /// An EMERGENCY step was announced: the fleet wall will read `post_step_wall_ns` once it has
-    /// landed (review round 2).
+    /// landed. The windows are judged afresh from there (review round 2): one already closed at
+    /// that wall is handled, one open there is still to decide, and every later one is ahead —
+    /// so a step BACK across a night never hides the next window, and nothing it jumped over
+    /// (either way) is reported missed.
     pub fn on_emergency_step(&mut self, post_step_wall_ns: i64) {
-        let _ = post_step_wall_ns;
+        let start = self.window_start(post_step_wall_ns);
+        let open = post_step_wall_ns.saturating_sub(start) < DAILY_WINDOW_NS;
+        self.done_window = Some(if open {
+            start.saturating_sub(DAY_NS)
+        } else {
+            start
+        });
+        self.waiting_window = None;
+        self.last_asked_wall = None;
     }
 
     /// A nightly step of `amount_ns` was announced to land at the fleet wall `landing_wall_ns`.
