@@ -57,8 +57,11 @@ where
         let Some(ann) = announced else {
             return;
         };
-        let on_line = own == fleet && !self.ptp_offline && !self.in_step_backoff();
-        if self.date_sync.daily() {
+        let daily = self.date_sync.daily();
+        // #119 (1.12): a daily-mode master without PTP keeps the fleet D (no local NTP steps), so
+        // it takes the fleet's steps on its own wall too.
+        let on_line = own == fleet && (!self.ptp_offline || daily) && !self.in_step_backoff();
+        if daily {
             // #119 (1.12): the nightly step — one a night, loud.
             info!(
                 "[DATE] AUTHORITY: nightly date step {:+.3} ms (the whole UTC error, a coordinated \
@@ -133,8 +136,8 @@ where
                 error_ns as f64 / 1e6
             ),
             Some(DailyDecision::Waiting { window_end_wall_ns }) => warn!(
-                "[DATE] AUTHORITY: nightly date step waiting: no fresh UTC reading at the window — \
-                 it is made as soon as UTC is back, until {} (fleet time; ntp_age_s)",
+                "[DATE] AUTHORITY: nightly date step waiting: not enough fresh UTC readings at the \
+                 window — it is made once UTC is back (see ntp_age_s), until {} (fleet time)",
                 fmt(window_end_wall_ns)
             ),
             Some(DailyDecision::Skipped {
@@ -144,6 +147,17 @@ where
                     "[DATE] AUTHORITY: nightly date step SKIPPED: no UTC reading through the whole \
                      window — the fleet date runs free at the grandmaster's rate until the next \
                      window at {} (fleet time)",
+                    fmt(next_window_wall_ns)
+                );
+                self.update_shared_status();
+            }
+            Some(DailyDecision::Missed {
+                next_window_wall_ns,
+            }) => {
+                warn!(
+                    "[DATE] AUTHORITY: nightly date step MISSED: the window closed while another \
+                     date change was in flight (or the daemon stalled) — the fleet date runs free \
+                     until the next window at {} (fleet time)",
                     fmt(next_window_wall_ns)
                 );
                 self.update_shared_status();

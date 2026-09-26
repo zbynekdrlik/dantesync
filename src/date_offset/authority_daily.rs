@@ -57,7 +57,7 @@ impl DateAuthority {
     /// (they describe the error once it has landed), as for a micro-correction.
     pub(super) fn daily_tick(&mut self, now_ptp_ns: i64, land: i64) -> Option<DateAnnounce> {
         let wall = now_ptp_ns.wrapping_add(self.current_ns);
-        let estimate = if self.micro.fresh(now_ptp_ns) {
+        let estimate = if self.micro.settled(now_ptp_ns) {
             self.micro.estimate(land)
         } else {
             None

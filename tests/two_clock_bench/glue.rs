@@ -43,6 +43,13 @@ pub(super) fn master_publishes_after_ntp(_ptp_offline: bool) -> bool {
 /// Whether the master's local NTP step refreshes it (`note_local_date_step`).
 pub(super) const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = true;
 
+/// Whether the master takes its authority's announce on its own wall (`ntp_under_date_authority`
+/// / `tick_date_authority`): only on the fleet line. #119 (1.12): a daily-mode master without PTP
+/// still is (its D is the fleet D; it takes no local NTP steps).
+fn master_on_line(d: i64, fleet: i64, ptp_offline: bool, daily: bool) -> bool {
+    d == fleet && (!ptp_offline || daily)
+}
+
 /// #119 (1.12) — whether the master runs its local NTP step path on its OWN wall while it has no
 /// PTP (`ntp_under_date_authority`). In daily mode it does not: the fleet line is deliberately up
 /// to a day's drift off UTC, so stepping to UTC would move the master off it by that much (and
@@ -84,12 +91,13 @@ pub(super) fn master_feed_authority(
     a: &mut DateAuthority,
     utc_err_ns: i64,
     ptp_offline: bool,
+    daily: bool,
 ) -> Option<(DateAnnounce, bool, i64)> {
     let d = m.d_in_effect();
     let now_ptp = m.wall_ns() - d;
     let fleet = a.in_effect_ns(now_ptp);
     let fleet_err = utc_err_ns + (d - fleet);
-    let on_line = d == fleet && !ptp_offline;
+    let on_line = master_on_line(d, fleet, ptp_offline, daily);
     a.on_utc_error(fleet_err, now_ptp)
         .map(|ann| (ann, on_line, fleet))
 }
@@ -101,6 +109,7 @@ pub(super) fn master_tick_authority(
     m: &Box_,
     a: &mut DateAuthority,
     ptp_offline: bool,
+    daily: bool,
 ) -> Option<(DateAnnounce, bool, i64)> {
     if m.core.rebase_pending() {
         return None;
@@ -108,7 +117,7 @@ pub(super) fn master_tick_authority(
     let d = m.d_in_effect();
     let now_ptp = m.wall_ns() - d;
     let fleet = a.in_effect_ns(now_ptp);
-    let on_line = d == fleet && !ptp_offline;
+    let on_line = master_on_line(d, fleet, ptp_offline, daily);
     a.on_tick(now_ptp).map(|ann| (ann, on_line, fleet))
 }
 

@@ -204,15 +204,22 @@ fn check(sc: &Scenario, r: &RunResult) {
         );
     }
     // SIMULTANEITY: every announced step landed on every box that applied it within 100 µs.
+    // (#119 1.12: a daily-mode master takes the fleet's step during its own PTP outage too, at its
+    // free-running wall: that landing is off by its free-run error, like the rest of its wall.)
     let mut worst_spread = 0.0f64;
+    let in_master_outage =
+        |i: usize, t_ns: f64| i == 0 && sc.master_offline_at((t_ns / TRUE_DT_NS) as u64);
     for (seq, _) in &r.announced {
         let landings: Vec<f64> = r
             .steps
             .iter()
-            .flat_map(|steps| {
+            .enumerate()
+            .flat_map(|(i, steps)| {
                 steps
                     .iter()
-                    .filter(|s| s.2 == StepKind::Coordinated && s.0 == *seq)
+                    .filter(move |s| {
+                        s.2 == StepKind::Coordinated && s.0 == *seq && !in_master_outage(i, s.3)
+                    })
                     .map(|s| s.3)
             })
             .collect();

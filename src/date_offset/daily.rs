@@ -20,9 +20,9 @@
 //!   loudly. `crate::date_offset::DateAuthority::on_utc_error` does that: it is the abnormal-step
 //!   path with its cap raised from 2 × the step bound to the emergency cap.
 //!
-//! The window is read on the FLEET-line wall (`PTP time + D`, the time every box shows), which
-//! trails UTC by the accumulated error. So it opens at most that late (≤ ~1.5 s) after
-//! `daily_step_utc` in UTC.
+//! The window is read on the FLEET-line wall (`PTP time + D`, the time every box shows), which is
+//! off UTC by the accumulated error. So it opens that much (≤ ~1.5 s on the rig) off
+//! `daily_step_utc` in UTC: later when the fleet runs behind UTC, earlier when it runs ahead.
 //!
 //! This module is the DECISION only: pure, explicit time inputs, no I/O. The error estimate is
 //! the micro scheduler's robust line (`crate::date_offset::MicroScheduler`), fed exactly as in
@@ -191,6 +191,9 @@ pub struct DailyScheduler {
     done_window: Option<i64>,
     /// The start of the window that is waiting for UTC.
     waiting_window: Option<i64>,
+    /// The fleet wall at the previous ask: a window that opened after it and has closed by now
+    /// was never asked in (reported `Missed`); `None` before the first ask (a boot).
+    last_asked_wall: Option<i64>,
     /// The last nightly step announced: (the fleet-wall instant it lands on, its size), ns.
     last_step: Option<(i64, i64)>,
 }
@@ -201,6 +204,7 @@ impl DailyScheduler {
             cfg,
             done_window: None,
             waiting_window: None,
+            last_asked_wall: None,
             last_step: None,
         }
     }
@@ -222,17 +226,29 @@ impl DailyScheduler {
     /// would land, or `None` without a fresh UTC reading.
     ///
     /// A window already past at the first call (a boot in the afternoon) is taken as handled,
-    /// silently; a window is reported skipped only when this scheduler waited in it.
+    /// silently; one that closed while this scheduler waited in it is reported `Skipped`, and one
+    /// that opened and closed between two asks is reported `Missed`.
+    ///
+    /// A window at or before the last handled one is handled too: a backward step can land the
+    /// fleet wall before the start of the window it was decided in, and the night must not be
+    /// decided again.
     pub fn decide(&mut self, wall_ns: i64, estimate: Option<MicroEstimate>) -> DailyDecision {
         let start = self.window_start(wall_ns);
-        if self.done_window == Some(start) {
+        let asked_before = self.last_asked_wall.replace(wall_ns);
+        if self.handled(start) {
             return DailyDecision::Idle;
         }
         if wall_ns.saturating_sub(start) >= DAILY_WINDOW_NS {
             self.done_window = Some(start);
+            let next_window_wall_ns = start.saturating_add(DAY_NS);
             if self.waiting_window.take() == Some(start) {
                 return DailyDecision::Skipped {
-                    next_window_wall_ns: start.saturating_add(DAY_NS),
+                    next_window_wall_ns,
+                };
+            }
+            if asked_before.is_some_and(|w| w < start) {
+                return DailyDecision::Missed {
+                    next_window_wall_ns,
                 };
             }
             return DailyDecision::Idle;
@@ -270,16 +286,27 @@ impl DailyScheduler {
         self.last_step
     }
 
+    /// Is the window starting at `start` handled (it or a later one was stepped, not needed,
+    /// skipped or missed)?
+    fn handled(&self, start: i64) -> bool {
+        self.done_window.is_some_and(|done| start <= done)
+    }
+
     /// The start of the next window that can still step (fleet wall, ns): the one open now, if
     /// it is not handled yet, else the next one.
     pub fn next_window_wall_ns(&self, wall_ns: i64) -> i64 {
         let start = self.window_start(wall_ns);
         let open = wall_ns.saturating_sub(start) < DAILY_WINDOW_NS;
-        if open && self.done_window != Some(start) {
+        let mut next = if open && !self.handled(start) {
             start
         } else {
             start.saturating_add(DAY_NS)
+        };
+        // After a backward step across a window start, that window is still ahead but handled.
+        while self.handled(next) {
+            next = next.saturating_add(DAY_NS);
         }
+        next
     }
 }
 

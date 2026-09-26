@@ -591,8 +591,11 @@ where
                 .saturating_mul(1_000)
                 .wrapping_add(anchor.wrapping_sub(fleet));
             self.date_sync.master_utc_error_ns = Some(fleet_err);
-            let on_line = anchor == fleet && !self.ptp_offline && !self.in_step_backoff();
             let daily = self.date_sync.daily();
+            // #119 (1.12): a daily-mode master without PTP is still on the fleet line (its D is
+            // the fleet D, it takes no local NTP steps), so it takes the fleet's steps itself.
+            let on_line =
+                anchor == fleet && (!self.ptp_offline || daily) && !self.in_step_backoff();
             if !self.ptp_offline || daily {
                 // Log-surface contract: every NTP cycle keeps the exact `[NTP] offset:{:+}us`
                 // prefix the camera-box freshness gates parse (offline, the NTP step path logs it).

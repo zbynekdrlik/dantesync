@@ -244,7 +244,8 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_else_the_next_night_119()
 fn a_master_only_ptp_outage_in_daily_mode_keeps_the_master_near_the_fleet_line_119() {
     // ONLY the master loses PTP for 30 minutes in the afternoon, ~0.1 s off UTC by then. In daily
     // mode it does not step its own wall to UTC (the fleet line is deliberately off UTC): it
-    // free-runs on its learned frequency and re-joins the fleet line with one step of a few µs.
+    // free-runs on its learned frequency and re-joins the fleet line with one step of its measured
+    // free-run error (≈ 0.3 ms here).
     let mut sc = daily_scenario("daily: master-only PTP outage", 17.6);
     sc.run_windows = 24 * 3_600 * 2;
     sc.master_ptp_offline = vec![(2 * 3_600 * 2, 2 * 3_600 * 2 + 3_600)];
@@ -265,13 +266,14 @@ fn a_master_only_ptp_outage_in_daily_mode_keeps_the_master_near_the_fleet_line_1
 
 #[test]
 fn a_master_without_ptp_over_the_window_still_takes_the_nightly_step_with_the_fleet_119() {
-    // Review round 1: ONLY the master loses PTP from 01:40 to 03:40, across the window. It still
+    // Review round 1: ONLY the master loses PTP from 01:40 to 02:20, across the window (and ending
+    // before the grandmaster change at ~02:23, which would be the documented double fault). It still
     // announces the nightly step, and it takes it on its own wall with the fleet (its D is the
     // fleet D: in daily mode it never steps to UTC on its own) — otherwise a long outage would
     // leave it a day's drift off the fleet, and re-joining would be one large daytime step.
     let mut sc = daily_scenario("daily: master-only PTP outage over the window", 17.6);
     sc.run_windows = 24 * 3_600 * 2;
-    sc.master_ptp_offline = vec![(FIRST_WINDOW_W - 2_400, FIRST_WINDOW_W + 12_000)];
+    sc.master_ptp_offline = vec![(FIRST_WINDOW_W - 2_400, FIRST_WINDOW_W + 2_400)];
     let r = run(&sc);
     check(&sc, &r);
     println!(

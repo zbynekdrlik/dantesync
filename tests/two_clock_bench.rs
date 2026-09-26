@@ -685,7 +685,7 @@ impl<'s> Bench<'s> {
             }
         }
         // #119 follow-up: the micro-correction clock, every loop iteration.
-        if let Some(fed) = master_tick_authority(m, a, offline) {
+        if let Some(fed) = master_tick_authority(m, a, offline, self.sc.daily()) {
             Self::master_takes(
                 m,
                 fed,
@@ -699,7 +699,7 @@ impl<'s> Bench<'s> {
         }
         if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 && !self.sc.utc_down_at(w) {
             let err = self.utc.ns - m.wall_ns() + self.sc.ntp_noise.sample(&mut self.ntp_rng);
-            if let Some(fed) = master_feed_authority(m, a, err, offline) {
+            if let Some(fed) = master_feed_authority(m, a, err, offline, self.sc.daily()) {
                 Self::master_takes(
                     m,
                     fed,
