@@ -13,6 +13,11 @@ paths:
   - "src/time_server/tests.rs"
   - "tests/two_clock_bench.rs"
   - "tests/two_clock_bench/scenarios.rs"
+  - "tests/two_clock_bench/glue.rs"
+  - "tests/two_clock_bench/micro.rs"
+  - "src/date_offset/micro.rs"
+  - "src/date_offset/micro/tests.rs"
+  - "src/controller/date_sync/micro_tests.rs"
   - "tests/simulation_e2e.rs"
   - "src/date_offset/slew.rs"
   - "src/date_offset/slew/tests.rs"
@@ -266,6 +271,10 @@ There is no per-box latency calibration; add one only if the canary shows the sp
 
 ## #119 — a BACKWARD date correction is a coordinated SLEW, never a step
 
+> Since v1.11 the correction is made in MICRO-corrections (next section): a slew is ≤ 1 ms, and the
+> EXTENSION of a running slew described below no longer exists (a new need waits for the running
+> increment and the interval).
+
 A backward step runs wall time back on every box at once; the camera-box stream OBS lost 43.7 ms
 of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera-box#1372). So:
 
@@ -334,6 +343,60 @@ of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera
   successful write, and is not repeated by a rebase or an extension (review rounds 2-3).
 - **Rollout (v1.10.0): the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of
   the v2 extension and would step back at the slew's start.
+
+## #119 follow-up — the date is corrected in MICRO-corrections (v1.11)
+
+One 50 ms correction every ~47 min (the grandmaster's +1.06 ms/min vs UTC since 25.9.2026) is a
+visible 1.5-frame event for every wall-anchored consumer. The authority now corrects continuously:
+beyond a 2 ms dead band, increments ≤ `micro_step_us` (500) at most once per `micro_interval_s`
+(20) — capacity 1.5 ms/min — forward a coordinated step, backward a coordinated slew. The only
+large correction left is an abnormal error beyond `slew_cap_ns` (2 × the bound), either direction.
+
+- **Decide on the loop, measure on the NTP cadence.** `DateAuthority::on_utc_error` only records
+  a reading (target-relative: minus what is announced and not yet landed) or confirms the abnormal
+  step; `DateAuthority::on_tick` (the controller's `tick_date_authority`, every loop iteration)
+  decides the increment. Deciding only at readings made the spacing ride the NTP query timing: a
+  reading 19.9 s after the last increment waits for the next one, and the capacity drops to 1 ms/min
+  (< the rig's drift).
+- **The estimate is a robust LINE, not a plain median.** A plain median of the last readings lags a
+  ramp by half its span (0.5–2.6 ms at 1.06 ms/min), and with a 2 ms dead band that alone breaks a
+  3 ms bound. Drift = Theil–Sen over one-minute bin medians of 20 min; level = median of the last
+  5 min projected along it. The full Theil–Sen over raw readings is 7 000 slopes per reading: fine
+  on the daemon but minutes per bench run in a DEBUG `cargo test` (measured 272 s); the bins make it
+  190. Pairs `(i, i + n/2)` are cheap but ALL straddle a UTC step, so the drift goes wild after an
+  upstream jump — full Theil–Sen reaches at most half the pairs.
+- **Noise must make a correction less likely, never trigger one.** Every band is widened by the
+  level's measured standard error (1.4826 MAD / √n × 1.2533 — the residuals around the fitted line
+  are jitter, not the ramp, so the MAD doctrine above holds): 3 σ for a first correction or a
+  reversal, 1 σ to continue in the standing direction (each extra σ costs ~0.1–0.3 ms of fleet
+  error). A reversal needs 2 × the dead band unless the fitted drift itself turned by 2 ppm + 3 σ
+  of the drift. A TIME-based memory of the direction (forget after 10 min / 1 h) did not stop the
+  jitter case: the estimate wanders by the dead band over tens of minutes, so it walked the date
+  back and forth every hour or so.
+- **Two leads for a micro announce.** At ~3 announces a minute the few-in-10⁴ chance that a box
+  misses every poll of one 5 s lead (10 % loss in the bench) recurs daily as a LATE micro step; the
+  bench hit it. `MICRO_LEAD_FACTOR = 2` makes it vanish and still lands inside the 20 s spacing.
+- **Keep micro steps out of the #91 step-storm count** (`apply_date_step`): 180/h is their design
+  cadence, not a degraded frequency reference; their own alarm is `date correction falling behind`.
+- **Bench lessons (`tests/two_clock_bench/`):**
+  - A crossing must be judged on the INTEGER wall a window ends on: the master announces on its own
+    window grid and its wall can advance exactly the lead, landing ON the next boundary; the float
+    `to_cross <= TRUE_DT` test missed it and the bench booked a false late step.
+  - With a step pending a quarter of the time, a grandmaster event now finds one pending: a rebase
+    re-announces it under the rebase's seq (`renamed_steps`), and a box that re-anchored first
+    folds its own re-anchor residual (tens of µs) into that step instead of absorbing it. Steps are
+    compared seq-for-seq within `ABSORB_TOLERANCE_NS`, and the slew-vs-step word comparison leaves
+    out the 10 min after each GM event (the two runs remove that residual differently — a step vs
+    the phase lock's slew — which is PTP, not the date).
+  - The last announce of a run is often still pending: `into_result` drops it.
+  - A world with UTC drifting against grandmaster B (+3 ppm) after the GM change is not a
+    "no drift" world: judge jitter by reversals, and count "no-drift" corrections before the change.
+- **Known limits (accepted):** a genuine UTC step (an upstream server change) biases the drift fit
+  for up to the 20 min window — one or two extra increments, bounded by the reversal rule; a
+  grandmaster FREQUENCY change (tonight's −25 ppm, 25.9. 23:32 UTC) is re-learned over the same
+  window (the bench's +3 ppm GM change costs ~0.5 ms of fleet error for minutes); an error between
+  the dead band and the cap after a long outage or a boot is worked off at the capacity (60 ms ≈ 40
+  min at 1.5 ms/min, with the falling-behind alarm on) — deliberately never a large step.
 
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
