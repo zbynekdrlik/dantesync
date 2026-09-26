@@ -120,6 +120,13 @@ pub(super) struct DateSync {
     pub(super) falling_behind_warned_at: Option<Instant>,
     /// dantesync#119 follow-up — the micro-corrections' paused state last logged (no fresh UTC).
     pub(super) micro_paused_logged: bool,
+    /// dantesync#119 (1.11.1) — the phase-lock error of the last window before a clock step and
+    /// `D` just after the step moved it, until the first window after the step measured its jump.
+    pub(super) step_phase_ref: Option<(i64, i64)>,
+    /// dantesync#119 (1.11.1) — the phase jump of the last step MEASURED (`/status`): a later step
+    /// that could not be measured leaves it in place (it belongs to the last measured step, not
+    /// necessarily to `last_date_step_ts`).
+    pub(super) last_step_phase_jump_ns: Option<i64>,
 }
 
 impl DateSync {
@@ -188,6 +195,8 @@ impl DateSync {
             falling_behind_logged: false,
             falling_behind_warned_at: None,
             micro_paused_logged: false,
+            step_phase_ref: None,
+            last_step_phase_jump_ns: None,
         }
     }
 
@@ -210,6 +219,38 @@ impl DateSync {
         };
         self.pending_t1_ns = master_time_ns;
         self.window.clear();
+    }
+
+    /// #119 (1.11.1) — a clock step has moved the wall and `D` and is about to reset the
+    /// measurement: keep the last phase-lock error, if the last window describes the wall as it
+    /// was just before the step (else nothing to compare with), and `D` as the step left it.
+    pub(super) fn arm_step_phase_probe(&mut self) {
+        self.step_phase_ref = match (self.enabled && self.fresh_window, self.core.anchor_ns()) {
+            (true, Some(anchor)) => self.core.last_error_ns().map(|e| (e, anchor)),
+            _ => None,
+        };
+    }
+
+    /// #119 (1.11.1) — the first phase-lock window after a step measured `error_ns`: the step's
+    /// phase jump is its difference to the error before the step. Nothing is measured when `D`
+    /// moved again since the step (an absorb, the master's re-alignment, a slew fold — the error
+    /// then carries that move, not the step's) or the window re-anchored (its error is 0 by
+    /// construction).
+    fn measure_step_phase_jump(&mut self, error_ns: Option<i64>, event: AnchorEvent) {
+        let Some((before, anchor)) = self.step_phase_ref.take() else {
+            return;
+        };
+        if self.core.anchor_ns() != Some(anchor) {
+            return;
+        }
+        if let (Some(after), AnchorEvent::None) = (error_ns, event) {
+            let jump = after.wrapping_sub(before);
+            self.last_step_phase_jump_ns = Some(jump);
+            debug!(
+                "[PHASE-LOCK] the last step moved the phase error by {:+.1}us",
+                jump as f64 / 1_000.0
+            );
+        }
     }
 
     /// The PTP sender may carry another time base (another grandmaster, or the same one after a
@@ -264,6 +305,8 @@ where
             .core
             .on_window(median_ns, locked, total_correction, dt);
         self.handle_phase_anchor_event(out.event);
+        self.date_sync
+            .measure_step_phase_jump(out.error_ns, out.event);
         self.date_sync.fresh_window = out.error_ns.is_some();
         match out.freq_ppm {
             Some(word) => {
@@ -374,6 +417,8 @@ where
         self.date_sync.pending_median_ns = None;
         self.date_sync.last_t1_ns = None;
         self.date_sync.fresh_window = false;
+        // #119 (1.11.1): no step measured across an outage.
+        self.date_sync.step_phase_ref = None;
         self.pending_syncs.clear();
         self.prev_t1_ns = 0;
         self.prev_t2_ns = 0;

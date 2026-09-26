@@ -58,3 +58,28 @@ impl Clock {
         self.ns += whole as i64;
     }
 }
+
+/// What each box hears: the grandmaster's UUID and its time base. The grandmaster CHANGES (to
+/// another device: another UUID, uptime and oscillator) at `GM_CHANGE_AT_WINDOW`, and that new
+/// grandmaster REBOOTS under the same UUID (its uptime restarts) at `GM_REBOOT_AT_WINDOW`. Each box
+/// notices each event a few windows apart. At the change the MASTER is last, so followers
+/// re-anchor while it still publishes a `D` in the old base (refused by the anchor grandmaster in
+/// the extension). At the reboot the master is FIRST, so it publishes a `D` in the new base while
+/// some followers are still in the old one under the SAME UUID: only the time-base check
+/// (`same_time_base`) stops those from taking a multi-day "late" step.
+pub(super) fn gm_view<'a>(
+    w: u64,
+    lags: (u64, u64),
+    a: &'a Clock,
+    b_pre: &'a Clock,
+    b_post: &'a Clock,
+) -> (u8, &'a Clock) {
+    let (change_lag, reboot_lag) = lags;
+    if w < GM_CHANGE_AT_WINDOW + change_lag {
+        (1, a)
+    } else if w < GM_REBOOT_AT_WINDOW + reboot_lag {
+        (2, b_pre)
+    } else {
+        (2, b_post)
+    }
+}

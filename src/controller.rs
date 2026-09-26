@@ -1556,14 +1556,15 @@ where
                         if !(locked_now && step_us != offset_us) {
                             self.ntp_server_checks_since_step = 0;
                         }
-                        // Discard the post-step transient from every PTP measurement path.
-                        self.reset_ptp_measurement_after_step();
                         // #117: a step moves the wall, so D moves with it (the phase lock sees no
                         // disturbance) — this is the LOCAL date path (no authority heard, or PTP
                         // offline). It never moves the FLEET date offset (see date_sync.rs).
                         if self.date_sync.enabled {
                             self.note_local_date_step(step_us.saturating_mul(1_000));
                         }
+                        // Discard the post-step transient from every PTP measurement path (after
+                        // D moved, as `apply_date_step` does: #119 measures the step against it).
+                        self.reset_ptp_measurement_after_step();
                         // #68: publish what REMAINS, not the error just cancelled
                         // (0 for a full step, the remainder for a bounded one).
                         self.publish_post_step_residual(offset_us - step_us);
@@ -1716,6 +1717,8 @@ where
     /// windows, the 2 s grace, the rate tracker, the min-delta filter and the spike filter.
     /// Shared by the NTP step path and the coordinated date step, so both reset identically.
     fn reset_ptp_measurement_after_step(&mut self) {
+        // #119 (1.11.1): the phase-lock error before the step, to measure its jump across it.
+        self.date_sync.arm_step_phase_probe();
         // Clear PTP sample windows to discard post-step transient samples
         self.sample_window.clear();
         self.date_sync.window.clear();

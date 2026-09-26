@@ -115,6 +115,18 @@ struct Scenario {
     /// #119 follow-up: mixed into every noise source's seed (0 = the historical noise), so a
     /// statistic can be asserted over several noise samples (the "seed every noise source" rule).
     seed: u64,
+    /// #119 (1.11.1): the boxes running Windows — every step is realized by the production step
+    /// law (`dantesync::clock::step`) against a model of the Windows clock, and every PTP sample is
+    /// stamped by that stepped clock at its capture instant (`two_clock_bench/windows.rs`). The
+    /// others step ideally, as before.
+    windows_boxes: &'static [usize],
+    /// The Windows boxes' clock-interrupt tick (the coarse clock's resolution).
+    windows_tick_ns: i64,
+    /// How many 0.5 s windows the run lasts.
+    run_windows: u64,
+    /// `check()`'s bound on any box's hourly effective rate vs the grandmaster (ppm). Ideal steps
+    /// leave only the PI's noise (≈ 0.002); a real step's µs residual is paid through the rate.
+    hourly_rate_bound_ppm: f64,
 }
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
@@ -138,6 +150,10 @@ impl Scenario {
             settle_windows: 240,
             ntp_noise: NtpNoise::Gauss,
             seed: 0,
+            windows_boxes: &[],
+            windows_tick_ns: TICK_NS,
+            run_windows: HOURS * 3600 * 2,
+            hourly_rate_bound_ppm: 0.01,
         }
     }
     fn settling_after_a_utc_jump(&self, w: u64) -> bool {
@@ -160,6 +176,12 @@ use glue::*;
 #[path = "two_clock_bench/world.rs"]
 mod world;
 use world::*;
+// #119 (1.11.1): the Windows clock model and its scenario.
+#[path = "two_clock_bench/windows.rs"]
+mod windows;
+use windows::*;
+#[path = "two_clock_bench/box_ops.rs"]
+mod box_ops;
 
 struct Box_ {
     osc_ppm: f64,
@@ -196,6 +218,16 @@ struct Box_ {
     last_wall: i64,
     /// #119: the master's catch-ups with a fleet slew its own scheduler missed.
     catch_ups: u32,
+    /// #119 (1.11.1): the Windows clock model, on a Windows box.
+    win: Option<WinClock>,
+    /// The box's effective rate (ppm) and thermal wander in the current window.
+    rate_ppm: f64,
+    wander_now_ppm: f64,
+    /// The last step: (TRUE time it landed, the wall's realized move).
+    last_landing: Option<(f64, i64)>,
+    /// #119 (1.11.1): the rate audit after the settle — the integrator (the learned rate) and the
+    /// 20 s mean of the word against the truth (the grandmaster's rate minus the oscillator's).
+    rate_audit: RateAudit,
 }
 
 type Step = (u32, i64, StepKind, f64);
@@ -238,31 +270,10 @@ struct RunResult {
     gm_events_in_slew: u32,
     /// The master's catch-ups with a fleet slew its own scheduler missed.
     master_catch_ups: u32,
-}
-
-/// What each box hears: the grandmaster's UUID and its time base. The grandmaster CHANGES (to
-/// another device: another UUID, uptime and oscillator) at `GM_CHANGE_AT_WINDOW`, and that new
-/// grandmaster REBOOTS under the same UUID (its uptime restarts) at `GM_REBOOT_AT_WINDOW`. Each box
-/// notices each event a few windows apart. At the change the MASTER is last, so followers
-/// re-anchor while it still publishes a `D` in the old base (refused by the anchor grandmaster in
-/// the extension). At the reboot the master is FIRST, so it publishes a `D` in the new base while
-/// some followers are still in the old one under the SAME UUID: only the time-base check
-/// (`same_time_base`) stops those from taking a multi-day "late" step.
-fn gm_view<'a>(
-    w: u64,
-    lags: (u64, u64),
-    a: &'a Clock,
-    b_pre: &'a Clock,
-    b_post: &'a Clock,
-) -> (u8, &'a Clock) {
-    let (change_lag, reboot_lag) = lags;
-    if w < GM_CHANGE_AT_WINDOW + change_lag {
-        (1, a)
-    } else if w < GM_REBOOT_AT_WINDOW + reboot_lag {
-        (2, b_pre)
-    } else {
-        (2, b_post)
-    }
+    /// #119 (1.11.1): per box, the rate audit after the settle.
+    rate_audits: Vec<RateAudit>,
+    /// #119 (1.11.1): per box, the largest |requested − realized| of a step (0 on an ideal box).
+    max_step_residual_ns: Vec<i64>,
 }
 
 /// Everything one bench run evolves: the true clocks, the boxes, the master's authority and its
@@ -318,6 +329,9 @@ struct MasterWindow {
 }
 
 const TRUE_DT_NS: f64 = WINDOW_S * 1e9;
+/// The grandmasters' oscillators (ppm vs true time): A, then B after the change.
+const GM_A_PPM: f64 = 0.0;
+const GM_B_PPM: f64 = 3.0;
 /// Windows (30 s) after which every box has joined — the join happens within seconds.
 const ALL_JOINED_AFTER: u64 = 60;
 
@@ -368,6 +382,14 @@ impl<'s> Bench<'s> {
                 rebases: 0,
                 last_wall: 0,
                 catch_ups: 0,
+                win: sc
+                    .windows_boxes
+                    .contains(&i)
+                    .then(|| WinClock::new(i, sc.seed, sc.windows_tick_ns)),
+                rate_ppm: 0.0,
+                wander_now_ppm: 0.0,
+                last_landing: None,
+                rate_audit: RateAudit::default(),
             })
             .collect();
         let n = boxes.len();
@@ -423,7 +445,7 @@ impl<'s> Bench<'s> {
     ///    (the controller polls `due` every loop iteration, 1 ms / 50 µs), so the landing instant
     ///    is resolved below the window.
     fn advance_clocks(&mut self, w: u64, t0_ns: f64) {
-        let (gm_a_ppm, gm_b_ppm) = (0.0, 3.0);
+        let (gm_a_ppm, gm_b_ppm) = (GM_A_PPM, GM_B_PPM);
         let t_now_s = w as f64 * WINDOW_S;
         let grace = self.sc.grace;
         self.utc.advance(TRUE_DT_NS, self.sc.utc_vs_gm_ppm);
@@ -439,6 +461,8 @@ impl<'s> Bench<'s> {
             let wander =
                 b.wander_ppm * (2.0 * std::f64::consts::PI * t_now_s / b.wander_period_s).sin();
             let rate = b.osc_ppm + wander + b.word_ppm;
+            b.rate_ppm = rate;
+            b.wander_now_ppm = wander;
             let scale = 1.0 + rate * 1e-6;
             // #119: the slew's rate term, switched on/off at its start/end instants inside the
             // window (the controller re-applies the word from its 1 ms loop at those instants).
@@ -510,16 +534,27 @@ impl<'s> Bench<'s> {
             ran: false,
         };
         let (gm_a, gm_b_pre, gm_b_post) = (&self.gm_a, &self.gm_b_pre, &self.gm_b_post);
+        let t_end_ns = (w + 1) as f64 * TRUE_DT_NS;
+        let judged = w > self.sc.settle_windows;
         for (i, b) in self.boxes.iter_mut().enumerate() {
             let (gm_id, gm) = gm_view(w, b.lag, gm_a, gm_b_pre, gm_b_post);
+            let gm_ppm = if gm_id == 1 { GM_A_PPM } else { GM_B_PPM };
             // #119: every sample is de-slewed by the displacement the box's slew schedules at its
             // wall, so the phase lock never reads the deliberate slew as a phase error.
             let deslew = b.slew_displacement();
+            let (rel_ppm, landing) = (b.rate_ppm - gm_ppm, b.last_landing);
             let mut samples: Vec<i64> = (0..SAMPLES_PER_WINDOW)
                 .map(|_| {
                     let noise = b.rng.gauss() * PTP_NOISE_NS;
+                    // #119 (1.11.1): a Windows box stamps each sample with its stepped clock at the
+                    // capture instant, processed at the window's end (a queue that can span a
+                    // step). An ideal box reads both clocks at the window's end.
+                    let capture = b
+                        .win
+                        .as_mut()
+                        .map_or(0, |win| win.capture_shift_ns(t_end_ns, rel_ppm, landing));
                     // wall_rx − gm_tx = (wall − gm) + delay, plus the timestamp noise.
-                    b.wall_ns() - gm.ns + (b.delay_ns + noise).round() as i64 - deslew
+                    b.wall_ns() - gm.ns + (b.delay_ns + noise).round() as i64 - deslew - capture
                 })
                 .collect();
             samples.sort();
@@ -540,6 +575,7 @@ impl<'s> Bench<'s> {
                     b.word_ppm = b.core.integrator_ppm();
                 }
                 b.words.push(b.word_ppm);
+                b.audit_rate(gm_ppm, judged);
                 continue;
             }
             let out = b.core.on_window(median, true, b.word_ppm, WINDOW_S);
@@ -556,6 +592,7 @@ impl<'s> Bench<'s> {
             }
             b.word_ppm = out.freq_ppm.expect("locked from the start: always engaged");
             b.words.push(b.word_ppm);
+            b.audit_rate(gm_ppm, judged);
         }
         master
     }
@@ -892,13 +929,19 @@ impl<'s> Bench<'s> {
             corrections: self.corrections,
             gm_events_in_slew: self.gm_events_in_slew,
             master_catch_ups: self.boxes[0].catch_ups,
+            rate_audits: self.boxes.iter().map(|b| b.rate_audit).collect(),
+            max_step_residual_ns: self
+                .boxes
+                .iter()
+                .map(|b| b.win.as_ref().map_or(0, |win| win.max_residual_ns))
+                .collect(),
         }
     }
 }
 
 fn run(sc: &Scenario) -> RunResult {
     let mut bench = Bench::new(sc);
-    for w in 0..HOURS * 3600 * 2 {
+    for w in 0..sc.run_windows {
         let t0_ns = w as f64 * TRUE_DT_NS;
         let master_steps_at_start = bench.boxes[0].steps.len();
         bench.advance_clocks(w, t0_ns);
@@ -916,66 +959,6 @@ fn run(sc: &Scenario) -> RunResult {
         bench.audit_rates(w);
     }
     bench.into_result()
-}
-
-impl Box_ {
-    fn wall_ns(&self) -> i64 {
-        self.wall.ns + self.stepped + self.slewed_ns
-    }
-
-    /// #119: `D` in effect (the anchor plus the held slew's displacement at the wall).
-    fn d_in_effect(&self) -> i64 {
-        let anchor = self.core.anchor_ns().expect("anchored");
-        self.follower.in_effect_ns(anchor, self.wall_ns())
-    }
-
-    /// #119: the held slew's displacement at the current wall (0 before the first anchor).
-    fn slew_displacement(&self) -> i64 {
-        match self.core.anchor_ns() {
-            Some(anchor) => self.follower.displacement_at_wall(anchor, self.wall_ns()),
-            None => 0,
-        }
-    }
-
-    /// #119: integrate the slew's rate term over one window, switching it at the PTP instants
-    /// where the slew starts and ends (PTP time advances at the true rate to ≪ 1 ns per window:
-    /// the grandmasters run at 0 and +3 ppm).
-    fn advance_slew(&mut self, true_dt_ns: f64) {
-        let (Some(anchor), Some(h)) = (self.core.anchor_ns(), self.follower.held_slew()) else {
-            return;
-        };
-        let p0 = self.follower.now_ptp_ns(anchor, self.wall_ns()) as f64;
-        let p1 = p0 + true_dt_ns;
-        let on = (h.slew.start_ptp_ns as f64).max(p0);
-        let off = (h.slew.end_ptp_ns() as f64).min(p1);
-        if off > on {
-            let rate_ppm = h.slew.amount_ns().signum() as f64 * h.slew.ppm as f64;
-            let d = rate_ppm * 1e-6 * (off - on) + self.slew_frac;
-            let whole = d.floor();
-            self.slew_frac = d - whole;
-            self.slewed_ns += whole as i64;
-        }
-    }
-
-    /// Step the wall and move D with it (the controller's `apply_date_step`), recording it; with
-    /// `grace`, the next 2 s of PTP windows are dropped as the controller does after any step.
-    fn apply_step(
-        &mut self,
-        seq: u32,
-        delta_ns: i64,
-        kind: StepKind,
-        t_ns: f64,
-        w: u64,
-        grace: bool,
-    ) {
-        self.stepped += delta_ns;
-        self.core.note_step(delta_ns);
-        self.fresh = false;
-        self.steps.push((seq, delta_ns, kind, t_ns));
-        if grace {
-            self.grace_until = w + 1 + GRACE_WINDOWS;
-        }
-    }
 }
 
 // A crate root resolves `mod x;` beside itself (`tests/x.rs`), which cargo would also build as a

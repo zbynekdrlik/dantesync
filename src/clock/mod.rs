@@ -23,105 +23,98 @@ mod linux;
 #[cfg(unix)]
 pub use self::linux::LinuxClock as PlatformClock;
 
-/// #80 -- compute the target FILETIME (100ns ticks since 1601-01-01) for a Windows clock step,
-/// given the current FILETIME, the offset to apply, and its sign.
-///
-/// Pure arithmetic, deliberately NOT inside `windows.rs`: that module is `#[cfg(windows)]`-gated
-/// at the `mod` declaration above, so it is never even PARSED on Linux CI
-/// (`.claude/rules/windows-only-code.md`) -- this function lives here, unconditionally compiled,
-/// so its logic (in particular the negative-time guard's exact boundary) gets real Linux-CI test
-/// execution instead of being invisible until a live Windows box exercises it.
-///
-/// This function only computes WHAT the target should be; it does not decide HOW to apply it.
-/// dantesync#80's actual bug was in the "how": `windows.rs` used to route this precise,
-/// 100ns-resolution target through `FileTimeToSystemTime` + the legacy `SetSystemTime` Win32
-/// API, whose `SYSTEMTIME` parameter has no field finer than whole milliseconds -- silently
-/// discarding up to ~1ms of the computed target on every single step. The fix routes the SAME
-/// target this function computes through the native `NtSetSystemTime` API instead (a raw
-/// `LARGE_INTEGER` FILETIME, no `SYSTEMTIME` intermediate) -- this function's own contract
-/// (compute the precise target) was never the defect and is unchanged by that fix.
-pub fn compute_step_target_100ns(
-    before_100ns: u64,
-    offset: std::time::Duration,
-    sign: i8,
-) -> Result<u64> {
-    let offset_100ns = (offset.as_nanos() / 100) as u64;
-    if sign > 0 {
-        // No overflow guard here (unlike the negative branch below), deliberately: a real
-        // FILETIME `before_100ns` around 2026 is ~1.3e17 (100ns ticks since 1601-01-01)
-        // against a `u64::MAX` of ~1.8e19 -- headroom of over 400 years even for an
-        // absurdly large `offset` (review finding, #80: worth stating explicitly, since a
-        // future reader has no reason to already know the FILETIME epoch is 1601).
-        Ok(before_100ns + offset_100ns)
-    } else if before_100ns > offset_100ns {
-        Ok(before_100ns - offset_100ns)
+pub mod step;
+
+/// dantesync#119 (1.11.1) -- FILETIME (100 ns ticks since 1601-01-01) of the Unix epoch.
+pub const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+/// A Windows FILETIME as ns since the Unix epoch (the step law's time axis, `step`). Pure and
+/// unconditionally compiled so Linux CI runs its tests (`windows.rs` is never parsed there).
+pub fn filetime_to_unix_ns(filetime: u64) -> i64 {
+    (filetime as i64 - FILETIME_UNIX_EPOCH as i64) * 100
+}
+
+/// The FILETIME for `unix_ns`, rounded to the nearest 100 ns tick (the finest `NtSetSystemTime`
+/// takes).
+pub fn unix_ns_to_filetime(unix_ns: i64) -> u64 {
+    ((unix_ns + 50).div_euclid(100) + FILETIME_UNIX_EPOCH as i64) as u64
+}
+
+/// A QPC reading as ns at the SYSTEM TIME's rate: the kernel advances the system time by `inc`
+/// per `adj` QPC counts (`GetSystemTimeAdjustmentPrecise`; a larger `adj` runs slower), so this
+/// clock follows the frequency word like the wall does and never steps -- the step law's
+/// reference on Windows. Only its differences are used.
+pub fn qpc_to_reference_ns(qpc: i64, frequency: i64, increment: u64, adjustment: u64) -> i64 {
+    let ratio = if adjustment == 0 {
+        1.0
     } else {
-        Err(anyhow::anyhow!("Clock step would result in negative time"))
+        increment as f64 / adjustment as f64
+    };
+    (qpc as f64 / frequency as f64 * 1e9 * ratio).round() as i64
+}
+
+/// The one log line of a date/NTP step, both operating systems (`step::step_wall`'s outcome).
+pub fn log_step_outcome(out: &step::StepOutcome, lead: step::StepLead) {
+    let line = format!(
+        "[StepClock] stepped {:+.1}us (requested {:+.1}us, residual {:+.1}us, {} set(s), learned \
+         set latency {:.1}us, coarse clock lag {:.1}us)",
+        out.realized_ns as f64 / 1e3,
+        out.requested_ns as f64 / 1e3,
+        out.residual_ns() as f64 / 1e3,
+        out.attempts,
+        lead.lead_ns() as f64 / 1e3,
+        out.coarse_lag_ns as f64 / 1e3
+    );
+    if let Some(why) = &out.stopped {
+        log::warn!(
+            "{} -- NOT EXACT ({}): the phase lock pays the residual back",
+            line,
+            why
+        );
+    } else if out.residual_ns().abs() > step::STEP_TOLERANCE_NS {
+        log::warn!(
+            "{} -- NOT EXACT: the phase lock pays the residual back",
+            line
+        );
+    } else {
+        log::info!("{}", line);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
-    fn positive_sign_adds_the_offset() {
-        assert_eq!(
-            compute_step_target_100ns(1_000_000, Duration::from_micros(2_335), 1).unwrap(),
-            1_000_000 + 23_350
-        );
+    fn the_unix_epoch_is_filetime_116444736000000000() {
+        assert_eq!(filetime_to_unix_ns(FILETIME_UNIX_EPOCH), 0);
+        // 2026-09-26 00:00:00 UTC = 1_790_380_800 s.
+        let ft = FILETIME_UNIX_EPOCH + 1_790_380_800 * 10_000_000;
+        assert_eq!(filetime_to_unix_ns(ft), 1_790_380_800_000_000_000);
     }
 
     #[test]
-    fn negative_sign_subtracts_the_offset_when_it_fits() {
-        assert_eq!(
-            compute_step_target_100ns(1_000_000, Duration::from_micros(500), -1).unwrap(),
-            1_000_000 - 5_000
-        );
+    fn a_unix_time_round_trips_through_filetime_to_the_100_ns_tick() {
+        let ns: i64 = 1_790_380_800_123_456_789;
+        let ft = unix_ns_to_filetime(ns);
+        assert_eq!(filetime_to_unix_ns(ft), 1_790_380_800_123_456_800);
+        assert_eq!(unix_ns_to_filetime(1_790_380_800_123_456_749), ft - 1);
     }
 
     #[test]
-    fn negative_sign_exactly_equal_to_before_is_rejected() {
-        // The boundary is strict (`>`, not `>=`) in the original code this was extracted from --
-        // preserved exactly: a step that would land precisely on epoch-zero-relative-to-before
-        // (before == offset) is treated the same as one that would go negative, not as the
-        // allowed edge case.
-        assert!(compute_step_target_100ns(5_000, Duration::from_nanos(500_000), -1).is_err());
-    }
-
-    #[test]
-    fn negative_sign_larger_than_before_is_rejected() {
-        // offset_100ns (2000, i.e. 200us) genuinely exceeds before_100ns (1000) here.
-        let err = compute_step_target_100ns(1_000, Duration::from_micros(200), -1).unwrap_err();
-        assert!(
-            err.to_string().contains("negative"),
-            "error must explain WHY the step was rejected, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn negative_sign_one_tick_under_before_succeeds() {
-        // One 100ns tick short of the strict boundary above -- must NOT be rejected.
-        assert_eq!(
-            compute_step_target_100ns(5_001, Duration::from_nanos(500_000), -1).unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn zero_offset_returns_before_unchanged_either_sign() {
-        // Review finding, #80: a genuine zero-offset call never happens in production
-        // (controller.rs only steps for a measured over-threshold offset), but it costs
-        // nothing to pin as a defensive edge case -- neither sign should perturb the value.
-        assert_eq!(
-            compute_step_target_100ns(1_000_000, Duration::ZERO, 1).unwrap(),
-            1_000_000
-        );
-        assert_eq!(
-            compute_step_target_100ns(1_000_000, Duration::ZERO, -1).unwrap(),
-            1_000_000
-        );
+    fn the_qpc_reference_runs_at_the_system_time_rate() {
+        // A 10 MHz QPC. Nominal: 1 s of QPC is 1 s.
+        let f = 10_000_000;
+        assert_eq!(qpc_to_reference_ns(f, f, 156_250, 156_250), 1_000_000_000);
+        // adj 20 ppm LARGER than inc: the system time runs 20 ppm slow, and so does the reference.
+        let r = qpc_to_reference_ns(f, f, 1_000_000, 1_000_020);
+        assert!((r - 999_980_000).abs() <= 1, "{r}");
+        // Only differences are used: a big QPC origin keeps sub-ns resolution per second.
+        let origin = 3_600 * 24 * 30 * f;
+        let d = qpc_to_reference_ns(origin + f, f, 1_000_000, 999_990)
+            - qpc_to_reference_ns(origin, f, 1_000_000, 999_990);
+        assert!((d - 1_000_010_000).abs() <= 1, "{d}");
+        // A zero adjustment (never returned) is read as nominal, not a division by zero.
+        assert_eq!(qpc_to_reference_ns(f, f, 156_250, 0), 1_000_000_000);
     }
 }

@@ -26,6 +26,11 @@ paths:
   - "src/date_offset/slew/tests.rs"
   - "src/controller/date_sync/slew.rs"
   - "src/controller/date_sync/slew/tests.rs"
+  - "src/clock/step.rs"
+  - "src/clock/mod.rs"
+  - "src/clock/windows.rs"
+  - "src/clock/linux.rs"
+  - "tests/two_clock_bench/windows.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -418,6 +423,67 @@ large correction left is an abnormal error beyond `slew_cap_ns` (2 × the bound)
   the dead band and the cap after a long outage or a boot is worked off at the capacity (60 ms ≈ 40
   min at 1.5 ms/min, with the falling-behind alarm on) — deliberately never a large step.
 
+## #119 (1.11.1) — every clock step must land EXACTLY, or the phase lock pays it through the rate
+
+The phase lock moves `D` by the REQUESTED step (`note_step`), so any shortfall between the
+requested and the realized wall move is a phase error. `K_P` then turns it into rate: 250 µs is
+5 ppm. At the 1.11.0 micro cadence (a step every 20 s) that rate is never clean, and the Windows
+media clocks that follow the adjustment rate leave the Dante tick (camera-box#1372, the stream
+`mbc` ASRC).
+
+**The root cause.** Windows stepped by read-modify-write with `GetSystemTimeAsFileTime`, which is
+COARSE: it updates only on the clock interrupt, a 0.5 ms tick on a media PC. Every step lost that
+lag (0 … one tick).
+
+**How it was found.** The live signature was that the phase-lock error was always NEGATIVE after
+every forward step (−170 … −860 µs on stream). Samples straddling a step would scatter both ways,
+so a one-signed error means the step itself landed short.
+
+**Why the old diagnostic missed it.** The #80 `Actual step: X (expected: Y)` line measured the
+step with the same coarse clock on both sides, so it could NOT see this. It also showed
+`NtSetSystemTime` blocking ~117 ms.
+
+**The law (`src/clock/step.rs`, both OSes):**
+- read the PRECISE wall and a reference no step moves, with the reference read on BOTH sides of
+  the wall (`ClockReading::sandwiched`);
+- read again when the reading was preempted (`read_tight`). The first CI run caught this: one
+  preempted Linux read put the two clocks 508 µs apart;
+- set from that precise read plus a learned read→set latency: the lower median of the last 8
+  sets' latencies. A preemption only adds latency, so a burst of them (the bench met three in a
+  row within one step) never makes the next set overshoot. It is not biased low the way a minimum
+  is, so the steps carry no systematic shortfall;
+- measure the realized move as Δwall − Δreference;
+- correct the residual beyond 10 µs: forward always (a late set, either way the step went), back
+  only for a backward step;
+- never chase a set latency below −10 µs or beyond 2 ms. That is another writer, a failed read,
+  or a stalled set;
+- once a set has landed, the step is made (`stopped` says why it stopped short), so the caller
+  moves `D` with it.
+
+**Rules for any future change to a step path:**
+- Never read "now" for a step target from a coarse API.
+- Never judge a step with the clock it moved. Use a step-immune reference: QPC scaled by
+  `inc/adj` on Windows, `CLOCK_MONOTONIC` on Linux.
+- Keep every step through `step_wall` so the bench's Windows model (`two_clock_bench/windows.rs`)
+  tests the production law.
+
+`/status.date_step_phase_jump_us` is the on-rig check: the phase-lock error's move across the last
+step. It should read a few µs.
+- The probe is armed AFTER the step moved `D`: every step path moves `D` first, then calls
+  `reset_ptp_measurement_after_step`.
+- The measurement is void if `D` moved again before the first window (an absorb, the master's
+  re-alignment, a slew fold), or across a PTP outage.
+
+The stream tick is unmeasured. The post-roll acceptance is that, once the learned latency
+settles, the `[StepClock]` lines show `1 set(s)` (an occasional preempted set: 2) with the residual
+within the tolerance.
+
+The bench's Windows day showed two gotchas:
+- a step that lands µs short right at its instant can make a poll schedule the same announce once
+  more as a ZERO step. `apply_date_step` and the bench's `apply_step` ignore it;
+- µs step residuals are paid through the rate, so a Windows day's hourly rate error is ~0.011 ppm
+  against ~0.002 for ideal steps. `check()`'s bound is a Scenario field for that.
+
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
 `tests/simulation_e2e.rs` drew its jitter from unseeded `rand::random()`, and its high-jitter test
@@ -656,9 +722,10 @@ working tree.
 Issue 80's own investigation (strih's steady-state "drag" -- corrections that looked right in
 cadence but never converged) found its root cause not by adding new diagnostics, but by grepping
 what was ALREADY being logged for a completely different original purpose:
-`WindowsClock::step_clock()` has always logged `[StepClock] Actual step: X (expected: Y)` (a
+until 1.11.1 `WindowsClock::step_clock()` logged `[StepClock] Actual step: X (expected: Y)` (a
 before/after `GetSystemTimeAsFileTime()` sanity check, presumably added to confirm the step syscall
-did SOMETHING) -- nobody had ever checked whether `X` and `Y` actually MATCH. They didn't, by a
+did SOMETHING; replaced by the step law's `[StepClock] stepped …` line, see the #119 1.11.1
+section) -- nobody had ever checked whether `X` and `Y` actually MATCH. They didn't, by a
 large and inconsistent margin, and that exact shortfall pattern (27.6%-116.7% delivered, no fixed
 ratio) was the whole proof of a millisecond-quantization bug once checked against `SYSTEMTIME`'s
 own field width. **Before reaching for new instrumentation on a live clock-daemon mystery, grep the

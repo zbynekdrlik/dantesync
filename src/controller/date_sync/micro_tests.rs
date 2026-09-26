@@ -195,3 +195,125 @@ fn stopped_utc_readings_pause_the_micro_corrections_loudly_and_resume_119() {
     let st = st.read().expect("status");
     assert!(!st.date_micro_paused);
 }
+
+/// One phase-lock window of this controller at `e_ns` off `anchor`, `k` half-seconds after the
+/// anchoring one, outside any post-step grace (the test drives the windows itself).
+fn window_at(
+    c: &mut PtpController<MockSystemClock, crate::traits::MockPtpNetwork, MockNtpSource>,
+    anchor: i64,
+    e_ns: i64,
+    k: i64,
+) {
+    c.last_ntp_step = None;
+    c.date_sync.pending_median_ns = Some(anchor + e_ns);
+    c.date_sync.pending_t1_ns = super::tests::PL_PTP_NOW_NS + k * 500_000_000;
+    c.apply_self_tuning_servo(0.0);
+}
+
+#[test]
+fn the_phase_jump_a_step_leaves_is_measured_once_and_published_119() {
+    // 1.11.1: every step path measures how far the phase-lock error moved across the step — the
+    // first window after the step minus the last one before it — and `/status` publishes it. An
+    // exact step reads ~0; one that landed short reads minus its shortfall (on 1.11.0 Windows,
+    // −170 … −860 µs), the error the phase lock would pay back through the rate.
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), false);
+    window_at(&mut c, d, 12_000, 1);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, None, "no step yet");
+
+    // A coordinated +500 µs step that the clock realized 240 µs short.
+    c.apply_date_step(500_000, StepKind::Coordinated, 7);
+    window_at(&mut c, d + 500_000, 12_000 - 240_000, 6);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, Some(-240_000));
+    let mut st = SyncStatus::default();
+    c.publish_date_status(&mut st);
+    assert_eq!(st.date_step_phase_jump_us, Some(-240.0));
+
+    // Later windows are the phase lock's own business: the measurement stays the step's.
+    window_at(&mut c, d + 500_000, -200_000, 7);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, Some(-240_000));
+
+    // The LOCAL NTP step path is measured the same way (an exact step: ~0); like the controller's
+    // NTP step path, it moves D first and then resets the measurement.
+    c.note_local_date_step(-1_000_000);
+    c.reset_ptp_measurement_after_step();
+    window_at(&mut c, d - 500_000, -200_000 + 3_000, 12);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, Some(3_000));
+}
+
+#[test]
+fn a_d_moved_by_anything_but_the_step_voids_the_steps_measurement_119() {
+    // Between the step and the first window after it, D moves again — an absorb of the fleet D,
+    // the master's re-alignment (its Join step followed by `set_anchor(fleet)`), a slew fold. The
+    // error then carries that move, not the step's residual: nothing is published for this step.
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), false);
+    window_at(&mut c, d, 12_000, 1);
+    c.apply_date_step(500_000, StepKind::Coordinated, 7);
+    c.date_sync.core.set_anchor(d + 500_000 + 60_000); // an absorb 60 µs further
+    window_at(&mut c, d + 500_000 + 60_000, -48_000, 6);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, None);
+
+    // The local NTP step path arms after moving D, so its own move is not "another" one.
+    c.note_local_date_step(-1_000_000);
+    c.reset_ptp_measurement_after_step();
+    window_at(&mut c, d - 500_000 + 60_000, -48_000 + 2_000, 12);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, Some(2_000));
+}
+
+#[test]
+fn the_real_ntp_step_path_is_measured_119() {
+    // A follower that has not joined an authority takes the LOCAL NTP step (two agreeing 20 ms
+    // readings) through `check_ntp_utc_tracking` itself. That path moves D before it resets the
+    // measurement, so the probe measures the step instead of voiding it.
+    let mut ntp = MockNtpSource::new();
+    ntp.expect_get_offset()
+        .returning(|| Ok(one_offset(20_000, 1)));
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller(clock, ntp, false);
+    window_at(&mut c, d, 12_000, 1);
+    for _ in 0..6 {
+        if c.date_sync.last_step.is_some() {
+            break;
+        }
+        c.last_ntp_check = Instant::now() - Duration::from_secs(3_600);
+        c.check_ntp_utc_tracking();
+    }
+    let (delta, _, kind) = c.date_sync.last_step.expect("the local NTP path stepped");
+    assert_eq!(kind, "local");
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d + delta));
+    window_at(&mut c, d + delta, 12_000 + 1_000, 6);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, Some(1_000));
+}
+
+#[test]
+fn an_outage_between_the_step_and_its_first_window_voids_the_measurement_119() {
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), false);
+    window_at(&mut c, d, 12_000, 1);
+    c.apply_date_step(500_000, StepKind::Coordinated, 7);
+    c.ptp_offline = true;
+    c.on_ptp_offline_edge();
+    c.ptp_offline = false;
+    window_at(&mut c, d + 500_000, 80_000, 6);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, None);
+}
+
+#[test]
+fn a_step_after_a_ptp_outage_has_no_window_to_measure_against_119() {
+    // No fresh window before the step (the outage dropped them): nothing to compare, nothing
+    // published — never a jump against a stale error.
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller(clock, MockNtpSource::new(), false);
+    c.ptp_offline = true;
+    c.on_ptp_offline_edge();
+    c.ptp_offline = false;
+    c.apply_date_step(500_000, StepKind::Coordinated, 7);
+    window_at(&mut c, d + 500_000, 80_000, 6);
+    assert_eq!(c.date_sync.last_step_phase_jump_ns, None);
+}

@@ -1,11 +1,14 @@
+use super::step::{self, ClockReading, StepLead, StepOps};
 use super::SystemClock;
 use anyhow::{anyhow, Result};
-use libc::{self, adjtimex, settimeofday, timeval, timex, ADJ_FREQUENCY};
+use libc::{self, adjtimex, timespec, timex, ADJ_FREQUENCY, CLOCK_MONOTONIC, CLOCK_REALTIME};
 use std::mem;
 use std::time::Duration;
 
 pub struct LinuxClock {
     original_freq: i64,
+    /// dantesync#119: the learned read->set latency of a step (`super::step`).
+    step_lead: StepLead,
 }
 
 impl LinuxClock {
@@ -20,7 +23,50 @@ impl LinuxClock {
 
         Ok(LinuxClock {
             original_freq: tx.freq,
+            step_lead: StepLead::default(),
         })
+    }
+}
+
+/// dantesync#119 (1.11.1) -- ns since the epoch as a `timespec` (the nanoseconds always in
+/// `0..1e9`, also before the epoch).
+fn ns_to_timespec(ns: i64) -> (i64, i64) {
+    (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
+}
+
+fn read_clock(clock: libc::clockid_t) -> i64 {
+    let mut ts: timespec = unsafe { mem::zeroed() };
+    // clock_gettime cannot fail for these two always-present clocks with a valid pointer.
+    unsafe { libc::clock_gettime(clock, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// dantesync#119 (1.11.1) -- Linux under the step law (`super::step`): `CLOCK_REALTIME` is the
+/// wall (no coarser path is in use, so `coarse == precise`), `CLOCK_MONOTONIC` the reference: it
+/// follows the frequency word like the wall and no step moves it.
+struct LinuxStepOps;
+
+impl StepOps for LinuxStepOps {
+    fn read(&mut self) -> ClockReading {
+        let reference_before = read_clock(CLOCK_MONOTONIC);
+        let precise = read_clock(CLOCK_REALTIME);
+        let reference_after = read_clock(CLOCK_MONOTONIC);
+        ClockReading::sandwiched(precise, precise, reference_before, reference_after)
+    }
+
+    fn set(&mut self, target_ns: i64) -> std::result::Result<(), String> {
+        let (sec, nsec) = ns_to_timespec(target_ns);
+        let mut ts: timespec = unsafe { mem::zeroed() };
+        ts.tv_sec = sec as libc::time_t;
+        ts.tv_nsec = nsec as _;
+        let ret = unsafe { libc::clock_settime(CLOCK_REALTIME, &ts) };
+        if ret < 0 {
+            return Err(format!(
+                "clock_settime failed: errno={}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -41,38 +87,15 @@ impl SystemClock for LinuxClock {
         Ok(())
     }
 
+    /// dantesync#119 (1.11.1): the step law (`super::step::step_wall`) -- the wall moves by
+    /// exactly `offset`, measured against `CLOCK_MONOTONIC` (the same law as on Windows).
     fn step_clock(&mut self, offset: Duration, sign: i8) -> Result<()> {
-        let mut tv: timeval = unsafe { mem::zeroed() };
-        unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
-
-        let offset_sec = offset.as_secs() as i64;
-        let offset_usec = offset.subsec_micros() as i64;
-
-        if sign > 0 {
-            tv.tv_sec += offset_sec;
-            tv.tv_usec += offset_usec;
-        } else {
-            tv.tv_sec -= offset_sec;
-            tv.tv_usec -= offset_usec;
-        }
-
-        // Normalize
-        while tv.tv_usec >= 1_000_000 {
-            tv.tv_sec += 1;
-            tv.tv_usec -= 1_000_000;
-        }
-        while tv.tv_usec < 0 {
-            tv.tv_sec -= 1;
-            tv.tv_usec += 1_000_000;
-        }
-
-        let ret = unsafe { settimeofday(&tv, std::ptr::null()) };
-        if ret < 0 {
-            return Err(anyhow!(
-                "settimeofday failed: errno={}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        let magnitude = i64::try_from(offset.as_nanos())
+            .map_err(|_| anyhow!("a clock step of {:?} does not fit the time axis", offset))?;
+        let requested = if sign > 0 { magnitude } else { -magnitude };
+        let out = step::step_wall(&mut LinuxStepOps, &mut self.step_lead, requested)
+            .map_err(|e| anyhow!(e))?;
+        super::log_step_outcome(&out, self.step_lead);
         Ok(())
     }
 }
@@ -137,103 +160,42 @@ mod tests {
         assert_eq!(freq_500ppm, 32768000);
     }
 
-    /// Test tv_usec normalization logic
+    /// dantesync#119: a step target as a `timespec`, nanoseconds normalized also before the epoch.
     #[test]
-    fn test_tv_usec_normalization() {
-        // Helper to normalize tv_usec (same logic as step_clock)
-        fn normalize_timeval(tv_sec: &mut i64, tv_usec: &mut i64) {
-            while *tv_usec >= 1_000_000 {
-                *tv_sec += 1;
-                *tv_usec -= 1_000_000;
-            }
-            while *tv_usec < 0 {
-                *tv_sec -= 1;
-                *tv_usec += 1_000_000;
-            }
-        }
-
-        // Overflow case: tv_usec = 1,500,000 → should normalize to sec+1, usec=500,000
-        let (mut sec, mut usec) = (10, 1_500_000);
-        normalize_timeval(&mut sec, &mut usec);
-        assert_eq!(sec, 11);
-        assert_eq!(usec, 500_000);
-
-        // Double overflow: tv_usec = 2,500,000
-        let (mut sec, mut usec) = (10, 2_500_000);
-        normalize_timeval(&mut sec, &mut usec);
-        assert_eq!(sec, 12);
-        assert_eq!(usec, 500_000);
-
-        // Underflow case: tv_usec = -500,000 → should normalize to sec-1, usec=500,000
-        let (mut sec, mut usec) = (10, -500_000);
-        normalize_timeval(&mut sec, &mut usec);
-        assert_eq!(sec, 9);
-        assert_eq!(usec, 500_000);
-
-        // Double underflow: tv_usec = -1,500,000
-        let (mut sec, mut usec) = (10, -1_500_000);
-        normalize_timeval(&mut sec, &mut usec);
-        assert_eq!(sec, 8);
-        assert_eq!(usec, 500_000);
-
-        // No change needed
-        let (mut sec, mut usec) = (10, 500_000);
-        normalize_timeval(&mut sec, &mut usec);
-        assert_eq!(sec, 10);
-        assert_eq!(usec, 500_000);
+    fn a_step_target_is_a_normalized_timespec_119() {
+        use super::ns_to_timespec;
+        assert_eq!(
+            ns_to_timespec(1_790_380_800_123_456_789),
+            (1_790_380_800, 123_456_789)
+        );
+        assert_eq!(ns_to_timespec(1_500_000_000), (1, 500_000_000));
+        assert_eq!(ns_to_timespec(0), (0, 0));
+        assert_eq!(ns_to_timespec(-1), (-1, 999_999_999));
     }
 
-    /// Test step_clock offset calculation
+    /// dantesync#119: the step law's two Linux clocks advance together while nothing steps (no
+    /// root needed to read them): a mix-up of the clocks or of the units would be off by orders of
+    /// magnitude.
     #[test]
-    fn test_step_offset_calculation() {
-        use std::time::Duration;
-
-        // Helper to compute new timeval from base + offset (same logic as step_clock)
-        fn apply_step(base_sec: i64, base_usec: i64, offset: Duration, sign: i8) -> (i64, i64) {
-            let offset_sec = offset.as_secs() as i64;
-            let offset_usec = offset.subsec_micros() as i64;
-
-            let (mut tv_sec, mut tv_usec) = (base_sec, base_usec);
-
-            if sign > 0 {
-                tv_sec += offset_sec;
-                tv_usec += offset_usec;
-            } else {
-                tv_sec -= offset_sec;
-                tv_usec -= offset_usec;
-            }
-
-            // Normalize
-            while tv_usec >= 1_000_000 {
-                tv_sec += 1;
-                tv_usec -= 1_000_000;
-            }
-            while tv_usec < 0 {
-                tv_sec -= 1;
-                tv_usec += 1_000_000;
-            }
-
-            (tv_sec, tv_usec)
-        }
-
-        // Step forward by 1.5 seconds
-        let (sec, usec) = apply_step(100, 250_000, Duration::from_micros(1_500_000), 1);
-        assert_eq!(sec, 101);
-        assert_eq!(usec, 750_000);
-
-        // Step backward by 1.5 seconds
-        let (sec, usec) = apply_step(100, 250_000, Duration::from_micros(1_500_000), -1);
-        assert_eq!(sec, 98);
-        assert_eq!(usec, 750_000);
-
-        // Small step forward (500us)
-        let (sec, usec) = apply_step(100, 999_000, Duration::from_micros(500), 1);
-        assert_eq!(sec, 100);
-        assert_eq!(usec, 999_500);
-
-        // Small step causing overflow
-        let (sec, usec) = apply_step(100, 999_000, Duration::from_micros(2000), 1);
-        assert_eq!(sec, 101);
-        assert_eq!(usec, 1_000);
+    fn the_step_references_advance_together_on_linux_119() {
+        use super::super::step::read_tight;
+        let mut ops = super::LinuxStepOps;
+        // The best of a few pairs: a shared CI runner may preempt or slew any single one.
+        let best = (0..5)
+            .map(|_| {
+                let a = read_tight(&mut ops);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let b = read_tight(&mut ops);
+                assert_eq!(b.coarse_ns, b.precise_ns);
+                let d_reference = b.reference_ns - a.reference_ns;
+                assert!(
+                    (45_000_000..1_000_000_000).contains(&d_reference),
+                    "the reference advanced {d_reference} ns in a 50 ms sleep"
+                );
+                ((b.precise_ns - a.precise_ns) - d_reference).abs()
+            })
+            .min()
+            .unwrap();
+        assert!(best < 50_000, "precise vs reference off by {best} ns");
     }
 }
