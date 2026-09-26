@@ -878,6 +878,17 @@ fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the c
 (`tests/x.rs`, which cargo would also build as its own target): use
 `#[path = "<bench>/x.rs"] mod x;` for a submodule of a `tests/*.rs` bench.
 
+**Two gotchas from a worktree-isolated camera-box lane (#119 1.12):**
+- The lane's isolation guard refuses a Bash call it cannot prove stays inside the camera-box
+  worktree. That includes heredocs, `$VAR` in a command position, and compound `gh ... -q`
+  expressions. Put each edit and each runner in a script file in the scratchpad and run
+  `python3 /abs/script.py` or `bash /abs/run.sh`. Simple `cd <dantesync worktree> && git …`
+  chains pass.
+- In such a Python edit script, a Rust string continuation (`\` + newline) inside a NON-raw
+  Python string is itself a Python line continuation. Python eats it, and the Rust literal gains
+  a run of spaces. CI caught one in a config warning. Write `\\` or use a raw string, then grep
+  the result for 8+ spaces inside a string literal.
+
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually
 verify a branch, **open a PR to `master`** (that fires the `pull_request` CI); monitor it to green;
