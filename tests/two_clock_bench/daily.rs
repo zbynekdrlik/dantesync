@@ -198,13 +198,18 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_else_the_next_night_119()
         sc.label, r.corrections
     );
     assert_eq!(r.corrections.len(), 2, "{:?}", r.corrections);
+    // Review round 1: once UTC is back (02:10), the step waits for the level to hold
+    // MICRO_MIN_READINGS fresh readings (the sixth arrives 50 s later) — never one reading alone.
     assert!(
-        (7_800.0..7_811.0).contains(&tods[0]),
-        "the first night steps when UTC is back (02:10): {tods:?}"
+        (7_850.0..7_861.0).contains(&tods[0]),
+        "the first night steps once UTC is back and read six times: {tods:?}"
     );
     assert_in_window(sc.label, &tods[1..], 7_200.0);
     // The estimate after the gap still knows the whole error.
-    let first = accrued(17.6, FIRST_WINDOW_W as f64 / 2.0 + 600.0 + LANDING_S);
+    let first = accrued(
+        17.6,
+        FIRST_WINDOW_W as f64 / 2.0 + (tods[0] - 7_200.0) + LANDING_S,
+    );
     assert!(
         (r.corrections[0].1 - first).abs() < 5 * MS,
         "{} vs {first}",
@@ -256,4 +261,37 @@ fn a_master_only_ptp_outage_in_daily_mode_keeps_the_master_near_the_fleet_line_1
         "the master stayed near the fleet line: {joins:?}"
     );
     assert_eq!(r.corrections.len(), 1, "{:?}", r.corrections);
+}
+
+#[test]
+fn a_master_without_ptp_over_the_window_still_takes_the_nightly_step_with_the_fleet_119() {
+    // Review round 1: ONLY the master loses PTP from 01:40 to 03:40, across the window. It still
+    // announces the nightly step, and it takes it on its own wall with the fleet (its D is the
+    // fleet D: in daily mode it never steps to UTC on its own) — otherwise a long outage would
+    // leave it a day's drift off the fleet, and re-joining would be one large daytime step.
+    let mut sc = daily_scenario("daily: master-only PTP outage over the window", 17.6);
+    sc.run_windows = 24 * 3_600 * 2;
+    sc.master_ptp_offline = vec![(FIRST_WINDOW_W - 2_400, FIRST_WINDOW_W + 12_000)];
+    let r = run(&sc);
+    check(&sc, &r);
+    println!(
+        "[master outage over the window] corrections {:?}; the master's steps {:?}",
+        r.corrections, r.steps[0]
+    );
+    assert_eq!(r.corrections.len(), 1, "{:?}", r.corrections);
+    let seq = r.announced[0].0;
+    let own: Vec<&Step> = r.steps[0]
+        .iter()
+        .filter(|s| s.2 == StepKind::Coordinated && s.0 == seq)
+        .collect();
+    assert_eq!(own.len(), 1, "the master took the nightly step itself");
+    assert_eq!(own[0].1, r.announced[0].1, "the whole announced step");
+    let joins: Vec<&Step> = r.steps[0]
+        .iter()
+        .filter(|s| s.2 == StepKind::Join)
+        .collect();
+    assert!(
+        joins.iter().all(|s| s.1.abs() < MS),
+        "it re-joined the fleet line with its free-run error only: {joins:?}"
+    );
 }

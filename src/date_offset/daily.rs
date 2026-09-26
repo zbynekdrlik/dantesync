@@ -176,6 +176,10 @@ pub enum DailyDecision {
     /// The window closed while waiting for UTC: tonight's step is skipped; the next window opens
     /// at `next_window_wall_ns`. Reported once.
     Skipped { next_window_wall_ns: i64 },
+    /// The window opened and closed while the scheduler was not asked (the authority had another
+    /// date change in flight, or the process was stalled): tonight's step is missed; the next
+    /// window opens at `next_window_wall_ns`. Reported once.
+    Missed { next_window_wall_ns: i64 },
 }
 
 /// The date authority's nightly scheduler. All instants are FLEET-line wall time (Unix ns), which

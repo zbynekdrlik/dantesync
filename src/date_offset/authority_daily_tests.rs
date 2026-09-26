@@ -190,9 +190,12 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_inside_it_else_the_next_n
     l.run(15 * 3_600, down);
     assert_eq!(l.steps.len(), 1, "{:?}", l.steps);
     let tod = (l.steps[0].2 - DAY0).rem_euclid(86_400 * S);
+    // Review round 1: never on the first reading back — the level needs MICRO_MIN_READINGS fresh
+    // readings (the sixth arrives 50 s after UTC is back), so one WAN outlier cannot set the
+    // whole step.
     assert!(
-        (132 * 60 * S..150 * 60 * S).contains(&tod),
-        "inside the window, after UTC came back: {}",
+        ((132 * 60 + 50) * S..150 * 60 * S).contains(&tod),
+        "inside the window, once the estimate has fresh readings again: {}",
         tod / S
     );
     assert!(matches!(l.events[0], DailyDecision::Waiting { .. }));

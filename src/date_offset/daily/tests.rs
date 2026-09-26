@@ -176,12 +176,61 @@ fn without_utc_the_window_waits_up_to_30_minutes_then_skips_the_night_119() {
 }
 
 #[test]
-fn a_window_passed_while_the_scheduler_was_not_asked_is_not_reported_119() {
-    // The authority only asks while nothing else is in flight: a window it never asked in closes
-    // silently.
+fn a_window_that_closed_while_the_scheduler_was_not_asked_is_reported_once_119() {
+    // The authority only asks while nothing else is in flight. A window that opened and closed in
+    // between (another date change in flight all along, a stalled process) is missed: reported
+    // once, loudly (review round 1) — only a window already past at the FIRST ask (a boot) is
+    // silent.
     let mut d = DailyScheduler::new(DailyConfig::default());
     assert_eq!(d.decide(at(1, 0, 0), est(MS * 900)), DailyDecision::Idle);
-    assert_eq!(d.decide(at(3, 0, 0), est(MS * 900)), DailyDecision::Idle);
+    assert_eq!(
+        d.decide(at(3, 0, 0), est(MS * 900)),
+        DailyDecision::Missed {
+            next_window_wall_ns: at(2, 0, 0) + 86_400 * S
+        }
+    );
+    assert_eq!(d.decide(at(3, 0, 1), est(MS * 900)), DailyDecision::Idle);
+    assert_eq!(
+        d.decide(at(2, 0, 0) + 86_400 * S, est(MS * 900)),
+        DailyDecision::Step {
+            amount_ns: 900 * MS
+        }
+    );
+}
+
+#[test]
+fn a_backward_step_across_the_window_start_never_decides_the_night_again_119() {
+    // Review round 1: a step lands the fleet wall BEFORE the window start it was decided in (a
+    // backward step larger than the landing's distance from the start, possible once
+    // daily_emergency_ms is configured past 10 s). The night is handled: no second decision, no
+    // false skip, and the next window is tomorrow's.
+    let mut d = DailyScheduler::new(DailyConfig::default());
+    assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
+    assert_eq!(
+        d.decide(at(2, 0, 0), est(-20 * S)),
+        DailyDecision::Step { amount_ns: -20 * S }
+    );
+    // Landed at 02:00:10: the wall reads 01:59:50.
+    for t in [
+        at(1, 59, 50),
+        at(1, 59, 59),
+        at(2, 0, 0),
+        at(2, 10, 0),
+        at(2, 30, 0),
+    ] {
+        assert_eq!(d.decide(t, None), DailyDecision::Idle, "{t}");
+        assert_eq!(
+            d.next_window_wall_ns(t),
+            at(2, 0, 0) + 86_400 * S,
+            "the next window is tomorrow's"
+        );
+    }
+    assert_eq!(
+        d.decide(at(2, 0, 0) + 86_400 * S, est(MS * 900)),
+        DailyDecision::Step {
+            amount_ns: 900 * MS
+        }
+    );
 }
 
 #[test]

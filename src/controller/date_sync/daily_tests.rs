@@ -184,6 +184,37 @@ fn a_daily_master_without_ptp_keeps_off_the_local_ntp_step_path_119() {
 }
 
 #[test]
+fn a_daily_master_without_ptp_takes_its_own_nightly_step_with_the_fleet_119() {
+    // Review round 1: its D is the fleet D (it takes no local NTP steps), so it schedules the
+    // nightly step on its own wall like every follower — a long outage never leaves it a day's
+    // drift off the fleet.
+    let mut clock = MockSystemClock::new();
+    clock
+        .expect_step_clock()
+        .times(1)
+        .withf(|dur, sg| *dur == Duration::from_millis(300) && *sg == 1)
+        .returning(|_, _| Ok(()));
+    let start_s = now_s() - 1;
+    let (mut c, d) = anchored_controller_with(clock, ntp_at(300_000), true, daily_config(start_s));
+    c.ptp_offline = true;
+    c.service_date_offset();
+    readings_then_tick(&mut c);
+    assert_eq!(
+        c.date_sync.authority.as_ref().unwrap().seq(),
+        2,
+        "announced"
+    );
+    let due = c
+        .date_sync
+        .follower
+        .due(wall_now_ns() + 11 * S)
+        .expect("the off-line master scheduled the fleet step for its own wall");
+    assert_eq!(due.delta_ns, 300_000_000);
+    c.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d + 300_000_000));
+}
+
+#[test]
 fn the_configured_mode_reaches_the_authority_and_micro_stays_micro_119() {
     let (c, _d) = anchored_controller_with(
         MockSystemClock::new(),
