@@ -2305,8 +2305,13 @@ where
             .unwrap_or_default()
             .as_nanos() as i64;
 
+        // #119: remove a running date slew's scheduled displacement from the measurement, so
+        // neither servo reads the deliberate slew as grandmaster disagreement (the phase lock gets
+        // `t2_lock`, the rate servo `t2_rate`; both equal `t2_ns` when no slew was ever held).
+        let (t2_lock, t2_rate) = self.date_sync.deslew_sample(t2_ns);
+
         // Calculate display phase offset (modulo-based for readability)
-        let phase_offset_ns = self.calculate_phase_offset(t1_ns, t2_ns);
+        let phase_offset_ns = self.calculate_phase_offset(t1_ns, t2_rate);
 
         // Handle calibration if needed
         if self.process_calibration(phase_offset_ns) {
@@ -2327,7 +2332,7 @@ where
         // Process sync once settled
         self.valid_count += 1;
         if self.valid_count >= self.settling_threshold {
-            self.process_settled_sync(t1_ns, t2_ns, phase_offset_ns);
+            self.process_settled_sync(t1_ns, t2_lock, phase_offset_ns);
         }
 
         self.prev_t1_ns = t1_ns;
@@ -2782,10 +2787,14 @@ where
         // rate mechanism composes with the slew automatically; there is no second frequency path).
         // Then remember the applied f_phase for the NEXT interval's decoupling. When the servo is
         // disabled this is exactly `total_correction` and `last_applied_f_phase_ppm` stays 0.
+        //
+        // #119: plus a running date slew's rate term (fleet-common, 0 outside a slew) — composed
+        // into the same word, never a second writer (the slew edges re-apply this composition
+        // from the loop, `apply_slew_edge`).
         let f_total = if self.phase_slew.is_some() {
             phase_slew::compose_frequency(applied_word, self.pending_f_phase_ppm, DRIFT_MAX_PPM)
         } else {
-            applied_word
+            self.compose_slew_word(applied_word)
         };
         self.last_applied_f_phase_ppm = if self.phase_slew.is_some() {
             self.pending_f_phase_ppm

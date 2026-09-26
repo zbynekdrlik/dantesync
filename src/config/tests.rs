@@ -544,3 +544,29 @@ fn date_offset_tuning_is_floored_and_zero_means_default_88() {
     assert_eq!(c.date_offset.step_bound_ns(), 20_000_000);
     assert_eq!(c.date_offset.step_lead_ns(), 5_000_000_000);
 }
+
+#[test]
+fn date_slew_ppm_defaults_to_100_and_is_clamped_to_10_500_119() {
+    // A v1.9.0 config has no slew key: the default.
+    let c: SystemConfig =
+        serde_json::from_str(r#"{"date_offset":{"step_bound_ms":50}}"#).expect("parses");
+    assert_eq!(c.date_offset.slew_ppm(), 100);
+    assert_eq!(SystemConfig::default().date_offset.slew_ppm(), 100);
+    for (raw, want) in [
+        ("0", 100),
+        ("5", 10),
+        ("10", 10),
+        ("250", 250),
+        ("250.4", 250),
+        ("500", 500),
+        ("501", 500),
+        ("99999999999", 500),
+        ("\"fast\"", 100),
+        ("-3", 100),
+        ("null", 100),
+    ] {
+        let json = format!(r#"{{"date_offset":{{"slew_ppm":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        assert_eq!(c.date_offset.slew_ppm(), want, "slew_ppm {raw}");
+    }
+}

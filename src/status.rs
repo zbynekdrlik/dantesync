@@ -308,6 +308,24 @@ pub struct SyncStatus {
     /// healthy fleet this stays 0 — every step lands at the announced instant on every box.
     #[serde(default)]
     pub date_steps_late: u32,
+    /// dantesync#119: this node is SLEWING the fleet date now (a backward correction: `D` moves at
+    /// `date_slew_ppm`, the wall never steps back).
+    #[serde(default)]
+    pub date_slew_active: bool,
+    /// dantesync#119: what this node's slew still has to move `D` (ms); `null` without a slew
+    /// scheduled or running.
+    #[serde(default)]
+    pub date_slew_remaining_ms: Option<f64>,
+    /// dantesync#119: the rate (ppm) of the fleet's current slew announce; `null` when the
+    /// published date change is not a slew.
+    #[serde(default)]
+    pub date_slew_ppm: Option<u32>,
+    /// dantesync#119: the published slew's start and end `D` (its start instant is
+    /// `date_offset_effective_ptp_ns`) — what the 31900 extension carries.
+    #[serde(default)]
+    pub date_slew_from_ns: Option<i64>,
+    #[serde(default)]
+    pub date_slew_to_ns: Option<i64>,
 
     // ========================================================================
     // PTP phase lock (dantesync#117) — additive.
@@ -408,6 +426,11 @@ impl Default for SyncStatus {
             last_date_step_ts: None,
             last_date_step_kind: String::new(),
             date_steps_late: 0,
+            date_slew_active: false,
+            date_slew_remaining_ms: None,
+            date_slew_ppm: None,
+            date_slew_from_ns: None,
+            date_slew_to_ns: None,
             // #117: unknown until the controller publishes
             clock_discipline: String::new(),
             rate_source: String::new(),
@@ -835,6 +858,42 @@ mod tests {
         assert_eq!(back.date_offset_seq, Some(4));
         assert_eq!(back.date_step_pending_ns, Some(-51_000_000));
         assert_eq!(back.last_date_step_kind, "coordinated");
+    }
+
+    /// dantesync#119: the slew fields are additive. A v1.9.0 blob (the #88/#117 fields, no slew)
+    /// must deserialize to "not slewing", and a slewing node's state round-trips.
+    #[test]
+    fn test_sync_status_date_slew_fields_are_additive_119() {
+        let v190 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "clock_discipline":"ptp_phase_lock","rate_source":"ptp","ptp_phase_locked":true,
+            "date_authority":"follower","date_offset_ns":1790000000123456789,"date_offset_seq":7,
+            "date_step_pending_ns":null,"date_steps_late":0}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(v190).expect("v1.9.0 JSON must still deserialize");
+        assert!(!restored.date_slew_active);
+        assert_eq!(restored.date_slew_remaining_ms, None);
+        assert_eq!(restored.date_slew_ppm, None);
+        assert_eq!(restored.date_slew_from_ns, None);
+        assert_eq!(restored.date_slew_to_ns, None);
+        assert_eq!(restored.date_offset_seq, Some(7));
+
+        let slewing = SyncStatus {
+            date_slew_active: true,
+            date_slew_remaining_ms: Some(37.5),
+            date_slew_ppm: Some(100),
+            date_slew_from_ns: Some(1_790_000_000_000_000_000),
+            date_slew_to_ns: Some(1_789_999_999_949_000_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&slewing).expect("serialize failed");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert!(back.date_slew_active);
+        assert_eq!(back.date_slew_remaining_ms, Some(37.5));
+        assert_eq!(back.date_slew_ppm, Some(100));
+        assert_eq!(back.date_slew_from_ns, Some(1_790_000_000_000_000_000));
+        assert_eq!(back.date_slew_to_ns, Some(1_789_999_999_949_000_000));
     }
 
     #[test]

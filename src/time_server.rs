@@ -36,8 +36,9 @@
 //! extension: the same 64-byte base, then — when this node has a date-offset state —
 //! the [`crate::date_offset`] extension (`[64]` version, `[65]` flags with bit 0 = the fleet's
 //! date-offset AUTHORITY, `[68-75]` `date_offset_ns`, `[76-83]` `effective_ptp_ns`, `[84-87]`
-//! `seq`, `[88-93]` the anchor's grandmaster UUID, `[96-103]` the replier's PTP "now"). See
-//! `date_offset::EXT_SIZE` for the authoritative layout. Compatibility, both directions:
+//! `seq`, `[88-93]` the anchor's grandmaster UUID, `[96-103]` the replier's PTP "now"; since
+//! dantesync#119 version 2: flags bit 1 = a SLEW, `[66-67]` its ppm, `[104-111]` its start `D`).
+//! See `date_offset::EXT_SIZE` for the authoritative layout. Compatibility, both directions:
 //!
 //! - an OLD client sends `"DSYN"` and gets the byte-identical 64-byte reply it always got — it
 //!   never sees extra bytes (a 64-byte receive buffer on Windows would otherwise fail the whole
@@ -52,7 +53,9 @@
 //! A new client reads the extension with [`parse_reply`]; [`UdpAuthorityPoller`] polls the NTP
 //! master once per second on a background thread so the sync loop never blocks on DNS or I/O.
 
-use crate::date_offset::{decode_extension, encode_extension, DateAnnounce, DateExtension};
+use crate::date_offset::{
+    decode_extension, encode_extension, DateAnnounce, DateExtension, SlewSpec,
+};
 use crate::status::SyncStatus;
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -128,8 +131,9 @@ impl TimeServer {
                     if size >= REQUEST_SIZE {
                         let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                         if magic == REQUEST_MAGIC_EXT && size < EXT_REQUEST_SIZE {
-                            // #88: the extended reply is 104 bytes; answering a short request
-                            // would make every spoofed one an amplifier.
+                            // #88: the extended reply is 112 bytes (104 before the #119 slew
+                            // fields); answering a short request would make every spoofed one an
+                            // amplifier.
                             debug!(
                                 "[TimeServer] Ignoring an unpadded DSYX request ({} bytes) from {}",
                                 size, src
@@ -265,8 +269,20 @@ fn build_response(request_id: u32, status: &SyncStatus) -> [u8; RESPONSE_SIZE] {
 /// (`date_step_pending_ns`), the published offset is the one it will take — `D + step` — with
 /// `date_offset_effective_ptp_ns` (the step's future instant). The controller writes the anchor
 /// and the pending step in ONE status update, so a reader never sees the step counted twice.
+///
+/// dantesync#119: when the published change is a SLEW (`date_slew_from_ns` / `date_slew_to_ns` /
+/// `date_slew_ppm`), the announce is the slew — its end `D`, its start instant and its rate — and
+/// never a pending step.
 fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<DateExtension> {
     let in_effect = status.date_offset_ns?;
+    let slew = match (
+        status.date_slew_from_ns,
+        status.date_slew_to_ns,
+        status.date_slew_ppm,
+    ) {
+        (Some(from_ns), Some(to_ns), Some(ppm)) => Some((SlewSpec { from_ns, ppm }, to_ns)),
+        _ => None,
+    };
     Some(DateExtension {
         version: crate::date_offset::EXT_VERSION,
         authority: status.date_authority == "master",
@@ -274,9 +290,13 @@ fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<D
         // This node's PTP "now" from its D IN EFFECT (never the published, possibly pending D).
         now_ptp_ns: now_wall_ns.wrapping_sub(in_effect),
         announce: DateAnnounce {
-            date_offset_ns: in_effect.wrapping_add(status.date_step_pending_ns.unwrap_or(0)),
+            date_offset_ns: match slew {
+                Some((_, to_ns)) => to_ns,
+                None => in_effect.wrapping_add(status.date_step_pending_ns.unwrap_or(0)),
+            },
             effective_ptp_ns: status.date_offset_effective_ptp_ns?,
             seq: status.date_offset_seq?,
+            slew: slew.map(|(spec, _)| spec),
         },
     })
 }

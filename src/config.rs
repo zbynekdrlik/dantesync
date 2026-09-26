@@ -146,6 +146,14 @@ pub struct DateOffsetConfig {
         deserialize_with = "lenient_lead_ms"
     )]
     pub step_lead_ms: u64,
+    /// dantesync#119 — the rate (ppm) at which a BACKWARD correction is slewed (a backward date
+    /// step would lose Dante audio downstream). Default 100 (50 ms in 500 s). `0` means the
+    /// default; anything else is clamped to 10..=500 at read time ([`Self::slew_ppm`]).
+    #[serde(
+        default = "default_date_slew_ppm",
+        deserialize_with = "lenient_slew_ppm"
+    )]
+    pub slew_ppm: u64,
 }
 
 /// dantesync#117 — a hand-edit like `"clock_discipline": true` must not fail the WHOLE config
@@ -205,6 +213,20 @@ where
     ))
 }
 
+fn lenient_slew_ppm<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_slew_ppm(),
+    ))
+}
+
+fn default_date_slew_ppm() -> u64 {
+    crate::date_offset::DEFAULT_SLEW_PPM as u64
+}
+
 fn default_date_step_bound_ms() -> u64 {
     50
 }
@@ -218,6 +240,7 @@ impl Default for DateOffsetConfig {
         DateOffsetConfig {
             step_bound_ms: default_date_step_bound_ms(),
             step_lead_ms: default_date_step_lead_ms(),
+            slew_ppm: default_date_slew_ppm(),
         }
     }
 }
@@ -236,6 +259,12 @@ impl DateOffsetConfig {
     /// The effective lead in ns (floored at 5 s).
     pub fn step_lead_ns(&self) -> i64 {
         (self.step_lead_ms.clamp(5_000, 3_600_000) as i64) * 1_000_000
+    }
+
+    /// dantesync#119 — the effective slew rate (ppm): `0` → the default (100), else clamped to
+    /// `crate::date_offset::MIN_SLEW_PPM..=MAX_SLEW_PPM` (10..=500).
+    pub fn slew_ppm(&self) -> u32 {
+        crate::date_offset::clamp_slew_ppm(self.slew_ppm.min(u32::MAX as u64) as u32)
     }
 }
 
