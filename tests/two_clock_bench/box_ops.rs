@@ -53,6 +53,12 @@ impl Box_ {
         w: u64,
         grace: bool,
     ) {
+        // `apply_date_step` does nothing for a zero step. (#119 1.11.1: a step that lands a few µs
+        // short right at its instant leaves the box's PTP view of "now" behind that instant, so a
+        // poll may schedule the same announce once more — as a zero step.)
+        if delta_ns == 0 {
+            return;
+        }
         // #119 (1.11.1): a Windows box's wall moves by what the step law realizes against the
         // Windows clock model; D moves by the REQUESTED amount, as `apply_date_step` does.
         let realized = match self.win.as_mut() {

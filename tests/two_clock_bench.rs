@@ -124,6 +124,9 @@ struct Scenario {
     windows_tick_ns: i64,
     /// How many 0.5 s windows the run lasts.
     run_windows: u64,
+    /// `check()`'s bound on any box's hourly effective rate vs the grandmaster (ppm). Ideal steps
+    /// leave only the PI's noise (≈ 0.002); a real step's µs residual is paid through the rate.
+    hourly_rate_bound_ppm: f64,
 }
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
@@ -150,6 +153,7 @@ impl Scenario {
             windows_boxes: &[],
             windows_tick_ns: TICK_NS,
             run_windows: HOURS * 3600 * 2,
+            hourly_rate_bound_ppm: 0.01,
         }
     }
     fn settling_after_a_utc_jump(&self, w: u64) -> bool {

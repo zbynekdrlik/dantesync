@@ -74,7 +74,7 @@ fn check(sc: &Scenario, r: &RunResult) {
         r.rate_errors_ppm.len()
     );
     assert!(
-        worst < 0.01,
+        worst < sc.hourly_rate_bound_ppm,
         "[{label}] a box's rate left the PTP rate by {worst} ppm"
     );
 
@@ -545,6 +545,11 @@ fn windows_boxes_take_the_backward_steps_exactly_too_119() {
     sc.master_boot_err_ns = 3 * S;
     sc.expects_too_large_step = true;
     sc.windows_boxes = &WINDOWS_BOXES;
+    // Each Windows step lands within the law's tolerance, µs off, and the phase lock pays that
+    // through the rate: at ~47 steps an hour, a mean residual of 0.3 µs and a spread of ~2 µs a
+    // step (the model's set latency around the learned median), up to ~60 µs an hour ≈ 0.016 ppm.
+    // Ideal steps stay under 0.003 (every other scenario, still bounded at 0.01).
+    sc.hourly_rate_bound_ppm = 0.02;
     let r = run(&sc);
     check(&sc, &r);
     for &i in &WINDOWS_BOXES {
