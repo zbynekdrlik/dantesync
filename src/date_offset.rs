@@ -187,10 +187,10 @@ pub fn effective_micro(requested: MicroConfig, lead_ns: i64, slew_ppm: u32) -> M
     MicroConfig {
         interval_ns,
         // A backward increment is in flight for its slew too; a forward one is a step.
-        backward_interval_ns: {
-            let _ = slew_ns;
-            interval_ns
-        },
+        backward_interval_ns: requested
+            .backward_interval_ns
+            .max(interval_ns)
+            .max(lead.saturating_add(slew_ns)),
         ..requested
     }
 }

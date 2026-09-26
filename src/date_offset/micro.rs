@@ -533,8 +533,9 @@ impl MicroScheduler {
     /// [`MICRO_READING_MAX_AGE_NS`] at `now_ptp_ns`. No correction is decided meanwhile (the fleet
     /// date runs free at the grandmaster's rate); the controller says so loudly.
     pub fn paused(&self, now_ptp_ns: i64) -> bool {
-        let _ = now_ptp_ns;
-        false
+        self.readings
+            .back()
+            .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) > MICRO_READING_MAX_AGE_NS)
     }
 
     /// How many readings are kept.
