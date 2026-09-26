@@ -404,7 +404,8 @@ impl DateOffsetConfig {
         }
         if v.eq_ignore_ascii_case(DATE_CORRECTION_BOUND) {
             warnings.push(format!(
-                "system.date_offset.correction {:?}: the step-bound correction was removed in                  1.11.0 — using {:?} (one coordinated step per night)",
+                "system.date_offset.correction {:?}: the step-bound correction was removed in \
+                 1.11.0 — using {:?} (one coordinated step per night)",
                 self.correction, DATE_CORRECTION_DAILY
             ));
         } else if !v.eq_ignore_ascii_case(DATE_CORRECTION_DAILY) {
@@ -418,7 +419,8 @@ impl DateOffsetConfig {
         }
         let tod_s = parse_daily_step_utc(&self.daily_step_utc).unwrap_or_else(|| {
             warnings.push(format!(
-                "system.date_offset.daily_step_utc {:?} is not a UTC time of day (\"HH:MM\") —                  using {:?}",
+                "system.date_offset.daily_step_utc {:?} is not a UTC time of day (\"HH:MM\") — \
+                 using {:?}",
                 self.daily_step_utc, DEFAULT_DAILY_STEP_UTC
             ));
             DEFAULT_DAILY_STEP_TOD_S
