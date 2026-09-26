@@ -120,6 +120,8 @@ struct Scenario {
     /// stamped by that stepped clock at its capture instant (`two_clock_bench/windows.rs`). The
     /// others step ideally, as before.
     windows_boxes: &'static [usize],
+    /// The Windows boxes' clock-interrupt tick (the coarse clock's resolution).
+    windows_tick_ns: i64,
     /// How many 0.5 s windows the run lasts.
     run_windows: u64,
 }
@@ -146,6 +148,7 @@ impl Scenario {
             ntp_noise: NtpNoise::Gauss,
             seed: 0,
             windows_boxes: &[],
+            windows_tick_ns: TICK_NS,
             run_windows: HOURS * 3600 * 2,
         }
     }
@@ -378,7 +381,7 @@ impl<'s> Bench<'s> {
                 win: sc
                     .windows_boxes
                     .contains(&i)
-                    .then(|| WinClock::new(i, sc.seed)),
+                    .then(|| WinClock::new(i, sc.seed, sc.windows_tick_ns)),
                 rate_ppm: 0.0,
                 wander_now_ppm: 0.0,
                 last_landing: None,

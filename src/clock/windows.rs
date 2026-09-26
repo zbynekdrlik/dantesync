@@ -87,25 +87,26 @@ impl WindowsStepOps {
 
 impl StepOps for WindowsStepOps {
     fn read(&mut self) -> ClockReading {
-        let mut qpc: i64 = 0;
-        // QueryPerformanceCounter cannot fail since Windows XP (documented); a failure would read
-        // 0 and show up as an absurd realized step in the step log, never silently.
-        // The coarse read first, so it can never be ahead of the precise one read after it.
+        let (mut qpc_before, mut qpc_after) = (0i64, 0i64);
+        // QueryPerformanceCounter cannot fail since Windows XP (documented); a failed read would
+        // leave 0, a reading the step law's window check and correction bound refuse to act on.
+        // The coarse read before the precise one, so it can never be ahead of it.
         let (coarse, precise) = unsafe {
+            let _ = QueryPerformanceCounter(&mut qpc_before);
             let coarse = filetime_u64(GetSystemTimeAsFileTime());
-            let _ = QueryPerformanceCounter(&mut qpc);
-            (coarse, filetime_u64(GetSystemTimePreciseAsFileTime()))
+            let precise = filetime_u64(GetSystemTimePreciseAsFileTime());
+            let _ = QueryPerformanceCounter(&mut qpc_after);
+            (coarse, precise)
         };
-        ClockReading {
-            coarse_ns: super::filetime_to_unix_ns(coarse),
-            precise_ns: super::filetime_to_unix_ns(precise),
-            reference_ns: super::qpc_to_reference_ns(
-                qpc,
-                self.perf_frequency,
-                self.increment,
-                self.adjustment,
-            ),
-        }
+        let reference = |qpc| {
+            super::qpc_to_reference_ns(qpc, self.perf_frequency, self.increment, self.adjustment)
+        };
+        ClockReading::sandwiched(
+            super::filetime_to_unix_ns(coarse),
+            super::filetime_to_unix_ns(precise),
+            reference(qpc_before),
+            reference(qpc_after),
+        )
     }
 
     fn set(&mut self, target_ns: i64) -> std::result::Result<(), String> {
@@ -595,30 +596,33 @@ mod tests {
     /// A unit slip (100 ns vs ns, a QPC frequency mix-up) would be off by orders of magnitude.
     #[test]
     fn the_step_references_advance_together_on_windows_119() {
-        use super::super::step::StepOps;
+        use super::super::step::read_tight;
         let mut freq: i64 = 0;
         unsafe {
             windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq).unwrap();
         }
         let mut ops = super::WindowsStepOps::new(freq);
-        let a = ops.read();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let b = ops.read();
-        let d_precise = b.precise_ns - a.precise_ns;
-        let d_reference = b.reference_ns - a.reference_ns;
-        assert!(
-            (190_000_000..1_000_000_000).contains(&d_reference),
-            "the reference advanced {d_reference} ns in a 200 ms sleep"
-        );
-        assert!(
-            (d_precise - d_reference).abs() < 100_000,
-            "precise {d_precise} ns vs reference {d_reference} ns"
-        );
-        // The coarse clock is the precise one at the last clock interrupt: never ahead of it,
-        // never more than one (default 15.6 ms) tick behind.
-        assert!(
-            (0..16_000_000).contains(&(b.precise_ns - b.coarse_ns)),
-            "{b:?}"
-        );
+        // The best of a few pairs: a shared CI runner may preempt, slew or step any single one.
+        let best = (0..5)
+            .map(|_| {
+                let a = read_tight(&mut ops);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let b = read_tight(&mut ops);
+                let d_reference = b.reference_ns - a.reference_ns;
+                assert!(
+                    (45_000_000..1_000_000_000).contains(&d_reference),
+                    "the reference advanced {d_reference} ns in a 50 ms sleep"
+                );
+                // The coarse clock is the precise one at the last clock interrupt: never ahead of
+                // it, never more than one (default 15.6 ms) tick behind.
+                assert!(
+                    (0..16_000_000).contains(&(b.precise_ns - b.coarse_ns)),
+                    "{b:?}"
+                );
+                ((b.precise_ns - a.precise_ns) - d_reference).abs()
+            })
+            .min()
+            .unwrap();
+        assert!(best < 50_000, "precise vs reference off by {best} ns");
     }
 }

@@ -48,13 +48,10 @@ struct LinuxStepOps;
 
 impl StepOps for LinuxStepOps {
     fn read(&mut self) -> ClockReading {
-        let reference = read_clock(CLOCK_MONOTONIC);
+        let reference_before = read_clock(CLOCK_MONOTONIC);
         let precise = read_clock(CLOCK_REALTIME);
-        ClockReading {
-            coarse_ns: precise,
-            precise_ns: precise,
-            reference_ns: reference,
-        }
+        let reference_after = read_clock(CLOCK_MONOTONIC);
+        ClockReading::sandwiched(precise, precise, reference_before, reference_after)
     }
 
     fn set(&mut self, target_ns: i64) -> std::result::Result<(), String> {
@@ -181,21 +178,24 @@ mod tests {
     /// magnitude.
     #[test]
     fn the_step_references_advance_together_on_linux_119() {
-        use super::super::step::StepOps;
+        use super::super::step::read_tight;
         let mut ops = super::LinuxStepOps;
-        let a = ops.read();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let b = ops.read();
-        let d_precise = b.precise_ns - a.precise_ns;
-        let d_reference = b.reference_ns - a.reference_ns;
-        assert!(
-            (190_000_000..1_000_000_000).contains(&d_reference),
-            "the reference advanced {d_reference} ns in a 200 ms sleep"
-        );
-        assert!(
-            (d_precise - d_reference).abs() < 100_000,
-            "precise {d_precise} ns vs reference {d_reference} ns"
-        );
-        assert_eq!(b.coarse_ns, b.precise_ns);
+        // The best of a few pairs: a shared CI runner may preempt or slew any single one.
+        let best = (0..5)
+            .map(|_| {
+                let a = read_tight(&mut ops);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let b = read_tight(&mut ops);
+                assert_eq!(b.coarse_ns, b.precise_ns);
+                let d_reference = b.reference_ns - a.reference_ns;
+                assert!(
+                    (45_000_000..1_000_000_000).contains(&d_reference),
+                    "the reference advanced {d_reference} ns in a 50 ms sleep"
+                );
+                ((b.precise_ns - a.precise_ns) - d_reference).abs()
+            })
+            .min()
+            .unwrap();
+        assert!(best < 50_000, "precise vs reference off by {best} ns");
     }
 }

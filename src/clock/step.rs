@@ -33,8 +33,10 @@
 //! Pure (the OS behind [`StepOps`]) so the unit tests and the two-clock bench run the same law
 //! against models of both operating systems.
 
-/// One back-to-back reading of the clocks a step is measured with (ns since the Unix epoch for
-/// the two system times; the reference has an arbitrary origin).
+/// One reading of the clocks a step is measured with (ns since the Unix epoch for the two system
+/// times; the reference has an arbitrary origin). The reference is read on BOTH sides of the
+/// system times: `reference_ns` is the midpoint, `window_ns` how far apart the two reads were —
+/// a read the scheduler preempted in the middle has a wide window and cannot be trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockReading {
     /// The system time as the COARSE API returns it (Windows `GetSystemTimeAsFileTime`, updated
@@ -42,13 +44,36 @@ pub struct ClockReading {
     pub coarse_ns: i64,
     /// The precise system time — the clock every PTP timestamp is taken with.
     pub precise_ns: i64,
-    /// A clock no step moves, running at the system time's rate (its frequency word included).
+    /// A clock no step moves, running at the system time's rate (its frequency word included):
+    /// the midpoint of its reads before and after the system times.
     pub reference_ns: i64,
+    /// The reference's advance across the reading (its uncertainty).
+    pub window_ns: i64,
+}
+
+impl ClockReading {
+    /// A reading from the reference read before (`reference_before_ns`) and after
+    /// (`reference_after_ns`) the two system times.
+    pub fn sandwiched(
+        coarse_ns: i64,
+        precise_ns: i64,
+        reference_before_ns: i64,
+        reference_after_ns: i64,
+    ) -> Self {
+        let window_ns = reference_after_ns - reference_before_ns;
+        ClockReading {
+            coarse_ns,
+            precise_ns,
+            reference_ns: reference_before_ns + window_ns / 2,
+            window_ns,
+        }
+    }
 }
 
 /// The operating system under the step law.
 pub trait StepOps {
-    /// Read all three clocks, back to back.
+    /// Read the three clocks: the reference, the coarse and the precise system time, the
+    /// reference again ([`ClockReading::sandwiched`]).
     fn read(&mut self) -> ClockReading;
     /// Set the system time to `target_ns` (ns since the Unix epoch).
     fn set(&mut self, target_ns: i64) -> Result<(), String>;
@@ -66,6 +91,17 @@ pub const MAX_LEAD_NS: i64 = 1_000_000;
 /// One observation moves the learned latency by at most this, so a single preempted set cannot
 /// make the next steps overshoot by more than the tolerance.
 pub const LEAD_SLEW_NS: i64 = 5_000;
+
+/// A reading whose reference reads are further apart than this was preempted: read again.
+pub const READ_WINDOW_MAX_NS: i64 = 20_000;
+
+/// At most this many readings for one; the tightest is used if none is within the window.
+pub const READ_TRIES: u32 = 8;
+
+/// A residual is only corrected up to this (and never beyond the requested step itself): a
+/// larger one means the measurement is wrong (another writer stepped the clock during the call,
+/// a clock read failed), and chasing it could move the wall by anything.
+pub const MAX_CORRECTION_NS: i64 = 2_000_000;
 
 /// The learned read→set latency (ns) of this clock, carried from step to step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -87,7 +123,7 @@ impl StepLead {
 }
 
 /// What one step did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepOutcome {
     pub requested_ns: i64,
     /// The wall's measured move (`Δprecise − Δreference` summed over the sets).
@@ -96,6 +132,15 @@ pub struct StepOutcome {
     pub attempts: u32,
     /// `precise − coarse` at the first read: what a coarse-read step would have lost.
     pub coarse_lag_ns: i64,
+    /// Why the law stopped short of the tolerance, if it did: a correction set that failed, or a
+    /// residual beyond [`MAX_CORRECTION_NS`] (the wall HAS moved by `realized_ns` either way).
+    pub stopped: Option<String>,
+}
+
+/// Read `ops` until the reading is not preempted (its window within [`READ_WINDOW_MAX_NS`]), at
+/// most [`READ_TRIES`] times; else the tightest reading.
+pub fn read_tight<O: StepOps>(ops: &mut O) -> ClockReading {
+    ops.read()
 }
 
 impl StepOutcome {
@@ -116,6 +161,7 @@ pub fn step_wall<O: StepOps>(
         realized_ns: 0,
         attempts: 0,
         coarse_lag_ns: 0,
+        stopped: None,
     };
     if requested_ns == 0 {
         return Ok(out);
@@ -171,6 +217,13 @@ mod tests {
         tick_ns: i64,
         latencies: Vec<i64>,
         sets: u32,
+        /// Per read (in order), a preemption between the first reference read and the system
+        /// times (0 = none; reads beyond the list are not preempted).
+        read_gaps: Vec<i64>,
+        reads: usize,
+        /// Per set (in order): `Err` refuses it; `Ok(jump)` lets another writer move the wall by
+        /// `jump` during the call (sets beyond the list succeed with no jump).
+        set_script: Vec<Result<i64, String>>,
     }
 
     impl FakeOs {
@@ -181,6 +234,9 @@ mod tests {
                 tick_ns,
                 latencies: vec![latency_ns],
                 sets: 0,
+                read_gaps: Vec::new(),
+                reads: 0,
+                set_script: Vec::new(),
             }
         }
         fn wall(&self) -> i64 {
@@ -190,19 +246,26 @@ mod tests {
 
     impl StepOps for FakeOs {
         fn read(&mut self) -> ClockReading {
-            self.true_ns += US;
+            let gap = self.read_gaps.get(self.reads).copied().unwrap_or(0);
+            self.reads += 1;
+            let reference_before = self.true_ns;
+            self.true_ns += gap + US / 2;
             let precise = self.wall();
-            ClockReading {
-                coarse_ns: precise - self.true_ns.rem_euclid(self.tick_ns),
-                precise_ns: precise,
-                reference_ns: self.true_ns,
-            }
+            let coarse = precise - self.true_ns.rem_euclid(self.tick_ns);
+            self.true_ns += US / 2;
+            ClockReading::sandwiched(coarse, precise, reference_before, self.true_ns)
         }
         fn set(&mut self, target_ns: i64) -> Result<(), String> {
             let i = (self.sets as usize).min(self.latencies.len() - 1);
+            let script = self.set_script.get(self.sets as usize).cloned();
             self.sets += 1;
+            let jump = match script {
+                Some(Err(e)) => return Err(e),
+                Some(Ok(jump)) => jump,
+                None => 0,
+            };
             self.true_ns += self.latencies[i];
-            self.stepped_ns = target_ns - self.true_ns;
+            self.stepped_ns = target_ns - self.true_ns + jump;
             self.true_ns += 117 * MS;
             Ok(())
         }
@@ -223,7 +286,7 @@ mod tests {
     #[test]
     fn a_coarse_clock_interrupt_lag_is_not_lost_from_the_step() {
         // 250 µs into a 0.5 ms tick: a coarse-read step lands 250 µs short.
-        let mut os = FakeOs::new(T0 + 250 * US - US, 500 * US, 3 * US);
+        let mut os = FakeOs::new(T0 + 250 * US - US / 2, 500 * US, 3 * US);
         let out = step_wall(&mut os, &mut StepLead::default(), 500 * US).unwrap();
         assert_eq!(out.coarse_lag_ns, 250 * US);
         assert!(
@@ -283,7 +346,8 @@ mod tests {
         let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
         let out = step_wall(&mut os, &mut lead, 500 * US).unwrap();
         assert_eq!(out.attempts, 1, "{out:?}");
-        assert_eq!(out.realized_ns, 500 * US + 50 * US - 3 * US);
+        // (The set lands its latency after the read's wall sample, half a µs before its end.)
+        assert_eq!(out.realized_ns, 500 * US + 50 * US - 3 * US - US / 2);
         assert!(out.residual_ns() < 0);
         assert_eq!(
             lead.lead_ns(),
@@ -320,20 +384,80 @@ mod tests {
 
     #[test]
     fn a_failed_set_is_an_error() {
-        struct Refuses;
-        impl StepOps for Refuses {
-            fn read(&mut self) -> ClockReading {
-                ClockReading {
-                    coarse_ns: T0,
-                    precise_ns: T0,
-                    reference_ns: 0,
-                }
-            }
-            fn set(&mut self, _: i64) -> Result<(), String> {
-                Err("NtSetSystemTime failed with NTSTATUS 0xC0000061".into())
-            }
-        }
-        let err = step_wall(&mut Refuses, &mut StepLead::default(), 500 * US).unwrap_err();
+        let mut os = FakeOs::new(T0, 500 * US, 3 * US);
+        os.set_script = vec![Err("NtSetSystemTime failed with NTSTATUS 0xC0000061".into())];
+        let err = step_wall(&mut os, &mut StepLead::default(), 500 * US).unwrap_err();
         assert!(err.contains("0xC0000061"));
+        assert_eq!(os.stepped_ns, 0, "nothing moved");
+    }
+
+    #[test]
+    fn a_failed_correction_keeps_the_move_already_made() {
+        // The first set lands 300 µs short (preempted), the correction set is refused: the wall
+        // HAS moved 200 µs, so the step is reported as made (D must move with it), with why it
+        // stopped short — never an error that makes the caller leave D behind.
+        let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 300 * US);
+        os.set_script = vec![
+            Ok(0),
+            Err("NtSetSystemTime failed with NTSTATUS 0xC0000061".into()),
+        ];
+        let out = step_wall(&mut os, &mut StepLead::default(), 500 * US)
+            .expect("the wall already moved: the step is reported, not failed");
+        assert_eq!(out.realized_ns, os.stepped_ns);
+        assert_eq!(out.realized_ns, 200 * US);
+        assert_eq!(out.attempts, 1, "one set landed");
+        assert!(
+            out.stopped
+                .as_deref()
+                .is_some_and(|s| s.contains("0xC0000061")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_preempted_read_is_read_again_and_never_mis_measures_the_step() {
+        // The first reading is preempted 600 µs between its reference and wall reads: taken
+        // alone it would place the wall 300 µs off the reference, and the law would "correct" a
+        // step that was exact.
+        let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
+        os.read_gaps = vec![600 * US];
+        let out = step_wall(&mut os, &mut StepLead::default(), 500 * US).unwrap();
+        assert_eq!(
+            out.realized_ns, os.stepped_ns,
+            "the measurement is the true move"
+        );
+        assert!(out.residual_ns().abs() <= STEP_TOLERANCE_NS, "{out:?}");
+    }
+
+    #[test]
+    fn read_tight_takes_the_tightest_reading() {
+        let mut os = FakeOs::new(T0, 500 * US, 3 * US);
+        os.read_gaps = vec![900 * US, 30 * US, 700 * US];
+        os.read_gaps.resize(READ_TRIES as usize, 400 * US);
+        let r = read_tight(&mut os);
+        assert_eq!(
+            r.window_ns,
+            30 * US + US,
+            "the tightest of the preempted readings"
+        );
+        assert_eq!(os.reads, READ_TRIES as usize, "all of them tried");
+        // A clean reading is taken at once.
+        let mut os = FakeOs::new(T0, 500 * US, 3 * US);
+        os.read_gaps = vec![900 * US];
+        assert_eq!(read_tight(&mut os).window_ns, US);
+        assert_eq!(os.reads, 2);
+    }
+
+    #[test]
+    fn a_measurement_the_step_cannot_explain_is_not_chased() {
+        // Another writer steps the clock +3 ms during the set of a −500 µs step: the measured move
+        // is +2.5 ms, a residual of −3 ms — beyond the step itself. Chasing it would move the wall
+        // by an unverified amount: the law stops and says why.
+        let mut os = FakeOs::new(T0 + 11 * US, 500 * US, 3 * US);
+        os.set_script = vec![Ok(3 * MS)];
+        let out = step_wall(&mut os, &mut StepLead::default(), -500 * US).unwrap();
+        assert_eq!(out.attempts, 1, "{out:?}");
+        assert!(out.stopped.is_some(), "{out:?}");
+        assert_eq!(os.sets, 1);
     }
 }

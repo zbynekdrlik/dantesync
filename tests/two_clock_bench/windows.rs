@@ -3,21 +3,26 @@
 //! by that stepped clock, and the scenario that proves a date micro-step every 20 s never moves the
 //! rate servo.
 //!
-//! The model, from the rig (stream, 1.11.0, 26.9.2026):
+//! The model. MEASURED on the rig (stream, 1.11.0, 26.9.2026): `NtSetSystemTime` blocks ~117 ms
+//! (every `[StepClock]` line), and every step landed short (the phase-lock error was always
+//! negative after it, −170 … −860 µs as the shortfalls accumulate under the phase lock's pay-back).
+//! ASSUMED, from the Windows documentation and the rig's timer resolution:
 //!
 //! - the COARSE system time (`GetSystemTimeAsFileTime`) is the precise one at the last clock
-//!   interrupt, a 0.5 ms tick (the raised timer resolution of a media PC);
-//! - `NtSetSystemTime` sets the PRECISE time to its target a few µs after the call starts (rarely a
-//!   preempted few hundred µs), then blocks ~117 ms (every `[StepClock]` line on stream);
+//!   interrupt — a 0.5 ms tick on a media PC, run also at 1 ms and the default 15.625 ms;
+//! - `NtSetSystemTime` sets the PRECISE time to its target a few µs after the call starts, 3 % of
+//!   the calls preempted for a few hundred µs; 1 % of the clock reads are preempted between their
+//!   reference and system-time reads;
 //! - QPC runs at the wall's rate (the step law scales it by the adjustment) and never steps;
 //! - Npcap stamps a packet with the precise system time at capture; the controller processes it at
-//!   the end of its window, so a step can land between the stamp and the processing.
+//!   the end of its window (the stamp and the processing can straddle a step — the controller's
+//!   2 s post-step grace drops such windows, and the no-grace scenario proves the law without it).
 
 use super::*;
-use dantesync::clock::step::{step_wall, ClockReading, StepLead, StepOps};
+use dantesync::clock::step::{step_wall, ClockReading, StepLead, StepOps, STEP_TOLERANCE_NS};
 
-/// The Windows clock interrupt with a raised timer resolution.
-const TICK_NS: i64 = 500 * US;
+/// The Windows clock interrupt with a raised timer resolution (the rig's media PCs).
+pub(super) const TICK_NS: i64 = 500 * US;
 /// `NtSetSystemTime` blocks this long after it applied the time (measured on stream).
 const SET_CALL_NS: i64 = 117 * MS;
 /// Npcap's own queue on top of the window: a packet may be processed this long after the window
@@ -27,24 +32,26 @@ const CAPTURE_QUEUE_NS: f64 = 20e6;
 /// Linux).
 pub(super) const WINDOWS_BOXES: [usize; 3] = [1, 3, 5];
 
-/// One box's Windows clock: its phase against the clock-interrupt grid, its own noise, the step
-/// law's learned latency, and what its steps did.
+/// One box's Windows clock: its clock-interrupt tick and phase, its own noise, the step law's
+/// learned latency, and what its steps did.
 pub(super) struct WinClock {
     lead: StepLead,
     rng: Rng,
+    tick_ns: i64,
     tick_phase_ns: i64,
     pub(super) max_residual_ns: i64,
 }
 
 impl WinClock {
-    pub(super) fn new(i: usize, seed: u64) -> Self {
+    pub(super) fn new(i: usize, seed: u64, tick_ns: i64) -> Self {
         let mut rng = Rng(0x5851_F42D_4C95_7F2D
             ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9)
             ^ seed.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        let tick_phase_ns = (rng.uniform() * TICK_NS as f64) as i64;
+        let tick_phase_ns = (rng.uniform() * tick_ns as f64) as i64;
         WinClock {
             lead: StepLead::default(),
             rng,
+            tick_ns,
             tick_phase_ns,
             max_residual_ns: 0,
         }
@@ -59,6 +66,15 @@ impl WinClock {
             0.0
         };
         (base + preempted).round() as i64
+    }
+
+    /// A preemption between a read's reference and system-time reads: 1 % of the reads.
+    fn read_gap_ns(&mut self) -> i64 {
+        if self.rng.uniform() < 0.01 {
+            (100_000.0 + self.rng.uniform() * 500_000.0).round() as i64
+        } else {
+            0
+        }
     }
 
     /// Step the wall by `requested_ns` at TRUE time `t_ns` through the production step law; returns
@@ -116,17 +132,21 @@ struct WinOs<'a> {
 
 impl StepOps for WinOs<'_> {
     fn read(&mut self) -> ClockReading {
-        self.elapsed_ns += 300; // three back-to-back API calls
+        // QPC, the coarse and the precise system time, QPC again: 100 ns apart, unless preempted.
+        // QPC runs at the wall's rate: over the ~0.1 s call the frequency word (≤ 60 ppm) is
+        // < 7 µs either way, and the law scales it out on the real box.
+        let reference_before = self.elapsed_ns;
+        self.elapsed_ns += 100 + self.clock.read_gap_ns();
         let now_true = self.true_ns + self.elapsed_ns;
         let precise = self.wall0_ns + self.elapsed_ns + self.stepped_ns;
-        let since_interrupt = (now_true + self.clock.tick_phase_ns).rem_euclid(TICK_NS);
-        ClockReading {
-            coarse_ns: precise - since_interrupt,
-            precise_ns: precise,
-            // QPC at the wall's rate: over the ~0.1 s call the frequency word (≤ 60 ppm) is < 7 µs
-            // either way, and the law scales it out on the real box.
-            reference_ns: self.elapsed_ns,
-        }
+        let since_interrupt = (now_true + self.clock.tick_phase_ns).rem_euclid(self.clock.tick_ns);
+        self.elapsed_ns += 100;
+        ClockReading::sandwiched(
+            precise - since_interrupt,
+            precise,
+            reference_before,
+            self.elapsed_ns,
+        )
     }
 
     fn set(&mut self, target_ns: i64) -> Result<(), String> {
@@ -172,17 +192,15 @@ impl Box_ {
     }
 }
 
-#[test]
-fn windows_boxes_take_a_micro_step_every_20_s_without_moving_the_rate_119() {
-    // The rig since 1.11.0: +500 µs every 20 s (the fleet date falls behind UTC faster than the
-    // micro capacity, as at +30 ppm here). Windows followers beside a Linux master, 80 minutes, the
-    // last hour judged. Acceptance (the #119 rate-leak slice): every box's learned rate within
-    // ±0.5 ppm of the truth, the word's 20 s mean too, the fleet's relative phase within 50 µs.
+/// The Windows scenarios of one clock-interrupt tick, with or without the controller's post-step
+/// grace, one run per seed in parallel.
+fn windows_runs(tick_ns: i64, grace: bool) -> Vec<(Scenario, RunResult)> {
     let scenarios: Vec<Scenario> = [0u64, 1, 2]
         .iter()
         .map(|&seed| {
-            let mut sc = Scenario::plain("micro every 20 s on Windows boxes", 30.0, true);
+            let mut sc = Scenario::plain("micro every 20 s on Windows boxes", 30.0, grace);
             sc.windows_boxes = &WINDOWS_BOXES;
+            sc.windows_tick_ns = tick_ns;
             sc.run_windows = 80 * 60 * 2;
             sc.settle_windows = 20 * 60 * 2;
             sc.seed = seed;
@@ -199,58 +217,95 @@ fn windows_boxes_take_a_micro_step_every_20_s_without_moving_the_rate_119() {
             .map(|h| h.join().expect("a bench run panicked"))
             .collect()
     });
-    for (sc, r) in scenarios.iter().zip(&results) {
-        let seed = sc.seed;
-        let judged_from = sc.settle_windows as f64 * TRUE_DT_NS;
-        let label = format!("[windows micro, seed {seed}]");
-        for &i in &WINDOWS_BOXES {
-            // (A step that lands SHORT leaves the box's PTP view of "now" behind the instant it
-            // just applied, so it re-schedules that announce as a zero step — not counted.)
-            let micro_steps = r.steps[i]
-                .iter()
-                .filter(|s| {
-                    s.2 == StepKind::Coordinated
-                        && s.3 > judged_from
-                        && s.1 != 0
-                        && s.1.abs() <= MICRO_STEP_NS
-                })
-                .count();
-            println!(
-                "{label} box {i}: {micro_steps} micro steps in the judged hour, worst step \
-                 residual {} µs, learned rate off by ≤ {:.3} ppm, 20 s mean word off by ≤ {:.3} \
-                 ppm",
-                r.max_step_residual_ns[i] as f64 / 1e3,
-                r.rate_audits[i].max_integrator_err_ppm,
-                r.rate_audits[i].max_mean_word_err_ppm
-            );
-            assert!(
-                micro_steps >= 170,
-                "{label} box {i}: a micro-step every 20 s ({micro_steps} in the hour)"
-            );
-        }
-        for (i, a) in r.rate_audits.iter().enumerate() {
-            assert!(
-                a.max_integrator_err_ppm <= 0.5,
-                "{label} box {i}: the learned rate left the truth by {:.3} ppm",
-                a.max_integrator_err_ppm
-            );
-            assert!(
-                a.max_mean_word_err_ppm <= 0.5,
-                "{label} box {i}: the 20 s mean word left the truth by {:.3} ppm",
-                a.max_mean_word_err_ppm
-            );
-        }
+    scenarios.into_iter().zip(results).collect()
+}
+
+/// The acceptance of the #119 rate-leak slice on one run: a micro-step every 20 s on every
+/// Windows box, each landing within the step law's tolerance (plus the lead's bounded overshoot),
+/// every box's learned rate and 20 s mean word within ±0.5 ppm of the truth, the fleet's relative
+/// phase within 50 µs.
+fn check_windows_run(label: &str, sc: &Scenario, r: &RunResult) {
+    let judged_from = sc.settle_windows as f64 * TRUE_DT_NS;
+    for &i in &WINDOWS_BOXES {
+        // (A step that lands SHORT leaves the box's PTP view of "now" behind the instant it just
+        // applied, so it re-schedules that announce as a zero step — not counted.)
+        let micro_steps = r.steps[i]
+            .iter()
+            .filter(|s| {
+                s.2 == StepKind::Coordinated
+                    && s.3 > judged_from
+                    && s.1 != 0
+                    && s.1.abs() <= MICRO_STEP_NS
+            })
+            .count();
         println!(
-            "{label} relative phase max {} µs, max wall disagreement {} µs",
-            r.max_relative_phase_ns / US,
-            r.max_disagreement_ns / US
+            "{label} box {i}: {micro_steps} micro steps in the judged hour, worst step residual \
+             {} µs, learned rate off by ≤ {:.3} ppm, 20 s mean word off by ≤ {:.3} ppm",
+            r.max_step_residual_ns[i] as f64 / 1e3,
+            r.rate_audits[i].max_integrator_err_ppm,
+            r.rate_audits[i].max_mean_word_err_ppm
         );
         assert!(
-            r.max_relative_phase_ns <= 50 * US,
-            "{label} relative phase {} µs",
-            r.max_relative_phase_ns / US
+            micro_steps >= 170,
+            "{label} box {i}: a micro-step every 20 s ({micro_steps} in the hour)"
         );
-        assert_eq!(r.wall_went_back, 0, "{label}");
-        assert!(r.late_steps.iter().all(|&l| l == 0), "{label} late steps");
+        assert!(
+            r.max_step_residual_ns[i] <= 2 * STEP_TOLERANCE_NS,
+            "{label} box {i}: a step landed {} µs off",
+            r.max_step_residual_ns[i] as f64 / 1e3
+        );
+    }
+    for (i, a) in r.rate_audits.iter().enumerate() {
+        assert!(
+            a.max_integrator_err_ppm <= 0.5,
+            "{label} box {i}: the learned rate left the truth by {:.3} ppm",
+            a.max_integrator_err_ppm
+        );
+        assert!(
+            a.max_mean_word_err_ppm <= 0.5,
+            "{label} box {i}: the 20 s mean word left the truth by {:.3} ppm",
+            a.max_mean_word_err_ppm
+        );
+    }
+    println!(
+        "{label} relative phase max {} µs, max wall disagreement {} µs",
+        r.max_relative_phase_ns / US,
+        r.max_disagreement_ns / US
+    );
+    assert!(
+        r.max_relative_phase_ns <= 50 * US,
+        "{label} relative phase {} µs",
+        r.max_relative_phase_ns / US
+    );
+    assert_eq!(r.wall_went_back, 0, "{label}");
+    assert!(r.late_steps.iter().all(|&l| l == 0), "{label} late steps");
+}
+
+#[test]
+fn windows_boxes_take_a_micro_step_every_20_s_without_moving_the_rate_119() {
+    // The rig since 1.11.0: +500 µs every 20 s (the fleet date falls behind UTC faster than the
+    // micro capacity, as at +30 ppm here). Windows followers beside a Linux master, 80 minutes, the
+    // last hour judged, at the rig's 0.5 ms clock-interrupt tick and at 1 ms and the default
+    // 15.625 ms (the law never reads the coarse clock, so the tick must not matter).
+    for tick_ns in [TICK_NS, MS, 15_625 * US] {
+        for (sc, r) in windows_runs(tick_ns, true) {
+            let label = format!(
+                "[windows micro, tick {} µs, seed {}]",
+                tick_ns / US,
+                sc.seed
+            );
+            check_windows_run(&label, &sc, &r);
+        }
+    }
+}
+
+#[test]
+fn without_the_post_step_grace_a_stamp_before_the_step_still_moves_nothing_119() {
+    // The controller drops 2 s of PTP windows after every step. Without it, the window a step
+    // lands in mixes samples stamped before the step (processed after it) with ones after: the
+    // queue that spans the step. The exact step keeps even that inside the acceptance.
+    for (sc, r) in windows_runs(TICK_NS, false) {
+        let label = format!("[windows micro, no grace, seed {}]", sc.seed);
+        check_windows_run(&label, &sc, &r);
     }
 }
