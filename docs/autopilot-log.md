@@ -706,5 +706,11 @@ canary evidence before continuing.
 - Finding (issuecomment-5845464425): the +1.06 ms/min drift since 25.9. is a grandmaster frequency
   change at 23:32–23:35 UTC (every box's word moved ~−25 ppm, dev1 included, before strih-lx's
   23:39 restart; same NTP server 162.159.200.1, same sync source) — not the restart, not the UTC path.
+- Review round 1 (fresh context, 0 🔴 7 🟡 5 🔵), all fixed in-lane: no decision without a fresh
+  UTC reading (no holdover); `effective_micro` (honest capacity from lead + slew); a rebase keeps
+  an in-flight micro kind; step bound floored at 5 ms; glue split into `date_sync/micro.rs` +
+  `date_sync/publish.rs`, the codec into `date_offset/wire.rs`, the bench world into
+  `two_clock_bench/world.rs` (every touched file ≤ 1000 lines); the bench's step-size tolerance
+  only within 5 min after a GM event, a ≤ 1 ppm word bound there (measured 0.37), renamed seqs in
+  the in-flight detection, every micro statistic over 3 bench / 4 pure seeds; doc fixes.
 - Not merged, released or deployed. Rollout: followers first, the NTP master last.
-

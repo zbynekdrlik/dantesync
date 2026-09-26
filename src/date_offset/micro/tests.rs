@@ -206,10 +206,14 @@ fn beyond_the_dead_band_one_step_sized_increment_per_interval_in_the_errors_dire
         small.record(2_300 * US, i * 10 * S);
     }
     assert_eq!(small.decide(now, now + LEAD), Some(500 * US));
-    assert_eq!(small.decide(now + 20 * S, now + 25 * S), Some(500 * US));
-    assert_eq!(small.decide(now + 40 * S, now + 45 * S), Some(500 * US));
-    assert_eq!(small.decide(now + 60 * S, now + 65 * S), Some(500 * US));
+    // (Each new reading shows the same error, less what was announced.)
+    for k in 1..=3 {
+        let t = now + k * 20 * S;
+        small.record(2_300 * US - k * 500 * US, t);
+        assert_eq!(small.decide(t, t + LEAD), Some(500 * US), "k {k}");
+    }
     // … down to the exit band (0.3 ms left), then it stops.
+    small.record(300 * US, now + 80 * S);
     assert_eq!(small.decide(now + 80 * S, now + 85 * S), None);
 }
 
@@ -288,6 +292,35 @@ fn a_rebase_moves_the_kept_instants_and_the_estimate_with_the_time_base_119() {
 }
 
 #[test]
+fn no_correction_is_decided_without_a_fresh_utc_reading_119() {
+    // The UTC source went quiet: the date is left alone, never steered along the drift fitted
+    // before the loss (a silent holdover).
+    let mut m = MicroScheduler::new(MicroConfig::default());
+    for i in 0..10 {
+        m.record(7 * MS, i * 10 * S);
+    }
+    let last = 90 * S;
+    assert_eq!(
+        m.decide(
+            last + MICRO_READING_MAX_AGE_NS + 1,
+            last + MICRO_READING_MAX_AGE_NS + LEAD
+        ),
+        None
+    );
+    assert_eq!(
+        m.decide(
+            last + MICRO_READING_MAX_AGE_NS,
+            last + MICRO_READING_MAX_AGE_NS + LEAD
+        ),
+        Some(500 * US),
+        "a reading exactly at the age limit is still fresh"
+    );
+    // Readings resume: corrections resume.
+    m.record(6_500 * US, 400 * S);
+    assert_eq!(m.decide(400 * S, 400 * S + LEAD), Some(500 * US));
+}
+
+#[test]
 fn a_cleared_scheduler_needs_fresh_readings_119() {
     let mut m = MicroScheduler::new(MicroConfig::default());
     for i in 0..10 {
@@ -300,40 +333,45 @@ fn a_cleared_scheduler_needs_fresh_readings_119() {
 
 #[test]
 fn a_day_at_plus_17_6_ppm_holds_utc_within_3_ms_in_increments_of_at_most_500_us_119() {
-    let w = run(17.6, gauss_400us, 24, 0x5EED_0001, &[]);
-    println!(
-        "+17.6 ppm: {} increments, max error {} µs, rate {:?} ns/min",
-        w.increments.len(),
-        w.max_error_ns / US,
-        w.final_rate_ns_per_min
-    );
-    assert!(w.increments.iter().all(|&i| i > 0 && i <= 500 * US));
-    assert!(
-        w.max_error_ns <= 3 * MS,
-        "max error {} µs",
-        w.max_error_ns / US
-    );
-    assert_eq!(w.reversals, 0);
-    assert!(
-        !w.behind_raised,
-        "1.06 ms/min is within the 1.5 ms/min capacity"
-    );
-    // The measured correction rate is the drift: 17.6 ppm = 1.056 ms/min.
-    let rate = w.final_rate_ns_per_min.unwrap();
-    assert!((rate - 1_056_000.0).abs() < 200_000.0, "rate {rate}");
+    // Over several noise samples: the worst must pass (the "seed every noise source" rule).
+    for seed in [0x5EED_0001u64, 0x5EED_0011, 0x5EED_0021, 0x5EED_0031] {
+        let w = run(17.6, gauss_400us, 24, seed, &[]);
+        println!(
+            "+17.6 ppm, seed {seed:#x}: {} increments, max error {} µs, rate {:?} ns/min",
+            w.increments.len(),
+            w.max_error_ns / US,
+            w.final_rate_ns_per_min
+        );
+        assert!(w.increments.iter().all(|&i| i > 0 && i <= 500 * US));
+        assert!(
+            w.max_error_ns <= 3 * MS,
+            "seed {seed:#x}: max error {} µs",
+            w.max_error_ns / US
+        );
+        assert_eq!(w.reversals, 0);
+        assert!(
+            !w.behind_raised,
+            "1.06 ms/min is within the 1.5 ms/min capacity"
+        );
+        // The measured correction rate is the drift: 17.6 ppm = 1.056 ms/min.
+        let rate = w.final_rate_ns_per_min.unwrap();
+        assert!((rate - 1_056_000.0).abs() < 200_000.0, "rate {rate}");
+    }
 }
 
 #[test]
 fn a_day_at_minus_15_ppm_holds_utc_within_3_ms_backwards_119() {
-    let w = run(-15.0, gauss_400us, 24, 0x5EED_0002, &[]);
-    assert!(w.increments.iter().all(|&i| (-500 * US..0).contains(&i)));
-    assert!(
-        w.max_error_ns <= 3 * MS,
-        "max error {} µs",
-        w.max_error_ns / US
-    );
-    assert_eq!(w.reversals, 0);
-    assert!(!w.behind_raised);
+    for seed in [0x5EED_0002u64, 0x5EED_0012, 0x5EED_0022, 0x5EED_0032] {
+        let w = run(-15.0, gauss_400us, 24, seed, &[]);
+        assert!(w.increments.iter().all(|&i| (-500 * US..0).contains(&i)));
+        assert!(
+            w.max_error_ns <= 3 * MS,
+            "seed {seed:#x}: max error {} µs",
+            w.max_error_ns / US
+        );
+        assert_eq!(w.reversals, 0);
+        assert!(!w.behind_raised);
+    }
 }
 
 #[test]

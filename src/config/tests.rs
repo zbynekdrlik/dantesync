@@ -622,3 +622,21 @@ fn date_micro_step_and_interval_default_to_500_us_and_20_s_and_are_clamped_119()
         );
     }
 }
+
+#[test]
+fn date_step_bound_is_floored_so_the_cap_stays_above_the_micro_dead_band_119() {
+    for (raw, want_ms) in [("1", 5), ("4", 5), ("5", 5), ("6", 6), ("50", 50)] {
+        let json = format!(r#"{{"date_offset":{{"step_bound_ms":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("parses");
+        assert_eq!(
+            c.date_offset.step_bound_ns(),
+            want_ms * 1_000_000,
+            "step_bound_ms {raw}"
+        );
+    }
+    // The abnormal cap (2 × the bound) is then never below 10 ms: 5 × the 2 ms dead band.
+    assert!(
+        crate::date_offset::slew_cap_ns(super::MIN_DATE_STEP_BOUND_MS as i64 * 1_000_000)
+            >= 5 * crate::date_offset::MICRO_DEAD_BAND_NS
+    );
+}

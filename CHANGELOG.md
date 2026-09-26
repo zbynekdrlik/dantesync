@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `date_correction_rate_ms_per_min`, `date_correction_falling_behind` and `date_offset_micro`. The
   31900 extension is v3: flags bit 2 = MICRO (same 48 bytes; a 1.10 follower ignores the bit and
   applies the increment as a plain step or slew). Rollout: followers first, the NTP master last.
+  Nothing is decided without a UTC reading in the last minute (no silent holdover); the interval is
+  raised to the in-flight time of one increment (two leads plus, backward, its slew), so the
+  capacity and the alarm are honest; `date_offset.step_bound_ms` is floored at 5 ms.
+  **Consumers:** the step bound now only sets the abnormal cap. The journal's
+  `[NTP] offset: … step bound 50000us)` line and `/status.ntp_deadband_us` /
+  `ntp_step_threshold_us` on the master still carry it unchanged (byte-compatible), but they no
+  longer say how far the fleet date may sit off UTC — that is now the 2 ms dead band, with
+  `date_correction_falling_behind` as the alarm to grade on.
 
 ## [1.10.0] - 2026-09-26
 

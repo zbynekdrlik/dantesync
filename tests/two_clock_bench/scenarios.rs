@@ -2,14 +2,29 @@
 
 use super::*;
 
-/// The same announces (seq for seq), each applied within the absorb tolerance of its announced
-/// size. #119 follow-up: a micro step a box scheduled right after its re-anchor on a new time base
-/// also carries that re-anchor's residual (tens of µs) — the step lands the box exactly on the
-/// fleet D, as an absorb would have; with a step every 20 s that coincidence now happens.
-fn same_steps(got: &[(u32, i64)], want: &[(u32, i64)]) -> bool {
+/// #119 follow-up: true time (ns) within 5 minutes after a grandmaster event — the change or the
+/// reboot — while boxes re-anchor on the new time base.
+pub(super) fn near_gm_event(t_ns: f64) -> bool {
+    [GM_CHANGE_AT_WINDOW, GM_REBOOT_AT_WINDOW].iter().any(|&e| {
+        let at = e as f64 * TRUE_DT_NS;
+        (at..at + 300e9).contains(&t_ns)
+    })
+}
+
+/// The same announces (seq for seq) at exactly their announced size — except a step landing just
+/// after a grandmaster event, which may be off by up to the absorb tolerance. #119 follow-up: a
+/// micro step a box scheduled right after its re-anchor on the new time base also carries that
+/// re-anchor's residual (tens of µs): the step lands the box exactly on the fleet D, as an absorb
+/// would have; with a step every 20 s that coincidence now happens. `got` is (seq, size, landing).
+fn same_steps(got: &[(u32, i64, f64)], want: &[(u32, i64)]) -> bool {
     got.len() == want.len()
         && got.iter().zip(want).all(|(g, w)| {
-            g.0 == w.0 && (g.1 - w.1).abs() <= dantesync::date_offset::ABSORB_TOLERANCE_NS
+            let tolerance = if near_gm_event(g.2) {
+                dantesync::date_offset::ABSORB_TOLERANCE_NS
+            } else {
+                0
+            };
+            g.0 == w.0 && (g.1 - w.1).abs() <= tolerance
         })
 }
 
@@ -120,10 +135,10 @@ fn check(sc: &Scenario, r: &RunResult) {
             "[{label}] a wall ran backwards after the join"
         );
     }
-    let master_coord: Vec<(u32, i64)> = r.steps[0]
+    let master_coord: Vec<(u32, i64, f64)> = r.steps[0]
         .iter()
         .filter(|s| s.2 == StepKind::Coordinated)
-        .map(|s| (s.0, s.1))
+        .map(|s| (s.0, s.1, s.3))
         .collect();
     assert!(
         r.steps[0]
@@ -168,7 +183,7 @@ fn check(sc: &Scenario, r: &RunResult) {
             "[{label}] box {i} made an uncoordinated step: {rest:?}"
         );
         // A step re-announced by a grandmaster rebase counts under the seq it was announced as.
-        let got: Vec<(u32, i64)> = rest
+        let got: Vec<(u32, i64, f64)> = rest
             .iter()
             .map(|s| {
                 let seq = r
@@ -176,7 +191,7 @@ fn check(sc: &Scenario, r: &RunResult) {
                     .iter()
                     .find(|(_, new)| *new == s.0)
                     .map_or(s.0, |(old, _)| *old);
-                (seq, s.1)
+                (seq, s.1, s.3)
             })
             .collect();
         assert!(
@@ -314,10 +329,12 @@ fn a_fleet_ahead_of_utc_slews_back_never_steps_back_and_keeps_its_relative_phase
     }
     // The law: the slew is decoupled from the phase lock, so its words match a run whose date
     // only steps up to numerical noise (the de-slewed schedule vs the integrated rate term).
-    // #119 follow-up: the windows after each grandmaster event are left out. There every box removes
-    // its re-anchor residual (tens of µs): as an absorb the phase lock slews out over ~2 min, or —
-    // when a micro STEP of the other run is due just then — inside that step. Which one depends on
-    // the date's timing by construction; it is the phase lock removing a PTP residual, not the slew.
+    // #119 follow-up: the 10 minutes after each grandmaster event are judged on their own. There
+    // every box removes its re-anchor residual (≤ the 100 µs absorb tolerance): as an absorb the
+    // phase lock slews out over ~2 min, or — when a micro STEP of the other run is due just then —
+    // inside that step. Which one depends on the date's timing by construction, so the words may
+    // differ there by the phase lock's pull-in of that residual (≈ 100 µs / 100 s = 1 ppm), never
+    // by more; everywhere else by numerical noise only.
     let plus = run(&Scenario::plain("UTC +8 ppm vs GM", 8.0, false));
     let after_gm_event = |k: usize| {
         let k = k as u64;
@@ -325,18 +342,27 @@ fn a_fleet_ahead_of_utc_slews_back_never_steps_back_and_keeps_its_relative_phase
             .iter()
             .any(|&e| (e..e + 1_200).contains(&k))
     };
-    let worst = r
-        .words
-        .iter()
-        .zip(&plus.words)
-        .flat_map(|(a, b)| {
-            a.iter()
-                .zip(b)
-                .enumerate()
-                .filter(|(k, _)| !after_gm_event(*k))
-                .map(|(_, (x, y))| (x - y).abs())
-        })
-        .fold(0.0f64, f64::max);
+    let diff = |near: bool| {
+        r.words
+            .iter()
+            .zip(&plus.words)
+            .flat_map(|(a, b)| {
+                a.iter()
+                    .zip(b)
+                    .enumerate()
+                    .filter(|(k, _)| after_gm_event(*k) == near)
+                    .map(|(_, (x, y))| (x - y).abs())
+                    .collect::<Vec<_>>()
+            })
+            .fold(0.0f64, f64::max)
+    };
+    let worst = diff(false);
+    let worst_near_gm = diff(true);
+    println!("[slew] worst word difference right after a GM event: {worst_near_gm:.6} ppm");
+    assert!(
+        worst_near_gm < 1.0,
+        "a re-anchor residual is at most the absorb tolerance: {worst_near_gm} ppm"
+    );
     println!("[slew] worst word difference vs the forward-only run: {worst:.6} ppm");
     assert!(
         worst < 0.001,

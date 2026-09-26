@@ -18,6 +18,9 @@ paths:
   - "src/date_offset/micro.rs"
   - "src/date_offset/micro/tests.rs"
   - "src/controller/date_sync/micro_tests.rs"
+  - "src/controller/date_sync/micro.rs"
+  - "src/controller/date_sync/publish.rs"
+  - "src/date_offset/wire.rs"
   - "tests/simulation_e2e.rs"
   - "src/date_offset/slew.rs"
   - "src/date_offset/slew/tests.rs"
@@ -373,6 +376,16 @@ large correction left is an abnormal error beyond `slew_cap_ns` (2 × the bound)
   of the drift. A TIME-based memory of the direction (forget after 10 min / 1 h) did not stop the
   jitter case: the estimate wanders by the dead band over tens of minutes, so it walked the date
   back and forth every hour or so.
+- **No holdover.** Nothing is decided without a UTC reading in the last minute
+  (`MICRO_READING_MAX_AGE_NS`): extrapolating a 20-minute drift fit through an upstream outage is a
+  silent holdover that can walk the date hundreds of ms in hours with no alarm (review round 1).
+- **The capacity must be the honest one.** One increment is in flight at a time, for
+  `MICRO_LEAD_FACTOR` × lead plus (backward) its slew, so `date_offset::effective_micro` raises the
+  interval to that; the falling-behind alarm and the start-up line compare against the effective
+  capacity (a 30 s lead or a 10 ppm slew rate otherwise hid a drift the corrections could not hold).
+- **A rebase keeps an in-flight micro-correction micro** (re-announced under the rebase's seq).
+- **`date_offset.step_bound_ms` is floored at 5** (`MIN_DATE_STEP_BOUND_MS`): a 1 ms bound made the
+  cap 2 ms = the dead band, and every normal correction became a confirmed large step.
 - **Two leads for a micro announce.** At ~3 announces a minute the few-in-10⁴ chance that a box
   misses every poll of one 5 s lead (10 % loss in the bench) recurs daily as a LATE micro step; the
   bench hit it. `MICRO_LEAD_FACTOR = 2` makes it vanish and still lands inside the 20 s spacing.
@@ -391,7 +404,10 @@ large correction left is an abnormal error beyond `slew_cap_ns` (2 × the bound)
   - The last announce of a run is often still pending: `into_result` drops it.
   - A world with UTC drifting against grandmaster B (+3 ppm) after the GM change is not a
     "no drift" world: judge jitter by reversals, and count "no-drift" corrections before the change.
-- **Known limits (accepted):** a genuine UTC step (an upstream server change) biases the drift fit
+- **Known limits (accepted):** the standing direction never expires on its own — after a drift
+  reversal smaller than the turn threshold (2 ppm + 3 σ of the fitted drift), the first opposite
+  correction waits for 4 ms + 3 σ; under ±5 ms jitter plus a −3 ppm turn the bench saw the fleet
+  up to ~7 ms off UTC for a while (never an oscillation). A genuine UTC step (an upstream server change) biases the drift fit
   for up to the 20 min window — one or two extra increments, bounded by the reversal rule; a
   grandmaster FREQUENCY change (tonight's −25 ppm, 25.9. 23:32 UTC) is re-learned over the same
   window (the bench's +3 ppm GM change costs ~0.5 ms of fleet error for minutes); an error between

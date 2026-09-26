@@ -46,9 +46,6 @@ const AUTHORITY_LOSS: Duration = Duration::from_secs(30);
 /// to step is not re-tried (and re-warned) every second.
 const STEP_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 
-/// #119 follow-up — while the micro-corrections fall behind, the loud line is repeated this often.
-const FALLING_BEHIND_WARN_INTERVAL: Duration = Duration::from_secs(300);
-
 fn step_kind_label(kind: StepKind, micro: bool) -> &'static str {
     match (kind, micro) {
         (StepKind::Join, _) => "join",
@@ -308,125 +305,6 @@ where
             && self.ntp_server_mode
             && self.date_sync.authority.is_some()
             && !self.ptp_offline
-    }
-
-    /// #117 / #88 — publish the discipline, the phase lock and the fleet date offset. `D` in
-    /// effect and a scheduled step are written together (one status write), so the 31900
-    /// extension never counts a step twice; nothing is published while a re-anchor is pending (`D`
-    /// would still be in the OLD time base) — and the time base is named by the ANCHOR's
-    /// grandmaster, never the one merely heard.
-    pub(super) fn publish_date_status(&self, status: &mut SyncStatus) {
-        let ds = &self.date_sync;
-        status.clock_discipline = if ds.enabled {
-            CLOCK_DISCIPLINE_PTP_PHASE_LOCK
-        } else {
-            CLOCK_DISCIPLINE_LEGACY
-        }
-        .to_string();
-        status.rate_source = if self.phase_slew.is_some() {
-            "ptp+ntp"
-        } else {
-            "ptp"
-        }
-        .to_string();
-        status.ptp_phase_locked = ds.core.engaged();
-        status.ptp_phase_error_us = if ds.enabled {
-            ds.core.last_error_ns().map(|e| e as f64 / 1_000.0)
-        } else {
-            None
-        };
-
-        let now_wall = wall_now_ns();
-        // #119: D IN EFFECT — the anchor plus a held slew's displacement.
-        let anchor = if ds.enabled && !ds.core.rebase_pending() {
-            ds.d_in_effect(now_wall)
-        } else {
-            None
-        };
-        status.date_offset_ns = anchor;
-        status.date_offset_gm_uuid = anchor.and(ds.anchor_gm);
-        status.date_authority = match anchor {
-            None => String::new(),
-            Some(_) if ds.authority.is_some() => "master".to_string(),
-            Some(_) if ds.follower.adopted() => "follower".to_string(),
-            Some(_) => "local".to_string(),
-        };
-        let published = match ds.authority.as_ref() {
-            Some(a) => Some(a.announce()),
-            None => ds.last_announce,
-        };
-        status.date_offset_seq = anchor.and(published.map(|p| p.seq));
-        status.date_offset_effective_ptp_ns = anchor.and(published.map(|p| p.effective_ptp_ns));
-        // #119: a slew is published by its own fields (never as a pending step), and this box's
-        // own progress through the slew it follows.
-        let published_slew = anchor.and(published.and_then(|p| p.as_slew()));
-        status.date_slew_from_ns = published_slew.map(|s| s.from_ns);
-        status.date_slew_to_ns = published_slew.map(|s| s.to_ns);
-        status.date_slew_ppm = published_slew.map(|s| s.ppm);
-        let base = ds.core.anchor_ns();
-        status.date_slew_active =
-            ds.enabled && base.is_some_and(|b| ds.follower.slew_rate_ppm(b, now_wall) != 0.0);
-        status.date_slew_remaining_ms = if ds.enabled {
-            base.and_then(|b| ds.follower.slew_remaining_ns(b, now_wall))
-                .map(|n| n as f64 / 1e6)
-        } else {
-            None
-        };
-        // The master publishes exactly its authority's announce: D in effect on its own wall
-        // (the anchor) plus the difference to the announced D. While a step is pending that is
-        // the step; once its instant has passed but before this loop applies it, or while the
-        // master is off the fleet line (its own PTP outage, a failed step), it is the correction
-        // back to the fleet D — so a follower always reads the FLEET D, never the master's own.
-        match (ds.authority.as_ref(), anchor) {
-            (Some(_), Some(_)) if published_slew.is_some() => {
-                status.date_step_pending_ns = None;
-                status.date_step_due_in_ms = None;
-            }
-            (Some(a), Some(d)) => {
-                let ann = a.announce();
-                let delta = ann.date_offset_ns.wrapping_sub(d);
-                status.date_step_pending_ns = (delta != 0).then_some(delta);
-                status.date_step_due_in_ms = status.date_step_pending_ns.map(|_| {
-                    ann.effective_ptp_ns.wrapping_sub(now_wall.wrapping_sub(d)) / 1_000_000
-                });
-            }
-            _ => {
-                status.date_step_pending_ns = ds.follower.pending().map(|p| p.delta_ns);
-                status.date_step_due_in_ms =
-                    ds.follower.time_to_due_ns(now_wall).map(|n| n / 1_000_000);
-            }
-        }
-        // #119 follow-up: the micro-correction state.
-        status.date_offset_micro = anchor.is_some() && published.is_some_and(|p| p.micro);
-        status.date_micro_active =
-            ds.enabled && base.is_some_and(|b| ds.follower.micro_in_flight(b, now_wall));
-        status.date_micro_last_us = ds.last_micro_ns.map(|n| n / 1_000);
-        status.date_correction_rate_ms_per_min = match (ds.authority.as_ref(), anchor) {
-            (Some(a), Some(d)) => a
-                .micro()
-                .correction_rate_ns_per_min(now_wall.wrapping_sub(d))
-                .map(|r| r / 1e6),
-            _ => None,
-        };
-        status.date_correction_falling_behind = ds
-            .authority
-            .as_ref()
-            .is_some_and(|a| a.micro().falling_behind());
-        let master = ds.authority.is_some();
-        status.date_offset_error_ms = if master {
-            ds.master_utc_error_ns.map(|e| e as f64 / 1e6)
-        } else {
-            None
-        };
-        status.date_step_bound_ms = if master {
-            Some(ds.step_bound_ns as f64 / 1e6)
-        } else {
-            None
-        };
-        status.last_date_step_ns = ds.last_step.map(|s| s.0);
-        status.last_date_step_ts = ds.last_step.map(|s| s.1);
-        status.last_date_step_kind = ds.last_step.map(|s| s.2.to_string()).unwrap_or_default();
-        status.date_steps_late = ds.follower.late_steps();
     }
 
     /// #117 — the LOCAL date path stepped the wall by `delta_ns` (the NTP step path: no authority
@@ -698,106 +576,6 @@ where
         false
     }
 
-    /// #88 / #119 — the master's own scheduler takes its authority's announce like every box
-    /// (only while it is on the fleet line: off it, it re-aligns afterwards).
-    fn master_schedules_own(&mut self, ann: DateAnnounce, base: i64, now_wall: i64) {
-        let act = self.date_sync.follower.on_announce(ann, base, now_wall);
-        debug!("[DATE] master's own scheduler: {:?}", act);
-        // Defensive — on the line D and the authority agree to the ns (the bench asserts it).
-        if let FollowAction::Absorb { new_anchor_ns } = act {
-            self.date_sync.core.set_anchor(new_anchor_ns);
-        }
-    }
-
-    /// #119 follow-up — the NTP master's micro-correction clock, every loop iteration: the
-    /// authority decides the next increment on the exact interval (not on the NTP cadence). An
-    /// increment is scheduled on the master's own wall like any announce (only on the fleet line)
-    /// and published at once, so followers hear it within its lead. Also keeps the loud
-    /// `date correction falling behind` line in step with the authority's alarm.
-    pub(super) fn tick_date_authority(&mut self) {
-        if !self.date_sync.enabled || !self.ntp_server_mode || self.date_sync.core.rebase_pending()
-        {
-            return;
-        }
-        let Some(base) = self.date_sync.core.anchor_ns() else {
-            return;
-        };
-        let now_wall = wall_now_ns();
-        // The master's D IN EFFECT (its anchor plus a held slew's displacement).
-        let own = self.date_sync.follower.in_effect_ns(base, now_wall);
-        let now_ptp = now_wall.wrapping_sub(own);
-        let Some(a) = self.date_sync.authority.as_mut() else {
-            return;
-        };
-        let fleet = a.in_effect_ns(now_ptp);
-        let announced = a.on_tick(now_ptp);
-        self.report_falling_behind(now_ptp);
-        let Some(ann) = announced else {
-            return;
-        };
-        let on_line = own == fleet && !self.ptp_offline && !self.in_step_backoff();
-        debug!(
-            "[DATE] AUTHORITY: micro-correction {:+}us ({}) at PTP {}, seq {}{}",
-            ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
-            if ann.as_slew().is_some() {
-                "slew"
-            } else {
-                "step"
-            },
-            ann.effective_ptp_ns,
-            ann.seq,
-            if on_line { "" } else { " (off the fleet line)" }
-        );
-        if on_line {
-            self.master_schedules_own(ann, base, now_wall);
-        }
-        // Publish NOW (see `ntp_under_date_authority`): the 31900 server reads this snapshot.
-        self.update_shared_status();
-    }
-
-    /// #119 follow-up — log the micro-corrections' falling-behind alarm: loudly when it is raised
-    /// (and every [`FALLING_BEHIND_WARN_INTERVAL`] while it stays), once when it clears.
-    fn report_falling_behind(&mut self, now_ptp: i64) {
-        let Some(a) = self.date_sync.authority.as_ref() else {
-            return;
-        };
-        let behind = a.micro().falling_behind();
-        let ds = &self.date_sync;
-        if behind == ds.falling_behind_logged
-            && (!behind
-                || ds
-                    .falling_behind_warned_at
-                    .is_some_and(|t| t.elapsed() < FALLING_BEHIND_WARN_INTERVAL))
-        {
-            return;
-        }
-        let cfg = a.micro().config();
-        let est = a.micro().estimate(now_ptp);
-        if behind {
-            warn!(
-                "[DATE] AUTHORITY: date correction falling behind: the fleet line is {:+.1} ms off \
-                 UTC and drifting {:+.2} ms/min, the micro-corrections hold at most {:.2} ms/min \
-                 ({}us per {} s) — no large step is taken below {} ms; check the grandmaster's \
-                 frequency and the UTC source",
-                est.map(|e| e.error_ns as f64 / 1e6).unwrap_or(0.0),
-                est.map(|e| e.trend_ns_per_s * 60.0 / 1e6).unwrap_or(0.0),
-                cfg.capacity_ns_per_min() as f64 / 1e6,
-                cfg.step_ns / 1_000,
-                cfg.interval_ns / 1_000_000_000,
-                crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000
-            );
-            self.date_sync.falling_behind_warned_at = Some(Instant::now());
-        } else {
-            info!(
-                "[DATE] AUTHORITY: date correction caught up: the fleet line is {:+.1} ms off UTC",
-                est.map(|e| e.error_ns as f64 / 1e6).unwrap_or(0.0)
-            );
-            self.date_sync.falling_behind_warned_at = None;
-        }
-        self.date_sync.falling_behind_logged = behind;
-        self.update_shared_status();
-    }
-
     /// #88 — make the NTP master the fleet date-offset authority once it is anchored, and align
     /// its own scheduler with itself (so its announces are scheduled like everyone's).
     pub(super) fn ensure_date_authority(&mut self) {
@@ -823,7 +601,8 @@ where
             .follower
             .on_announce(authority.announce(), base, now_wall);
         debug!("[DATE] master aligned with its own authority: {:?}", act);
-        let micro = self.date_sync.micro;
+        // The EFFECTIVE micro tuning: the interval is at least the in-flight time of one increment.
+        let micro = authority.micro().config();
         info!(
             "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date is \
              held within {} ms of UTC by micro-corrections of at most {}us, one per {} s ({:.2} \
@@ -1164,6 +943,8 @@ where
     }
 }
 
+mod micro;
+mod publish;
 mod slew;
 
 #[cfg(test)]

@@ -98,7 +98,7 @@ struct Scenario {
     /// which followers take as one small late step: allowed, bounded to < 1 ms.
     gm_change_in_master_outage: bool,
     /// #119: UTC jumps (window, ns) — an upstream stepping back makes the fleet run ahead at once,
-    /// so a backward correction (or an extension of a running slew) follows. The master's UTC
+    /// so backward (micro-)corrections follow. The master's UTC
     /// bound is not judged for `UTC_JUMP_SETTLE_WINDOWS` after each jump.
     utc_jumps: Vec<(u64, i64)>,
     /// #119 ROZHODNUTÉ: this scenario MEANS to cause a backward correction beyond the slew cap
@@ -112,33 +112,14 @@ struct Scenario {
     settle_windows: u64,
     /// #119 follow-up: the master's UTC reading noise.
     ntp_noise: NtpNoise,
+    /// #119 follow-up: mixed into every noise source's seed (0 = the historical noise), so a
+    /// statistic can be asserted over several noise samples (the "seed every noise source" rule).
+    seed: u64,
 }
 
-/// #119 follow-up — how the master's UTC reading is disturbed.
-#[derive(Clone, Copy, PartialEq)]
-enum NtpNoise {
-    /// A WAN upstream: σ = [`NTP_NOISE_NS`].
-    Gauss,
-    /// A mobile-data upstream: half the readings delayed by up to +5 ms one way, the other half
-    /// early by up to 1.5 ms, on top of the WAN noise.
-    Asymmetric5ms,
-}
-
-impl NtpNoise {
-    fn sample(self, rng: &mut Rng) -> i64 {
-        let base = rng.gauss() * NTP_NOISE_NS;
-        let jitter = match self {
-            NtpNoise::Gauss => 0.0,
-            NtpNoise::Asymmetric5ms if rng.uniform() < 0.5 => rng.uniform() * 5_000_000.0,
-            NtpNoise::Asymmetric5ms => -rng.uniform() * 1_500_000.0,
-        };
-        (base + jitter).round() as i64
-    }
-}
-
-/// #119: after a UTC jump the fleet is off UTC by the jump until the slew has paid it. Two chained
-/// 80 ms jumps on top of a fleet error of up to 50 ms extend one slew to ~210 ms, i.e. 2 100 s
-/// at 100 ppm (measured: 201.7 ms) plus the agreement and the lead: 50 minutes covers it.
+/// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
+/// Since the micro-corrections (v1.11) a jump of up to 30 ms is worked off at the capacity (the
+/// jumps scenario's 25 ppm slews hold ~1.2 ms/min: 30 ms in ~25 min): 50 minutes covers it.
 const UTC_JUMP_SETTLE_WINDOWS: u64 = 6_000;
 
 impl Scenario {
@@ -155,6 +136,7 @@ impl Scenario {
             slew_ppm: DEFAULT_SLEW_PPM,
             settle_windows: 240,
             ntp_noise: NtpNoise::Gauss,
+            seed: 0,
         }
     }
     fn settling_after_a_utc_jump(&self, w: u64) -> bool {
@@ -174,41 +156,9 @@ impl Scenario {
 #[path = "two_clock_bench/glue.rs"]
 mod glue;
 use glue::*;
-
-/// xorshift64* — deterministic, dependency-free.
-struct Rng(u64);
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn uniform(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-    fn gauss(&mut self) -> f64 {
-        let u1 = self.uniform().max(1e-300);
-        let u2 = self.uniform();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
-}
-
-/// A clock whose reading is an integer ns + a fractional carry (a wall of 1.79e18 ns does not fit
-/// an f64 at ns resolution).
-#[derive(Clone, Copy)]
-struct Clock {
-    ns: i64,
-    frac: f64,
-}
-impl Clock {
-    fn advance(&mut self, true_dt_ns: f64, rate_ppm: f64) {
-        let d = true_dt_ns * (1.0 + rate_ppm * 1e-6) + self.frac;
-        let whole = d.floor();
-        self.frac = d - whole;
-        self.ns += whole as i64;
-    }
-}
+#[path = "two_clock_bench/world.rs"]
+mod world;
+use world::*;
 
 struct Box_ {
     osc_ppm: f64,
@@ -408,7 +358,10 @@ impl<'s> Bench<'s> {
                 lag: (change_lags[i], reboot_lags[i]),
                 grace_until: 0,
                 fresh: false,
-                rng: Rng(0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1) * 0x1000_0000_01B3),
+                rng: Rng(
+                    (0x9E37_79B9_7F4A_7C15 ^ ((i as u64 + 1) * 0x1000_0000_01B3))
+                        ^ sc.seed.wrapping_mul(0x2545_F491_4F6C_DD1D),
+                ),
                 words: Vec::new(),
                 steps: Vec::new(),
                 rebases: 0,
@@ -447,8 +400,8 @@ impl<'s> Bench<'s> {
             renamed_steps: Vec::new(),
             corrections: Vec::new(),
             gm_events_in_slew: 0,
-            ntp_rng: Rng(0xD1B5_4A32_D192_ED03),
-            net_rng: Rng(0xABCD_EF01_2345_6789),
+            ntp_rng: Rng(0xD1B5_4A32_D192_ED03 ^ sc.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            net_rng: Rng(0xABCD_EF01_2345_6789 ^ sc.seed.wrapping_mul(0xD6E8_FEB8_6659_FD93)),
             max_dis: 0,
             max_settling_dis: 0,
             in_flight: 0,
@@ -813,10 +766,18 @@ impl<'s> Bench<'s> {
             .map(|(_, b)| b)
             .collect();
         let landed: Vec<u32> = judged.iter().flat_map(|b| landed_now(b)).collect();
+        // (#119 follow-up: a step a grandmaster rebase re-announced is pending under the rebase's
+        // seq on a box that re-anchored first, while the master lands it under the original one.)
+        let original_seq = |seq: u32| {
+            self.renamed_steps
+                .iter()
+                .find(|(_, new)| *new == seq)
+                .map_or(seq, |(old, _)| *old)
+        };
         let straddling = judged.iter().any(|b| {
             b.follower
                 .pending()
-                .is_some_and(|p| landed.contains(&p.seq))
+                .is_some_and(|p| landed.contains(&original_seq(p.seq)))
         });
         // The documented double fault: when the master returns on a new grandmaster it re-bases
         // the fleet D with its own free-run error (~100 µs here). Followers take it at their next

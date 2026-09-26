@@ -271,6 +271,10 @@ fn default_date_slew_ppm() -> u64 {
     crate::date_offset::DEFAULT_SLEW_PPM as u64
 }
 
+/// dantesync#119 follow-up — the smallest effective `date_offset.step_bound_ms` (the cap is 2 × it,
+/// 10 ms, five times the micro-corrections' dead band).
+pub const MIN_DATE_STEP_BOUND_MS: u64 = 5;
+
 fn default_date_step_bound_ms() -> u64 {
     50
 }
@@ -292,7 +296,10 @@ impl Default for DateOffsetConfig {
 }
 
 impl DateOffsetConfig {
-    /// The effective bound in ns (`0` → the default).
+    /// The effective bound in ns (`0` → the default). dantesync#119 follow-up: floored at
+    /// [`MIN_DATE_STEP_BOUND_MS`], so the abnormal-correction cap (2 × the bound) stays well above
+    /// the micro-corrections' 2 ms dead band — a smaller bound would turn every normal correction
+    /// into a confirmed large step and the micro-corrections would never run.
     pub fn step_bound_ns(&self) -> i64 {
         let ms = if self.step_bound_ms == 0 {
             default_date_step_bound_ms()

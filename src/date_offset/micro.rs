@@ -34,8 +34,11 @@
 //!   [`MICRO_EXIT_BAND_NS`] (so the fleet date is brought near UTC, not parked on the band's edge).
 //! - A correction in the OPPOSITE direction to the last one needs twice the dead band, unless the
 //!   fitted drift has turned that way too: noise must not make the fleet date oscillate.
-//! - Every band is widened by three standard errors of the estimate, measured from the readings'
-//!   own scatter around the fitted line: a noisy UTC path makes a correction less likely.
+//! - Every band is widened by the estimate's standard error, measured from the readings' own
+//!   scatter around the fitted line — three of them for a first correction or a reversal, one to
+//!   continue in the standing direction: a noisy UTC path makes a correction less likely.
+//! - Without fresh UTC readings ([`MICRO_READING_MAX_AGE_NS`]) nothing is decided: the fitted
+//!   drift is never extrapolated as a holdover.
 //! - A drift beyond the capacity cannot be held: the error grows, and [`MicroScheduler::falling_behind`]
 //!   says so (the controller logs `date correction falling behind` loudly) — never a large step.
 //!   A large step exists only for an abnormal error beyond the #119 cap (`DateAuthority`).
@@ -52,8 +55,9 @@ pub const MAX_MICRO_STEP_US: u64 = 1_000;
 
 /// Default spacing of micro-corrections (s). With the default step the capacity is 1.5 ms/min.
 pub const DEFAULT_MICRO_INTERVAL_S: u64 = 20;
-/// The configurable spacing is clamped to this range (a correction needs its 5 s announce lead
-/// and, backwards, its slew: one at a time, so a shorter spacing would not be honoured anyway).
+/// The configurable spacing is clamped to this range. One correction is in flight at a time, so
+/// the spacing actually achieved is at least its announce lead (two leads, 10 s by default) plus,
+/// backwards, its slew — `DateAuthority` raises the effective interval to that.
 pub const MIN_MICRO_INTERVAL_S: u64 = 10;
 pub const MAX_MICRO_INTERVAL_S: u64 = 600;
 
@@ -77,7 +81,8 @@ pub const MICRO_TREND_BIN_NS: i64 = 60_000_000_000;
 /// The LEVEL is the median of the readings of this last stretch, each projected along the drift.
 pub const MICRO_LEVEL_WINDOW_NS: i64 = 300_000_000_000;
 /// A correction against the direction of the last one needs [`MICRO_REVERSAL_BAND_NS`] — unless
-/// the fitted drift itself has turned against that direction by at least this (ns per s = ppm):
+/// the fitted drift itself has turned against that direction by at least this (ns per s; 1 000 =
+/// 1 ppm) plus three of its standard errors:
 /// then the fleet really runs the other way now and the plain dead band applies. Pure jitter
 /// leaves the drift near 0, so it can never walk the date back and forth.
 pub const MICRO_TURNED_TREND_NS_PER_S: f64 = 2_000.0;
@@ -85,7 +90,11 @@ pub const MICRO_TURNED_TREND_NS_PER_S: f64 = 2_000.0;
 pub const MICRO_MAX_READINGS: usize = 256;
 /// No estimate from fewer readings than this (about the first minute after the authority starts).
 pub const MICRO_MIN_READINGS: usize = 6;
-/// The drift estimate is clamped to ±this (ns per s = ppm): a grandmaster-vs-UTC rate beyond it is
+/// No correction is decided when the newest UTC reading is older than this (six missed readings
+/// at the master's 10 s cadence): without UTC the date is left alone rather than steered along a
+/// drift fitted before the loss — an upstream outage must never turn into a silent holdover.
+pub const MICRO_READING_MAX_AGE_NS: i64 = 60_000_000_000;
+/// The drift estimate is clamped to ±this (ns per s; 50 000 = 50 ppm): a grandmaster-vs-UTC rate beyond it is
 /// not a rate this fleet has, and a wild estimate must not be projected.
 pub const MICRO_MAX_TREND_NS_PER_S: f64 = 50_000.0;
 /// Every band is widened by this many standard errors of the level estimate (measured from the
@@ -155,7 +164,7 @@ impl Default for MicroConfig {
 pub struct MicroEstimate {
     /// Estimated `UTC − fleet line` once everything announced has landed (ns).
     pub error_ns: i64,
-    /// Its drift (ns per s, i.e. ppm; positive = the fleet falls behind UTC).
+    /// Its drift (ns per s, 1 000 = 1 ppm; positive = the fleet falls behind UTC).
     pub trend_ns_per_s: f64,
     /// The standard error of `error_ns` from the readings' own jitter (ns).
     pub noise_ns: f64,
@@ -341,9 +350,9 @@ impl MicroScheduler {
         (trend, noise)
     }
 
-    /// Refit the robust line after the readings changed: the drift is the median pairwise slope of
-    /// all kept readings, the level the median of the last [`MICRO_LEVEL_WINDOW_NS`] of readings
-    /// projected to the newest one along it. The level's standard error comes from the same
+    /// Refit the robust line after the readings changed: the drift from [`Self::trend_ns_per_s`]
+    /// (Theil–Sen over the one-minute bin medians of all kept readings), the level the median of
+    /// the last [`MICRO_LEVEL_WINDOW_NS`] of readings projected to the newest one along it. The level's standard error comes from the same
     /// readings' scatter around the line (1.4826 × MAD, × 1.2533 / √n for a median).
     fn refit(&mut self) {
         let Some(&(t_ref, _)) = self.readings.back() else {
@@ -400,7 +409,8 @@ impl MicroScheduler {
 
     /// The next micro-correction at `now_ptp_ns`, if one is due: the estimated error where it would
     /// land (`land_ptp_ns`, the announce's instant) decides. Records it: the readings are
-    /// compensated at once, and the next one waits at least the interval.
+    /// compensated at once, and the next one waits at least the interval. Nothing without a UTC
+    /// reading in the last [`MICRO_READING_MAX_AGE_NS`].
     pub fn decide(&mut self, now_ptp_ns: i64, land_ptp_ns: i64) -> Option<i64> {
         if let Some((t, _)) = self.last {
             if now_ptp_ns.saturating_sub(t) < self.cfg.interval_ns {

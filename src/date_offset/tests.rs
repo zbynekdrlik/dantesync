@@ -623,3 +623,50 @@ fn a_follower_knows_a_held_micro_slew_until_it_is_complete_119() {
     assert_eq!(f.take_completed_slew(d, end_wall), Some(-500 * US));
     assert!(!f.held_slew_is_micro());
 }
+
+#[test]
+fn the_effective_micro_interval_covers_the_increment_in_flight_119() {
+    let c = MicroConfig::default();
+    // Two 5 s leads + a 5 s slew of 500 µs at 100 ppm = 15 s < 20 s: unchanged.
+    assert_eq!(effective_micro(c, MIN_STEP_LEAD_NS, 100), c);
+    // A 30 s lead: one increment is in flight 60 s + 5 s, so the capacity is honest about it.
+    let long = effective_micro(c, 30 * S, 100);
+    assert_eq!(long.interval_ns, 65 * S);
+    assert!(long.capacity_ns_per_min() < c.capacity_ns_per_min());
+    // A 10 ppm slew: 500 µs take 50 s.
+    assert_eq!(effective_micro(c, MIN_STEP_LEAD_NS, 10).interval_ns, 60 * S);
+    // The authority runs on it, whichever builder comes last.
+    assert_eq!(
+        DateAuthority::new(0, 0, 50 * MS, 30 * S)
+            .micro()
+            .config()
+            .interval_ns,
+        65 * S
+    );
+    let a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
+        .with_micro(MicroConfig::new(500, 20))
+        .with_slew_ppm(10);
+    assert_eq!(a.micro().config().interval_ns, 60 * S);
+    let b = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
+        .with_slew_ppm(10)
+        .with_micro(MicroConfig::new(500, 20));
+    assert_eq!(b.micro().config().interval_ns, 60 * S);
+}
+
+#[test]
+fn a_rebase_re_announces_an_in_flight_micro_correction_as_micro_119() {
+    let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
+    for i in 0..6 {
+        a.on_utc_error(7 * MS, 10 * S + i * 10 * S);
+    }
+    assert!(a.on_tick(60 * S).unwrap().micro);
+    let r = a.rebase(5 * S, 61 * S);
+    assert!(
+        r.micro,
+        "the pending micro step keeps its kind in the new base"
+    );
+    assert_eq!(r.date_offset_ns - 5 * S, 500 * US, "same size");
+    // Once it has landed, a rebase is its own (non-micro) change of D.
+    let r2 = a.rebase(10 * S, 100 * S);
+    assert!(!r2.micro);
+}

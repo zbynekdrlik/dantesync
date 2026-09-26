@@ -328,8 +328,8 @@ fn a_rebase_moves_a_running_slew_into_the_new_base_119() {
     let moved = r.as_slew().expect("still the slew");
     assert_eq!(r.seq, 3);
     assert!(
-        !r.micro,
-        "a rebase is its own change of D, not a micro-correction"
+        r.micro,
+        "the micro-slew still in flight stays a micro-correction in the new base"
     );
     assert_eq!(moved, first.shifted(shift));
     // Same wall line now and at every later instant.
