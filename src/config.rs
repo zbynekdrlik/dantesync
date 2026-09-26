@@ -204,8 +204,8 @@ pub struct DateOffsetConfig {
 }
 
 /// The `system.date_offset.correction` values (dantesync#119, 1.12).
-pub const DATE_CORRECTION_DAILY: &str = "daily";
-pub const DATE_CORRECTION_MICRO: &str = "micro";
+pub const DATE_CORRECTION_DAILY: &str = crate::date_offset::CORRECTION_DAILY;
+pub const DATE_CORRECTION_MICRO: &str = crate::date_offset::CORRECTION_MICRO;
 /// The 1.10 correction at the step bound: removed in 1.11.0, read as `"daily"` with a warning.
 pub const DATE_CORRECTION_BOUND: &str = "bound";
 

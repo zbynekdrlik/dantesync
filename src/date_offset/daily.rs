@@ -138,6 +138,10 @@ impl Default for DailyConfig {
     }
 }
 
+/// The `system.date_offset.correction` value (and `/status.date_correction_mode`) of each mode.
+pub const CORRECTION_DAILY: &str = "daily";
+pub const CORRECTION_MICRO: &str = "micro";
+
 /// How the fleet date is corrected (`system.date_offset.correction`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorrectionMode {
@@ -151,8 +155,8 @@ impl CorrectionMode {
     /// The config / `/status` value: `"daily"` or `"micro"`.
     pub fn label(&self) -> &'static str {
         match self {
-            CorrectionMode::Daily(_) => "daily",
-            CorrectionMode::Micro => "micro",
+            CorrectionMode::Daily(_) => CORRECTION_DAILY,
+            CorrectionMode::Micro => CORRECTION_MICRO,
         }
     }
 }

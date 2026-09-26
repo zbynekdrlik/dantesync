@@ -435,11 +435,7 @@ impl MicroScheduler {
                 return None;
             }
         }
-        let fresh = self
-            .readings
-            .back()
-            .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) <= MICRO_READING_MAX_AGE_NS);
-        if !fresh {
+        if !self.fresh(now_ptp_ns) {
             self.correcting = false;
             return None;
         }
