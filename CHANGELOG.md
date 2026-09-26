@@ -22,18 +22,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of every ~47 minutes, so the rate was never clean. The Windows media clocks that follow the
     adjustment rate (the camera-box OBS audio) left the Dante tick.
   - **The fix, on both operating systems.** Read the precise wall and a clock that no step moves
-    (Windows: QPC at the system-time rate; Linux: `CLOCK_MONOTONIC`). Set the target from that
-    read plus the learned read→set latency. Measure what the set actually did, and correct a
-    residual beyond 10 µs (at most 3 sets, never backwards).
+    (Windows: QPC at the system-time rate; Linux: `CLOCK_MONOTONIC`), the latter on both sides of
+    the wall; a reading preempted in between is taken again. Set the target from that read plus
+    the learned read→set latency. Measure what the set actually did, and correct a residual beyond
+    10 µs (at most 4 sets, never backwards). A residual beyond 2 ms is never chased, since the
+    measurement is then wrong. A correction set that fails keeps the step as made, so `D` moves
+    with the wall.
+  - **Unconfirmed, and the on-rig check for it.** The stream's timer tick is not measured; a
+    0.5 ms tick fits the always-negative error, which accumulated to −860 µs under the pay-back.
+    After the roll, every `[StepClock]` line should show `1 set(s)` and a residual within 10 µs,
+    and `date_step_phase_jump_us` should read a few µs.
   - **The step's log line** is now `[StepClock] stepped +500.0us (requested +500.0us, residual
     +0.0us, 1 set(s), learned set latency …, coarse clock lag …)`. The coarse lag shows what the
     old path would have lost. The old `Actual step: X (expected: Y)` line compared the coarse
     clock with itself, so it could not see the shortfall.
   - **Bench.** The two-clock bench models the Windows clock and a micro-step every 20 s for an
-    hour. The learned rate stays within 0.16 ppm of the truth (it was 24 ppm) and the relative
-    phase within 21 µs.
+    hour, at 0.5 ms, 1 ms and 15.625 ms ticks, with and without the post-step grace. The learned
+    rate stays within 0.13 ppm of the truth (it was 24 ppm), the 20 s mean word within 0.28 ppm,
+    every step within 7 µs and the relative phase within 23 µs.
 - **`/status` adds `date_step_phase_jump_us`**: how far the phase-lock error moved across the last
-  step (the first window after it minus the last before it). An exact step reads a few µs.
+  step it could measure (the first window after it minus the last before it; not measured when
+  `D` moved again in between, or across a PTP outage). An exact step reads a few µs.
 
 ## [1.11.0] - 2026-09-26
 

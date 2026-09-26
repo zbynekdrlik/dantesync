@@ -65,7 +65,13 @@ pub fn log_step_outcome(out: &step::StepOutcome, lead: step::StepLead) {
         lead.lead_ns() as f64 / 1e3,
         out.coarse_lag_ns as f64 / 1e3
     );
-    if out.residual_ns().abs() > step::STEP_TOLERANCE_NS {
+    if let Some(why) = &out.stopped {
+        log::warn!(
+            "{} -- NOT EXACT ({}): the phase lock pays the residual back",
+            line,
+            why
+        );
+    } else if out.residual_ns().abs() > step::STEP_TOLERANCE_NS {
         log::warn!(
             "{} -- NOT EXACT: the phase lock pays the residual back",
             line

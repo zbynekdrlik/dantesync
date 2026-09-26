@@ -444,10 +444,17 @@ step with the same coarse clock on both sides, so it could NOT see this. It also
 `NtSetSystemTime` blocking ~117 ms.
 
 **The law (`src/clock/step.rs`, both OSes):**
-- read the PRECISE wall and a reference no step moves, back to back;
-- set from that precise read plus a learned read→set latency;
+- read the PRECISE wall and a reference no step moves, with the reference read on BOTH sides of
+  the wall (`ClockReading::sandwiched`);
+- read again when the reading was preempted (`read_tight`). The first CI run caught this: one
+  preempted Linux read put the two clocks 508 µs apart;
+- set from that precise read plus a learned read→set latency. The latency rises by at most 1 µs
+  per set, so preempted sets never make later steps overshoot;
 - measure the realized move as Δwall − Δreference;
-- correct the residual beyond 10 µs, in the requested direction only.
+- correct the residual beyond 10 µs, in the requested direction only and up to 2 ms. A larger
+  residual means the measurement is wrong, so it is never chased;
+- once a set has landed, the step is made (`stopped` says why it stopped short), so the caller
+  moves `D` with it.
 
 **Rules for any future change to a step path:**
 - Never read "now" for a step target from a coarse API.
@@ -458,6 +465,13 @@ step with the same coarse clock on both sides, so it could NOT see this. It also
 
 `/status.date_step_phase_jump_us` is the on-rig check: the phase-lock error's move across the last
 step. It should read a few µs.
+- The probe is armed AFTER the step moved `D`: every step path moves `D` first, then calls
+  `reset_ptp_measurement_after_step`.
+- The measurement is void if `D` moved again before the first window (an absorb, the master's
+  re-alignment, a slew fold), or across a PTP outage.
+
+The stream tick is unmeasured. The post-roll acceptance is that every `[StepClock]` line shows
+`1 set(s)` with the residual within the tolerance.
 
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
