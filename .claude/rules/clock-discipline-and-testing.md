@@ -608,6 +608,16 @@ seeds gave the same result on `origin/master`, on the branch and on the branch i
 the failure was the test's own unseeded noise, not the change. Replica results are evidence, not
 proof: CI still type-checks and runs the real crate.
 
+**A third local net: MSRV-aware clippy on the replica (#119).** The replica runs `rustc`, which
+does not know the crate's MSRV, so a newer std API (`u128::div_ceil`, 1.73 > `rust-version` 1.70)
+passed it and turned CI's Lint red (`clippy::incompatible_msrv`). `clippy-driver` is not a cargo
+shape either: `CARGO_PKG_RUST_VERSION=1.70.0 ~/.cargo/bin/clippy-driver --edition 2021
+--crate-type lib --crate-name dantesync <replica>/src/lib.rs -o <scratch>/x.rlib -D warnings -A
+dead_code` reproduces the Lint job on the pure modules (give `-o` a writable path; `/dev/null`
+fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the crate root
+(`tests/x.rs`, which cargo would also build as its own target): use
+`#[path = "<bench>/x.rs"] mod x;` for a submodule of a `tests/*.rs` bench.
+
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually
 verify a branch, **open a PR to `master`** (that fires the `pull_request` CI); monitor it to green;
