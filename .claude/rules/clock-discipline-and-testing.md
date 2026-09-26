@@ -33,9 +33,11 @@ paths:
   - "tests/two_clock_bench/windows.rs"
   - "src/date_offset/daily.rs"
   - "src/date_offset/daily/tests.rs"
+  - "src/date_offset/authority_daily.rs"
   - "src/date_offset/authority_daily_tests.rs"
   - "src/controller/date_sync/daily_tests.rs"
   - "tests/two_clock_bench/daily.rs"
+  - "tests/two_clock_bench/measure.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -505,10 +507,17 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
   never a slew, `MICRO_LEAD_FACTOR` leads ahead.
 - The window is read on the FLEET wall (`ptp + D`). A grandmaster rebase moves PTP time, never
   that wall, so the scheduler keeps no PTP state and needs no rebase.
-- A decision needs a FRESH estimate (a reading within 60 s). Without one the window waits up to
-  30 minutes, then the night is SKIPPED and the next night steps both days.
-- A window that closed while the authority was busy (another change in flight), or before boot,
-  closes silently. Only a waited window is reported as skipped.
+- A decision needs a SETTLED estimate (`MicroScheduler::settled`): at least `MICRO_MIN_READINGS`
+  readings in the 5 min level window, the newest within 60 s. After a UTC gap the first reading
+  back is alone in the level window, and its noise reads as 0. One WAN outlier would then set the
+  whole step (review round 1). Without a settled estimate the window waits up to 30 minutes, then
+  the night is SKIPPED and the next night steps both days.
+- A window that opened and closed between two asks is reported `Missed`, loudly (review round 1).
+  That happens when the authority had another change in flight all window, or the daemon
+  stalled. Only a window already past at the FIRST ask (a boot) closes silently.
+- A window at or before the last handled one counts as handled (review round 1). A backward step
+  larger than the landing's distance from the window start moves the fleet wall back before it.
+  The scheduler then saw the night as new: a second decision, and a false SKIPPED 30 min later.
 - No step for |error| ≤ 2 ms + 3 σ, for example after a restart right after the night's step.
 
 **What changes by mode:**
@@ -529,6 +538,12 @@ re-join. So in daily mode:
 - `ntp_under_date_authority` returns true while the master is offline: it still feeds the
   authority, and it still logs the `[NTP] offset:` line the camera-box freshness gates parse.
 - The master free-runs on the learned frequency.
+- It stays ON the fleet line (`on_line` ignores `ptp_offline` in daily mode). Its D is the fleet
+  D, so it takes the fleet's nightly and emergency steps on its own wall (review round 1).
+  Otherwise a long outage would leave it a day's drift off, with one large daytime Join at the
+  end.
+- Its landing is off by its free-run error, like the rest of its wall. The bench's
+  simultaneity check leaves out a master landing inside its own outage.
 - `master_outage_realign` makes `realign_master_to_fleet` re-join on the measured error even
   though its `D` never left the fleet line. The bench measured −323 µs after 30 min.
 - Without the re-join the bench showed the master 377 µs off for minutes while the PI pulled it
@@ -543,6 +558,9 @@ re-join. So in daily mode:
   count and the size instead.
 - Measured at +17.6 ppm: 746.47 ms and 1520.59 ms (the true error: 746.42 / 1520.64). Announced
   at 02:00:00.000 and 02:00:00.246 fleet time. Relative phase max 19 µs, hourly rate ≤ 0.0023 ppm.
+- A master outage over the window must END before the grandmaster change (~02:23 bench time).
+  Otherwise it is the documented double fault (the master publishes an old-base D until it
+  returns: thousands of refused replies, 929 µs of settling). Round 1 hit that by accident.
 
 **Status for consumers:**
 - `date_step_pending_ns` / `date_step_due_in_ms` show the nightly step during its lead and clear

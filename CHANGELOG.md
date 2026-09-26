@@ -28,12 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     accepted). It is read on the fleet wall. The step is made once per UTC day. When no fresh
     UTC reading exists at the window, it waits up to 30 minutes for one; otherwise the night is
     skipped (loudly) and the next night steps both days.
+    - "Fresh" means at least six readings in the last 5 minutes, the newest within a minute, so
+      one reading after a UTC gap never sets the whole step.
+    - A window that opened and closed while another date change was in flight is reported as
+      missed (loudly).
   - **An emergency** (an error beyond `daily_emergency_ms`, default 5000) is stepped at once,
     loudly: a bad boot or a lost UTC reference.
   - **The master's own PTP outage.** In daily mode the master no longer steps its own wall to
     UTC while it has no PTP: that would move it up to a day's drift off the fleet. It free-runs
-    on the learned frequency and re-joins the fleet line with one step of the measured free-run
-    error once PTP is back.
+    on the learned frequency and still takes the fleet's nightly (and emergency) steps on its
+    own wall. Once PTP is back it re-joins the fleet line with one step of the measured
+    free-run error.
   - **`system.date_offset.correction`**: `"daily"` (the new default) or `"micro"` (the 1.11
     behaviour, unchanged). The 1.10 step-bound correction (`"bound"`) no longer exists since
     1.11.0; that value, or any other, means `"daily"` with a loud warning. A bad `daily_step_utc`
@@ -53,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pending step is visible during its lead as before, on every box: `date_step_pending_ns`
   (signed) and `date_step_due_in_ms`. They clear once it lands.
 - New journal lines on the master: `nightly date step ±… ms`, `nightly date step not needed`,
-  `nightly date step waiting` and `nightly date step SKIPPED`.
+  `nightly date step waiting`, `nightly date step SKIPPED` and `nightly date step MISSED`.
 
 ## [1.11.1] - 2026-09-26
 

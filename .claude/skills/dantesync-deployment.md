@@ -111,7 +111,9 @@ own user login password). Windows boxes are reached via MCP only in this procedu
      - **Pre-announce check:** before the step lands, `date_step_pending_ns` (signed) and
        `date_step_due_in_ms` are set during its 10 s lead.
      - **A `nightly date step SKIPPED` line** means UTC was unreachable for the whole window. The
-       next night steps both days. Only an error beyond `daily_emergency_ms` (5 s) is stepped by
+       next night steps both days.
+     - **A `nightly date step MISSED` line** means another date change was in flight all window,
+       or the daemon stalled. Only an error beyond `daily_emergency_ms` (5 s) is stepped by
        day, and it logs `date correction beyond the emergency cap`.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
