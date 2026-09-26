@@ -1,9 +1,9 @@
 use super::*;
 
-const S: i64 = 1_000_000_000;
-const MS: i64 = 1_000_000;
+pub(super) const S: i64 = 1_000_000_000;
+pub(super) const MS: i64 = 1_000_000;
 
-fn ext(offset: i64, eff: i64, seq: u32, authority: bool) -> DateExtension {
+pub(super) fn ext(offset: i64, eff: i64, seq: u32, authority: bool) -> DateExtension {
     DateExtension {
         version: EXT_VERSION,
         authority,
@@ -11,6 +11,7 @@ fn ext(offset: i64, eff: i64, seq: u32, authority: bool) -> DateExtension {
             date_offset_ns: offset,
             effective_ptp_ns: eff,
             seq,
+            slew: None,
         },
         gm_uuid: [0x00, 0x1d, 0xc1, 0x01, 0x02, (seq & 0xff) as u8],
         now_ptp_ns: eff.wrapping_add(7),
@@ -27,7 +28,7 @@ fn extension_round_trips_every_field_including_negative_offsets() {
         ext(i64::MAX, i64::MIN, 0, true),
     ] {
         let bytes = encode_extension(&e);
-        assert_eq!(bytes.len(), EXT_SIZE);
+        assert_eq!(bytes.len(), EXT_SIZE_V2);
         assert_eq!(decode_extension(&bytes), Some(e));
     }
 }
@@ -40,9 +41,10 @@ fn extension_layout_is_the_documented_big_endian_one() {
         0x2122_2324,
         true,
     ));
-    assert_eq!(bytes[0], 1, "version byte");
+    assert_eq!(bytes[0], EXT_VERSION, "version byte");
+    assert_eq!(EXT_VERSION, 2, "#119 bumped the extension to v2");
     assert_eq!(bytes[1], EXT_FLAG_AUTHORITY, "authority flag");
-    assert_eq!(&bytes[2..4], &[0, 0], "reserved");
+    assert_eq!(&bytes[2..4], &[0, 0], "no slew: slew_ppm is zero");
     assert_eq!(&bytes[4..12], &[1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
         &bytes[12..20],
@@ -146,7 +148,8 @@ fn authority_publishes_its_anchor_in_effect_at_seq_1() {
         DateAnnounce {
             date_offset_ns: 900 * S,
             effective_ptp_ns: 10 * S - IMMEDIATE_BACKDATE_NS,
-            seq: 1
+            seq: 1,
+            slew: None,
         }
     );
     assert!(!a.has_pending(11 * S));
@@ -198,7 +201,8 @@ fn authority_announces_the_full_correction_lead_ahead_on_two_agreeing_readings()
         DateAnnounce {
             date_offset_ns: 1_000 * S + 52 * MS,
             effective_ptp_ns: 110 * S + MIN_STEP_LEAD_NS,
-            seq: 2
+            seq: 2,
+            slew: None,
         }
     );
     // Until the instant the OLD offset stays in effect.
@@ -261,7 +265,8 @@ fn rebase_without_pending_is_in_effect_now() {
         DateAnnounce {
             date_offset_ns: 12 * S,
             effective_ptp_ns: 48 * S - IMMEDIATE_BACKDATE_NS,
-            seq: 2
+            seq: 2,
+            slew: None,
         }
     );
     assert_eq!(
@@ -274,11 +279,12 @@ fn rebase_without_pending_is_in_effect_now() {
 
 // ---- follower --------------------------------------------------------------------------
 
-fn in_effect(offset: i64, seq: u32) -> DateAnnounce {
+pub(super) fn in_effect(offset: i64, seq: u32) -> DateAnnounce {
     DateAnnounce {
         date_offset_ns: offset,
         effective_ptp_ns: 0,
         seq,
+        slew: None,
     }
 }
 
@@ -328,6 +334,7 @@ fn an_unjoined_follower_ignores_a_pending_step_until_it_is_in_effect() {
         date_offset_ns: d + 60 * MS,
         effective_ptp_ns: 50 * S,
         seq: 9,
+        slew: None,
     };
     assert_eq!(f.on_announce(pending, d, d + 45 * S), FollowAction::None);
     assert_eq!(f.pending(), None);
@@ -350,6 +357,7 @@ fn a_joined_follower_schedules_and_applies_at_the_wall_instant() {
         date_offset_ns: d - 55 * MS,
         effective_ptp_ns: 20 * S,
         seq: 2,
+        slew: None,
     };
     assert_eq!(
         f.on_announce(pending, d, d + 15 * S),
@@ -409,6 +417,7 @@ fn a_scheduled_step_survives_a_local_re_anchor_in_the_wall_domain() {
             date_offset_ns: d + 60 * MS,
             effective_ptp_ns: 20 * S,
             seq: 2,
+            slew: None,
         },
         d,
         d + 15 * S,
@@ -450,6 +459,7 @@ fn cancel_pending_keeps_the_alignment() {
             date_offset_ns: S + 60 * MS,
             effective_ptp_ns: 10 * S,
             seq: 2,
+            slew: None,
         },
         S,
         6 * S,
@@ -468,6 +478,7 @@ fn forget_drops_the_alignment_but_keeps_a_scheduled_step() {
             date_offset_ns: S + 60 * MS,
             effective_ptp_ns: 10 * S,
             seq: 2,
+            slew: None,
         },
         S,
         6 * S,

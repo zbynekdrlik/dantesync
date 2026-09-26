@@ -12,7 +12,12 @@ paths:
   - "src/date_offset/tests.rs"
   - "src/time_server/tests.rs"
   - "tests/two_clock_bench.rs"
+  - "tests/two_clock_bench/scenarios.rs"
   - "tests/simulation_e2e.rs"
+  - "src/date_offset/slew.rs"
+  - "src/date_offset/slew/tests.rs"
+  - "src/controller/date_sync/slew.rs"
+  - "src/controller/date_sync/slew/tests.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -258,6 +263,77 @@ There is no per-box latency calibration; add one only if the canary shows the sp
 - In the controller, the step lands within one loop iteration of its instant (1 ms Linux /
   50 µs Windows) plus the cross-box wall disagreement (µs). For that window the fleet genuinely
   differs by the step size. It is the only disagreement a coordinated step leaves.
+
+## #119 — a BACKWARD date correction is a coordinated SLEW, never a step
+
+A backward step runs wall time back on every box at once; the camera-box stream OBS lost 43.7 ms
+of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera-box#1372). So:
+
+- **The direction decision is `date_offset::correction_kind`**: `≥ 0` → coordinated step,
+  `< 0` → coordinated slew (`DateSlew`: `from → to` at `ppm` from `start`, a pure function of PTP
+  time, `offset_at` floored to the ns and exact at `end`). The authority's slew is its announce
+  until complete; a slew in progress judges readings by the error LEFT once it has paid, extends
+  (continuous, same rate, re-announced from `D` now) only while ≥ one lead is left, and makes a
+  forward need wait for its end.
+- **Every box holds the slew in `DateFollower`** (`HeldSlew { slew, ref, carry }`):
+  `D = anchor + carry + offset_at(ptp) − ref`. The anchor stays the phase lock's BASE; the paid
+  amount is folded into it when the slew completes (`D` unchanged). Joining mid-way lands once on
+  the fleet's current `D` (join/absorb/late rules) and slews the rest; any replacement keeps the
+  displacement so far as `carry`, so `D` never jumps.
+- **The decoupling statement for the slew** (this rule's standing requirement): the slew enters
+  the clock ONLY as a rate term of the one frequency word (`compose_slew_word`, re-applied from the
+  1 ms loop at the start/end instants by `apply_slew_edge`), and every PTP sample is DE-SLEWED by
+  the scheduled displacement before either servo sees it (`DateSync::deslew_sample`) — so the
+  phase lock and the rate servo read the clock as if no slew ran. Two gotchas: take the
+  displacement at the WALL (`t2`), never at `t1` (a grandmaster change delivers `t1` in another
+  base before the rebase); and the rate servo's phase is continuous across a fold only if the
+  folded amount stays removed from its measurement (`rate_folded_ns`, kept mod 1 s because its
+  phase is mod 1 s).
+- **Bench:** the bit-identity pair is now two FORWARD-only runs (+8 / +20 ppm); a slew adds an
+  NTP-derived rate term by design. The −15 ppm run proves the slew: no backward step, no wall
+  ever running back, relative phase (each wall + its own path delay) ≤ 50 µs while slewing
+  (measured 10 µs), and the words within 0.001 ppm of the forward-only run (measured 0.0004).
+  A UTC-jump scenario (the upstream steps back 80 ms, twice around the grandmaster change and
+  once before its reboot) extends a running slew and runs slews THROUGH both grandmaster
+  events; a steady drift alone never extends one (the slew outruns it).
+- **Solve `D`(wall) to a FIXED POINT, never a fixed round count** (`solve_displacement`: iterate
+  until unchanged). With 3 rounds, 6 % of instants at 500 ppm / 1 s missed by 1 ns, the master's
+  exact "on the fleet line" test then failed at such an instant, its own scheduler skipped an
+  extension, and it would have re-aligned with a backward Join after the slew (review round 1).
+  A test that builds a wall from the schedule still compares with ± 1 ns: under the floored
+  schedule two adjacent PTP instants can give the same wall.
+- **The master slews WITH the fleet it announced to.** While the authority's slew runs,
+  `realign_master_to_fleet` only calls `catch_up_fleet_slew`: a slew (or an extension) its own
+  scheduler missed is handed to it again, accepted only within the absorb tolerance — never a
+  step. The promoted form of the slew a box still runs, heard a hair before its own end, is
+  ignored: freezing there would schedule a µs step BACKWARDS.
+- **Known limits (accepted):** a box that first hears a slew after its whole lead catches up
+  with a counted LATE step, which can be backward (as any late step). A master more than the
+  absorb tolerance off the fleet line when a slew runs (its own PTP outage, a failed step) does
+  not join the slew; it re-aligns only after the slew ends, with ONE Join of its own wall that
+  then includes the part of the slew it did not follow — up to the slew's whole amount, a
+  backward step on the master alone (never on a follower). The local NTP fallback path (no authority heard) is uncoordinated and
+  unchanged.
+- **The slew cap (ROZHODNUTÉ issuecomment-5842590141):** a backward correction beyond
+  `slew_cap_ns` = 2 × the step bound (100 ms by default, ~17 min at 100 ppm) is an ABNORMAL state
+  (typically a master booted on a bad NTP reading) and is a coordinated STEP on every box
+  (`CorrectionKind::TooLargeToSlew`), logged `date correction too large to slew`. An EXTENSION
+  larger than the cap is not slewed either: it waits for the running slew's end and is then
+  stepped (the cap bounds each increment, not a slew's total; the wait is up to the rest of the
+  running slew). The bench's `check()` allows a backward step only in a scenario that opts in
+  (`expects_too_large_step`), so no other scenario can hide a correction that grew past the cap. A bench scenario must keep
+  its own corrections under the cap if it means to exercise slews (the UTC-jump one uses 60/70/60
+  ms jumps with UTC at 0 ppm vs GM A: 80 ms jumps on −15 ppm drift reached −130 ms).
+- **Only a BACKWARD slew is a slew** (`DateAnnounce::as_slew` ignores `to ≥ from`): the fixed-
+  point solve has no fixed point for a forward slew at some walls (a 2-cycle), and no authority
+  sends one.
+- **The slew's term counts as applied only after a SUCCESSFUL write** (`compose_slew_word`
+  records nothing; every writer — the servo window, the PTP-offline hold, the loop edge — calls
+  `slew_word_written` on `Ok`). A failed write is retried from the loop (no PTP window may
+  follow: PTP offline), at most every 100 ms; START is logged once per slew, after the first
+  successful write, and is not repeated by a rebase or an extension (review rounds 2-3).
+- **Rollout (v1.10.0): the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of
+  the v2 extension and would step back at the slew's start.
 
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
@@ -541,6 +617,16 @@ resolving). Even the CONTROLLER runs this way: strip `serde`, stub the external 
 seeds gave the same result on `origin/master`, on the branch and on the branch in legacy mode, so
 the failure was the test's own unseeded noise, not the change. Replica results are evidence, not
 proof: CI still type-checks and runs the real crate.
+
+**A third local net: MSRV-aware clippy on the replica (#119).** The replica runs `rustc`, which
+does not know the crate's MSRV, so a newer std API (`u128::div_ceil`, 1.73 > `rust-version` 1.70)
+passed it and turned CI's Lint red (`clippy::incompatible_msrv`). `clippy-driver` is not a cargo
+shape either: `CARGO_PKG_RUST_VERSION=1.70.0 ~/.cargo/bin/clippy-driver --edition 2021
+--crate-type lib --crate-name dantesync <replica>/src/lib.rs -o <scratch>/x.rlib -D warnings -A
+dead_code` reproduces the Lint job on the pure modules (give `-o` a writable path; `/dev/null`
+fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the crate root
+(`tests/x.rs`, which cargo would also build as its own target): use
+`#[path = "<bench>/x.rs"] mod x;` for a submodule of a `tests/*.rs` bench.
 
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually

@@ -667,3 +667,23 @@ canary evidence before continuing.
   legacy); fixed by seeding (`d4a5a57`), bound unchanged.
 - Not released or deployed. Rollout: canary cam4, then the NTP master, then the rest
   (`.claude/skills/dantesync-deployment.md` step 4).
+
+## #119 — a backward fleet date correction is SLEWED, never stepped (v1.10.0, draft PR #120, branch `issue-119-backward-slew`)
+
+- Design: main's Approach 1 (dantesync issuecomment-5841897121). `date_offset::correction_kind`
+  (forward = coordinated step, backward = coordinated `DateSlew` at `system.date_offset.slew_ppm`,
+  default 100, clamped 10-500); DSYX extension v2 (flags bit 1, ppm in bytes 2-3, start offset
+  appended, 112-byte reply); every box holds the slew (`HeldSlew`, `D = anchor + displacement`),
+  the rate term composed into the one word and switched/retried from the 1 ms loop, every PTP
+  sample de-slewed at its wall, the fold keeps both servos continuous; `/status`
+  `date_slew_active` / `date_slew_remaining_ms` / `date_slew_ppm`; `[DATE] slew START/DONE`.
+- Commits: bump `7551143`; RED→GREEN `3e6c495`→`8684bee`, docs `eb80f8a`; review round 1
+  `91c453d`→`9b64d62` (MSRV div_ceil, fixed-point solve, promoted form, master catch-up, module
+  split), v1.10.0 `a813fa6`, test modules `56cc819`; round 2 `f65cf2f`→`a158864` (failed-edge
+  retry, backward-only `as_slew`); round 3 `9420754`→`2d96200` (term recorded only after a
+  successful write, 100 ms retry bound, one START per slew).
+- Proof: bench at UTC −15 ppm/24 h — 28 slews, 0 steps, no wall back, relative phase 10 µs in
+  slews (≤ 50), words within 0.0004 ppm of a forward-only run; a UTC-jump scenario extends a slew
+  and runs slews through the GM change + reboot. CI green on `2d96200` (run 36212565243).
+- Not merged, released or deployed. Rollout: the NTP master LAST (a ≤ 1.9.0 follower reads a slew
+  as a backward step).

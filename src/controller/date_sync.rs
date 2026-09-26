@@ -7,6 +7,15 @@
 //! step), a follower's poll / join / schedule, the coordinated step itself, the anchor lifecycle,
 //! and what `/status` publishes. A child module of `controller` so it reaches the controller's
 //! private state; all of its state is the one [`DateSync`] field.
+//!
+//! dantesync#119 — a backward fleet correction is a coordinated SLEW (`crate::date_offset`): `D`
+//! follows the slew's schedule of PTP time. Here it becomes (1) an extra rate term of the ONE
+//! frequency word — composed with the phase lock's word in `apply_self_tuning_servo` and
+//! re-applied from the loop at the slew's start and end instants ([`PtpController::apply_slew_edge`]),
+//! and (2) a de-slew of every PTP sample by the scheduled displacement before either servo reads it
+//! ([`DateSync::deslew_sample`]). (2) is the decoupling: the phase lock and the rate servo see the
+//! clock as if no slew ran, so neither reads the deliberate rate as grandmaster disagreement, and
+//! the only residual they see is the rate term's switching delay (one loop iteration).
 
 use super::*;
 use crate::config::{CLOCK_DISCIPLINE_LEGACY, CLOCK_DISCIPLINE_PTP_PHASE_LOCK};
@@ -75,6 +84,24 @@ pub(super) struct DateSync {
     pub(super) last_step: Option<(i64, u64, &'static str)>,
     /// The master's last `UTC − wall` reading (ns), as fed to the authority.
     pub(super) master_utc_error_ns: Option<i64>,
+    /// dantesync#119 — the rate of a backward correction's slew (the master's authority uses it).
+    pub(super) slew_ppm: u32,
+    /// dantesync#119 — the slew rate term currently inside the applied frequency word (ppm).
+    pub(super) applied_slew_ppm: f64,
+    /// dantesync#119 — slews already folded into the anchor, as the RATE servo's measurement still
+    /// needs them removed (mod 1 s): its phase is continuous across a fold only this way.
+    pub(super) rate_folded_ns: i64,
+    /// dantesync#119 — when a failed slew-edge write, and a saturated word, were last warned
+    /// about (each throttled on its own: the loop runs every 1 ms / 50 µs).
+    pub(super) slew_write_warned_at: Option<Instant>,
+    pub(super) slew_saturation_warned_at: Option<Instant>,
+    /// dantesync#119 — the running slew's START was logged (one line per slew, however often its
+    /// word is re-applied, rebased or extended; reset when it is folded).
+    pub(super) slew_start_logged: bool,
+    /// dantesync#119 — when the last slew-edge write failed (the retry is rate-bounded).
+    pub(super) slew_write_failed_at: Option<Instant>,
+    /// dantesync#119 — the fleet slew the master's catch-up last failed to take (logged once).
+    pub(super) slew_catch_up_seq: Option<u32>,
 }
 
 impl DateSync {
@@ -130,6 +157,14 @@ impl DateSync {
             step_lead_ns: config.date_offset.step_lead_ns(),
             last_step: None,
             master_utc_error_ns: None,
+            slew_ppm: config.date_offset.slew_ppm(),
+            applied_slew_ppm: 0.0,
+            rate_folded_ns: 0,
+            slew_write_warned_at: None,
+            slew_saturation_warned_at: None,
+            slew_start_logged: false,
+            slew_write_failed_at: None,
+            slew_catch_up_seq: None,
         }
     }
 
@@ -278,12 +313,13 @@ where
             None
         };
 
+        let now_wall = wall_now_ns();
+        // #119: D IN EFFECT — the anchor plus a held slew's displacement.
         let anchor = if ds.enabled && !ds.core.rebase_pending() {
-            ds.core.anchor_ns()
+            ds.d_in_effect(now_wall)
         } else {
             None
         };
-        let now_wall = wall_now_ns();
         status.date_offset_ns = anchor;
         status.date_offset_gm_uuid = anchor.and(ds.anchor_gm);
         status.date_authority = match anchor {
@@ -298,12 +334,31 @@ where
         };
         status.date_offset_seq = anchor.and(published.map(|p| p.seq));
         status.date_offset_effective_ptp_ns = anchor.and(published.map(|p| p.effective_ptp_ns));
+        // #119: a slew is published by its own fields (never as a pending step), and this box's
+        // own progress through the slew it follows.
+        let published_slew = anchor.and(published.and_then(|p| p.as_slew()));
+        status.date_slew_from_ns = published_slew.map(|s| s.from_ns);
+        status.date_slew_to_ns = published_slew.map(|s| s.to_ns);
+        status.date_slew_ppm = published_slew.map(|s| s.ppm);
+        let base = ds.core.anchor_ns();
+        status.date_slew_active =
+            ds.enabled && base.is_some_and(|b| ds.follower.slew_rate_ppm(b, now_wall) != 0.0);
+        status.date_slew_remaining_ms = if ds.enabled {
+            base.and_then(|b| ds.follower.slew_remaining_ns(b, now_wall))
+                .map(|n| n as f64 / 1e6)
+        } else {
+            None
+        };
         // The master publishes exactly its authority's announce: D in effect on its own wall
         // (the anchor) plus the difference to the announced D. While a step is pending that is
         // the step; once its instant has passed but before this loop applies it, or while the
         // master is off the fleet line (its own PTP outage, a failed step), it is the correction
         // back to the fleet D — so a follower always reads the FLEET D, never the master's own.
         match (ds.authority.as_ref(), anchor) {
+            (Some(_), Some(_)) if published_slew.is_some() => {
+                status.date_step_pending_ns = None;
+                status.date_step_due_in_ms = None;
+            }
             (Some(a), Some(d)) => {
                 let ann = a.announce();
                 let delta = ann.date_offset_ns.wrapping_sub(d);
@@ -348,6 +403,10 @@ where
         // wall has not stepped yet, so its local step never covered the fleet's step.
         if self.ntp_server_mode {
             self.date_sync.follower.cancel_pending();
+            // #119: likewise its own slew stops where it is (D stays continuous).
+            if let Some(anchor) = self.date_sync.core.anchor_ns() {
+                self.date_sync.follower.freeze_slew(anchor, wall_now_ns());
+            }
         }
         self.date_sync.last_step =
             Some((delta_ns, (wall_now_ns() / 1_000_000_000) as u64, "local"));
@@ -408,8 +467,12 @@ where
             // the free-run through the outage is as small as the oscillator allows.
             self.last_adj_ppm = word;
             self.applied_freq_ppm = word;
-            if let Err(e) = self.clock.adjust_frequency(1.0 + word / 1_000_000.0) {
-                warn!("[PHASE-LOCK] holding {:+.3}ppm failed: {}", word, e);
+            // #119: a running slew keeps its rate term through the outage (open loop, with the
+            // rest of the fleet). Recorded only if written: else the loop retries it.
+            let (total, term) = self.compose_slew_word(word);
+            match self.clock.adjust_frequency(1.0 + total / 1_000_000.0) {
+                Ok(()) => self.slew_word_written(term, total),
+                Err(e) => warn!("[PHASE-LOCK] holding {:+.3}ppm failed: {}", word, e),
             }
             info!(
                 "[PHASE-LOCK] disengaged (PTP offline) — holding the learned {:+.3}ppm",
@@ -435,13 +498,22 @@ where
             return;
         }
         let (Some(anchor), Some(a)) = (
-            self.date_sync.core.anchor_ns(),
+            self.date_sync.d_in_effect(wall_now_ns()),
             self.date_sync.authority.as_ref(),
         ) else {
             return;
         };
         let now_ptp = wall_now_ns().wrapping_sub(anchor);
-        if a.pending_step_ns(now_ptp).is_some() || self.date_sync.follower.pending().is_some() {
+        // #119: while the fleet slews, the master only makes sure it slews WITH it (a slew or an
+        // extension its own scheduler missed); any other re-alignment waits for the slew's end.
+        if a.slew_in_progress(now_ptp).is_some() {
+            self.catch_up_fleet_slew();
+            return;
+        }
+        if a.pending_step_ns(now_ptp).is_some()
+            || self.date_sync.follower.pending().is_some()
+            || self.date_sync.follower.held_slew().is_some()
+        {
             return;
         }
         let fleet = a.in_effect_ns(now_ptp);
@@ -487,21 +559,23 @@ where
         if !self.date_sync.enabled {
             return false;
         }
-        let Some(anchor) = self.date_sync.core.anchor_ns() else {
+        let Some(base) = self.date_sync.core.anchor_ns() else {
             return false;
         };
         if self.ntp_server_mode {
             self.ensure_date_authority();
+            let now_wall = wall_now_ns();
+            // #119: the master's D IN EFFECT (its anchor plus a held slew's displacement).
+            let anchor = self.date_sync.follower.in_effect_ns(base, now_wall);
+            let now_ptp = now_wall.wrapping_sub(anchor);
             let Some(fleet) = self
                 .date_sync
                 .authority
                 .as_ref()
-                .map(|a| a.in_effect_ns(wall_now_ns().wrapping_sub(anchor)))
+                .map(|a| a.in_effect_ns(now_ptp))
             else {
                 return false;
             };
-            let now_wall = wall_now_ns();
-            let now_ptp = now_wall.wrapping_sub(anchor);
             // The authority owns the FLEET line, so it is fed the fleet line's UTC error: this
             // master's reading plus how far its own wall is off that line (`anchor − fleet`). On
             // the line that is the reading itself; through the master's own PTP outage (its wall
@@ -528,24 +602,60 @@ where
                 .as_mut()
                 .and_then(|a| a.on_utc_error(fleet_err, now_ptp));
             if let Some(ann) = announced {
-                info!(
-                    "[DATE] AUTHORITY: the fleet line is {:+}us off UTC (> {}us) — announcing a fleet \
-                     date step of {:+}us at PTP {} (in {} ms), seq {}{}",
-                    fleet_err / 1_000,
-                    self.date_sync.step_bound_ns / 1_000,
-                    ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
-                    ann.effective_ptp_ns,
-                    ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
-                    ann.seq,
-                    if on_line {
-                        ""
-                    } else {
-                        " (this master is off the fleet line: it re-aligns afterwards)"
-                    }
-                );
+                let off_line = if on_line {
+                    ""
+                } else {
+                    " (this master is off the fleet line: it re-aligns afterwards)"
+                };
+                match ann.as_slew() {
+                    // #119: a backward correction — a coordinated slew, never a backward step.
+                    Some(sl) => info!(
+                        "[DATE] AUTHORITY: the fleet line is {:+}us off UTC (> {}us) — announcing a \
+                         fleet date SLEW of {:+}us at {} ppm ({} s) from PTP {} (in {} ms), seq {}{}",
+                        fleet_err / 1_000,
+                        self.date_sync.step_bound_ns / 1_000,
+                        sl.to_ns.wrapping_sub(fleet) / 1_000,
+                        sl.ppm,
+                        sl.duration_ns() / 1_000_000_000,
+                        sl.start_ptp_ns,
+                        sl.start_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
+                        ann.seq,
+                        off_line
+                    ),
+                    // #119 ROZHODNUTÉ: a backward step only for a correction beyond the slew cap —
+                    // an abnormal state, logged loudly.
+                    None if ann.date_offset_ns < fleet => warn!(
+                        "[DATE] AUTHORITY: date correction too large to slew: the fleet line is \
+                         {:+}us off UTC (> {}us, the slew cap) — announcing a coordinated BACKWARD \
+                         date step of {:+}us at PTP {} (in {} ms), seq {}{}",
+                        fleet_err / 1_000,
+                        crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000,
+                        ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
+                        ann.effective_ptp_ns,
+                        ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
+                        ann.seq,
+                        off_line
+                    ),
+                    None => info!(
+                        "[DATE] AUTHORITY: the fleet line is {:+}us off UTC (> {}us) — announcing a \
+                         fleet date step of {:+}us at PTP {} (in {} ms), seq {}{}",
+                        fleet_err / 1_000,
+                        self.date_sync.step_bound_ns / 1_000,
+                        ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
+                        ann.effective_ptp_ns,
+                        ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
+                        ann.seq,
+                        off_line
+                    ),
+                }
                 if on_line {
-                    let act = self.date_sync.follower.on_announce(ann, anchor, now_wall);
+                    let act = self.date_sync.follower.on_announce(ann, base, now_wall);
                     debug!("[DATE] master's own scheduler: {:?}", act);
+                    // #119: defensive — on the line D and the authority agree to the ns, so an
+                    // extension changes nothing but the end (the bench asserts exactly that).
+                    if let FollowAction::Absorb { new_anchor_ns } = act {
+                        self.date_sync.core.set_anchor(new_anchor_ns);
+                    }
                 }
             }
             // Publish NOW: the 31900 time server reads this snapshot, and an announce heard only
@@ -580,27 +690,34 @@ where
         if !self.date_sync.enabled || !self.ntp_server_mode || self.date_sync.authority.is_some() {
             return;
         }
-        let Some(anchor) = self.date_sync.core.anchor_ns() else {
+        let now_wall = wall_now_ns();
+        // #119: the D IN EFFECT (the anchor plus a held slew's displacement).
+        let Some(anchor) = self.date_sync.d_in_effect(now_wall) else {
             return;
         };
-        let now_wall = wall_now_ns();
+        let base = self.date_sync.core.anchor_ns().unwrap_or(anchor);
         let authority = DateAuthority::new(
             anchor,
             now_wall.wrapping_sub(anchor),
             self.date_sync.step_bound_ns,
             self.date_sync.step_lead_ns,
-        );
+        )
+        .with_slew_ppm(self.date_sync.slew_ppm);
         let act = self
             .date_sync
             .follower
-            .on_announce(authority.announce(), anchor, now_wall);
+            .on_announce(authority.announce(), base, now_wall);
         debug!("[DATE] master aligned with its own authority: {:?}", act);
         info!(
             "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns, step bound {} ms, \
-             announce lead {} s — clients step together at the announced PTP instant",
+             announce lead {} s — clients step forward together at the announced PTP instant, \
+             and slew backward corrections up to {} ms at {} ppm (a larger one is an abnormal state \
+             and a coordinated step)",
             anchor,
             self.date_sync.step_bound_ns / 1_000_000,
-            self.date_sync.step_lead_ns / 1_000_000_000
+            self.date_sync.step_lead_ns / 1_000_000_000,
+            crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000,
+            authority.slew_ppm()
         );
         self.date_sync.authority = Some(authority);
     }
@@ -638,12 +755,20 @@ where
                     old_ns, new_ns, gm_label
                 );
                 self.date_sync.anchor_gm = self.current_gm_uuid;
+                // #119: "now" in the OLD base comes from the D IN EFFECT (the old anchor plus a
+                // held slew's displacement, which a rebase does not change) — then the held slew
+                // moves into the new base with the anchor, so it runs at the same wall instants.
+                let wall = wall_now_ns();
+                let disp = self.date_sync.follower.displacement_at_wall(old_ns, wall);
+                self.date_sync
+                    .follower
+                    .rebase_slew(new_ns.wrapping_sub(old_ns));
                 if let Some(a) = self.date_sync.authority.as_mut() {
                     // "now" in the OLD base: the wall did not move, the base did. The FLEET line is
                     // shifted by the observed base shift — not set to this master's own anchor,
                     // which may be off the fleet line (its own PTP outage, a failed step): folding
                     // that offset in would reach every follower as a step.
-                    let now_ptp_old = wall_now_ns().wrapping_sub(old_ns);
+                    let now_ptp_old = wall.wrapping_sub(old_ns).wrapping_sub(disp);
                     let fleet_old = a.in_effect_ns(now_ptp_old);
                     let fleet_new = fleet_old.wrapping_add(new_ns.wrapping_sub(old_ns));
                     let ann = a.rebase(fleet_new, now_ptp_old);
@@ -666,6 +791,24 @@ where
             // No PTP, no phase lock (normally done on the offline edge already).
             self.on_ptp_offline_edge();
         }
+        // #119: a slew whose amount is paid is folded into the anchor, then the rate term follows
+        // the slew's schedule at this very instant (its start and end land within one loop
+        // iteration on every box, like a coordinated step).
+        let now_wall = wall_now_ns();
+        if let Some(fold) = self.date_sync.fold_completed_slew(now_wall) {
+            self.date_sync.slew_start_logged = false;
+            info!(
+                "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
+                fold / 1_000,
+                self.date_sync
+                    .follower
+                    .adopted_seq()
+                    .map(|q| q.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            self.update_shared_status();
+        }
+        self.apply_slew_edge(now_wall);
         if let Some(due) = self.date_sync.follower.due(wall_now_ns()) {
             self.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
         }
@@ -713,8 +856,13 @@ where
         let Some(anchor) = self.date_sync.core.anchor_ns() else {
             return;
         };
+        // #119: this box's PTP view comes from its D IN EFFECT at the reply's arrival.
+        let d_at_reply = self
+            .date_sync
+            .follower
+            .in_effect_ns(anchor, reply.received_wall_ns);
         if Some(ext.gm_uuid) != self.date_sync.anchor_gm
-            || !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, anchor)
+            || !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, d_at_reply)
         {
             debug!(
                 "[DATE] authority announce seq {} is in another PTP time base (its GM {:?}, ours \
@@ -744,6 +892,27 @@ where
                     );
                 }
             }
+            // #119 ROZHODNUTÉ: a 1.10+ authority schedules a backward step only beyond the slew
+            // cap. A smaller one comes from an older master that never slews (the rollout upgrades
+            // the master LAST) — loud too, but not blamed on the cap.
+            FollowAction::Scheduled {
+                delta_ns,
+                effective_wall_ns,
+            } if delta_ns < 0 => {
+                let cap = crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns);
+                let cause = if delta_ns < -cap {
+                    "date correction too large to slew"
+                } else {
+                    "the authority does not slew (an older dantesync?)"
+                };
+                warn!(
+                    "[DATE] {}: coordinated BACKWARD date step {:+}us scheduled (seq {}) in {} ms",
+                    cause,
+                    delta_ns / 1_000,
+                    ext.announce.seq,
+                    effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
+                )
+            }
             FollowAction::Scheduled {
                 delta_ns,
                 effective_wall_ns,
@@ -756,6 +925,18 @@ where
             FollowAction::Step { delta_ns, kind } => {
                 self.apply_date_step(delta_ns, kind, ext.announce.seq)
             }
+            FollowAction::SlewScheduled {
+                amount_ns,
+                start_wall_ns,
+                ppm,
+            } => info!(
+                "[DATE] coordinated date SLEW {:+}us at {} ppm scheduled (seq {}) in {} ms — no \
+                 backward step",
+                amount_ns / 1_000,
+                ppm,
+                ext.announce.seq,
+                start_wall_ns.wrapping_sub(now_wall) / 1_000_000
+            ),
         }
     }
 
@@ -818,6 +999,8 @@ where
         self.update_shared_status();
     }
 }
+
+mod slew;
 
 #[cfg(test)]
 mod tests;

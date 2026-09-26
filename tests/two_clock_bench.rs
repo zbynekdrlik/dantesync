@@ -30,10 +30,18 @@
 //! 3. DATE: every step after the join is a COORDINATED one, applied by every box in the same
 //!    window; zero late or local steps; the master's wall stays within the step bound of UTC.
 //! 4. GM CHANGE: no box steps its wall when the grandmaster changes.
+//!
+//! dantesync#119: a BACKWARD correction (UTC −15 ppm vs the GM: the fleet runs ahead) is a
+//! coordinated SLEW, never a step. The bench mirrors the controller's slew glue — the rate term in
+//! the frequency word (applied at the start/end instants, so resolved inside the window like a
+//! step's landing) and the de-slew of every PTP sample — and proves: no box ever steps backwards
+//! or runs its wall backwards, the relative phase of the fleet (each wall plus its own PTP path
+//! delay) stays within 50 µs through every slew, and the phase lock's law is untouched (the
+//! words differ from a forward-only run by numerical noise only).
 
 use dantesync::date_offset::{
-    same_time_base, DateAnnounce, DateAuthority, DateFollower, FollowAction, StepKind,
-    DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
+    same_time_base, slew_cap_ns, DateAnnounce, DateAuthority, DateFollower, FollowAction, SlewSpec,
+    StepKind, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
 };
 use dantesync::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 
@@ -79,7 +87,19 @@ struct Scenario {
     /// re-bases the fleet D with its own untracked free-run error (it had no PTP to measure it),
     /// which followers take as one small late step: allowed, bounded to < 1 ms.
     gm_change_in_master_outage: bool,
+    /// #119: UTC jumps (window, ns) — an upstream stepping back makes the fleet run ahead at once,
+    /// so a backward correction (or an extension of a running slew) follows. The master's UTC
+    /// bound is not judged for `UTC_JUMP_SETTLE_WINDOWS` after each jump.
+    utc_jumps: Vec<(u64, i64)>,
+    /// #119 ROZHODNUTÉ: this scenario MEANS to cause a backward correction beyond the slew cap
+    /// (a master booting seconds ahead); only then does `check()` accept a backward step.
+    expects_too_large_step: bool,
 }
+
+/// #119: after a UTC jump the fleet is off UTC by the jump until the slew has paid it. Two chained
+/// 80 ms jumps on top of a fleet error of up to 50 ms extend one slew to ~210 ms, i.e. 2 100 s
+/// at 100 ppm (measured: 201.7 ms) plus the agreement and the lead: 50 minutes covers it.
+const UTC_JUMP_SETTLE_WINDOWS: u64 = 6_000;
 
 impl Scenario {
     fn plain(label: &'static str, utc_vs_gm_ppm: f64, grace: bool) -> Self {
@@ -90,7 +110,14 @@ impl Scenario {
             master_boot_err_ns: 0,
             master_ptp_offline: Vec::new(),
             gm_change_in_master_outage: false,
+            utc_jumps: Vec::new(),
+            expects_too_large_step: false,
         }
+    }
+    fn settling_after_a_utc_jump(&self, w: u64) -> bool {
+        self.utc_jumps
+            .iter()
+            .any(|&(at, _)| (at..at + UTC_JUMP_SETTLE_WINDOWS).contains(&w))
     }
     fn master_offline_at(&self, w: u64) -> bool {
         self.master_ptp_offline
@@ -113,7 +140,10 @@ struct Published {
     date_offset_ns: i64,
     effective_ptp_ns: i64,
     seq: u32,
+    slew: Option<SlewSpec>,
     gm: u8,
+    /// The master's D IN EFFECT at the publish (anchor + its slew's displacement): the time
+    /// server derives the replier's PTP now from it.
     master_anchor_ns: i64,
 }
 
@@ -123,8 +153,9 @@ fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
         date_offset_ns: ann.date_offset_ns,
         effective_ptp_ns: ann.effective_ptp_ns,
         seq: ann.seq,
+        slew: ann.slew,
         gm: m.core_gm,
-        master_anchor_ns: m.core.anchor_ns().expect("anchored"),
+        master_anchor_ns: m.d_in_effect(),
     }
 }
 
@@ -140,11 +171,13 @@ const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = true;
 /// A follower's applicability checks (`service_date_offset`); the time server computes the
 /// replier's PTP now from the SNAPSHOT's D in effect and the live wall.
 fn follower_accepts(b: &Box_, p: &Published, master_wall_now: i64) -> bool {
-    let Some(anchor) = b.core.anchor_ns() else {
+    if b.core.anchor_ns().is_none() {
         return false;
-    };
+    }
     let now_ptp = master_wall_now - p.master_anchor_ns;
-    !b.core.rebase_pending() && b.core_gm == p.gm && same_time_base(now_ptp, b.wall_ns(), anchor)
+    !b.core.rebase_pending()
+        && b.core_gm == p.gm
+        && same_time_base(now_ptp, b.wall_ns(), b.d_in_effect())
 }
 
 /// The master's local NTP step while it has no PTP (`note_local_date_step`): its own wall and D
@@ -154,6 +187,8 @@ fn master_local_step(m: &mut Box_, _a: &mut DateAuthority, delta_ns: i64) {
     m.core.note_step(delta_ns);
     m.fresh = false;
     m.follower.cancel_pending();
+    let anchor = m.core.anchor_ns().expect("anchored");
+    m.follower.freeze_slew(anchor, m.wall_ns());
 }
 
 /// The master's UTC reading → the authority (`ntp_under_date_authority`): the FLEET line's error
@@ -166,19 +201,26 @@ fn master_feed_authority(
     utc_err_ns: i64,
     ptp_offline: bool,
 ) -> Option<(DateAnnounce, bool, i64)> {
-    let anchor = m.core.anchor_ns().expect("anchored");
-    let now_ptp = m.wall_ns() - anchor;
+    let d = m.d_in_effect();
+    let now_ptp = m.wall_ns() - d;
     let fleet = a.in_effect_ns(now_ptp);
-    let fleet_err = utc_err_ns + (anchor - fleet);
-    let on_line = anchor == fleet && !ptp_offline;
+    let fleet_err = utc_err_ns + (d - fleet);
+    let on_line = d == fleet && !ptp_offline;
     a.on_utc_error(fleet_err, now_ptp)
         .map(|ann| (ann, on_line, fleet))
 }
 
 /// The master re-anchored on a new time base (`handle_phase_anchor_event`): the fleet D moves by
 /// the observed base shift, never onto the master's own (possibly off-line) anchor.
-fn master_rebases_fleet(a: &mut DateAuthority, master_wall_ns: i64, old_ns: i64, new_ns: i64) {
-    let now_ptp_old = master_wall_ns - old_ns;
+fn master_rebases_fleet(
+    a: &mut DateAuthority,
+    master_wall_ns: i64,
+    old_ns: i64,
+    new_ns: i64,
+    displacement_ns: i64,
+) {
+    // "now" in the OLD base, from the D IN EFFECT (anchor + the slew's displacement).
+    let now_ptp_old = master_wall_ns - old_ns - displacement_ns;
     let fleet_old = a.in_effect_ns(now_ptp_old);
     a.rebase(fleet_old + (new_ns - old_ns), now_ptp_old);
 }
@@ -192,17 +234,37 @@ fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u64, grace: b
     if !m.core.engaged() || m.core.rebase_pending() {
         return;
     }
-    let anchor = m.core.anchor_ns().expect("anchored");
-    let now_ptp = m.wall_ns() - anchor;
-    if a.pending_step_ns(now_ptp).is_some() || m.follower.pending().is_some() {
+    let d = m.d_in_effect();
+    let now_ptp = m.wall_ns() - d;
+    // #119: while the fleet slews the master only catches up with a slew its own scheduler
+    // missed, within the absorb tolerance (`catch_up_fleet_slew`); nothing else.
+    if let Some(fleet_slew) = a.slew_in_progress(now_ptp) {
+        let anchor = m.core.anchor_ns().expect("anchored");
+        let gap = a.in_effect_ns(now_ptp) - d;
+        if m.follower.held_slew().map(|h| h.slew) != Some(fleet_slew)
+            && gap.abs() <= dantesync::date_offset::ABSORB_TOLERANCE_NS
+        {
+            if let FollowAction::Absorb { new_anchor_ns } =
+                m.follower.on_announce(a.announce(), anchor, m.wall_ns())
+            {
+                m.core.set_anchor(new_anchor_ns);
+            }
+            m.catch_ups += 1;
+        }
+        return;
+    }
+    if a.pending_step_ns(now_ptp).is_some()
+        || m.follower.pending().is_some()
+        || m.follower.held_slew().is_some()
+    {
         return;
     }
     let fleet = a.in_effect_ns(now_ptp);
-    if fleet == anchor || !m.fresh {
+    if fleet == d || !m.fresh {
         return;
     }
     let e = m.core.last_error_ns().unwrap_or(0);
-    let delta = fleet - anchor - e;
+    let delta = fleet - d - e;
     if delta.abs() > dantesync::date_offset::ABSORB_TOLERANCE_NS {
         m.apply_step(a.seq(), delta, StepKind::Join, t_ns, w, grace);
     }
@@ -254,6 +316,10 @@ struct Box_ {
     /// times still integrate bit-identical oscillator paths.
     wall: Clock,
     stepped: i64,
+    /// #119: the wall's slew part — the integral of the slew's rate term, kept apart from the
+    /// oscillator-driven clock like the steps (so the hourly rate audit still reads the PI law).
+    slewed_ns: i64,
+    slew_frac: f64,
     word_ppm: f64,
     core: PhaseLockCore,
     follower: DateFollower,
@@ -271,6 +337,10 @@ struct Box_ {
     /// Every applied step: (announce seq, size ns, kind, TRUE time it landed, ns since start).
     steps: Vec<Step>,
     rebases: u32,
+    /// #119: the wall at the previous window boundary (it must never go back after the join).
+    last_wall: i64,
+    /// #119: the master's catch-ups with a fleet slew its own scheduler missed.
+    catch_ups: u32,
 }
 
 type Step = (u32, i64, StepKind, f64);
@@ -293,8 +363,23 @@ struct RunResult {
     late_steps: Vec<u32>,
     /// Every coordinated step the authority announced: (seq, size).
     announced: Vec<(u32, i64)>,
+    /// #119: every coordinated slew it announced: (seq, amount).
+    announced_slews: Vec<(u32, i64)>,
     /// Follower polls refused as another time base (another GM, or a GM that rebooted).
     refused_replies: u32,
+    /// #119: the fleet's worst RELATIVE phase — the spread of (wall + own PTP path delay), i.e.
+    /// the wall disagreement without the static receive-latency asymmetry — overall after the
+    /// join, and while a slew runs.
+    max_relative_phase_ns: i64,
+    max_relative_phase_in_slew_ns: i64,
+    /// #119: windows measured while a slew ran (so the in-slew bound is not vacuous).
+    slew_windows: u32,
+    /// #119: times any box's wall read less than at the previous window boundary.
+    wall_went_back: u32,
+    extensions: u32,
+    gm_events_in_slew: u32,
+    /// The master's catch-ups with a fleet slew its own scheduler missed.
+    master_catch_ups: u32,
 }
 
 /// What each box hears: the grandmaster's UUID and its time base. The grandmaster CHANGES (to
@@ -337,6 +422,11 @@ struct Bench<'s> {
     master_local_candidate: Option<i64>,
     /// Every coordinated step the authority announced: (seq, size).
     announced: Vec<(u32, i64)>,
+    announced_slews: Vec<(u32, i64)>,
+    /// #119: slews the authority extended while they ran.
+    extensions: u32,
+    /// #119: grandmaster events (change, reboot) that happened while the fleet slewed.
+    gm_events_in_slew: u32,
     ntp_rng: Rng,
     net_rng: Rng,
     // metrics
@@ -349,6 +439,10 @@ struct Bench<'s> {
     /// The FLEET LINE's UTC error, read on a follower (box 1): what every genlocked box shows.
     max_fleet_utc: i64,
     refused: u32,
+    max_rel: i64,
+    max_rel_slew: i64,
+    slew_windows: u32,
+    wall_back: u32,
     /// Per-hour effective-rate audit of every box vs the grandmaster it currently hears:
     /// (continuous wall, gm) at the start of the hour.
     hour_start: Vec<(i64, i64)>,
@@ -394,6 +488,8 @@ impl<'s> Bench<'s> {
                     frac: 0.0,
                 },
                 stepped: 0,
+                slewed_ns: 0,
+                slew_frac: 0.0,
                 // The rate servo hands over a word that is 0.4 ppm off the truth.
                 word_ppm: -oscs[i] + 0.4,
                 core: PhaseLockCore::new(),
@@ -406,6 +502,8 @@ impl<'s> Bench<'s> {
                 words: Vec::new(),
                 steps: Vec::new(),
                 rebases: 0,
+                last_wall: 0,
+                catch_ups: 0,
             })
             .collect();
         let n = boxes.len();
@@ -435,6 +533,9 @@ impl<'s> Bench<'s> {
             snapshot: None,
             master_local_candidate: None,
             announced: Vec::new(),
+            announced_slews: Vec::new(),
+            extensions: 0,
+            gm_events_in_slew: 0,
             ntp_rng: Rng(0xD1B5_4A32_D192_ED03),
             net_rng: Rng(0xABCD_EF01_2345_6789),
             max_dis: 0,
@@ -443,6 +544,10 @@ impl<'s> Bench<'s> {
             max_utc: 0,
             max_fleet_utc: 0,
             refused: 0,
+            max_rel: 0,
+            max_rel_slew: 0,
+            slew_windows: 0,
+            wall_back: 0,
             hour_start: vec![(0, 0); n],
             rate_errors: Vec::new(),
         }
@@ -457,6 +562,11 @@ impl<'s> Bench<'s> {
         let t_now_s = w as f64 * WINDOW_S;
         let grace = self.sc.grace;
         self.utc.advance(TRUE_DT_NS, self.sc.utc_vs_gm_ppm);
+        for &(at, jump) in &self.sc.utc_jumps {
+            if at == w {
+                self.utc.ns += jump;
+            }
+        }
         self.gm_a.advance(TRUE_DT_NS, gm_a_ppm);
         self.gm_b_pre.advance(TRUE_DT_NS, gm_b_ppm);
         self.gm_b_post.advance(TRUE_DT_NS, gm_b_ppm);
@@ -465,6 +575,9 @@ impl<'s> Bench<'s> {
                 b.wander_ppm * (2.0 * std::f64::consts::PI * t_now_s / b.wander_period_s).sin();
             let rate = b.osc_ppm + wander + b.word_ppm;
             let scale = 1.0 + rate * 1e-6;
+            // #119: the slew's rate term, switched on/off at its start/end instants inside the
+            // window (the controller re-applies the word from its 1 ms loop at those instants).
+            b.advance_slew(TRUE_DT_NS);
             let start = b.wall_ns();
             let crossing = b.follower.pending().and_then(|p| {
                 let to_cross = (p.effective_wall_ns - start) as f64 / scale;
@@ -481,6 +594,18 @@ impl<'s> Bench<'s> {
                     w,
                     grace,
                 );
+            }
+        }
+    }
+
+    /// 1b. #119: a slew that has paid its amount is folded into the anchor (`D` unchanged) — the
+    ///     controller does it every loop iteration.
+    fn fold_completed_slews(&mut self) {
+        for b in self.boxes.iter_mut() {
+            if let Some(anchor) = b.core.anchor_ns() {
+                if let Some(fold) = b.follower.take_completed_slew(anchor, b.wall_ns()) {
+                    b.core.set_anchor(anchor + fold);
+                }
             }
         }
     }
@@ -514,11 +639,14 @@ impl<'s> Bench<'s> {
         let (gm_a, gm_b_pre, gm_b_post) = (&self.gm_a, &self.gm_b_pre, &self.gm_b_post);
         for (i, b) in self.boxes.iter_mut().enumerate() {
             let (gm_id, gm) = gm_view(w, b.lag, gm_a, gm_b_pre, gm_b_post);
+            // #119: every sample is de-slewed by the displacement the box's slew schedules at its
+            // wall, so the phase lock never reads the deliberate slew as a phase error.
+            let deslew = b.slew_displacement();
             let mut samples: Vec<i64> = (0..SAMPLES_PER_WINDOW)
                 .map(|_| {
                     let noise = b.rng.gauss() * PTP_NOISE_NS;
                     // wall_rx − gm_tx = (wall − gm) + delay, plus the timestamp noise.
-                    b.wall_ns() - gm.ns + (b.delay_ns + noise).round() as i64
+                    b.wall_ns() - gm.ns + (b.delay_ns + noise).round() as i64 - deslew
                 })
                 .collect();
             samples.sort();
@@ -548,6 +676,7 @@ impl<'s> Bench<'s> {
             }
             if let AnchorEvent::Rebased { old_ns, new_ns } = out.event {
                 b.rebases += 1;
+                b.follower.rebase_slew(new_ns - old_ns);
                 if i == 0 {
                     master.rebase = Some((old_ns, new_ns));
                 }
@@ -578,7 +707,8 @@ impl<'s> Bench<'s> {
         let a = self.authority.as_mut().unwrap();
         if let Some((old_ns, new_ns)) = window.rebase {
             // The master's re-anchor on a new time base rebases the fleet offset (no step).
-            master_rebases_fleet(a, m.wall_ns(), old_ns, new_ns);
+            let disp = m.follower.displacement_at_wall(new_ns, m.wall_ns());
+            master_rebases_fleet(a, m.wall_ns(), old_ns, new_ns, disp);
         }
         if window.ran {
             self.snapshot = Some(master_publishes(m, a)); // the status write ending the window
@@ -595,14 +725,29 @@ impl<'s> Bench<'s> {
                 self.utc.ns - m.wall_ns() + (self.ntp_rng.gauss() * NTP_NOISE_NS).round() as i64;
             let fed = master_feed_authority(m, a, err, offline);
             if let Some((ann, own, before)) = fed {
-                self.announced.push((ann.seq, ann.date_offset_ns - before));
+                if ann.slew.is_some() {
+                    let sl = ann.as_slew().unwrap();
+                    // An extension re-announces from the running slew's current D.
+                    self.announced_slews.push((ann.seq, sl.amount_ns()));
+                } else {
+                    self.announced.push((ann.seq, ann.date_offset_ns - before));
+                }
                 if own {
                     let anchor = m.core.anchor_ns().unwrap();
+                    let now_ptp = m.wall_ns() - m.d_in_effect();
+                    // An extension starts NOW: the master's own slew continues (at most a ns off).
+                    let extension = ann.as_slew().is_some_and(|sl| sl.start_ptp_ns <= now_ptp);
                     let act = m.follower.on_announce(ann, anchor, m.wall_ns());
-                    assert!(
-                        matches!(act, FollowAction::Scheduled { .. }),
-                        "master schedules its own step: {act:?}"
-                    );
+                    // On the line, D and the authority agree to the ns at the same instant: an
+                    // extension changes nothing but the end (no absorb, not even of a ns).
+                    match act {
+                        FollowAction::Scheduled { .. } | FollowAction::SlewScheduled { .. } => {}
+                        FollowAction::None if extension => {}
+                        other => panic!("master schedules its own step / slew: {other:?}"),
+                    }
+                    if extension {
+                        self.extensions += 1;
+                    }
                 }
             }
             if master_publishes_after_ntp(offline) {
@@ -632,7 +777,7 @@ impl<'s> Bench<'s> {
         if w % 20 == 13 {
             self.snapshot = Some(master_publishes(m, a));
         }
-        if w > 240 {
+        if w > 240 && !self.sc.settling_after_a_utc_jump(w) {
             self.max_utc = self.max_utc.max((self.utc.ns - m.wall_ns()).abs());
         }
     }
@@ -651,6 +796,7 @@ impl<'s> Bench<'s> {
             date_offset_ns: published.date_offset_ns,
             effective_ptp_ns: published.effective_ptp_ns,
             seq: published.seq,
+            slew: published.slew,
         };
         for b in self.boxes.iter_mut().skip(1) {
             if self.net_rng.uniform() < POLL_LOSS {
@@ -662,7 +808,9 @@ impl<'s> Bench<'s> {
             }
             let anchor = b.core.anchor_ns().expect("accepted ⇒ anchored");
             match b.follower.on_announce(ann, anchor, b.wall_ns()) {
-                FollowAction::None | FollowAction::Scheduled { .. } => {}
+                FollowAction::None
+                | FollowAction::Scheduled { .. }
+                | FollowAction::SlewScheduled { .. } => {}
                 FollowAction::Absorb { new_anchor_ns } => b.core.set_anchor(new_anchor_ns),
                 FollowAction::Step { delta_ns, kind } => {
                     b.apply_step(ann.seq, delta_ns, kind, t0_ns + TRUE_DT_NS, w, grace)
@@ -675,7 +823,7 @@ impl<'s> Bench<'s> {
     ///     delay (a box holds `t2 − t1 = D`, so its wall sits `delay` behind the GM line) — exactly
     ///     what a cross-box genlock grid sees.
     fn measure_disagreement(&mut self, w: u64, t0_ns: f64) {
-        if w > 240 {
+        if w > 240 && !self.sc.settling_after_a_utc_jump(w) {
             self.max_fleet_utc = self
                 .max_fleet_utc
                 .max((self.utc.ns - self.boxes[1].wall_ns()).abs());
@@ -697,9 +845,14 @@ impl<'s> Bench<'s> {
         // date path by design.
         let a = self.authority.as_ref().unwrap();
         let m = &self.boxes[0];
-        let m_anchor = m.core.anchor_ns().unwrap();
+        let m_d = m.d_in_effect();
         let master_on_line =
-            !self.sc.master_offline_at(w) && a.in_effect_ns(m.wall_ns() - m_anchor) == m_anchor;
+            !self.sc.master_offline_at(w) && a.in_effect_ns(m.wall_ns() - m_d) == m_d;
+        let slewing = a.slew_in_progress(m.wall_ns() - m_d).is_some()
+            || self.boxes.iter().any(|b| b.follower.held_slew().is_some());
+        if slewing && (w == GM_CHANGE_AT_WINDOW || w == GM_REBOOT_AT_WINDOW) {
+            self.gm_events_in_slew += 1;
+        }
         let judged: Vec<&Box_> = self
             .boxes
             .iter()
@@ -732,6 +885,26 @@ impl<'s> Bench<'s> {
             self.max_settling_dis = self.max_settling_dis.max(hi - lo);
         } else {
             self.max_dis = self.max_dis.max(hi - lo);
+            // #119: the relative phase — each wall plus its own path delay (a box holds its wall
+            // `delay` behind the GM line, see above).
+            let rel: Vec<i64> = judged
+                .iter()
+                .map(|b| b.wall_ns() + b.delay_ns.round() as i64)
+                .collect();
+            let spread = rel.iter().max().unwrap() - rel.iter().min().unwrap();
+            self.max_rel = self.max_rel.max(spread);
+            if slewing {
+                self.max_rel_slew = self.max_rel_slew.max(spread);
+                self.slew_windows += 1;
+            }
+        }
+        // #119: no wall ever reads less than at the previous boundary.
+        for b in self.boxes.iter_mut() {
+            let now = b.wall_ns();
+            if now < b.last_wall {
+                self.wall_back += 1;
+            }
+            b.last_wall = now;
         }
     }
 
@@ -778,7 +951,15 @@ impl<'s> Bench<'s> {
             rebases: self.boxes.iter().map(|b| b.rebases).collect(),
             late_steps: self.boxes.iter().map(|b| b.follower.late_steps()).collect(),
             announced: self.announced,
+            announced_slews: self.announced_slews,
             refused_replies: self.refused,
+            max_relative_phase_ns: self.max_rel,
+            max_relative_phase_in_slew_ns: self.max_rel_slew,
+            slew_windows: self.slew_windows,
+            wall_went_back: self.wall_back,
+            extensions: self.extensions,
+            gm_events_in_slew: self.gm_events_in_slew,
+            master_catch_ups: self.boxes[0].catch_ups,
         }
     }
 }
@@ -789,6 +970,7 @@ fn run(sc: &Scenario) -> RunResult {
         let t0_ns = w as f64 * TRUE_DT_NS;
         let master_steps_at_start = bench.boxes[0].steps.len();
         bench.advance_clocks(w, t0_ns);
+        bench.fold_completed_slews();
         bench.apply_overdue_steps(w, t0_ns);
         if bench.boxes[0].steps.len() != master_steps_at_start {
             if let Some(a) = bench.authority.as_ref() {
@@ -806,7 +988,41 @@ fn run(sc: &Scenario) -> RunResult {
 
 impl Box_ {
     fn wall_ns(&self) -> i64 {
-        self.wall.ns + self.stepped
+        self.wall.ns + self.stepped + self.slewed_ns
+    }
+
+    /// #119: `D` in effect (the anchor plus the held slew's displacement at the wall).
+    fn d_in_effect(&self) -> i64 {
+        let anchor = self.core.anchor_ns().expect("anchored");
+        self.follower.in_effect_ns(anchor, self.wall_ns())
+    }
+
+    /// #119: the held slew's displacement at the current wall (0 before the first anchor).
+    fn slew_displacement(&self) -> i64 {
+        match self.core.anchor_ns() {
+            Some(anchor) => self.follower.displacement_at_wall(anchor, self.wall_ns()),
+            None => 0,
+        }
+    }
+
+    /// #119: integrate the slew's rate term over one window, switching it at the PTP instants
+    /// where the slew starts and ends (PTP time advances at the true rate to ≪ 1 ns per window:
+    /// the grandmasters run at 0 and +3 ppm).
+    fn advance_slew(&mut self, true_dt_ns: f64) {
+        let (Some(anchor), Some(h)) = (self.core.anchor_ns(), self.follower.held_slew()) else {
+            return;
+        };
+        let p0 = self.follower.now_ptp_ns(anchor, self.wall_ns()) as f64;
+        let p1 = p0 + true_dt_ns;
+        let on = (h.slew.start_ptp_ns as f64).max(p0);
+        let off = (h.slew.end_ptp_ns() as f64).min(p1);
+        if off > on {
+            let rate_ppm = h.slew.amount_ns().signum() as f64 * h.slew.ppm as f64;
+            let d = rate_ppm * 1e-6 * (off - on) + self.slew_frac;
+            let whole = d.floor();
+            self.slew_frac = d - whole;
+            self.slewed_ns += whole as i64;
+        }
     }
 
     /// Step the wall and move D with it (the controller's `apply_date_step`), recording it; with
@@ -830,258 +1046,7 @@ impl Box_ {
     }
 }
 
-fn check(sc: &Scenario, r: &RunResult) {
-    let label = sc.label;
-    let offline_scenario = !sc.master_ptp_offline.is_empty();
-    let n = r.words.len();
-    println!(
-        "[{label}] max wall disagreement {} µs, master |UTC − wall| max {} ms, rebases {:?}, \
-         {} replies refused as another time base",
-        r.max_disagreement_ns / US,
-        r.max_utc_error_ns / MS,
-        r.rebases,
-        r.refused_replies
-    );
-
-    // PHASE: all walls agree within 100 µs at every instant after the join.
-    assert!(
-        r.max_disagreement_ns < 100 * US,
-        "[{label}] walls disagreed by {} µs",
-        r.max_disagreement_ns / US
-    );
-    // … and while the fleet settles the double fault, within `SETTLING_BOUND_NS`.
-    println!(
-        "[{label}] max wall disagreement while settling the double fault {} µs",
-        r.max_settling_disagreement_ns / US
-    );
-    assert!(
-        r.max_settling_disagreement_ns < SETTLING_BOUND_NS,
-        "[{label}] walls disagreed by {} µs while settling the double fault",
-        r.max_settling_disagreement_ns / US
-    );
-    if sc.gm_change_in_master_outage {
-        assert!(
-            r.max_settling_disagreement_ns > 0,
-            "[{label}] the settling window was actually measured"
-        );
-    }
-
-    // RATE: effective rate == the grandmaster's rate, every box, every clean hour.
-    let worst = r
-        .rate_errors_ppm
-        .iter()
-        .fold(0.0f64, |a, &x| a.max(x.abs()));
-    println!(
-        "[{label}] worst hourly rate error vs the GM: {worst:.5} ppm over {} box-hours",
-        r.rate_errors_ppm.len()
-    );
-    assert!(
-        worst < 0.01,
-        "[{label}] a box's rate left the PTP rate by {worst} ppm"
-    );
-
-    // DATE: every follower joined once at boot, then took EXACTLY the announced steps (same seq,
-    // same size), all coordinated — zero late, zero uncoordinated. The master took them too,
-    // except (in the master-offline scenario) one it had to drop while running its local path;
-    // its own re-alignment to the fleet line afterwards is a Join.
-    assert!(
-        !r.announced.is_empty(),
-        "[{label}] the authority never announced a date step"
-    );
-    let master_coord: Vec<(u32, i64)> = r.steps[0]
-        .iter()
-        .filter(|s| s.2 == StepKind::Coordinated)
-        .map(|s| (s.0, s.1))
-        .collect();
-    assert!(
-        r.steps[0]
-            .iter()
-            .all(|s| s.2 == StepKind::Coordinated || (offline_scenario && s.2 == StepKind::Join)),
-        "[{label}] the master made a step that is neither coordinated nor its re-alignment: {:?}",
-        r.steps[0]
-    );
-    assert!(
-        master_coord.iter().all(|c| r.announced.contains(c)),
-        "[{label}] the master stepped something it never announced"
-    );
-    if !offline_scenario {
-        assert_eq!(
-            master_coord, r.announced,
-            "[{label}] the master skipped an announce"
-        );
-    }
-    for (i, steps) in r.steps.iter().enumerate().skip(1) {
-        let (lates, steps): (Vec<&Step>, Vec<&Step>) = steps
-            .iter()
-            .partition(|s| sc.gm_change_in_master_outage && s.2 == StepKind::Late);
-        assert!(
-            lates.len() <= 1 && lates.iter().all(|s| s.1.abs() < MS),
-            "[{label}] box {i}: the double-fault re-basing may cost one late step < 1 ms: {lates:?}"
-        );
-        let (joins, rest): (Vec<&Step>, Vec<&Step>) =
-            steps.into_iter().partition(|s| s.2 == StepKind::Join);
-        assert!(
-            joins.len() <= 1,
-            "[{label}] box {i} joined {} times",
-            joins.len()
-        );
-        assert!(
-            joins.iter().all(|s| s.3 < 10e9),
-            "[{label}] box {i} joined late: {joins:?}"
-        );
-        assert!(
-            rest.iter().all(|s| s.2 == StepKind::Coordinated),
-            "[{label}] box {i} made an uncoordinated step: {rest:?}"
-        );
-        let got: Vec<(u32, i64)> = rest.iter().map(|s| (s.0, s.1)).collect();
-        assert_eq!(
-            got, r.announced,
-            "[{label}] box {i} did not take exactly the announced steps"
-        );
-    }
-    // SIMULTANEITY: every announced step landed on every box that applied it within 100 µs.
-    let mut worst_spread = 0.0f64;
-    for (seq, _) in &r.announced {
-        let landings: Vec<f64> = r
-            .steps
-            .iter()
-            .flat_map(|steps| {
-                steps
-                    .iter()
-                    .filter(|s| s.2 == StepKind::Coordinated && s.0 == *seq)
-                    .map(|s| s.3)
-            })
-            .collect();
-        let spread = landings.iter().cloned().fold(f64::MIN, f64::max)
-            - landings.iter().cloned().fold(f64::MAX, f64::min);
-        assert!(
-            spread < 100_000.0,
-            "[{label}] step seq {seq} landed across {spread} ns"
-        );
-        worst_spread = worst_spread.max(spread);
-    }
-    println!(
-        "[{label}] {} coordinated steps, worst landing spread {:.1} µs, {} in-flight samples",
-        r.announced.len(),
-        worst_spread / 1_000.0,
-        r.in_flight_samples
-    );
-    let late_allowed = if sc.gm_change_in_master_outage { 1 } else { 0 };
-    assert!(
-        r.late_steps.iter().all(|&l| l <= late_allowed),
-        "[{label}] late steps {:?}",
-        r.late_steps
-    );
-    // Every box re-anchored exactly twice — at the grandmaster change and at its reboot — and
-    // never stepped for either; the replies it saw in another time base meanwhile were refused.
-    assert!(
-        r.rebases.iter().all(|&x| x == 2),
-        "[{label}] rebases {:?}",
-        r.rebases
-    );
-    assert!(
-        r.refused_replies > 0,
-        "[{label}] the master-lags-the-fleet windows must actually be exercised"
-    );
-
-    // UTC: the master holds the date within the bound (+ the drift accrued over the 5 s lead and
-    // the 2-reading confirmation, + NTP noise).
-    assert!(
-        r.max_utc_error_ns < DEFAULT_STEP_BOUND_NS + 2 * MS,
-        "[{label}] master drifted {} ms from UTC",
-        r.max_utc_error_ns / MS
-    );
-    // … and so does the FLEET (read on a follower), whatever happens to the master's own wall.
-    assert!(
-        r.max_fleet_utc_error_ns < DEFAULT_STEP_BOUND_NS + 2 * MS,
-        "[{label}] the fleet line drifted {} ms from UTC",
-        r.max_fleet_utc_error_ns / MS
-    );
-    assert_eq!(n, 6);
-}
-
-#[test]
-fn two_clock_bench_rate_is_ptp_phase_agrees_and_every_date_step_is_coordinated_117_88() {
-    let sc_plus = Scenario::plain("UTC +8 ppm vs GM", 8.0, false);
-    let sc_minus = Scenario::plain("UTC -15 ppm vs GM", -15.0, false);
-    let plus = run(&sc_plus);
-    check(&sc_plus, &plus);
-    let minus = run(&sc_minus);
-    check(&sc_minus, &minus);
-
-    // THE DECOUPLING STATEMENT, for the frequency LAW: the two runs share every PTP input and
-    // differ ONLY in UTC (so in the number, size and timing of the date steps). The frequency
-    // command of every box is bit-identical between them: NTP contributes nothing to the rate.
-    for i in 0..plus.words.len() {
-        assert_eq!(
-            plus.words[i], minus.words[i],
-            "box {i}: the frequency word depends on UTC — NTP leaked into the rate path"
-        );
-    }
-    // … while the date genuinely differed (the runs are not trivially identical).
-    assert_ne!(plus.announced.len(), minus.announced.len());
-    let dir = |r: &RunResult| r.announced.iter().map(|s| s.1.signum()).sum::<i64>();
-    assert!(
-        dir(&plus) > 0 && dir(&minus) < 0,
-        "UTC ahead ⇒ forward steps, behind ⇒ backward"
-    );
-}
-
-#[test]
-fn with_the_controllers_post_step_grace_the_envelopes_still_hold_117_88() {
-    // The controller drops 2 s of PTP windows after every step (the step transient), holding the
-    // word. Those windows fall at UTC-dependent times, so the words are no longer bit-identical
-    // across UTC scenarios — the hold carries no NTP value, it only delays the next update. What
-    // must survive is every envelope: rate = the GM's, walls within 100 µs, only coordinated
-    // steps, no step at a grandmaster change or reboot.
-    for sc in [
-        Scenario::plain("UTC +8 ppm vs GM, with grace", 8.0, true),
-        Scenario::plain("UTC -15 ppm vs GM, with grace", -15.0, true),
-    ] {
-        check(&sc, &run(&sc));
-    }
-}
-
-#[test]
-fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_88() {
-    // The master boots 3 s behind UTC: its first announce is a 3 s step (a boot-time NTP failure,
-    // an upstream jump). Later ONLY the master loses PTP for 10 minutes and runs its local NTP
-    // date path. Neither may reach a follower as an uncoordinated (late) step, and the fleet must
-    // stay on one line throughout.
-    let sc = Scenario {
-        label: "3 s first step + master-only PTP outage, with grace",
-        utc_vs_gm_ppm: 8.0,
-        grace: true,
-        master_boot_err_ns: -3 * S,
-        master_ptp_offline: vec![(6 * 3600 * 2, 6 * 3600 * 2 + 1_200)],
-        gm_change_in_master_outage: false,
-    };
-    let r = run(&sc);
-    check(&sc, &r);
-    assert!(
-        r.announced.iter().any(|a| a.1.abs() > 2 * S),
-        "the multi-second first step was actually exercised"
-    );
-}
-
-#[test]
-fn a_long_master_outage_and_a_grandmaster_change_during_one_keep_the_fleet_on_utc_117_88() {
-    // ONLY the master loses PTP for 3 hours (the fleet line would drift ~86 ms from UTC at +8 ppm
-    // if its date froze), and later for 30 minutes that END 10 s after the grandmaster changed —
-    // the master comes back on the new grandmaster while its own wall is off the fleet line. The
-    // fleet must stay within the bound of UTC, coordinated, and never take the master's own
-    // offset as a step.
-    let sc = Scenario {
-        label: "3 h master outage + GM change at the end of a 30 min one, with grace",
-        utc_vs_gm_ppm: 8.0,
-        grace: true,
-        master_boot_err_ns: 0,
-        master_ptp_offline: vec![
-            (2 * 3600 * 2, 5 * 3600 * 2),
-            (GM_CHANGE_AT_WINDOW - 3_600, GM_CHANGE_AT_WINDOW + 20),
-        ],
-        gm_change_in_master_outage: true,
-    };
-    let r = run(&sc);
-    check(&sc, &r);
-}
+// A crate root resolves `mod x;` beside itself (`tests/x.rs`), which cargo would also build as a
+// test target of its own: the path keeps the scenarios inside this bench.
+#[path = "two_clock_bench/scenarios.rs"]
+mod scenarios;

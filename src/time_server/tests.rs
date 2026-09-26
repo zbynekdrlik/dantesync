@@ -241,8 +241,9 @@ fn master_status() -> SyncStatus {
 
 #[test]
 fn a_dsyx_request_is_padded_to_the_base_reply_size_88() {
-    // The reply is 104 bytes: a request of the base reply's size keeps the reply-to-request
-    // ratio at ~1.6 (an 8-byte request would make every spoofed one a 13x amplifier).
+    // The reply is 112 bytes (104 before the #119 slew fields): a request of the base reply's
+    // size keeps the reply-to-request ratio at 1.75 (an 8-byte request would make every spoofed
+    // one a 14x amplifier).
     let req = build_ext_request(3);
     assert_eq!(req.len(), EXT_REQUEST_SIZE);
     assert_eq!(EXT_REQUEST_SIZE, RESPONSE_SIZE);
@@ -308,7 +309,7 @@ fn the_extended_reply_is_the_same_base_plus_the_extension_88() {
     let ext_reply = build_response_ext(7, &status);
     assert_eq!(
         ext_reply.len(),
-        RESPONSE_SIZE + crate::date_offset::EXT_SIZE
+        RESPONSE_SIZE + crate::date_offset::EXT_SIZE_V2
     );
     let base = build_response(7, &status);
     // Every base field an old client reads is identical in the extended reply, except the
@@ -361,6 +362,39 @@ fn a_pending_step_is_published_as_the_offset_it_will_take_88() {
     );
     assert_eq!(ext.announce.effective_ptp_ns, 12_350_000_000_000);
     assert_eq!(ext.announce.seq, 4);
+}
+
+#[test]
+fn a_slew_is_published_as_the_slew_never_as_a_backward_step_119() {
+    // A slewing master: D in effect is part-way down; the published change is the slew itself.
+    let mut status = master_status();
+    status.date_offset_ns = Some(1_790_000_000_000_000_000 - 10_000_000);
+    status.date_slew_from_ns = Some(1_790_000_000_000_000_000);
+    status.date_slew_to_ns = Some(1_790_000_000_000_000_000 - 51_000_000);
+    status.date_slew_ppm = Some(100);
+    status.date_offset_effective_ptp_ns = Some(12_350_000_000_000);
+    status.date_offset_seq = Some(5);
+    // Even a stale pending-step value must not turn it into a step.
+    status.date_step_pending_ns = Some(-41_000_000);
+    let reply = build_response_ext(11, &status);
+    assert_eq!(reply.len(), RESPONSE_SIZE + crate::date_offset::EXT_SIZE_V2);
+    let ext = parse_reply(&reply, 11, Instant::now(), 0)
+        .unwrap()
+        .ext
+        .expect("extension");
+    let sl = ext.announce.as_slew().expect("published as a slew");
+    assert_eq!(sl.from_ns, 1_790_000_000_000_000_000);
+    assert_eq!(sl.to_ns, 1_790_000_000_000_000_000 - 51_000_000);
+    assert_eq!(sl.start_ptp_ns, 12_350_000_000_000);
+    assert_eq!(sl.ppm, 100);
+    assert_eq!(ext.announce.seq, 5);
+    // The replier's PTP now comes from its D IN EFFECT.
+    let e = date_extension_from_status(&status, 1_790_000_100_000_000_000).unwrap();
+    assert_eq!(e.now_ptp_ns, 100_000_000_000 + 10_000_000);
+    // Without every slew field it is the plain (step) form.
+    status.date_slew_ppm = None;
+    let e = date_extension_from_status(&status, 1_790_000_100_000_000_000).unwrap();
+    assert_eq!(e.announce.slew, None);
 }
 
 #[test]
@@ -494,7 +528,7 @@ fn the_server_answers_dsyn_with_64_bytes_and_dsyx_with_the_extension_over_real_u
 
     client.send_to(&build_ext_request(6), addr).unwrap();
     let n = serve_until_reply(&server, &status, &client, &mut buf);
-    assert_eq!(n, RESPONSE_SIZE + crate::date_offset::EXT_SIZE);
+    assert_eq!(n, RESPONSE_SIZE + crate::date_offset::EXT_SIZE_V2);
     let parsed = parse_reply(&buf[..n], 6, Instant::now(), 0).unwrap();
     assert_eq!(
         parsed.ext.unwrap().announce.date_offset_ns,

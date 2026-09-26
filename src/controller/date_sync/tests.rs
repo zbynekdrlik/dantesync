@@ -2,7 +2,7 @@ use super::*;
 use crate::clock::MockSystemClock;
 use crate::traits::{MockNtpSource, MockPtpNetwork};
 
-fn one_offset(us: i64, sign: i8) -> crate::ntp::NtpMeasurement {
+pub(super) fn one_offset(us: i64, sign: i8) -> crate::ntp::NtpMeasurement {
     crate::ntp::NtpMeasurement {
         offset: Duration::from_micros(us.unsigned_abs()),
         sign,
@@ -28,10 +28,10 @@ impl crate::time_server::DateAuthoritySource for ScriptedAuthority {
     }
 }
 
-const PL_GM: [u8; 6] = [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c];
-const PL_PTP_NOW_NS: i64 = 10_000_000_000;
+pub(super) const PL_GM: [u8; 6] = [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c];
+pub(super) const PL_PTP_NOW_NS: i64 = 10_000_000_000;
 
-fn phase_lock_config() -> SystemConfig {
+pub(super) fn phase_lock_config() -> SystemConfig {
     let mut config = SystemConfig::default();
     config.filters.calibration_samples = 0;
     config.filters.warmup_secs = 0.0;
@@ -75,7 +75,7 @@ fn anchored_controller(
     (c, d)
 }
 
-fn authority_reply(
+pub(super) fn authority_reply(
     serial: u64,
     gm: [u8; 6],
     date_offset_ns: i64,
@@ -116,6 +116,7 @@ fn authority_reply_in_effect(
                 date_offset_ns,
                 effective_ptp_ns,
                 seq,
+                slew: None,
             },
             gm_uuid: gm,
             now_ptp_ns: now - in_effect_ns,
@@ -124,7 +125,7 @@ fn authority_reply_in_effect(
     }
 }
 
-fn with_authority(
+pub(super) fn with_authority(
     c: &mut PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
 ) -> Arc<std::sync::Mutex<Option<crate::time_server::AuthorityReply>>> {
     let slot = Arc::new(std::sync::Mutex::new(None));

@@ -71,6 +71,17 @@ own user login password). Windows boxes are reached via MCP only in this procedu
    - Verify the master: `curl http://<master>:8898/status` shows `date_authority: "master"` and
      a `date_offset_ns`. Verify a follower after it: `date_authority: "follower"` with the same
      `date_offset_seq`.
+   - **From v1.10.0 (issue #119, backward corrections are SLEWED) the NTP master goes LAST** (the
+     v1.9.0 master-first rule was about moving onto the authority at all; a 1.9.0 fleet already
+     has one). A 1.10.0 master announces a backward correction as a slew in extension v2, and a
+     1.9.0 follower reads only its v1 part: a backward STEP at the slew's start. While any box is
+     still ≤ 1.9.0 it would split off the slewing fleet by up to the correction (≤ ~50 ms) for the
+     slew's duration (~500 s). A 1.9.0 master with 1.10.0 followers publishes v1 announces, which
+     every box applies as today's steps: uniform. Verify on the master after it:
+     `date_slew_ppm` / `date_slew_active` / `date_slew_remaining_ms` appear in `/status`, and at
+     the next backward correction the journal shows `[DATE] slew START` then `[DATE] slew DONE`
+     on every box and no `[DATE] stepped -…` (a backward step appears only after a
+     `date correction too large to slew` warning: a correction beyond 2 × the step bound).
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.
