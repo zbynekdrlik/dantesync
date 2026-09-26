@@ -404,7 +404,11 @@ mod tests {
         let out = step_wall(&mut os, &mut StepLead::default(), 500 * US)
             .expect("the wall already moved: the step is reported, not failed");
         assert_eq!(out.realized_ns, os.stepped_ns);
-        assert_eq!(out.realized_ns, 200 * US);
+        assert_eq!(
+            out.realized_ns,
+            200 * US - US / 2,
+            "short by the latency after the wall sample"
+        );
         assert_eq!(out.attempts, 1, "one set landed");
         assert!(
             out.stopped
