@@ -653,8 +653,11 @@ pub enum CorrectionKind {
 /// positive moves the wall forward, which every consumer tolerates (a forward step lost no audio
 /// on the rig); negative would move it BACKWARDS, which Dante DVS/ASIO turns into lost samples.
 pub fn correction_kind(correction_ns: i64) -> CorrectionKind {
-    let _ = correction_ns;
-    CorrectionKind::Step
+    if correction_ns >= 0 {
+        CorrectionKind::Step
+    } else {
+        CorrectionKind::Slew
+    }
 }
 
 // ============================================================================
@@ -906,6 +909,9 @@ impl DateFollower {
     ) -> FollowAction {
         let own_d = self.in_effect_ns(own_anchor_ns, now_wall_ns);
         let own_now_ptp = now_wall_ns.wrapping_sub(own_d);
+        if let Some(slew) = a.as_slew() {
+            return self.on_slew_announce(a.seq, slew, own_anchor_ns, own_d, own_now_ptp);
+        }
         // #119: an announce without a slew while this box still follows one (a new authority
         // session, or the promoted form of a slew heard a hair before this box's own end):
         // stop the slew where it is, so `D` stays continuous, and judge the announce from there.

@@ -177,7 +177,15 @@ impl DateSync {
     /// anchor (mod 1 s), so its phase is continuous across a fold. The displacement is taken
     /// at the WALL, so it stays right while a grandmaster change delivers `t1` in another base.
     pub(super) fn deslew_sample(&self, t2_ns: i64) -> (i64, i64) {
-        (t2_ns, t2_ns)
+        if !self.enabled {
+            return (t2_ns, t2_ns);
+        }
+        let Some(anchor) = self.core.anchor_ns() else {
+            return (t2_ns, t2_ns);
+        };
+        let d = self.follower.displacement_at_wall(anchor, t2_ns);
+        let raw = t2_ns.wrapping_sub(d);
+        (raw, raw.wrapping_sub(self.rate_folded_ns))
     }
 
     /// dantesync#119 — the held slew is complete: fold it into the anchor (`D` unchanged) and keep
@@ -927,7 +935,12 @@ where
     /// envelope), recording which term is in it. `pi_word` is the servo's own word (the phase
     /// lock's, or the rate servo's), i.e. `applied_freq_ppm`.
     pub(super) fn compose_slew_word(&mut self, pi_word: f64) -> f64 {
-        pi_word
+        let term = self.date_sync.slew_rate_ppm(wall_now_ns());
+        self.date_sync.applied_slew_ppm = term;
+        if term == 0.0 {
+            return pi_word;
+        }
+        (pi_word + term).clamp(-DRIFT_MAX_PPM, DRIFT_MAX_PPM)
     }
 
     /// #119 — every loop iteration: when the slew's rate term at this instant differs from the one
@@ -935,7 +948,38 @@ where
     /// of at the next PTP window (up to a window late, i.e. up to ~50 µs of relative phase at
     /// 100 ppm). Same composition, same `adjust_frequency` seam: there is no second frequency path.
     pub(super) fn apply_slew_edge(&mut self, now_wall: i64) {
-        let _ = now_wall;
+        let term = self.date_sync.slew_rate_ppm(now_wall);
+        if term == self.date_sync.applied_slew_ppm {
+            return;
+        }
+        let was = self.date_sync.applied_slew_ppm;
+        let total = self.compose_slew_word(self.applied_freq_ppm);
+        if let Err(e) = self.clock.adjust_frequency(1.0 + total / 1_000_000.0) {
+            warn!(
+                "[DATE] applying the slew rate {:+.1}ppm failed: {}",
+                term, e
+            );
+            // Retried next iteration.
+            self.date_sync.applied_slew_ppm = was;
+            return;
+        }
+        if was == 0.0 {
+            let remaining = self
+                .date_sync
+                .core
+                .anchor_ns()
+                .and_then(|a| self.date_sync.follower.slew_remaining_ns(a, now_wall))
+                .unwrap_or(0);
+            info!(
+                "[DATE] slew START: D moves {:+}us at {:+.0} ppm (~{} s), the wall never steps \
+                 back — word {:+.3}ppm",
+                (if term < 0.0 { -remaining } else { remaining }) / 1_000,
+                term,
+                (remaining as f64 / (term.abs() * 1_000.0)).round() as i64,
+                total
+            );
+        }
+        self.update_shared_status();
     }
 
     /// #88 — step the wall by `delta_ns` for the fleet date offset and move `D` with it.
