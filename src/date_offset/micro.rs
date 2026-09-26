@@ -417,6 +417,14 @@ impl MicroScheduler {
                 return None;
             }
         }
+        let fresh = self
+            .readings
+            .back()
+            .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) <= MICRO_READING_MAX_AGE_NS);
+        if !fresh {
+            self.correcting = false;
+            return None;
+        }
         let est = self.estimate(land_ptp_ns)?;
         let error = est.error_ns;
         let sign: i8 = if error > 0 {

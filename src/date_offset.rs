@@ -183,8 +183,10 @@ pub fn effective_micro(requested: MicroConfig, lead_ns: i64, slew_ppm: u32) -> M
     let in_flight = lead_ns
         .saturating_mul(MICRO_LEAD_FACTOR)
         .saturating_add(slew_ns);
-    let _ = in_flight;
-    requested
+    MicroConfig {
+        interval_ns: requested.interval_ns.max(in_flight),
+        ..requested
+    }
 }
 
 /// The master's date-offset policy. Owns `D` for the whole fleet.
@@ -498,7 +500,7 @@ impl DateAuthority {
         }
         self.micro.rebase(shift);
         // A micro-correction still in flight is re-announced in the new base as what it is.
-        self.micro_kind = false;
+        self.micro_kind = self.micro_kind && (self.pending.is_some() || self.slew.is_some());
         self.over_bound = None;
         self.seq = self.seq.wrapping_add(1);
         self.announce()

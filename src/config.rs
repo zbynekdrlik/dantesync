@@ -306,7 +306,7 @@ impl DateOffsetConfig {
         } else {
             self.step_bound_ms
         };
-        (ms.min(3_600_000) as i64) * 1_000_000
+        (ms.clamp(MIN_DATE_STEP_BOUND_MS, 3_600_000) as i64) * 1_000_000
     }
 
     /// The effective lead in ns (floored at 5 s).
