@@ -35,6 +35,9 @@ pub(super) fn phase_lock_config() -> SystemConfig {
     let mut config = SystemConfig::default();
     config.filters.calibration_samples = 0;
     config.filters.warmup_secs = 0.0;
+    // #119 (1.12): these controller tests exercise the micro-corrections (the 1.11 behaviour);
+    // the default is now the nightly step, which `daily_tests.rs` drives.
+    config.date_offset.correction = crate::config::DATE_CORRECTION_MICRO.to_string();
     config
 }
 
@@ -42,9 +45,22 @@ pub(super) fn phase_lock_config() -> SystemConfig {
 /// the grandmaster's PTP time is 10 s. `master` configures NTP server mode FIRST, so the
 /// anchor makes it the date-offset authority.
 pub(super) fn anchored_controller(
+    clock: MockSystemClock,
+    ntp: MockNtpSource,
+    master: bool,
+) -> (
+    PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
+    i64,
+) {
+    anchored_controller_with(clock, ntp, master, phase_lock_config())
+}
+
+/// [`anchored_controller`] with a given config (#119 1.12: the daily-mode tests).
+pub(super) fn anchored_controller_with(
     mut clock: MockSystemClock,
     ntp: MockNtpSource,
     master: bool,
+    config: SystemConfig,
 ) -> (
     PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
     i64,
@@ -55,7 +71,7 @@ pub(super) fn anchored_controller(
         MockPtpNetwork::new(),
         ntp,
         Arc::new(RwLock::new(SyncStatus::default())),
-        phase_lock_config(),
+        config,
     );
     if master {
         c.configure_ntp_server_mode(100_000);

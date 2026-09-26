@@ -89,8 +89,11 @@ fn check(sc: &Scenario, r: &RunResult) {
     // #119: THE FLEET DATE NEVER STEPS BACKWARDS for a normal correction. Every announced step is
     // forward, or backward beyond the slew cap (an abnormal state: ROZHODNUTÉ 5842590141), every
     // other backward correction is a slew, and no box applied any other backward step.
+    // #119 (1.12): in DAILY mode the one nightly step goes either way (a backward step at night is
+    // the owner's decision); `two_clock_bench/daily.rs` judges when and how big it is.
+    let daily = sc.daily();
     let cap = slew_cap_ns(DEFAULT_STEP_BOUND_NS);
-    let beyond_cap = |d: i64| d > 0 || (sc.expects_too_large_step && d < -cap);
+    let beyond_cap = |d: i64| daily || d > 0 || (sc.expects_too_large_step && d < -cap);
     assert!(
         r.announced.iter().all(|a| beyond_cap(a.1)),
         "[{label}] a backward step was announced (allowed only beyond the cap, in a scenario that expects one): {:?}",
@@ -104,9 +107,10 @@ fn check(sc: &Scenario, r: &RunResult) {
     // #119 follow-up: every correction is a micro-correction (≤ 500 µs) or the abnormal one
     // beyond the cap — never anything in between (the old 50 ms events).
     assert!(
-        r.corrections
-            .iter()
-            .all(|c| c.1.abs() <= MICRO_STEP_NS || c.1.abs() > cap),
+        daily
+            || r.corrections
+                .iter()
+                .all(|c| c.1.abs() <= MICRO_STEP_NS || c.1.abs() > cap),
         "[{label}] a correction between the micro step and the cap: {:?}",
         r.corrections
             .iter()
@@ -129,7 +133,7 @@ fn check(sc: &Scenario, r: &RunResult) {
         r.max_relative_phase_in_slew_ns / US,
         r.slew_windows
     );
-    if !offline_scenario {
+    if !offline_scenario && !daily {
         assert_eq!(
             r.wall_went_back, 0,
             "[{label}] a wall ran backwards after the join"
@@ -245,7 +249,12 @@ fn check(sc: &Scenario, r: &RunResult) {
     );
 
     // UTC: the master holds the date within the bound (+ the drift accrued over the 5 s lead and
-    // the 2-reading confirmation, + NTP noise).
+    // the 2-reading confirmation, + NTP noise). (#119 1.12: in daily mode the date runs free all
+    // day by design — `daily.rs` bounds it by the drift between two nights.)
+    if daily {
+        assert_eq!(n, 6);
+        return;
+    }
     assert!(
         r.max_utc_error_ns < DEFAULT_STEP_BOUND_NS + 2 * MS,
         "[{label}] master drifted {} ms from UTC",
@@ -570,5 +579,7 @@ fn windows_boxes_take_the_backward_steps_exactly_too_119() {
 }
 
 // A crate root resolves `mod x;` beside itself; see the harness's own `#[path]` note.
+#[path = "daily.rs"]
+mod daily;
 #[path = "micro.rs"]
 mod micro;

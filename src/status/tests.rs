@@ -520,6 +520,42 @@ fn test_sync_status_date_step_phase_jump_is_additive_119() {
     assert_eq!(back.date_step_phase_jump_us, Some(-3.5));
 }
 
+/// dantesync#119 (1.12): the daily-mode fields are additive — a 1.11.1 blob reads empty / `null`,
+/// and every value round-trips under its documented name.
+#[test]
+fn test_sync_status_date_daily_fields_are_additive_119() {
+    let v1111 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+        "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+        "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+        "date_micro_active":false,"date_step_phase_jump_us":2.5}"#;
+    let restored: SyncStatus =
+        serde_json::from_str(v1111).expect("v1.11.1 JSON must still deserialize");
+    assert_eq!(restored.date_correction_mode, "");
+    assert_eq!(restored.date_daily_next_utc, None);
+    assert_eq!(restored.date_daily_last_step_ts, None);
+    assert_eq!(restored.date_daily_last_step_ms, None);
+
+    let st = SyncStatus {
+        date_correction_mode: "daily".to_string(),
+        date_daily_next_utc: Some("2026-09-27T02:00:00Z".to_string()),
+        date_daily_last_step_ts: Some(1_790_388_010),
+        date_daily_last_step_ms: Some(-1_295.25),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&st).expect("serialize failed");
+    for field in [
+        r#""date_correction_mode":"daily""#,
+        r#""date_daily_next_utc":"2026-09-27T02:00:00Z""#,
+        r#""date_daily_last_step_ts":1790388010"#,
+        r#""date_daily_last_step_ms":-1295.25"#,
+    ] {
+        assert!(json.contains(field), "{field} in {json}");
+    }
+    let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+    assert_eq!(back.date_correction_mode, "daily");
+    assert_eq!(back.date_daily_last_step_ms, Some(-1_295.25));
+}
+
 #[test]
 fn test_to_json_bytes_matches_serde_json_to_vec() {
     // #47: the HTTP status endpoint and the named pipe must serve byte-identical

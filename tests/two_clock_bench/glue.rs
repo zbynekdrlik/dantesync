@@ -43,6 +43,15 @@ pub(super) fn master_publishes_after_ntp(_ptp_offline: bool) -> bool {
 /// Whether the master's local NTP step refreshes it (`note_local_date_step`).
 pub(super) const MASTER_PUBLISHES_AFTER_LOCAL_STEP: bool = true;
 
+/// #119 (1.12) — whether the master runs its local NTP step path on its OWN wall while it has no
+/// PTP (`ntp_under_date_authority`). In daily mode it does not: the fleet line is deliberately up
+/// to a day's drift off UTC, so stepping to UTC would move the master off it by that much (and
+/// back at its re-alignment). It free-runs on the learned frequency instead — the best estimate
+/// of the fleet line — and re-aligns with one small Join when PTP is back.
+pub(super) fn master_runs_local_ntp_path(daily: bool) -> bool {
+    !daily
+}
+
 /// A follower's applicability checks (`service_date_offset`); the time server computes the
 /// replier's PTP now from the SNAPSHOT's D in effect and the live wall.
 pub(super) fn follower_accepts(b: &Box_, p: &Published, master_wall_now: i64) -> bool {

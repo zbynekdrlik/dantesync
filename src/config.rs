@@ -170,6 +170,65 @@ pub struct DateOffsetConfig {
         deserialize_with = "lenient_micro_interval_s"
     )]
     pub micro_interval_s: u64,
+    /// dantesync#119 (1.12) — how the NTP master corrects the fleet date:
+    ///
+    /// - `"daily"` (DEFAULT, owner decision): nothing all day, then ONE coordinated step of the
+    ///   whole error, either direction, when the nightly window opens at `daily_step_utc`; an
+    ///   error beyond `daily_emergency_ms` is stepped at once.
+    /// - `"micro"`: the 1.11 micro-corrections (`micro_step_us` per `micro_interval_s`), unchanged.
+    ///
+    /// `"bound"` (the 1.10 step at the step bound) no longer exists since 1.11.0; it and any other
+    /// value mean `"daily"`, with a loud warning ([`Self::correction_mode`]). A String, not an
+    /// enum, so a bad value never fails the whole config parse.
+    #[serde(
+        default = "default_date_correction",
+        deserialize_with = "lenient_string"
+    )]
+    pub correction: String,
+    /// dantesync#119 (1.12) — where the nightly window opens, UTC (`"HH:MM"`, `"HH:MM:SS"` or
+    /// `"HH"`). Default `"02:00"` = 04:00 CEST / 03:00 CET (UTC keeps it tz-library-free; the 1 h
+    /// DST shift is accepted). A bad value means the default, with a loud warning.
+    #[serde(
+        default = "default_date_daily_step_utc",
+        deserialize_with = "lenient_string"
+    )]
+    pub daily_step_utc: String,
+    /// dantesync#119 (1.12) — in daily mode, an error beyond this (ms) is stepped at once, loudly,
+    /// not at night. Default 5000. `0` means the default; anything else is clamped to
+    /// 1000..=3600000 at read time.
+    #[serde(
+        default = "default_date_daily_emergency_ms",
+        deserialize_with = "lenient_daily_emergency_ms"
+    )]
+    pub daily_emergency_ms: u64,
+}
+
+/// The `system.date_offset.correction` values (dantesync#119, 1.12).
+pub const DATE_CORRECTION_DAILY: &str = "daily";
+pub const DATE_CORRECTION_MICRO: &str = "micro";
+/// The 1.10 correction at the step bound: removed in 1.11.0, read as `"daily"` with a warning.
+pub const DATE_CORRECTION_BOUND: &str = "bound";
+
+fn default_date_correction() -> String {
+    DATE_CORRECTION_DAILY.to_string()
+}
+
+fn default_date_daily_step_utc() -> String {
+    crate::date_offset::DEFAULT_DAILY_STEP_UTC.to_string()
+}
+
+fn default_date_daily_emergency_ms() -> u64 {
+    crate::date_offset::DEFAULT_DAILY_EMERGENCY_MS
+}
+
+fn lenient_daily_emergency_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_daily_emergency_ms(),
+    ))
 }
 
 /// dantesync#117 — a hand-edit like `"clock_discipline": true` must not fail the WHOLE config
@@ -291,6 +350,9 @@ impl Default for DateOffsetConfig {
             slew_ppm: default_date_slew_ppm(),
             micro_step_us: default_date_micro_step_us(),
             micro_interval_s: default_date_micro_interval_s(),
+            correction: default_date_correction(),
+            daily_step_utc: default_date_daily_step_utc(),
+            daily_emergency_ms: default_date_daily_emergency_ms(),
         }
     }
 }
@@ -324,6 +386,47 @@ impl DateOffsetConfig {
     /// clamped: step 50..=1000 µs, interval 10..=600 s).
     pub fn micro(&self) -> crate::date_offset::MicroConfig {
         crate::date_offset::MicroConfig::new(self.micro_step_us, self.micro_interval_s)
+    }
+
+    /// dantesync#119 (1.12) — the effective date-correction mode, and a warning for every value
+    /// that fell back to its default (the controller logs them loudly at startup): `"daily"` (the
+    /// default, and what an unknown value or the removed `"bound"` means) or `"micro"`,
+    /// case-insensitive; `daily_step_utc` parsed leniently, else 02:00.
+    pub fn correction_mode(&self) -> (crate::date_offset::CorrectionMode, Vec<String>) {
+        use crate::date_offset::{
+            parse_daily_step_utc, CorrectionMode, DailyConfig, DEFAULT_DAILY_STEP_TOD_S,
+            DEFAULT_DAILY_STEP_UTC,
+        };
+        let mut warnings = Vec::new();
+        let v = self.correction.trim();
+        if v.eq_ignore_ascii_case(DATE_CORRECTION_MICRO) {
+            return (CorrectionMode::Micro, warnings);
+        }
+        if v.eq_ignore_ascii_case(DATE_CORRECTION_BOUND) {
+            warnings.push(format!(
+                "system.date_offset.correction {:?}: the step-bound correction was removed in                  1.11.0 — using {:?} (one coordinated step per night)",
+                self.correction, DATE_CORRECTION_DAILY
+            ));
+        } else if !v.eq_ignore_ascii_case(DATE_CORRECTION_DAILY) {
+            warnings.push(format!(
+                "system.date_offset.correction {:?} is not {:?} or {:?} — using {:?}",
+                self.correction,
+                DATE_CORRECTION_DAILY,
+                DATE_CORRECTION_MICRO,
+                DATE_CORRECTION_DAILY
+            ));
+        }
+        let tod_s = parse_daily_step_utc(&self.daily_step_utc).unwrap_or_else(|| {
+            warnings.push(format!(
+                "system.date_offset.daily_step_utc {:?} is not a UTC time of day (\"HH:MM\") —                  using {:?}",
+                self.daily_step_utc, DEFAULT_DAILY_STEP_UTC
+            ));
+            DEFAULT_DAILY_STEP_TOD_S
+        });
+        (
+            CorrectionMode::Daily(DailyConfig::new(tod_s, self.daily_emergency_ms)),
+            warnings,
+        )
     }
 }
 

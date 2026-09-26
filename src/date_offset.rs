@@ -63,9 +63,16 @@
 //! only for an ABNORMAL error beyond [`slew_cap_ns`] (2 × the step bound): one coordinated step,
 //! either direction, logged loudly. The step bound itself no longer triggers anything.
 
+mod daily;
 mod micro;
 mod slew;
 mod wire;
+pub use daily::{
+    clamp_daily_emergency_ms, format_utc_rfc3339, parse_daily_step_utc, CorrectionMode,
+    DailyConfig, DailyDecision, DailyScheduler, DAILY_MIN_STEP_NS, DAILY_WINDOW_NS, DAY_NS,
+    DEFAULT_DAILY_EMERGENCY_MS, DEFAULT_DAILY_STEP_TOD_S, DEFAULT_DAILY_STEP_UTC,
+    MAX_DAILY_EMERGENCY_MS, MIN_DAILY_EMERGENCY_MS,
+};
 pub use micro::{
     clamp_micro_interval_s, clamp_micro_step_us, MicroConfig, MicroEstimate, MicroScheduler,
     DEFAULT_MICRO_INTERVAL_S, DEFAULT_MICRO_STEP_US, FALLING_BEHIND_ERROR_NS, MAX_MICRO_INTERVAL_S,
@@ -220,6 +227,15 @@ pub struct DateAuthority {
     micro: MicroScheduler,
     /// The change that made the current `seq` was a micro-correction (published with it).
     micro_kind: bool,
+    /// dantesync#119 (1.12) — how the date is corrected: one step per night (`Daily`, the
+    /// config's default) or the 1.11 micro-corrections (`Micro`, the pure constructor's default,
+    /// so a bare `DateAuthority::new` keeps the 1.11 behaviour byte for byte).
+    mode: CorrectionMode,
+    /// dantesync#119 (1.12) — the nightly scheduler (`Daily` mode only).
+    daily: Option<DailyScheduler>,
+    /// dantesync#119 (1.12) — the last nightly decision worth a log line, until the controller
+    /// takes it ([`take_daily_event`](Self::take_daily_event)).
+    daily_event: Option<DailyDecision>,
 }
 
 impl DateAuthority {
@@ -245,6 +261,9 @@ impl DateAuthority {
             micro_requested: MicroConfig::default(),
             micro: MicroScheduler::new(MicroConfig::default()),
             micro_kind: false,
+            mode: CorrectionMode::Micro,
+            daily: None,
+            daily_event: None,
         }
         .rebuild_micro()
     }
@@ -275,6 +294,40 @@ impl DateAuthority {
     pub fn with_micro(mut self, cfg: MicroConfig) -> Self {
         self.micro_requested = cfg;
         self.rebuild_micro()
+    }
+
+    /// dantesync#119 (1.12) — how the date is corrected (the controller passes the configured
+    /// mode; without this the authority runs the 1.11 micro-corrections).
+    pub fn with_correction(mut self, mode: CorrectionMode) -> Self {
+        self.mode = mode;
+        self.daily = match mode {
+            CorrectionMode::Daily(cfg) => Some(DailyScheduler::new(cfg)),
+            CorrectionMode::Micro => None,
+        };
+        self
+    }
+
+    pub fn correction_mode(&self) -> CorrectionMode {
+        self.mode
+    }
+
+    /// dantesync#119 (1.12) — the last nightly decision worth a log line (a step, no step
+    /// needed, waiting for UTC, a skipped night), once. `None` in micro mode.
+    pub fn take_daily_event(&mut self) -> Option<DailyDecision> {
+        self.daily_event.take()
+    }
+
+    /// dantesync#119 (1.12) — where the next nightly window opens (fleet wall, ns): the open one
+    /// while it has not stepped yet. `None` in micro mode.
+    pub fn daily_next_window_wall_ns(&self, now_ptp_ns: i64) -> Option<i64> {
+        let wall = now_ptp_ns.wrapping_add(self.in_effect_ns(now_ptp_ns));
+        self.daily.as_ref().map(|d| d.next_window_wall_ns(wall))
+    }
+
+    /// dantesync#119 (1.12) — the last nightly step announced: (the fleet-wall instant it lands
+    /// on, its size), ns. `None` before the first, and in micro mode.
+    pub fn daily_last_step(&self) -> Option<(i64, i64)> {
+        self.daily.as_ref().and_then(|d| d.last_step())
     }
 
     pub fn slew_ppm(&self) -> u32 {
@@ -911,5 +964,7 @@ impl DateFollower {
     }
 }
 
+#[cfg(test)]
+mod authority_daily_tests;
 #[cfg(test)]
 mod tests;

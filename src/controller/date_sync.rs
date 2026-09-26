@@ -892,6 +892,8 @@ mod publish;
 mod slew;
 
 #[cfg(test)]
+mod daily_tests;
+#[cfg(test)]
 mod micro_tests;
 #[cfg(test)]
 mod tests;

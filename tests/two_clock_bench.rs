@@ -45,10 +45,17 @@
 //! no single correction above 500 µs, the fleet date within 3 ms of UTC, the relative phase within
 //! 50 µs, no large step; and that ±5 ms asymmetric UTC jitter never makes the corrections
 //! oscillate.
+//!
+//! dantesync#119 (1.12): the fleet date is corrected ONCE A NIGHT (`correction = "daily"`, the
+//! new default): nothing all day, one coordinated step of the whole error — either direction —
+//! when the 02:00 UTC window opens, and an immediate step only beyond the 5 s emergency cap.
+//! `two_clock_bench/daily.rs` proves it over 48 h (see there); every scenario above runs in
+//! micro mode, which stays byte-identical.
 
 use dantesync::date_offset::{
-    same_time_base, slew_cap_ns, DateAnnounce, DateAuthority, DateFollower, FollowAction, SlewSpec,
-    StepKind, DEFAULT_SLEW_PPM, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
+    same_time_base, slew_cap_ns, CorrectionMode, DailyConfig, DateAnnounce, DateAuthority,
+    DateFollower, FollowAction, SlewSpec, StepKind, DEFAULT_SLEW_PPM, DEFAULT_STEP_BOUND_NS,
+    MIN_STEP_LEAD_NS,
 };
 use dantesync::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 
@@ -127,6 +134,16 @@ struct Scenario {
     /// `check()`'s bound on any box's hourly effective rate vs the grandmaster (ppm). Ideal steps
     /// leave only the PI's noise (≈ 0.002); a real step's µs residual is paid through the rate.
     hourly_rate_bound_ppm: f64,
+    /// #119 (1.12): how the authority corrects the date (the config's `correction`). Every
+    /// scenario before 1.12 runs the micro-corrections.
+    correction: CorrectionMode,
+    /// #119 (1.12): windows `[from, to)` in which the master gets no UTC reading (an upstream
+    /// outage).
+    utc_outages: Vec<(u64, u64)>,
+    /// #119 (1.12): grandmaster B's oscillator (ppm vs true time). [`GM_B_PPM`] by default; 0 keeps
+    /// UTC drifting at the same rate against the fleet across the grandmaster change (the daily
+    /// scenarios' "48 h at +17.6 ppm").
+    gm_b_ppm: f64,
 }
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
@@ -154,7 +171,18 @@ impl Scenario {
             windows_tick_ns: TICK_NS,
             run_windows: HOURS * 3600 * 2,
             hourly_rate_bound_ppm: 0.01,
+            correction: CorrectionMode::Micro,
+            utc_outages: Vec::new(),
+            gm_b_ppm: GM_B_PPM,
         }
+    }
+    fn daily(&self) -> bool {
+        matches!(self.correction, CorrectionMode::Daily(_))
+    }
+    fn utc_down_at(&self, w: u64) -> bool {
+        self.utc_outages
+            .iter()
+            .any(|&(from, to)| (from..to).contains(&w))
     }
     fn settling_after_a_utc_jump(&self, w: u64) -> bool {
         self.utc_jumps
@@ -274,6 +302,9 @@ struct RunResult {
     rate_audits: Vec<RateAudit>,
     /// #119 (1.11.1): per box, the largest |requested − realized| of a step (0 on an ideal box).
     max_step_residual_ns: Vec<i64>,
+    /// #119 (1.12): the master's wall when each correction was announced (same order as
+    /// `corrections`).
+    correction_walls: Vec<i64>,
 }
 
 /// Everything one bench run evolves: the true clocks, the boxes, the master's authority and its
@@ -297,6 +328,8 @@ struct Bench<'s> {
     /// #119 follow-up: every correction the authority announced, in order: (window, size) — a
     /// step's size or a slew's amount.
     corrections: Vec<(u64, i64)>,
+    /// #119 (1.12): the master's wall at each correction's announce.
+    correction_walls: Vec<i64>,
     /// #119: grandmaster events (change, reboot) that happened while the fleet slewed.
     gm_events_in_slew: u32,
     ntp_rng: Rng,
@@ -422,6 +455,7 @@ impl<'s> Bench<'s> {
             announced_slews: Vec::new(),
             renamed_steps: Vec::new(),
             corrections: Vec::new(),
+            correction_walls: Vec::new(),
             gm_events_in_slew: 0,
             ntp_rng: Rng(0xD1B5_4A32_D192_ED03 ^ sc.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
             net_rng: Rng(0xABCD_EF01_2345_6789 ^ sc.seed.wrapping_mul(0xD6E8_FEB8_6659_FD93)),
@@ -445,7 +479,7 @@ impl<'s> Bench<'s> {
     ///    (the controller polls `due` every loop iteration, 1 ms / 50 µs), so the landing instant
     ///    is resolved below the window.
     fn advance_clocks(&mut self, w: u64, t0_ns: f64) {
-        let (gm_a_ppm, gm_b_ppm) = (GM_A_PPM, GM_B_PPM);
+        let (gm_a_ppm, gm_b_ppm) = (GM_A_PPM, self.sc.gm_b_ppm);
         let t_now_s = w as f64 * WINDOW_S;
         let grace = self.sc.grace;
         self.utc.advance(TRUE_DT_NS, self.sc.utc_vs_gm_ppm);
@@ -538,7 +572,11 @@ impl<'s> Bench<'s> {
         let judged = w > self.sc.settle_windows;
         for (i, b) in self.boxes.iter_mut().enumerate() {
             let (gm_id, gm) = gm_view(w, b.lag, gm_a, gm_b_pre, gm_b_post);
-            let gm_ppm = if gm_id == 1 { GM_A_PPM } else { GM_B_PPM };
+            let gm_ppm = if gm_id == 1 {
+                GM_A_PPM
+            } else {
+                self.sc.gm_b_ppm
+            };
             // #119: every sample is de-slewed by the displacement the box's slew schedules at its
             // wall, so the phase lock never reads the deliberate slew as a phase error.
             let deslew = b.slew_displacement();
@@ -606,7 +644,8 @@ impl<'s> Bench<'s> {
         let now_ptp = m.wall_ns() - anchor;
         if self.authority.is_none() {
             let a = DateAuthority::new(anchor, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS)
-                .with_slew_ppm(self.sc.slew_ppm);
+                .with_slew_ppm(self.sc.slew_ppm)
+                .with_correction(self.sc.correction);
             let act = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
             assert_eq!(
                 act,
@@ -647,10 +686,11 @@ impl<'s> Bench<'s> {
                 &mut self.announced,
                 &mut self.announced_slews,
                 &mut self.corrections,
+                &mut self.correction_walls,
             );
             self.snapshot = Some(master_publishes(m, a)); // published at once
         }
-        if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 {
+        if w % NTP_INTERVAL_WINDOWS == 0 && w > 0 && !self.sc.utc_down_at(w) {
             let err = self.utc.ns - m.wall_ns() + self.sc.ntp_noise.sample(&mut self.ntp_rng);
             if let Some(fed) = master_feed_authority(m, a, err, offline) {
                 Self::master_takes(
@@ -660,12 +700,13 @@ impl<'s> Bench<'s> {
                     &mut self.announced,
                     &mut self.announced_slews,
                     &mut self.corrections,
+                    &mut self.correction_walls,
                 );
             }
             if master_publishes_after_ntp(offline) {
                 self.snapshot = Some(master_publishes(m, a));
             }
-            if offline {
+            if offline && master_runs_local_ntp_path(self.sc.daily()) {
                 // Its OWN wall: the local NTP date path (the legacy step gate, two agreeing
                 // over-threshold readings).
                 let over = err.abs() > MASTER_LOCAL_THRESHOLD_NS;
@@ -704,7 +745,9 @@ impl<'s> Bench<'s> {
         announced: &mut Vec<(u32, i64)>,
         announced_slews: &mut Vec<(u32, i64)>,
         corrections: &mut Vec<(u64, i64)>,
+        correction_walls: &mut Vec<i64>,
     ) {
+        correction_walls.push(m.wall_ns());
         match ann.as_slew() {
             Some(sl) => {
                 announced_slews.push((ann.seq, sl.amount_ns()));
@@ -935,6 +978,7 @@ impl<'s> Bench<'s> {
                 .iter()
                 .map(|b| b.win.as_ref().map_or(0, |win| win.max_residual_ns))
                 .collect(),
+            correction_walls: self.correction_walls,
         }
     }
 }
