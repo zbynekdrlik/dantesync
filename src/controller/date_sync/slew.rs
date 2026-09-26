@@ -164,5 +164,41 @@ where
     /// `D` is within the absorb tolerance of the fleet line, so this is a continuous catch-up (an
     /// absorb or a scheduled slew), never a step; a larger gap is the ordinary re-alignment after
     /// the slew's end.
-    pub(super) fn catch_up_fleet_slew(&mut self) {}
+    pub(super) fn catch_up_fleet_slew(&mut self) {
+        let now_wall = wall_now_ns();
+        let (Some(base), Some(a)) = (
+            self.date_sync.core.anchor_ns(),
+            self.date_sync.authority.as_ref(),
+        ) else {
+            return;
+        };
+        let own = self.date_sync.follower.in_effect_ns(base, now_wall);
+        let now_ptp = now_wall.wrapping_sub(own);
+        let Some(fleet_slew) = a.slew_in_progress(now_ptp) else {
+            return;
+        };
+        if self.date_sync.follower.held_slew().map(|h| h.slew) == Some(fleet_slew) {
+            return;
+        }
+        let gap = a.in_effect_ns(now_ptp).wrapping_sub(own);
+        if gap.abs() > crate::date_offset::ABSORB_TOLERANCE_NS {
+            return;
+        }
+        let ann = a.announce();
+        match self.date_sync.follower.on_announce(ann, base, now_wall) {
+            FollowAction::Absorb { new_anchor_ns } => {
+                self.date_sync.core.set_anchor(new_anchor_ns);
+            }
+            FollowAction::Step { delta_ns, kind } => {
+                // Unreachable within the tolerance; handled the ordinary way if it ever is.
+                self.apply_date_step(delta_ns, kind, ann.seq);
+            }
+            _ => {}
+        }
+        info!(
+            "[DATE] the master's own scheduler caught up with the fleet slew (seq {}), {:+}ns off \
+             the line — no step",
+            ann.seq, gap
+        );
+    }
 }

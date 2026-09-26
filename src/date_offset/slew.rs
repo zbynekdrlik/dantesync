@@ -209,8 +209,12 @@ impl HeldSlew {
 pub fn solve_displacement(h: &HeldSlew, anchor_ns: i64, wall_ns: i64) -> i64 {
     let base = wall_ns.wrapping_sub(anchor_ns);
     let mut d = h.carry_ns;
-    for _ in 0..3 {
-        d = h.displacement_at_ptp(base.wrapping_sub(d));
+    for _ in 0..SOLVE_MAX_ROUNDS {
+        let next = h.displacement_at_ptp(base.wrapping_sub(d));
+        if next == d {
+            break;
+        }
+        d = next;
     }
     d
 }

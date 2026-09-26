@@ -728,6 +728,14 @@ impl DateFollower {
         // #119: the authority's promoted form of the slew this box still runs (`to` in effect at
         // its end, same seq), heard a hair before this box's own end: nothing to do — the slew
         // lands on `to` by itself. (Freezing here would schedule a µs step backwards.)
+        if let Some(h) = self.held {
+            if self.adopted_seq == Some(a.seq)
+                && h.slew.to_ns == a.date_offset_ns
+                && h.slew.end_ptp_ns() == a.effective_ptp_ns
+            {
+                return FollowAction::None;
+            }
+        }
         // Any other announce without a slew while this box still follows one (a new authority
         // session): stop the slew where it is, so `D` stays continuous, and judge it from there.
         self.freeze_slew(own_anchor_ns, now_wall_ns);
