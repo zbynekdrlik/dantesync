@@ -162,7 +162,9 @@ pub(super) fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u6
         return;
     }
     let fleet = a.in_effect_ns(now_ptp);
-    if fleet == d || !m.fresh {
+    // #119 (1.12): in daily mode the master keeps its D through its own outage (no local NTP
+    // steps), so it re-joins on the measured free-run error alone.
+    if (fleet == d && !m.realign_after_outage) || !m.fresh {
         return;
     }
     let e = m.core.last_error_ns().unwrap_or(0);
@@ -171,4 +173,5 @@ pub(super) fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u6
         m.apply_step(a.seq(), delta, StepKind::Join, t_ns, w, grace);
     }
     m.core.set_anchor(fleet);
+    m.realign_after_outage = false;
 }

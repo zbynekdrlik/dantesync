@@ -250,6 +250,7 @@ fn a_master_only_ptp_outage_in_daily_mode_keeps_the_master_near_the_fleet_line_1
         .filter(|s| s.2 == StepKind::Join)
         .collect();
     println!("[master outage] the master's re-joins: {joins:?}");
+    assert_eq!(joins.len(), 1, "one re-join once PTP is back: {joins:?}");
     assert!(
         joins.iter().all(|s| s.1.abs() < MS),
         "the master stayed near the fleet line: {joins:?}"

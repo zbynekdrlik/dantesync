@@ -246,6 +246,9 @@ struct Box_ {
     last_wall: i64,
     /// #119: the master's catch-ups with a fleet slew its own scheduler missed.
     catch_ups: u32,
+    /// #119 (1.12): the master lost PTP in daily mode, so it re-joins the fleet line once PTP is
+    /// back even though its `D` never left it (the controller's `master_outage_realign`).
+    realign_after_outage: bool,
     /// #119 (1.11.1): the Windows clock model, on a Windows box.
     win: Option<WinClock>,
     /// The box's effective rate (ppm) and thermal wander in the current window.
@@ -415,6 +418,7 @@ impl<'s> Bench<'s> {
                 rebases: 0,
                 last_wall: 0,
                 catch_ups: 0,
+                realign_after_outage: false,
                 win: sc
                     .windows_boxes
                     .contains(&i)
@@ -611,6 +615,7 @@ impl<'s> Bench<'s> {
                     b.fresh = false;
                     b.core.disengage();
                     b.word_ppm = b.core.integrator_ppm();
+                    b.realign_after_outage = self.sc.daily();
                 }
                 b.words.push(b.word_ppm);
                 b.audit_rate(gm_ppm, judged);

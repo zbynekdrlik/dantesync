@@ -23,11 +23,22 @@
 //! applies an increment through the same step / slew paths, logs it quietly as `micro`, keeps it
 //! out of the NTP step-storm count, and publishes `date_micro_*` in `/status`. A drift the
 //! corrections cannot hold raises the loud `date correction falling behind` line.
+//!
+//! dantesync#119 (1.12) — by default the fleet date is corrected ONCE A NIGHT
+//! (`system.date_offset.correction = "daily"`, `crate::date_offset::DailyScheduler`): the master's
+//! loop drives the same authority tick, which announces nothing by day and ONE coordinated step
+//! of the whole error when the nightly window opens (logged loudly, published through the usual
+//! `date_step_pending_ns` / `date_step_due_in_ms` during its lead, and in `date_daily_*`). Every box
+//! applies it through the ordinary step path. In daily mode the master also keeps off its local
+//! NTP step path during its own PTP outage: the fleet line is deliberately off UTC, so it
+//! free-runs on the learned frequency and re-joins the fleet line with one step of the measured
+//! free-run error ([`DateSync::master_outage_realign`]).
 
 use super::*;
 use crate::config::{CLOCK_DISCIPLINE_LEGACY, CLOCK_DISCIPLINE_PTP_PHASE_LOCK};
 use crate::date_offset::{
-    same_time_base, DateAnnounce, DateAuthority, DateFollower, FollowAction, StepKind,
+    same_time_base, CorrectionMode, DateAnnounce, DateAuthority, DateFollower, FollowAction,
+    StepKind,
 };
 use crate::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 use crate::time_server::NoAuthority;
@@ -127,6 +138,13 @@ pub(super) struct DateSync {
     /// that could not be measured leaves it in place (it belongs to the last measured step, not
     /// necessarily to `last_date_step_ts`).
     pub(super) last_step_phase_jump_ns: Option<i64>,
+    /// dantesync#119 (1.12) — how the master's authority corrects the date (from
+    /// `system.date_offset.correction`: daily by default).
+    pub(super) correction: CorrectionMode,
+    /// dantesync#119 (1.12) — a daily-mode master lost its own PTP: it kept its `D` (no local
+    /// NTP steps) while its wall free-ran, so once PTP is back it re-joins the fleet line on the
+    /// measured error even though its `D` never left it (`realign_master_to_fleet`).
+    pub(super) master_outage_realign: bool,
 }
 
 impl DateSync {
@@ -161,6 +179,10 @@ impl DateSync {
                 "[PHASE-LOCK] clock discipline: {} — the pre-#117 rate servo + NTP step path",
                 CLOCK_DISCIPLINE_LEGACY
             );
+        }
+        let (correction, warnings) = config.date_offset.correction_mode();
+        for w in warnings {
+            warn!("[DATE] {}", w);
         }
         DateSync {
             enabled,
@@ -197,7 +219,14 @@ impl DateSync {
             micro_paused_logged: false,
             step_phase_ref: None,
             last_step_phase_jump_ns: None,
+            correction,
+            master_outage_realign: false,
         }
+    }
+
+    /// dantesync#119 (1.12) — the fleet date is corrected once a night (the master's mode).
+    pub(super) fn daily(&self) -> bool {
+        matches!(self.correction, CorrectionMode::Daily(_))
     }
 
     /// One accepted PTP sample: the RAW offset between the two time bases (not the mod-1 s
@@ -412,6 +441,10 @@ where
         if !self.date_sync.enabled {
             return;
         }
+        // #119 (1.12): a daily-mode master re-joins the fleet line once PTP is back.
+        if self.ntp_server_mode && self.date_sync.daily() {
+            self.date_sync.master_outage_realign = true;
+        }
         self.sample_window.clear();
         self.date_sync.window.clear();
         self.date_sync.pending_median_ns = None;
@@ -482,7 +515,9 @@ where
             return;
         }
         let fleet = a.in_effect_ns(now_ptp);
-        if fleet == anchor {
+        // #119 (1.12): a daily-mode master keeps its D through its own outage (it takes no local
+        // NTP steps), so it re-joins on the measured free-run error alone.
+        if fleet == anchor && !self.date_sync.master_outage_realign {
             return;
         }
         // The wall must land ON the fleet line, so the step also removes the phase error the
@@ -506,6 +541,7 @@ where
             }
         }
         self.date_sync.core.set_anchor(fleet);
+        self.date_sync.master_outage_realign = false;
     }
 
     /// #117 / #88 — the NTP reading under the phase lock. Returns true when it was fully handled
@@ -520,6 +556,11 @@ where
     /// Everything else (legacy discipline, not anchored yet, PTP offline, no authority heard or
     /// the authority lost) returns false and keeps the existing NTP step path — the local date
     /// fallback.
+    ///
+    /// dantesync#119 (1.12): a DAILY-mode master without PTP returns true too — its own wall is
+    /// NOT stepped to UTC, because the fleet line is deliberately up to a day's drift off UTC and
+    /// that step would put the master that far off the fleet (and back at its re-join). It
+    /// free-runs on the learned frequency and re-joins once PTP is back.
     pub(super) fn ntp_under_date_authority(&mut self, offset_us: i64) -> bool {
         if !self.date_sync.enabled {
             return false;
@@ -551,7 +592,8 @@ where
                 .wrapping_add(anchor.wrapping_sub(fleet));
             self.date_sync.master_utc_error_ns = Some(fleet_err);
             let on_line = anchor == fleet && !self.ptp_offline && !self.in_step_backoff();
-            if !self.ptp_offline {
+            let daily = self.date_sync.daily();
+            if !self.ptp_offline || daily {
                 // Log-surface contract: every NTP cycle keeps the exact `[NTP] offset:{:+}us`
                 // prefix the camera-box freshness gates parse (offline, the NTP step path logs it).
                 info!(
@@ -575,19 +617,32 @@ where
                 // #119 follow-up: from a reading only the ABNORMAL correction (beyond 2 × the step
                 // bound, typically a master booted on a bad NTP reading) is announced: one
                 // coordinated step, either direction, logged loudly. Normal corrections are the
-                // micro-corrections of `tick_date_authority`.
-                let cause = if ann.date_offset_ns < fleet {
-                    "date correction too large to slew"
-                } else {
-                    "date correction too large for micro-corrections"
+                // micro-corrections of `tick_date_authority`. #119 (1.12): in daily mode the cap
+                // is the emergency cap, and normal corrections are the nightly step.
+                let (cause, cap_label, cap_ns) = match self.date_sync.correction {
+                    CorrectionMode::Daily(cfg) => (
+                        "date correction beyond the emergency cap",
+                        "daily_emergency_ms",
+                        cfg.emergency_ns,
+                    ),
+                    CorrectionMode::Micro if ann.date_offset_ns < fleet => (
+                        "date correction too large to slew",
+                        "2 x the step bound",
+                        crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns),
+                    ),
+                    CorrectionMode::Micro => (
+                        "date correction too large for micro-corrections",
+                        "2 x the step bound",
+                        crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns),
+                    ),
                 };
                 warn!(
-                    "[DATE] AUTHORITY: {}: the fleet line is {:+}us off UTC (> {}us, 2 x the step \
-                     bound) — announcing a coordinated date step of {:+}us at PTP {} (in {} ms), \
-                     seq {}{}",
+                    "[DATE] AUTHORITY: {}: the fleet line is {:+}us off UTC (> {}us, {}) — \
+                     announcing a coordinated date step of {:+}us at PTP {} (in {} ms), seq {}{}",
                     cause,
                     fleet_err / 1_000,
-                    crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000,
+                    cap_ns / 1_000,
+                    cap_label,
                     ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
                     ann.effective_ptp_ns,
                     ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
@@ -601,8 +656,9 @@ where
             // Publish NOW: the 31900 time server reads this snapshot, and an announce heard only
             // at the next 10 s status tick would arrive after its 5 s lead (a late step).
             self.update_shared_status();
-            if self.ptp_offline {
-                // Its OWN wall keeps the local NTP step path while it has no PTP.
+            if self.ptp_offline && !daily {
+                // Its OWN wall keeps the local NTP step path while it has no PTP (micro mode; in
+                // daily mode it free-runs and re-joins the fleet line, see above).
                 return false;
             }
             // The NTP step path is bypassed: nothing pending, nothing starved.
@@ -643,12 +699,32 @@ where
             self.date_sync.step_lead_ns,
         )
         .with_slew_ppm(self.date_sync.slew_ppm)
-        .with_micro(self.date_sync.micro);
+        .with_micro(self.date_sync.micro)
+        .with_correction(self.date_sync.correction);
         let act = self
             .date_sync
             .follower
             .on_announce(authority.announce(), base, now_wall);
         debug!("[DATE] master aligned with its own authority: {:?}", act);
+        if let CorrectionMode::Daily(cfg) = self.date_sync.correction {
+            let tod_s = cfg.step_tod_ns / 1_000_000_000;
+            info!(
+                "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date \
+                 runs at the Dante tick all day and is corrected ONCE A NIGHT: one coordinated \
+                 step of the whole UTC error, either direction, when the window opens at \
+                 {:02}:{:02}:{:02} UTC (up to {} min while UTC is unavailable), announced {} s \
+                 ahead; only an error beyond {} ms is stepped at once (correction = \"daily\")",
+                anchor,
+                tod_s / 3_600,
+                tod_s % 3_600 / 60,
+                tod_s % 60,
+                crate::date_offset::DAILY_WINDOW_NS / 60_000_000_000,
+                authority.lead_ns() * crate::date_offset::MICRO_LEAD_FACTOR / 1_000_000_000,
+                cfg.emergency_ns / 1_000_000
+            );
+            self.date_sync.authority = Some(authority);
+            return;
+        }
         // The EFFECTIVE micro tuning: the interval is at least the in-flight time of one increment.
         let micro = authority.micro().config();
         info!(

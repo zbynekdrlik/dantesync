@@ -62,6 +62,17 @@
 //! box logs it quietly and keeps it out of the NTP step-storm count. The large correction exists
 //! only for an ABNORMAL error beyond [`slew_cap_ns`] (2 × the step bound): one coordinated step,
 //! either direction, logged loudly. The step bound itself no longer triggers anything.
+//!
+//! # dantesync#119 (1.12) — ONE coordinated step per NIGHT (the default)
+//!
+//! Each micro-step disturbs the Dante Virtual Soundcard on a Windows box; one rare step does not
+//! (owner decision, issue comment 5849932587). In [`CorrectionMode::Daily`] the authority keeps
+//! reading UTC and fitting the same robust estimate all day but announces nothing; when the nightly
+//! window opens ([`DailyScheduler`], 02:00 UTC by default) it announces ONE coordinated step of the
+//! whole estimated error, in either direction, [`MICRO_LEAD_FACTOR`] leads ahead. The abnormal cap
+//! becomes the emergency cap (`daily_emergency_ms`, 5 s): only an error beyond it is stepped by
+//! day. [`CorrectionMode::Micro`] is the 1.11 behaviour, byte for byte (and what a bare
+//! [`DateAuthority::new`] runs). The step bound's 1.10 correction ("bound") no longer exists.
 
 mod daily;
 mod micro;
@@ -454,6 +465,15 @@ impl DateAuthority {
         self.pending_step_ns(now_ptp_ns).unwrap_or(0)
     }
 
+    /// The error beyond which a reading is ABNORMAL and stepped at once: 2 × the step bound
+    /// ([`slew_cap_ns`]) in micro mode, the emergency cap in daily mode (dantesync#119, 1.12).
+    fn abnormal_cap_ns(&self) -> i64 {
+        match self.mode {
+            CorrectionMode::Daily(cfg) => cfg.emergency_ns,
+            CorrectionMode::Micro => slew_cap_ns(self.step_bound_ns),
+        }
+    }
+
     /// Feed one UTC measurement: `utc_error_ns = UTC − wall` on the master (the NTP offset).
     ///
     /// Correct because the master's own wall is `ptp + D`: `UTC − ptp = D + (UTC − wall)`. The
@@ -466,13 +486,20 @@ impl DateAuthority {
     /// a bad NTP reading, seconds off): on [`AUTHORITY_AGREEMENT_N`] consecutive same-sign ones it
     /// is corrected in ONE coordinated step taking effect `lead` from now, forward or backward
     /// (`TooLargeToSlew`), once no other change is in flight. Returns that announce.
+    ///
+    /// dantesync#119 (1.12): in daily mode the cap is the EMERGENCY cap (`daily_emergency_ms`): a
+    /// day's drift (~1.5 s on the rig) is recorded for the nightly step, never stepped by day, and
+    /// the micro-corrections' falling-behind alarm is never raised (there is nothing to fall
+    /// behind: the error is corrected at night by design).
     pub fn on_utc_error(&mut self, utc_error_ns: i64, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
         let error_ns = utc_error_ns.wrapping_sub(self.outstanding_ns(now_ptp_ns));
-        if error_ns.unsigned_abs() <= slew_cap_ns(self.step_bound_ns).unsigned_abs() {
+        if error_ns.unsigned_abs() <= self.abnormal_cap_ns().unsigned_abs() {
             self.over_bound = None;
             self.micro.record(error_ns, now_ptp_ns);
-            self.micro.update_falling_behind(now_ptp_ns);
+            if self.mode == CorrectionMode::Micro {
+                self.micro.update_falling_behind(now_ptp_ns);
+            }
             return None;
         }
         let sign: i8 = if error_ns > 0 { 1 } else { -1 };
@@ -504,12 +531,18 @@ impl DateAuthority {
     /// a coordinated STEP,
     /// backward a coordinated SLEW at `slew_ppm` ([`correction_kind`]). Nothing while another
     /// change is in flight or an abnormal correction is being confirmed.
+    ///
+    /// dantesync#119 (1.12): in daily mode the nightly scheduler decides instead
+    /// ([`daily_tick`](Self::daily_tick)).
     pub fn on_tick(&mut self, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
         if self.pending.is_some() || self.slew.is_some() || self.over_bound.is_some() {
             return None;
         }
         let land = now_ptp_ns.saturating_add(self.lead_ns.saturating_mul(MICRO_LEAD_FACTOR));
+        if let CorrectionMode::Daily(_) = self.mode {
+            return self.daily_tick(now_ptp_ns, land);
+        }
         let amount = self.micro.decide(now_ptp_ns, land)?;
         let target = self.current_ns.saturating_add(amount);
         match correction_kind(amount, self.step_bound_ns) {
@@ -527,6 +560,37 @@ impl DateAuthority {
             }
         }
         self.micro_kind = true;
+        self.seq = self.seq.wrapping_add(1);
+        Some(self.announce())
+    }
+
+    /// dantesync#119 (1.12) — the nightly step: the [`DailyScheduler`] decides on the FLEET wall
+    /// (`PTP now + D`; nothing is in flight here, so `D` is `current_ns`) from the micro
+    /// estimate at the landing instant — `None` without a UTC reading in the last
+    /// [`MICRO_READING_MAX_AGE_NS`]. A step is ONE coordinated step of the whole error, either
+    /// direction (never a slew), announced at `land`; the kept readings are compensated at once
+    /// (they describe the error once it has landed), as for a micro-correction.
+    fn daily_tick(&mut self, now_ptp_ns: i64, land: i64) -> Option<DateAnnounce> {
+        let wall = now_ptp_ns.wrapping_add(self.current_ns);
+        let estimate = if self.micro.fresh(now_ptp_ns) {
+            self.micro.estimate(land)
+        } else {
+            None
+        };
+        let decision = self.daily.as_mut()?.decide(wall, estimate);
+        if decision != DailyDecision::Idle {
+            self.daily_event = Some(decision);
+        }
+        let DailyDecision::Step { amount_ns } = decision else {
+            return None;
+        };
+        self.pending = Some((self.current_ns.saturating_add(amount_ns), land));
+        let landing_wall = land.wrapping_add(self.current_ns);
+        if let Some(daily) = self.daily.as_mut() {
+            daily.record_step(landing_wall, amount_ns);
+        }
+        self.micro.compensate(amount_ns);
+        self.micro_kind = false;
         self.seq = self.seq.wrapping_add(1);
         Some(self.announce())
     }
