@@ -219,43 +219,50 @@ fn an_off_line_daily_masters_failed_step_is_retried_after_the_backoff_119() {
     // Review round 2: with no PTP there is no re-alignment window, so a failed own step would
     // leave the master a whole nightly step off the fleet until PTP returns. It re-joins the
     // fleet line after the backoff (there is no phase error to measure without PTP).
-    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let seen = calls.clone();
+    //
+    // A failed step leaves the master's D behind the fleet D (the authority's, in effect): the
+    // test models that directly — its anchor 300 ms behind the fleet's, and the failure's
+    // backoff running — because no time passes in a controller test (the announce's instant
+    // cannot be reached).
     let mut clock = MockSystemClock::new();
     clock
         .expect_step_clock()
-        .times(2)
+        .times(1)
         .withf(|dur, sg| *dur == Duration::from_millis(300) && *sg == 1)
-        .returning(move |_, _| {
-            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Err(anyhow::anyhow!("clock refused"))
-            } else {
-                Ok(())
-            }
-        });
-    let start_s = now_s() - 1;
-    let (mut c, d) = anchored_controller_with(clock, ntp_at(300_000), true, daily_config(start_s));
+        .returning(|_, _| Ok(()));
+    let (mut c, d) = anchored_controller_with(
+        clock,
+        MockNtpSource::new(),
+        true,
+        daily_config(now_s() + 6 * 3_600),
+    );
     c.ptp_offline = true;
     c.service_date_offset();
-    readings_then_tick(&mut c);
-    let due = c
-        .date_sync
-        .follower
-        .due(wall_now_ns() + 11 * S)
-        .expect("scheduled on its own wall");
-    c.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
-    assert_eq!(c.date_sync.core.anchor_ns(), Some(d), "the step failed");
+    c.date_sync.core.set_anchor(d - 300_000_000);
+    c.date_sync.step_failed_at = Some(Instant::now());
     // Inside the backoff nothing happens; after it, one re-join onto the fleet line.
     c.service_date_offset();
-    assert_eq!(c.date_sync.core.anchor_ns(), Some(d));
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d - 300_000_000));
     c.date_sync.step_failed_at = Some(Instant::now() - Duration::from_secs(11));
     c.service_date_offset();
     assert_eq!(
         c.date_sync.core.anchor_ns(),
-        Some(d + 300_000_000),
+        Some(d),
         "back on the fleet line"
     );
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(c.date_sync.last_step.map(|s| s.2), Some("join"));
+    // … and a micro-mode master without PTP keeps the local NTP path instead (no re-join here).
+    let (mut c, d) = anchored_controller_with(
+        MockSystemClock::new(),
+        MockNtpSource::new(),
+        true,
+        super::tests::phase_lock_config(),
+    );
+    c.ptp_offline = true;
+    c.service_date_offset();
+    c.date_sync.core.set_anchor(d - 300_000_000);
+    c.service_date_offset();
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d - 300_000_000));
 }
 
 #[test]
