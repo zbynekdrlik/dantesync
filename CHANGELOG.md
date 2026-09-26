@@ -5,6 +5,56 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-09-26
+
+### Changed
+
+- **The fleet date is corrected ONCE A NIGHT (issue #119, owner decision).** The NTP master used
+  to correct the date continuously in 1.11: a coordinated 500 µs step every 20 s. It now reads
+  UTC all day but announces nothing. When the nightly window opens it announces ONE coordinated
+  step of the whole error, forward or backward, pre-announced over the usual DSYX extension
+  10 s ahead.
+  - **Why.** Every clock step on the stream box disturbs the Dante Virtual Soundcard: its ASIO
+    input starves, and OBS ratchets its audio buffering from 85 to 405 ms. With the 1.11 cadence
+    `mbc` starved 60 of 312 minutes; one step per 10 minutes starved nothing. The grandmaster (a
+    PCIe card with no clock input) cannot be locked to UTC, so the date still has to be stepped.
+    Now it is stepped once a night.
+  - **By day** the fleet date runs at the Dante tick and drifts from UTC at the grandmaster's
+    rate: about +1.5 s a day on the rig (+17.6 ppm). Every box shares that drift, so the boxes
+    agree to the µs and only the date is off. `date_offset_error_ms` grows to that much by
+    design.
+  - **The window** opens at `system.date_offset.daily_step_utc`, default `"02:00"` UTC (04:00
+    CEST / 03:00 CET; UTC keeps it free of a time-zone library, and the 1 h DST shift is
+    accepted). It is read on the fleet wall. The step is made once per UTC day. When no fresh
+    UTC reading exists at the window, it waits up to 30 minutes for one; otherwise the night is
+    skipped (loudly) and the next night steps both days.
+  - **An emergency** (an error beyond `daily_emergency_ms`, default 5000) is stepped at once,
+    loudly: a bad boot or a lost UTC reference.
+  - **The master's own PTP outage.** In daily mode the master no longer steps its own wall to
+    UTC while it has no PTP: that would move it up to a day's drift off the fleet. It free-runs
+    on the learned frequency and re-joins the fleet line with one step of the measured free-run
+    error once PTP is back.
+  - **`system.date_offset.correction`**: `"daily"` (the new default) or `"micro"` (the 1.11
+    behaviour, unchanged). The 1.10 step-bound correction (`"bound"`) no longer exists since
+    1.11.0; that value, or any other, means `"daily"` with a loud warning. A bad `daily_step_utc`
+    means 02:00 with a warning.
+  - **Followers need no change.** They apply the nightly step like any announced step,
+    counted as `coordinated`.
+
+### Added
+
+- `/status` (the NTP master), all additive:
+  - `date_correction_mode`: `"daily"` / `"micro"`; empty on a follower.
+  - `date_daily_next_utc`: the next window as an RFC 3339 UTC second, e.g.
+    `"2026-09-27T02:00:00Z"`.
+  - `date_daily_last_step_ts`: the fleet-wall epoch second the last nightly step lands on.
+  - `date_daily_last_step_ms`: that step's signed size.
+- In daily mode `date_correction_falling_behind` and `date_micro_paused` are always false.
+- The pending step is visible during its lead as before, on every box: `date_step_pending_ns`
+  (signed) and `date_step_due_in_ms`. They clear once it lands.
+- New journal lines on the master: `nightly date step ±… ms`, `nightly date step not needed`,
+  `nightly date step waiting` and `nightly date step SKIPPED`.
+
 ## [1.11.1] - 2026-09-26
 
 ### Fixed

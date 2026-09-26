@@ -31,6 +31,11 @@ paths:
   - "src/clock/windows.rs"
   - "src/clock/linux.rs"
   - "tests/two_clock_bench/windows.rs"
+  - "src/date_offset/daily.rs"
+  - "src/date_offset/daily/tests.rs"
+  - "src/date_offset/authority_daily_tests.rs"
+  - "src/controller/date_sync/daily_tests.rs"
+  - "tests/two_clock_bench/daily.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -483,6 +488,70 @@ The bench's Windows day showed two gotchas:
   more as a ZERO step. `apply_date_step` and the bench's `apply_step` ignore it;
 - µs step residuals are paid through the rate, so a Windows day's hourly rate error is ~0.011 ppm
   against ~0.002 for ideal steps. `check()`'s bound is a Scenario field for that.
+
+## #119 (1.12) — the fleet date is corrected ONCE A NIGHT (`correction = "daily"`, the default)
+
+The owner ruled one coordinated step per night (issue comment 5849932587). Each 1.11 micro-step
+(`NtSetSystemTime` every 20 s) starved the Dante Virtual Soundcard's ASIO input on the stream box,
+and OBS ratcheted its audio buffering from 85 to 405 ms. Rare steps starve nothing. The
+grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must still be stepped.
+
+**What it does:**
+- The authority keeps recording UTC readings into the SAME `MicroScheduler` estimate (Theil–Sen
+  line), but `DateAuthority::on_tick` hands the decision to `DailyScheduler`
+  (`src/date_offset/daily.rs`).
+- Nothing happens by day. When the window opens at `daily_step_utc` (02:00 UTC), the whole
+  estimated error at the landing instant is announced as ONE coordinated step, either direction,
+  never a slew, `MICRO_LEAD_FACTOR` leads ahead.
+- The window is read on the FLEET wall (`ptp + D`). A grandmaster rebase moves PTP time, never
+  that wall, so the scheduler keeps no PTP state and needs no rebase.
+- A decision needs a FRESH estimate (a reading within 60 s). Without one the window waits up to
+  30 minutes, then the night is SKIPPED and the next night steps both days.
+- A window that closed while the authority was busy (another change in flight), or before boot,
+  closes silently. Only a waited window is reported as skipped.
+- No step for |error| ≤ 2 ms + 3 σ, for example after a restart right after the night's step.
+
+**What changes by mode:**
+- `on_utc_error`'s abnormal cap is `daily_emergency_ms` (5 s) in daily mode, 2 × the step bound
+  in micro. A day's drift is recorded, never stepped by day.
+- The falling-behind alarm is never evaluated in daily mode: the error is corrected at night by
+  design. `date_micro_paused` is micro-only too.
+
+**Keep `micro` byte-identical.** The pure `DateAuthority::new` still runs micro (the bench's
+pre-1.12 scenarios and the date_offset tests rely on it). The CONFIG default is daily, and the
+controller passes it with `with_correction`. The controller test helper `phase_lock_config()`
+pins `"micro"`; the daily controller tests use their own config.
+
+**The master's own PTP outage (found while building 1.12).** In micro mode the master's local NTP
+path steps its OWN wall to UTC while it has no PTP. That is fine within 3 ms of UTC, but in daily
+mode it would move the master up to a day's drift (~1.5 s) off the fleet line and back at its
+re-join. So in daily mode:
+- `ntp_under_date_authority` returns true while the master is offline: it still feeds the
+  authority, and it still logs the `[NTP] offset:` line the camera-box freshness gates parse.
+- The master free-runs on the learned frequency.
+- `master_outage_realign` makes `realign_master_to_fleet` re-join on the measured error even
+  though its `D` never left the fleet line. The bench measured −323 µs after 30 min.
+- Without the re-join the bench showed the master 377 µs off for minutes while the PI pulled it
+  in: that breaks the 100 µs envelope.
+
+**Bench (`tests/two_clock_bench/daily.rs`, 48 h):**
+- `Scenario::gm_b_ppm = 0` keeps UTC at the same drift across the grandmaster change, so a full
+  day really is +17.6 ppm (the default grandmaster B at +3 ppm makes the second day 14.6 ppm).
+- `utc_outages` removes the master's readings.
+- `check()` skips the micro-era direction, size and UTC-bound assertions in daily mode, where the
+  date runs free by day and a backward step is allowed. The daily file asserts the window, the
+  count and the size instead.
+- Measured at +17.6 ppm: 746.47 ms and 1520.59 ms (the true error: 746.42 / 1520.64). Announced
+  at 02:00:00.000 and 02:00:00.246 fleet time. Relative phase max 19 µs, hourly rate ≤ 0.0023 ppm.
+
+**Status for consumers:**
+- `date_step_pending_ns` / `date_step_due_in_ms` show the nightly step during its lead and clear
+  once it lands, the same fields as every other step.
+- Also published: `date_correction_mode`, `date_daily_next_utc` (RFC 3339, fleet wall),
+  `date_daily_last_step_ts` (epoch s, fleet wall, where it lands) and `date_daily_last_step_ms`.
+
+**The 1.10 `"bound"` mode is gone** (since 1.11.0 the step bound only sets the micro cap). The
+value reads as daily with a warning.
 
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 
