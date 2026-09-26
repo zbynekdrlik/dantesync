@@ -78,7 +78,7 @@ pub use slew::{
 
 /// Version of the 31900 reply extension carried by this build (2 = v1 + the #119 slew fields,
 /// 3 = v2 + the MICRO flag).
-pub const EXT_VERSION: u8 = 2;
+pub const EXT_VERSION: u8 = 3;
 
 /// Size of the v1 extension appended after the 64-byte base reply.
 ///
@@ -253,6 +253,9 @@ pub fn encode_extension(ext: &DateExtension) -> [u8; EXT_SIZE_V2] {
         out[2..4].copy_from_slice(&ppm.to_be_bytes());
         out[40..48].copy_from_slice(&slew.from_ns.to_be_bytes());
     }
+    if ext.announce.micro {
+        out[1] |= EXT_FLAG_MICRO;
+    }
     out
 }
 
@@ -285,7 +288,7 @@ pub fn decode_extension(bytes: &[u8]) -> Option<DateExtension> {
             effective_ptp_ns: i64_at(12),
             seq: u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
             slew,
-            micro: false,
+            micro: bytes[0] >= 3 && bytes[1] & EXT_FLAG_MICRO != 0,
         },
         gm_uuid: [
             bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29],
@@ -498,20 +501,11 @@ impl DateAuthority {
     /// (`TooLargeToSlew`), once no other change is in flight. Returns that announce.
     pub fn on_utc_error(&mut self, utc_error_ns: i64, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
-        if self.pending.is_some() {
-            // One step at a time. Readings taken while a step is pending describe the wall that
-            // is about to move; they must not start a second, stale candidate.
+        let error_ns = utc_error_ns.wrapping_sub(self.outstanding_ns(now_ptp_ns));
+        if error_ns.unsigned_abs() <= slew_cap_ns(self.step_bound_ns).unsigned_abs() {
             self.over_bound = None;
-            return None;
-        }
-        let running = self.slew;
-        let error_ns = match running {
-            // The error left once the slew has paid: the wall still moves by `to − D now`.
-            Some(s) => utc_error_ns.wrapping_sub(s.to_ns.wrapping_sub(s.offset_at(now_ptp_ns))),
-            None => utc_error_ns,
-        };
-        if error_ns.abs() <= self.step_bound_ns {
-            self.over_bound = None;
+            self.micro.record(error_ns, now_ptp_ns);
+            self.micro.update_falling_behind(now_ptp_ns);
             return None;
         }
         let sign: i8 = if error_ns > 0 { 1 } else { -1 };
@@ -519,54 +513,20 @@ impl DateAuthority {
             Some((s, n)) if s == sign => n + 1,
             _ => 1,
         };
-        if count < AUTHORITY_AGREEMENT_N {
+        if count < AUTHORITY_AGREEMENT_N || self.pending.is_some() || self.slew.is_some() {
+            // Not agreed yet, or one change at a time: the large correction is made once the
+            // change in flight has landed (keeping the agreement).
             self.over_bound = Some((sign, count));
             return None;
         }
-        if let Some(s) = running {
-            // An extension LARGER THAN the slew cap is not slewed: it waits for the running slew's
-            // end and is then stepped (`TooLargeToSlew`), like any correction that large. (The cap
-            // bounds each extension, not the slew's total; the wait is up to the rest of the running
-            // slew — ≤ 100 ms at the configured rate, 2.8 h only at the 10 ppm floor — a double
-            // fault: a UTC jump during a slew.)
-            let extendable = sign < 0
-                && correction_kind(error_ns, self.step_bound_ns) == CorrectionKind::Slew
-                && s.active_at(now_ptp_ns)
-                && s.end_ptp_ns().saturating_sub(now_ptp_ns) >= self.lead_ns;
-            if !extendable {
-                // Keep the agreement: the correction is made once the slew allows it.
-                self.over_bound = Some((sign, count));
-                return None;
-            }
-            self.over_bound = None;
-            let from = s.offset_at(now_ptp_ns);
-            self.current_ns = from;
-            self.current_since_ptp_ns = now_ptp_ns;
-            self.slew = Some(DateSlew {
-                from_ns: from,
-                to_ns: s.to_ns.saturating_add(error_ns),
-                start_ptp_ns: now_ptp_ns,
-                ppm: s.ppm,
-            });
-            self.seq = self.seq.wrapping_add(1);
-            return Some(self.announce());
-        }
         self.over_bound = None;
-        let eff = now_ptp_ns.saturating_add(self.lead_ns);
-        let target = self.current_ns.saturating_add(error_ns);
-        match correction_kind(error_ns, self.step_bound_ns) {
-            CorrectionKind::Step | CorrectionKind::TooLargeToSlew => {
-                self.pending = Some((target, eff))
-            }
-            CorrectionKind::Slew => {
-                self.slew = Some(DateSlew {
-                    from_ns: self.current_ns,
-                    to_ns: target,
-                    start_ptp_ns: eff,
-                    ppm: self.slew_ppm,
-                })
-            }
-        }
+        self.pending = Some((
+            self.current_ns.saturating_add(error_ns),
+            now_ptp_ns.saturating_add(self.lead_ns),
+        ));
+        self.micro_kind = false;
+        // The kept readings described the abnormal state; the micro estimate starts again.
+        self.micro.clear();
         self.seq = self.seq.wrapping_add(1);
         Some(self.announce())
     }
@@ -579,7 +539,29 @@ impl DateAuthority {
     /// change is in flight or an abnormal correction is being confirmed.
     pub fn on_tick(&mut self, now_ptp_ns: i64) -> Option<DateAnnounce> {
         self.promote(now_ptp_ns);
-        None
+        if self.pending.is_some() || self.slew.is_some() || self.over_bound.is_some() {
+            return None;
+        }
+        let land = now_ptp_ns.saturating_add(self.lead_ns.saturating_mul(MICRO_LEAD_FACTOR));
+        let amount = self.micro.decide(now_ptp_ns, land)?;
+        let target = self.current_ns.saturating_add(amount);
+        match correction_kind(amount, self.step_bound_ns) {
+            CorrectionKind::Slew => {
+                self.slew = Some(DateSlew {
+                    from_ns: self.current_ns,
+                    to_ns: target,
+                    start_ptp_ns: land,
+                    ppm: self.slew_ppm,
+                })
+            }
+            // A micro increment is ≤ 1 ms, far inside the cap: backward it is always a slew.
+            CorrectionKind::Step | CorrectionKind::TooLargeToSlew => {
+                self.pending = Some((target, land))
+            }
+        }
+        self.micro_kind = true;
+        self.seq = self.seq.wrapping_add(1);
+        Some(self.announce())
     }
 
     /// Move `D` WITHOUT a coordinated step, effective immediately: the time base changed (a
@@ -840,6 +822,9 @@ impl DateFollower {
         own_anchor_ns: i64,
         now_wall_ns: i64,
     ) -> FollowAction {
+        if a.micro {
+            self.micro_seq = Some(a.seq);
+        }
         let own_d = self.in_effect_ns(own_anchor_ns, now_wall_ns);
         let own_now_ptp = now_wall_ns.wrapping_sub(own_d);
         if let Some(slew) = a.as_slew() {

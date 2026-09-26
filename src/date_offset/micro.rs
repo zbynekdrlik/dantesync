@@ -377,8 +377,14 @@ impl MicroScheduler {
     /// The estimated error at the PTP instant `at_ptp_ns`; `None` with fewer than
     /// [`MICRO_MIN_READINGS`] readings.
     pub fn estimate(&self, at_ptp_ns: i64) -> Option<MicroEstimate> {
-        let _ = (at_ptp_ns, self.fit);
-        None
+        let f = self.fit?;
+        Some(MicroEstimate {
+            error_ns: (f.level + f.trend * at_ptp_ns.wrapping_sub(f.t_ref) as f64 / 1e9).round()
+                as i64,
+            trend_ns_per_s: f.trend,
+            noise_ns: f.noise,
+            trend_noise_ns_per_s: f.trend_noise,
+        })
     }
 
     /// The direction of the last correction (±1), or 0 when there was none or the fitted drift
@@ -396,8 +402,57 @@ impl MicroScheduler {
     /// land (`land_ptp_ns`, the announce's instant) decides. Records it: the readings are
     /// compensated at once, and the next one waits at least the interval.
     pub fn decide(&mut self, now_ptp_ns: i64, land_ptp_ns: i64) -> Option<i64> {
-        let _ = (now_ptp_ns, land_ptp_ns);
-        None
+        if let Some((t, _)) = self.last {
+            if now_ptp_ns.saturating_sub(t) < self.cfg.interval_ns {
+                return None;
+            }
+        }
+        let est = self.estimate(land_ptp_ns)?;
+        let error = est.error_ns;
+        let sign: i8 = if error > 0 {
+            1
+        } else if error < 0 {
+            -1
+        } else {
+            0
+        };
+        let dir = self.standing_direction(&est);
+        // The noise margin is widest where noise could start something new: the first correction
+        // and a reversal. Continuing in the standing direction (the drift's, in steady state)
+        // takes one standard error: every extra one is ~0.1-0.3 ms of fleet error at the rig's
+        // drift, and noise there cannot make the date oscillate (a reversal still needs the
+        // wide band).
+        let (band, sigmas) = if sign != 0 && dir != 0 && sign != dir {
+            (
+                MICRO_REVERSAL_BAND_NS.max(self.cfg.dead_band_ns),
+                MICRO_NOISE_MARGIN_SIGMAS,
+            )
+        } else if dir == 0 {
+            (self.cfg.dead_band_ns, MICRO_NOISE_MARGIN_SIGMAS)
+        } else if self.correcting {
+            (MICRO_EXIT_BAND_NS.min(self.cfg.dead_band_ns), 1.0)
+        } else {
+            (self.cfg.dead_band_ns, 1.0)
+        };
+        let band = band.saturating_add((sigmas * est.noise_ns) as i64);
+        if sign == 0 || error.abs() <= band {
+            self.correcting = false;
+            return None;
+        }
+        let amount = sign as i64 * error.abs().min(self.cfg.step_ns);
+        self.correcting = true;
+        self.last = Some((now_ptp_ns, sign));
+        self.compensate(amount);
+        self.increments.push_back((now_ptp_ns, amount));
+        while self
+            .increments
+            .front()
+            .is_some_and(|&(t, _)| now_ptp_ns.saturating_sub(t) > MICRO_WINDOW_NS)
+        {
+            self.increments.pop_front();
+        }
+        self.last_increment_ns = Some(amount);
+        Some(amount)
     }
 
     /// Re-evaluate the falling-behind alarm at `now_ptp_ns`; `Some(new state)` when it changed.
@@ -406,8 +461,20 @@ impl MicroScheduler {
     /// reaches the capacity, or it is beyond [`FALLING_BEHIND_ERROR_NS`]. Cleared once the error
     /// is back inside the dead band (the corrections caught up).
     pub fn update_falling_behind(&mut self, now_ptp_ns: i64) -> Option<bool> {
-        let _ = now_ptp_ns;
-        None
+        let est = self.estimate(now_ptp_ns)?;
+        let e = est.error_ns;
+        let outrun =
+            est.trend_ns_per_s * 60.0 * e.signum() as f64 >= self.cfg.capacity_ns_per_min() as f64;
+        let behind = if self.falling_behind {
+            e.abs() > self.cfg.dead_band_ns
+        } else {
+            e.abs() > self.cfg.dead_band_ns && (outrun || e.abs() >= FALLING_BEHIND_ERROR_NS)
+        };
+        if behind == self.falling_behind {
+            return None;
+        }
+        self.falling_behind = behind;
+        Some(behind)
     }
 
     pub fn falling_behind(&self) -> bool {
@@ -423,8 +490,17 @@ impl MicroScheduler {
     /// signed; the covered time since the first reading when that is shorter, at least a minute).
     /// `None` before the first reading.
     pub fn correction_rate_ns_per_min(&self, now_ptp_ns: i64) -> Option<f64> {
-        let _ = now_ptp_ns;
-        None
+        let first = self.first_ptp?;
+        let covered = now_ptp_ns
+            .saturating_sub(first)
+            .clamp(60_000_000_000, MICRO_WINDOW_NS);
+        let sum: i64 = self
+            .increments
+            .iter()
+            .filter(|&&(t, _)| now_ptp_ns.saturating_sub(t) <= MICRO_WINDOW_NS)
+            .map(|&(_, a)| a)
+            .sum();
+        Some(sum as f64 * 60e9 / covered as f64)
     }
 }
 

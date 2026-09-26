@@ -316,8 +316,7 @@ impl DateOffsetConfig {
     /// dantesync#119 follow-up — the effective micro-correction tuning (`0` → the defaults, else
     /// clamped: step 50..=1000 µs, interval 10..=600 s).
     pub fn micro(&self) -> crate::date_offset::MicroConfig {
-        let _ = (self.micro_step_us, self.micro_interval_s);
-        crate::date_offset::MicroConfig::default()
+        crate::date_offset::MicroConfig::new(self.micro_step_us, self.micro_interval_s)
     }
 }
 

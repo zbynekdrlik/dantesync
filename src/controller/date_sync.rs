@@ -946,6 +946,7 @@ where
         }
         if self.ntp_server_mode {
             self.ensure_date_authority();
+            self.tick_date_authority();
             self.realign_master_to_fleet();
             return;
         }
@@ -1100,7 +1101,7 @@ where
         }
         // #119 follow-up: a micro-correction (applied at its instant, or late) is labelled `micro`
         // and kept out of the NTP step-storm count below; a join never is one.
-        let micro = false;
+        let micro = kind != StepKind::Join && self.date_sync.follower.is_micro_seq(seq);
         let label = step_kind_label(kind, micro);
         let dur = Duration::from_nanos(delta_ns.unsigned_abs());
         let sign: i8 = if delta_ns > 0 { 1 } else { -1 };

@@ -300,7 +300,7 @@ fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<D
             effective_ptp_ns: status.date_offset_effective_ptp_ns?,
             seq: status.date_offset_seq?,
             slew: slew.map(|(spec, _)| spec),
-            micro: false,
+            micro: status.date_offset_micro,
         },
     })
 }
