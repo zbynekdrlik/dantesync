@@ -349,12 +349,19 @@ fn legacy_discipline_never_slews_119() {
     assert_eq!(c.date_sync.deslew_sample(123_456), (123_456, 123_456));
 }
 
-#[test]
-fn a_failed_edge_write_is_retried_from_the_loop_without_a_ptp_window_119() {
-    // No servo window runs here (as while PTP is offline, when none follows at all): the loop is
-    // the only writer that can apply the slew's rate term. One failed write must not leave the
-    // box without it.
-    let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+type Flag = Arc<std::sync::atomic::AtomicBool>;
+
+/// An anchored controller whose clock fails the next `adjust_frequency` when `fail_next` is set,
+/// capturing every word it does apply; returns it with its `D` and the phase lock's word.
+#[allow(clippy::type_complexity)]
+fn failing_clock_controller() -> (
+    PtpController<MockSystemClock, MockPtpNetwork, MockNtpSource>,
+    i64,
+    f64,
+    Arc<std::sync::Mutex<Vec<f64>>>,
+    Flag,
+) {
+    let fail_next: Flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let captured = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
     let (fail, cap) = (fail_next.clone(), captured.clone());
     let mut clock = MockSystemClock::new();
@@ -381,23 +388,64 @@ fn a_failed_edge_write_is_retried_from_the_loop_without_a_ptp_window_119() {
     c.date_sync.pending_t1_ns = PL_PTP_NOW_NS;
     c.apply_self_tuning_servo(0.0);
     let pi = c.applied_freq_ppm;
-    // A slew that is already running: the next loop iteration switches the term on.
-    let now_ptp = wall_now_ns() - d;
-    let slew = DateSlew {
+    (c, d, pi, captured, fail_next)
+}
+
+/// A backward slew that started 10 ms ago (so it is running and its displacement is a µs).
+fn running_slew(d: i64) -> DateSlew {
+    DateSlew {
         from_ns: d,
         to_ns: d - 50_000_000,
-        start_ptp_ns: now_ptp - 100_000_000,
+        start_ptp_ns: wall_now_ns() - d - 10_000_000,
         ppm: 100,
-    };
-    follow_slew(&mut c, d, slew);
+    }
+}
+
+#[test]
+fn a_failed_edge_write_is_retried_from_the_loop_without_a_ptp_window_119() {
+    // No servo window runs here (as while PTP is offline, when none follows at all): the loop is
+    // the only writer that can apply the slew's rate term. One failed write must not leave the
+    // box without it — and a failing clock must not be hammered every loop iteration either.
+    let (mut c, d, pi, captured, fail_next) = failing_clock_controller();
+    follow_slew(&mut c, d, running_slew(d));
     captured.lock().unwrap().clear();
     fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
     c.service_date_offset(); // the write fails
     assert!(captured.lock().unwrap().is_empty());
-    c.service_date_offset(); // retried at once, from the loop
+    c.service_date_offset(); // right after: not retried yet (bounded retry rate)
+    assert!(captured.lock().unwrap().is_empty(), "no retry storm");
+    std::thread::sleep(Duration::from_millis(150));
+    c.service_date_offset(); // retried from the loop
     let seen = captured.lock().unwrap().clone();
     assert_eq!(seen.len(), 1, "retried exactly once: {seen:?}");
     assert!((seen[0] - (pi - 100.0)).abs() < 1e-9, "{seen:?}");
     c.service_date_offset(); // applied now: nothing more to write
     assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_failed_write_at_the_ptp_offline_edge_is_retried_from_the_loop_119() {
+    // The slew's START write fails, then PTP drops and the offline edge's write (the learned word
+    // plus the slew's term) fails too. No PTP window will follow: the loop must still apply it —
+    // the term may only count as applied once a write carrying it succeeded.
+    let (mut c, d, _pi, captured, fail_next) = failing_clock_controller();
+    follow_slew(&mut c, d, running_slew(d));
+    captured.lock().unwrap().clear();
+    fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    c.service_date_offset(); // the START write fails
+    c.ptp_offline = true;
+    fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    c.service_date_offset(); // the offline edge's write fails too
+    assert!(!c.date_sync.core.engaged());
+    assert!(captured.lock().unwrap().is_empty());
+    let learned = c.applied_freq_ppm;
+    std::thread::sleep(Duration::from_millis(150));
+    c.service_date_offset();
+    let seen = captured.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the held word plus the slew's term reached the clock once: {seen:?}"
+    );
+    assert!((seen[0] - (learned - 100.0)).abs() < 1e-9, "{seen:?}");
 }
