@@ -50,6 +50,7 @@ where
         let fleet = a.in_effect_ns(now_ptp);
         let announced = a.on_tick(now_ptp);
         self.report_falling_behind(now_ptp);
+        self.report_micro_paused(now_ptp);
         let Some(ann) = announced else {
             return;
         };
@@ -70,6 +71,31 @@ where
             self.master_schedules_own(ann, base, now_wall);
         }
         // Publish NOW (see `ntp_under_date_authority`): the 31900 server reads this snapshot.
+        self.update_shared_status();
+    }
+
+    /// #119 follow-up — the micro-corrections are paused while the UTC readings have stopped (the
+    /// authority decides nothing without a fresh one): say so once, loudly, and once when they
+    /// resume — the fleet date then runs free at the grandmaster's rate, and /status says
+    /// `date_micro_paused`.
+    fn report_micro_paused(&mut self, now_ptp: i64) {
+        let Some(a) = self.date_sync.authority.as_ref() else {
+            return;
+        };
+        let paused = a.micro().paused(now_ptp);
+        if paused == self.date_sync.micro_paused_logged {
+            return;
+        }
+        if paused {
+            warn!(
+                "[DATE] AUTHORITY: micro-corrections paused: no UTC reading for over {} s — the \
+                 fleet date runs free at the grandmaster's rate until UTC is back (ntp_age_s)",
+                crate::date_offset::MICRO_READING_MAX_AGE_NS / 1_000_000_000
+            );
+        } else {
+            info!("[DATE] AUTHORITY: micro-corrections resumed: UTC readings are back");
+        }
+        self.date_sync.micro_paused_logged = paused;
         self.update_shared_status();
     }
 

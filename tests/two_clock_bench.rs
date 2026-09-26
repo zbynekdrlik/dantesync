@@ -119,7 +119,8 @@ struct Scenario {
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
 /// Since the micro-corrections (v1.11) a jump of up to 30 ms is worked off at the capacity (the
-/// jumps scenario's 25 ppm slews hold ~1.2 ms/min: 30 ms in ~25 min): 50 minutes covers it.
+/// jumps scenario's 25 ppm slews are 30 s apart — two 5 s leads + a 20 s slew — so ~1 ms/min:
+/// 30 ms in ~30 min): 50 minutes covers it.
 const UTC_JUMP_SETTLE_WINDOWS: u64 = 6_000;
 
 impl Scenario {
@@ -765,7 +766,7 @@ impl<'s> Bench<'s> {
             .filter(|(i, _)| *i != 0 || master_on_line)
             .map(|(_, b)| b)
             .collect();
-        let landed: Vec<u32> = judged.iter().flat_map(|b| landed_now(b)).collect();
+
         // (#119 follow-up: a step a grandmaster rebase re-announced is pending under the rebase's
         // seq on a box that re-anchored first, while the master lands it under the original one.)
         let original_seq = |seq: u32| {
@@ -774,6 +775,12 @@ impl<'s> Bench<'s> {
                 .find(|(_, new)| *new == seq)
                 .map_or(seq, |(old, _)| *old)
         };
+        // Both sides in the ORIGINAL seq: a box may land the step under either.
+        let landed: Vec<u32> = judged
+            .iter()
+            .flat_map(|b| landed_now(b))
+            .map(original_seq)
+            .collect();
         let straddling = judged.iter().any(|b| {
             b.follower
                 .pending()

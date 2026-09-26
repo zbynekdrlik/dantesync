@@ -107,6 +107,10 @@ where
                 .map(|r| r / 1e6),
             _ => None,
         };
+        status.date_micro_paused = match (ds.authority.as_ref(), anchor) {
+            (Some(a), Some(d)) => a.micro().paused(now_wall.wrapping_sub(d)),
+            _ => false,
+        };
         status.date_correction_falling_behind = ds
             .authority
             .as_ref()

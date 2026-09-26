@@ -376,13 +376,17 @@ large correction left is an abnormal error beyond `slew_cap_ns` (2 × the bound)
   of the drift. A TIME-based memory of the direction (forget after 10 min / 1 h) did not stop the
   jitter case: the estimate wanders by the dead band over tens of minutes, so it walked the date
   back and forth every hour or so.
-- **No holdover.** Nothing is decided without a UTC reading in the last minute
+- **No holdover, and a loud pause.** Nothing is decided without a UTC reading in the last minute
   (`MICRO_READING_MAX_AGE_NS`): extrapolating a 20-minute drift fit through an upstream outage is a
   silent holdover that can walk the date hundreds of ms in hours with no alarm (review round 1).
-- **The capacity must be the honest one.** One increment is in flight at a time, for
-  `MICRO_LEAD_FACTOR` × lead plus (backward) its slew, so `date_offset::effective_micro` raises the
-  interval to that; the falling-behind alarm and the start-up line compare against the effective
-  capacity (a 30 s lead or a 10 ppm slew rate otherwise hid a drift the corrections could not hold).
+  The pause itself is loud: `micro-corrections paused` / `resumed` and `/status.date_micro_paused`
+  (review round 2 — the falling-behind alarm is only re-evaluated on a reading, so it froze).
+- **The capacity must be the honest one, per direction.** One increment is in flight at a time,
+  for `MICRO_LEAD_FACTOR` × lead, and a backward one also for its slew, so
+  `date_offset::effective_micro` raises `interval_ns` to the lead and `backward_interval_ns` to
+  lead + slew; the falling-behind alarm compares a forward drift with the forward capacity and a
+  backward one with the backward capacity (a 30 s lead or a 10 ppm slew rate otherwise hid a drift
+  the corrections could not hold — and a slow slew rate must not throttle forward steps).
 - **A rebase keeps an in-flight micro-correction micro** (re-announced under the rebase's seq).
 - **`date_offset.step_bound_ms` is floored at 5** (`MIN_DATE_STEP_BOUND_MS`): a 1 ms bound made the
   cap 2 ms = the dead band, and every normal correction became a confirmed large step.

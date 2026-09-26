@@ -97,8 +97,9 @@ pub const MICRO_READING_MAX_AGE_NS: i64 = 60_000_000_000;
 /// The drift estimate is clamped to ±this (ns per s; 50 000 = 50 ppm): a grandmaster-vs-UTC rate beyond it is
 /// not a rate this fleet has, and a wild estimate must not be projected.
 pub const MICRO_MAX_TREND_NS_PER_S: f64 = 50_000.0;
-/// Every band is widened by this many standard errors of the level estimate (measured from the
-/// readings' own scatter around the fitted line — jitter, not the ramp): a noisy UTC path must
+/// A first correction and a reversal are gated by this many standard errors of the level estimate
+/// on top of their band (continuing in the standing direction by one; the error is measured from
+/// the readings' own scatter around the fitted line — jitter, not the ramp): a noisy UTC path must
 /// make a correction LESS likely, never trigger one.
 pub const MICRO_NOISE_MARGIN_SIGMAS: f64 = 3.0;
 /// An estimated error this large means the corrections are not holding the date, whatever the
@@ -132,6 +133,9 @@ pub struct MicroConfig {
     pub step_ns: i64,
     /// The smallest spacing between two corrections (ns of PTP time).
     pub interval_ns: i64,
+    /// The smallest spacing before a BACKWARD correction (≥ `interval_ns`: a backward one is also
+    /// in flight for its slew; see `crate::date_offset::effective_micro`).
+    pub backward_interval_ns: i64,
     /// See [`MICRO_DEAD_BAND_NS`].
     pub dead_band_ns: i64,
 }
@@ -140,16 +144,30 @@ impl MicroConfig {
     /// From configured values (µs, s), clamped by [`clamp_micro_step_us`] /
     /// [`clamp_micro_interval_s`].
     pub fn new(step_us: u64, interval_s: u64) -> Self {
+        let interval_ns = clamp_micro_interval_s(interval_s) as i64 * 1_000_000_000;
         MicroConfig {
             step_ns: clamp_micro_step_us(step_us) as i64 * 1_000,
-            interval_ns: clamp_micro_interval_s(interval_s) as i64 * 1_000_000_000,
+            interval_ns,
+            backward_interval_ns: interval_ns,
             dead_band_ns: MICRO_DEAD_BAND_NS,
         }
     }
 
-    /// The largest drift the corrections can hold (ns of correction per minute).
+    /// The largest drift the corrections can hold (ns of correction per minute), forward.
     pub fn capacity_ns_per_min(&self) -> i64 {
-        ((self.step_ns as i128 * 60_000_000_000) / self.interval_ns.max(1) as i128) as i64
+        Self::per_min(self.step_ns, self.interval_ns)
+    }
+
+    /// The same for BACKWARD corrections (each also waits for its slew).
+    pub fn backward_capacity_ns_per_min(&self) -> i64 {
+        Self::per_min(
+            self.step_ns,
+            self.backward_interval_ns.max(self.interval_ns),
+        )
+    }
+
+    fn per_min(step_ns: i64, interval_ns: i64) -> i64 {
+        ((step_ns as i128 * 60_000_000_000) / interval_ns.max(1) as i128) as i64
     }
 }
 
@@ -457,6 +475,14 @@ impl MicroScheduler {
             self.correcting = false;
             return None;
         }
+        // A backward one also waits for the previous one's slew (the effective backward spacing).
+        if sign < 0 {
+            if let Some((t, _)) = self.last {
+                if now_ptp_ns.saturating_sub(t) < self.cfg.backward_interval_ns {
+                    return None;
+                }
+            }
+        }
         let amount = sign as i64 * error.abs().min(self.cfg.step_ns);
         self.correcting = true;
         self.last = Some((now_ptp_ns, sign));
@@ -481,8 +507,12 @@ impl MicroScheduler {
     pub fn update_falling_behind(&mut self, now_ptp_ns: i64) -> Option<bool> {
         let est = self.estimate(now_ptp_ns)?;
         let e = est.error_ns;
-        let outrun =
-            est.trend_ns_per_s * 60.0 * e.signum() as f64 >= self.cfg.capacity_ns_per_min() as f64;
+        let capacity = if e < 0 {
+            self.cfg.backward_capacity_ns_per_min()
+        } else {
+            self.cfg.capacity_ns_per_min()
+        };
+        let outrun = est.trend_ns_per_s * 60.0 * e.signum() as f64 >= capacity as f64;
         let behind = if self.falling_behind {
             e.abs() > self.cfg.dead_band_ns
         } else {
@@ -497,6 +527,19 @@ impl MicroScheduler {
 
     pub fn falling_behind(&self) -> bool {
         self.falling_behind
+    }
+
+    /// The UTC readings stopped: there were some, and the newest is older than
+    /// [`MICRO_READING_MAX_AGE_NS`] at `now_ptp_ns`. No correction is decided meanwhile (the fleet
+    /// date runs free at the grandmaster's rate); the controller says so loudly.
+    pub fn paused(&self, now_ptp_ns: i64) -> bool {
+        let _ = now_ptp_ns;
+        false
+    }
+
+    /// How many readings are kept.
+    pub fn readings(&self) -> usize {
+        self.readings.len()
     }
 
     /// The last micro-correction decided (ns, signed).

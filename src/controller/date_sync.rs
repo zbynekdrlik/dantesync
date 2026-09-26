@@ -118,6 +118,8 @@ pub(super) struct DateSync {
     /// dantesync#119 follow-up — the falling-behind state last logged, and when it was last warned.
     pub(super) falling_behind_logged: bool,
     pub(super) falling_behind_warned_at: Option<Instant>,
+    /// dantesync#119 follow-up — the micro-corrections' paused state last logged (no fresh UTC).
+    pub(super) micro_paused_logged: bool,
 }
 
 impl DateSync {
@@ -185,6 +187,7 @@ impl DateSync {
             last_micro_ns: None,
             falling_behind_logged: false,
             falling_behind_warned_at: None,
+            micro_paused_logged: false,
         }
     }
 
@@ -606,15 +609,16 @@ where
         info!(
             "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date is \
              held within {} ms of UTC by micro-corrections of at most {}us, one per {} s ({:.2} \
-             ms/min): forward a coordinated step, backward a coordinated slew at {} ppm, announced \
-             {} s ahead; only an error beyond {} ms is one coordinated step",
+             ms/min): forward a coordinated step, backward a coordinated slew at {} ppm (one per {} \
+             s), announced {} s ahead; only an error beyond {} ms is one coordinated step",
             anchor,
             micro.dead_band_ns / 1_000_000,
             micro.step_ns / 1_000,
             micro.interval_ns / 1_000_000_000,
             micro.capacity_ns_per_min() as f64 / 1e6,
             authority.slew_ppm(),
-            self.date_sync.step_lead_ns / 1_000_000_000,
+            micro.backward_interval_ns / 1_000_000_000,
+            authority.lead_ns() * crate::date_offset::MICRO_LEAD_FACTOR / 1_000_000_000,
             crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000
         );
         self.date_sync.authority = Some(authority);
@@ -689,36 +693,9 @@ where
             // No PTP, no phase lock (normally done on the offline edge already).
             self.on_ptp_offline_edge();
         }
-        // #119: a slew whose amount is paid is folded into the anchor, then the rate term follows
-        // the slew's schedule at this very instant (its start and end land within one loop
-        // iteration on every box, like a coordinated step).
+        // #119: a paid slew is folded into the anchor, then the rate term follows its schedule.
         let now_wall = wall_now_ns();
-        let micro_slew = self.date_sync.follower.held_slew_is_micro();
-        if let Some(fold) = self.date_sync.fold_completed_slew(now_wall) {
-            self.date_sync.slew_start_logged = false;
-            let seq = self
-                .date_sync
-                .follower
-                .adopted_seq()
-                .map(|q| q.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            if micro_slew {
-                // #119 follow-up: one quiet line per backward micro-correction.
-                self.date_sync.last_micro_ns = Some(fold);
-                info!(
-                    "[DATE] micro-slew done: D moved {:+}us, no wall step (seq {})",
-                    fold / 1_000,
-                    seq
-                );
-            } else {
-                info!(
-                    "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
-                    fold / 1_000,
-                    seq
-                );
-            }
-            self.update_shared_status();
-        }
+        self.fold_completed_slew_and_log(now_wall);
         self.apply_slew_edge(now_wall);
         if let Some(due) = self.date_sync.follower.due(wall_now_ns()) {
             self.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
@@ -787,90 +764,11 @@ where
         self.date_sync.last_announce = Some(ext.announce);
         let now_wall = wall_now_ns();
         let first = !self.date_sync.follower.adopted();
-        match self
+        let act = self
             .date_sync
             .follower
-            .on_announce(ext.announce, anchor, now_wall)
-        {
-            FollowAction::None => {}
-            FollowAction::Absorb { new_anchor_ns } => {
-                self.date_sync.core.set_anchor(new_anchor_ns);
-                if first {
-                    info!(
-                        "[DATE] aligned with the fleet date offset (seq {}): D adopted, {:+}ns \
-                         inside the absorb tolerance — no step",
-                        ext.announce.seq,
-                        new_anchor_ns.wrapping_sub(anchor)
-                    );
-                }
-            }
-            // #119 ROZHODNUTÉ: a 1.10+ authority schedules a backward step only beyond the slew
-            // cap. A smaller one comes from an older master that never slews (the rollout upgrades
-            // the master LAST) — loud too, but not blamed on the cap.
-            FollowAction::Scheduled {
-                delta_ns,
-                effective_wall_ns,
-            } if delta_ns < 0 => {
-                let cap = crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns);
-                let cause = if delta_ns < -cap {
-                    "date correction too large to slew"
-                } else {
-                    "the authority does not slew (an older dantesync?)"
-                };
-                warn!(
-                    "[DATE] {}: coordinated BACKWARD date step {:+}us scheduled (seq {}) in {} ms",
-                    cause,
-                    delta_ns / 1_000,
-                    ext.announce.seq,
-                    effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
-                )
-            }
-            // #119 follow-up: a micro-correction is scheduled quietly (it lands as one info line).
-            FollowAction::Scheduled {
-                delta_ns,
-                effective_wall_ns,
-            } if ext.announce.micro => debug!(
-                "[DATE] micro date step {:+}us scheduled (seq {}) in {} ms",
-                delta_ns / 1_000,
-                ext.announce.seq,
-                effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
-            ),
-            FollowAction::Scheduled {
-                delta_ns,
-                effective_wall_ns,
-            } => info!(
-                "[DATE] coordinated date step {:+}us scheduled (seq {}) in {} ms",
-                delta_ns / 1_000,
-                ext.announce.seq,
-                effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
-            ),
-            FollowAction::Step { delta_ns, kind } => {
-                self.apply_date_step(delta_ns, kind, ext.announce.seq)
-            }
-            FollowAction::SlewScheduled {
-                amount_ns,
-                start_wall_ns,
-                ppm,
-            } if ext.announce.micro => debug!(
-                "[DATE] micro date slew {:+}us at {} ppm scheduled (seq {}) in {} ms",
-                amount_ns / 1_000,
-                ppm,
-                ext.announce.seq,
-                start_wall_ns.wrapping_sub(now_wall) / 1_000_000
-            ),
-            FollowAction::SlewScheduled {
-                amount_ns,
-                start_wall_ns,
-                ppm,
-            } => info!(
-                "[DATE] coordinated date SLEW {:+}us at {} ppm scheduled (seq {}) in {} ms — no \
-                 backward step",
-                amount_ns / 1_000,
-                ppm,
-                ext.announce.seq,
-                start_wall_ns.wrapping_sub(now_wall) / 1_000_000
-            ),
-        }
+            .on_announce(ext.announce, anchor, now_wall);
+        self.act_on_announce(act, ext.announce, anchor, now_wall, first);
     }
 
     /// #88 — step the wall by `delta_ns` for the fleet date offset and move `D` with it.
@@ -943,6 +841,7 @@ where
     }
 }
 
+mod follow;
 mod micro;
 mod publish;
 mod slew;

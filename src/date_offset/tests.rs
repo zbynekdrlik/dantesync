@@ -627,30 +627,57 @@ fn a_follower_knows_a_held_micro_slew_until_it_is_complete_119() {
 #[test]
 fn the_effective_micro_interval_covers_the_increment_in_flight_119() {
     let c = MicroConfig::default();
-    // Two 5 s leads + a 5 s slew of 500 µs at 100 ppm = 15 s < 20 s: unchanged.
+    // Two 5 s leads (+ a 5 s slew of 500 µs at 100 ppm backwards) < 20 s: unchanged.
     assert_eq!(effective_micro(c, MIN_STEP_LEAD_NS, 100), c);
-    // A 30 s lead: one increment is in flight 60 s + 5 s, so the capacity is honest about it.
+    // A 30 s lead: a step is in flight 60 s, a slew 60 s + 5 s — the capacity is honest about it.
     let long = effective_micro(c, 30 * S, 100);
-    assert_eq!(long.interval_ns, 65 * S);
+    assert_eq!(long.interval_ns, 60 * S);
+    assert_eq!(long.backward_interval_ns, 65 * S);
     assert!(long.capacity_ns_per_min() < c.capacity_ns_per_min());
-    // A 10 ppm slew: 500 µs take 50 s.
-    assert_eq!(effective_micro(c, MIN_STEP_LEAD_NS, 10).interval_ns, 60 * S);
+    assert!(long.backward_capacity_ns_per_min() < long.capacity_ns_per_min());
+    // A 10 ppm slew: 500 µs take 50 s backwards; forward steps are not slowed by it.
+    let slow = effective_micro(c, MIN_STEP_LEAD_NS, 10);
+    assert_eq!(slow.interval_ns, 20 * S);
+    assert_eq!(slow.backward_interval_ns, 60 * S);
+    assert_eq!(slow.capacity_ns_per_min(), 1_500_000);
+    assert_eq!(slow.backward_capacity_ns_per_min(), 500_000);
     // The authority runs on it, whichever builder comes last.
     assert_eq!(
         DateAuthority::new(0, 0, 50 * MS, 30 * S)
             .micro()
             .config()
-            .interval_ns,
+            .backward_interval_ns,
         65 * S
     );
     let a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
         .with_micro(MicroConfig::new(500, 20))
         .with_slew_ppm(10);
-    assert_eq!(a.micro().config().interval_ns, 60 * S);
+    assert_eq!(a.micro().config().backward_interval_ns, 60 * S);
     let b = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS)
         .with_slew_ppm(10)
         .with_micro(MicroConfig::new(500, 20));
-    assert_eq!(b.micro().config().interval_ns, 60 * S);
+    assert_eq!(b.micro().config(), a.micro().config());
+}
+
+#[test]
+fn a_backward_increment_waits_for_the_backward_spacing_a_forward_one_does_not_119() {
+    // 10 ppm: a backward increment is in flight 10 s + 50 s, so the next backward one waits 60 s;
+    // forward ones keep the 20 s spacing.
+    let mut back = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS).with_slew_ppm(10);
+    for i in 0..6 {
+        back.on_utc_error(-7 * MS, 10 * S + i * 10 * S);
+    }
+    assert!(back.on_tick(60 * S).unwrap().as_slew().is_some());
+    back.on_utc_error(-6_500 * US, 115 * S);
+    assert_eq!(back.on_tick(119 * S), None, "the slew runs until 120 s");
+    assert!(back.on_tick(120 * S).is_some(), "60 s after the last one");
+    let mut fwd = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS).with_slew_ppm(10);
+    for i in 0..6 {
+        fwd.on_utc_error(7 * MS, 10 * S + i * 10 * S);
+    }
+    assert!(fwd.on_tick(60 * S).is_some());
+    fwd.on_utc_error(6_500 * US, 75 * S);
+    assert!(fwd.on_tick(80 * S).is_some(), "20 s after the last one");
 }
 
 #[test]

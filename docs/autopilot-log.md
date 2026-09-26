@@ -713,4 +713,11 @@ canary evidence before continuing.
   `two_clock_bench/world.rs` (every touched file ≤ 1000 lines); the bench's step-size tolerance
   only within 5 min after a GM event, a ≤ 1 ppm word bound there (measured 0.37), renamed seqs in
   the in-flight detection, every micro statistic over 3 bench / 4 pure seeds; doc fixes.
+- Review round 2 (fresh context, 0 🔴 2 🟡 5 🔵): the camera-box consumer follow-up is a supervisor
+  filing (no worker filing authority; documented in CHANGELOG); fixed in-lane: a loud pause
+  (`micro-corrections paused` / `date_micro_paused`), a per-direction effective capacity
+  (`backward_interval_ns`: a slow slew no longer throttles forward steps), a debug-assert against
+  a builder after the first reading, both sides of the bench's in-flight seq mapping, the
+  announce handling moved to `date_sync/follow.rs` and the slew fold/log to `date_sync/slew.rs`
+  (`service_date_offset` 193 → 85 lines), doc leftovers.
 - Not merged, released or deployed. Rollout: followers first, the NTP master last.

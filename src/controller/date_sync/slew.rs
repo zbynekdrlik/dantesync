@@ -190,6 +190,40 @@ where
         self.update_shared_status();
     }
 
+    /// #119 — every loop iteration: a slew whose amount is paid is folded into the anchor (then the
+    /// rate term follows the slew's schedule at this very instant: its start and end land within
+    /// one loop iteration on every box, like a coordinated step). One line per fold — a quiet
+    /// `micro-slew done` for a backward micro-correction (#119 follow-up), which it also records
+    /// as this box's last micro-correction.
+    pub(super) fn fold_completed_slew_and_log(&mut self, now_wall: i64) {
+        let micro_slew = self.date_sync.follower.held_slew_is_micro();
+        let Some(fold) = self.date_sync.fold_completed_slew(now_wall) else {
+            return;
+        };
+        self.date_sync.slew_start_logged = false;
+        let seq = self
+            .date_sync
+            .follower
+            .adopted_seq()
+            .map(|q| q.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        if micro_slew {
+            self.date_sync.last_micro_ns = Some(fold);
+            info!(
+                "[DATE] micro-slew done: D moved {:+}us, no wall step (seq {})",
+                fold / 1_000,
+                seq
+            );
+        } else {
+            info!(
+                "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
+                fold / 1_000,
+                seq
+            );
+        }
+        self.update_shared_status();
+    }
+
     /// #119 — the NTP master while the fleet slews: its own scheduler must hold the authority's
     /// slew. If it missed it (it was off the line at the announce, or an extension was announced
     /// while its step backoff ran), hand it the announce again — accepted only while the master's

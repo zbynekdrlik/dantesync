@@ -168,3 +168,30 @@ fn an_error_the_micro_corrections_cannot_hold_raises_the_falling_behind_alarm_11
         "still only a micro-correction, never a large step"
     );
 }
+
+#[test]
+fn stopped_utc_readings_pause_the_micro_corrections_loudly_and_resume_119() {
+    let mut ntp = MockNtpSource::new();
+    ntp.expect_get_offset()
+        .returning(|| Ok(one_offset(7_000, 1)));
+    // No step_clock expectation: a pause never steps anything.
+    let (mut c, d) = anchored_controller(MockSystemClock::new(), ntp, true);
+    readings_then_tick(&mut c);
+    assert!(!c.date_sync.micro_paused_logged);
+    // The master's PTP time 61 s on with no reading since (the anchor moved back by as much).
+    c.date_sync.core.set_anchor(d - 61_000_000_000);
+    c.service_date_offset();
+    assert!(c.date_sync.micro_paused_logged, "the loud line was logged");
+    {
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert!(st.date_micro_paused);
+    }
+    // Back to the time of the last reading: resumed.
+    c.date_sync.core.set_anchor(d);
+    c.service_date_offset();
+    assert!(!c.date_sync.micro_paused_logged);
+    let st = c.get_status_shared();
+    let st = st.read().expect("status");
+    assert!(!st.date_micro_paused);
+}

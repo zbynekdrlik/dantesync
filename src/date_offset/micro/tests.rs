@@ -300,6 +300,12 @@ fn no_correction_is_decided_without_a_fresh_utc_reading_119() {
         m.record(7 * MS, i * 10 * S);
     }
     let last = 90 * S;
+    assert!(!m.paused(last + MICRO_READING_MAX_AGE_NS));
+    assert!(m.paused(last + MICRO_READING_MAX_AGE_NS + 1));
+    assert!(
+        !MicroScheduler::new(MicroConfig::default()).paused(last),
+        "no reading yet is warming up, not paused"
+    );
     assert_eq!(
         m.decide(
             last + MICRO_READING_MAX_AGE_NS + 1,

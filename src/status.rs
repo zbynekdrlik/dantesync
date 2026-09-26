@@ -349,6 +349,11 @@ pub struct SyncStatus {
     /// bound.
     #[serde(default)]
     pub date_correction_falling_behind: bool,
+    /// dantesync#119 follow-up (the NTP master only): the micro-corrections are paused — no UTC
+    /// reading for over a minute (journal line `micro-corrections paused`); the fleet date runs
+    /// free at the grandmaster's rate until UTC is back.
+    #[serde(default)]
+    pub date_micro_paused: bool,
 
     // ========================================================================
     // PTP phase lock (dantesync#117) — additive.
@@ -459,6 +464,7 @@ impl Default for SyncStatus {
             date_micro_last_us: None,
             date_correction_rate_ms_per_min: None,
             date_correction_falling_behind: false,
+            date_micro_paused: false,
             // #117: unknown until the controller publishes
             clock_discipline: String::new(),
             rate_source: String::new(),
@@ -942,6 +948,7 @@ mod tests {
         assert_eq!(restored.date_micro_last_us, None);
         assert_eq!(restored.date_correction_rate_ms_per_min, None);
         assert!(!restored.date_correction_falling_behind);
+        assert!(!restored.date_micro_paused);
         assert_eq!(restored.date_offset_seq, Some(7));
 
         let master = SyncStatus {

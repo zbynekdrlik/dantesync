@@ -69,8 +69,9 @@ mod wire;
 pub use micro::{
     clamp_micro_interval_s, clamp_micro_step_us, MicroConfig, MicroEstimate, MicroScheduler,
     DEFAULT_MICRO_INTERVAL_S, DEFAULT_MICRO_STEP_US, FALLING_BEHIND_ERROR_NS, MAX_MICRO_INTERVAL_S,
-    MAX_MICRO_STEP_US, MICRO_DEAD_BAND_NS, MICRO_EXIT_BAND_NS, MICRO_REVERSAL_BAND_NS,
-    MICRO_TURNED_TREND_NS_PER_S, MICRO_WINDOW_NS, MIN_MICRO_INTERVAL_S, MIN_MICRO_STEP_US,
+    MAX_MICRO_STEP_US, MICRO_DEAD_BAND_NS, MICRO_EXIT_BAND_NS, MICRO_READING_MAX_AGE_NS,
+    MICRO_REVERSAL_BAND_NS, MICRO_TURNED_TREND_NS_PER_S, MICRO_WINDOW_NS, MIN_MICRO_INTERVAL_S,
+    MIN_MICRO_STEP_US,
 };
 pub use slew::{
     clamp_slew_ppm, correction_kind, slew_cap_ns, solve_displacement, CorrectionKind, DateSlew,
@@ -174,17 +175,22 @@ impl DateAnnounce {
 // ============================================================================
 
 /// dantesync#119 follow-up — the micro-correction tuning as it can actually run: one correction
-/// is in flight at a time and each is announced [`MICRO_LEAD_FACTOR`] × `lead_ns` ahead (plus, a
-/// backward one, its slew of one step at `slew_ppm`), so the interval is at least that. The
+/// is in flight at a time and each is announced [`MICRO_LEAD_FACTOR`] × `lead_ns` ahead, so the
+/// interval is at least that; a backward one is in flight for its slew of one step at `slew_ppm`
+/// too, so the BACKWARD interval is at least lead + slew (a forward step is not slowed by it). The
 /// capacity (and the falling-behind alarm that compares against it) is then the honest one — a
 /// long configured lead or a slow slew rate can no longer hide a drift the corrections cannot hold.
 pub fn effective_micro(requested: MicroConfig, lead_ns: i64, slew_ppm: u32) -> MicroConfig {
+    let lead = lead_ns.saturating_mul(MICRO_LEAD_FACTOR);
     let slew_ns = requested.step_ns.saturating_mul(1_000_000) / clamp_slew_ppm(slew_ppm) as i64;
-    let in_flight = lead_ns
-        .saturating_mul(MICRO_LEAD_FACTOR)
-        .saturating_add(slew_ns);
+    let interval_ns = requested.interval_ns.max(lead);
     MicroConfig {
-        interval_ns: requested.interval_ns.max(in_flight),
+        interval_ns,
+        // A backward increment is in flight for its slew too; a forward one is a step.
+        backward_interval_ns: {
+            let _ = slew_ns;
+            interval_ns
+        },
         ..requested
     }
 }
@@ -243,8 +249,14 @@ impl DateAuthority {
         .rebuild_micro()
     }
 
-    /// Build the micro scheduler on the effective tuning (a builder runs before any reading).
+    /// Build the micro scheduler on the effective tuning. A builder runs before any reading: a
+    /// rebuild would drop the kept readings.
     fn rebuild_micro(mut self) -> Self {
+        debug_assert_eq!(
+            self.micro.readings(),
+            0,
+            "a builder after the first UTC reading"
+        );
         self.micro = MicroScheduler::new(effective_micro(
             self.micro_requested,
             self.lead_ns,
