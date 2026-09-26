@@ -31,18 +31,36 @@ pub fn clamp_slew_ppm(ppm: u32) -> u32 {
 /// dantesync#119 — how a fleet date correction is applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorrectionKind {
-    /// Every box steps its wall at the announced instant (forward only: the fleet is behind UTC).
+    /// Every box steps its wall forward at the announced instant (the fleet is behind UTC).
     Step,
     /// Every box moves `D` down at `slew_ppm` from the announced instant: the wall never runs back.
     Slew,
+    /// A backward correction beyond [`slew_cap_ns`]: an ABNORMAL state (typically a master that
+    /// booted on a bad NTP reading, seconds off), where an hours-long slew would keep the fleet
+    /// date wrong. Every box steps it at the announced instant, like a forward step, and says so
+    /// loudly (`date correction too large to slew`).
+    TooLargeToSlew,
+}
+
+/// dantesync#119 ROZHODNUTÉ (issuecomment-5842590141) — a backward correction is slewed only up
+/// to this many step bounds: 2 × 50 ms = 100 ms by default, ~17 min at 100 ppm. Normal drift
+/// corrections are just over one bound, so they always slew.
+pub const SLEW_CAP_STEP_BOUNDS: i64 = 2;
+
+/// dantesync#119 — the largest backward correction that is slewed, for a step bound (ns).
+pub fn slew_cap_ns(step_bound_ns: i64) -> i64 {
+    step_bound_ns.saturating_mul(SLEW_CAP_STEP_BOUNDS)
 }
 
 /// dantesync#119 — THE direction decision. `correction_ns` is the change of `D` (`UTC − wall`):
 /// positive moves the wall forward, which every consumer tolerates (a forward step lost no audio
-/// on the rig); negative would move it BACKWARDS, which Dante DVS/ASIO turns into lost samples.
-pub fn correction_kind(correction_ns: i64) -> CorrectionKind {
+/// on the rig); negative would move it BACKWARDS, which Dante DVS/ASIO turns into lost samples,
+/// so it is slewed — unless it is larger than [`slew_cap_ns`] of `step_bound_ns`.
+pub fn correction_kind(correction_ns: i64, step_bound_ns: i64) -> CorrectionKind {
     if correction_ns >= 0 {
         CorrectionKind::Step
+    } else if step_bound_ns == i64::MIN {
+        CorrectionKind::TooLargeToSlew
     } else {
         CorrectionKind::Slew
     }

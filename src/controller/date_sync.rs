@@ -622,6 +622,20 @@ where
                         ann.seq,
                         off_line
                     ),
+                    // #119 ROZHODNUTÉ: a backward step only for a correction beyond the slew cap —
+                    // an abnormal state, logged loudly.
+                    None if ann.date_offset_ns < fleet => warn!(
+                        "[DATE] AUTHORITY: date correction too large to slew: the fleet line is \
+                         {:+}us off UTC (> {}us, the slew cap) — announcing a coordinated BACKWARD \
+                         date step of {:+}us at PTP {} (in {} ms), seq {}{}",
+                        fleet_err / 1_000,
+                        crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000,
+                        ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
+                        ann.effective_ptp_ns,
+                        ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
+                        ann.seq,
+                        off_line
+                    ),
                     None => info!(
                         "[DATE] AUTHORITY: the fleet line is {:+}us off UTC (> {}us) — announcing a \
                          fleet date step of {:+}us at PTP {} (in {} ms), seq {}{}",
@@ -876,6 +890,17 @@ where
                     );
                 }
             }
+            // #119 ROZHODNUTÉ: the authority schedules a backward step only beyond the slew cap.
+            FollowAction::Scheduled {
+                delta_ns,
+                effective_wall_ns,
+            } if delta_ns < 0 => warn!(
+                "[DATE] date correction too large to slew: coordinated BACKWARD date step {:+}us \
+                 scheduled (seq {}) in {} ms",
+                delta_ns / 1_000,
+                ext.announce.seq,
+                effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
+            ),
             FollowAction::Scheduled {
                 delta_ns,
                 effective_wall_ns,

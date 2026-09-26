@@ -449,3 +449,30 @@ fn a_failed_write_at_the_ptp_offline_edge_is_retried_from_the_loop_119() {
     );
     assert!((seen[0] - (learned - 100.0)).abs() < 1e-9, "{seen:?}");
 }
+
+#[test]
+fn a_master_booted_seconds_ahead_announces_one_coordinated_step_not_a_slew_119() {
+    // ROZHODNUTÉ issuecomment-5842590141: −3 s is beyond the slew cap (2 × 50 ms).
+    let mut ntp = MockNtpSource::new();
+    ntp.expect_get_offset()
+        .returning(|| Ok(one_offset(3_000_000, -1)));
+    // No step_clock expectation: the announce schedules the step, it never steps at NTP time.
+    let (mut c, d, _words) = capturing_anchored_controller(true, ntp);
+    for _ in 0..2 {
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+    }
+    let st = c.get_status_shared();
+    let st = st.read().expect("status");
+    assert_eq!(st.date_step_pending_ns, Some(-3_000_000_000));
+    assert_eq!(st.date_slew_ppm, None, "not published as a slew");
+    assert_eq!(st.date_slew_from_ns, None);
+    assert!(!st.date_slew_active);
+    assert_eq!(st.date_offset_ns, Some(d), "in effect only at the instant");
+    assert!(c.date_sync.follower.held_slew().is_none());
+    assert_eq!(
+        c.date_sync.follower.pending().map(|p| p.delta_ns),
+        Some(-3_000_000_000),
+        "the master's own scheduler holds the coordinated step"
+    );
+}

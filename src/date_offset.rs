@@ -46,11 +46,16 @@
 //! runs backwards: the controller applies the slew as an extra rate term of the ONE frequency word
 //! and removes the scheduled displacement from every PTP measurement, so neither servo reads it as
 //! grandmaster disagreement (`controller/date_sync.rs`).
+//!
+//! The slew is for normal drift corrections. A backward correction larger than
+//! [`slew_cap_ns`] (2 × the step bound, 100 ms by default) is an abnormal state — typically a master
+//! that booted on a bad NTP reading — and an hours-long slew would keep the fleet date wrong, so it
+//! is a coordinated step, logged loudly (ROZHODNUTÉ issuecomment-5842590141).
 
 mod slew;
 pub use slew::{
-    clamp_slew_ppm, correction_kind, solve_displacement, CorrectionKind, DateSlew, HeldSlew,
-    SlewSpec, DEFAULT_SLEW_PPM, MAX_SLEW_PPM, MIN_SLEW_PPM,
+    clamp_slew_ppm, correction_kind, slew_cap_ns, solve_displacement, CorrectionKind, DateSlew,
+    HeldSlew, SlewSpec, DEFAULT_SLEW_PPM, MAX_SLEW_PPM, MIN_SLEW_PPM, SLEW_CAP_STEP_BOUNDS,
 };
 
 /// Version of the 31900 reply extension carried by this build (2 = v1 + the #119 slew fields).
@@ -415,7 +420,8 @@ impl DateAuthority {
     ///
     /// dantesync#119 — the DIRECTION decides how (see [`correction_kind`]): a positive correction
     /// is a coordinated STEP taking effect `lead` from now; a negative one is a coordinated SLEW
-    /// at `slew_ppm` starting `lead` from now. The fleet date never steps backwards.
+    /// at `slew_ppm` starting `lead` from now, up to [`slew_cap_ns`] (2 bounds); a larger backward
+    /// one is an abnormal state and is a coordinated step too (`TooLargeToSlew`).
     ///
     /// A slew in progress absorbs a new correction: readings are judged by the error that will
     /// REMAIN once it has paid (`utc_error − (to − D now)`). A further backward need extends the
@@ -451,6 +457,8 @@ impl DateAuthority {
             return None;
         }
         if let Some(s) = running {
+            // An extension beyond the slew cap is not slewed: it waits for the end and is then
+            // stepped (`TooLargeToSlew`), like any correction that large.
             let extendable = sign < 0
                 && s.active_at(now_ptp_ns)
                 && s.end_ptp_ns().saturating_sub(now_ptp_ns) >= self.lead_ns;
@@ -475,8 +483,10 @@ impl DateAuthority {
         self.over_bound = None;
         let eff = now_ptp_ns.saturating_add(self.lead_ns);
         let target = self.current_ns.saturating_add(error_ns);
-        match correction_kind(error_ns) {
-            CorrectionKind::Step => self.pending = Some((target, eff)),
+        match correction_kind(error_ns, self.step_bound_ns) {
+            CorrectionKind::Step | CorrectionKind::TooLargeToSlew => {
+                self.pending = Some((target, eff))
+            }
             CorrectionKind::Slew => {
                 self.slew = Some(DateSlew {
                     from_ns: self.current_ns,

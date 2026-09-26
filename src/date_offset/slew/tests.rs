@@ -20,12 +20,13 @@ fn slew(from: i64, to: i64, start: i64, ppm: u32) -> DateSlew {
 
 #[test]
 fn the_direction_decides_step_forward_slew_backward_119() {
-    assert_eq!(correction_kind(51 * MS), CorrectionKind::Step);
-    assert_eq!(correction_kind(1), CorrectionKind::Step);
-    assert_eq!(correction_kind(0), CorrectionKind::Step);
-    assert_eq!(correction_kind(-1), CorrectionKind::Slew);
-    assert_eq!(correction_kind(-51 * MS), CorrectionKind::Slew);
-    assert_eq!(correction_kind(-3 * S), CorrectionKind::Slew);
+    let bound = DEFAULT_STEP_BOUND_NS;
+    assert_eq!(correction_kind(51 * MS, bound), CorrectionKind::Step);
+    assert_eq!(correction_kind(1, bound), CorrectionKind::Step);
+    assert_eq!(correction_kind(0, bound), CorrectionKind::Step);
+    assert_eq!(correction_kind(3 * S, bound), CorrectionKind::Step);
+    assert_eq!(correction_kind(-1, bound), CorrectionKind::Slew);
+    assert_eq!(correction_kind(-51 * MS, bound), CorrectionKind::Slew);
 }
 
 #[test]
@@ -630,4 +631,91 @@ fn a_forward_slew_from_the_wire_is_not_a_slew_119() {
     assert_eq!(e.announce.as_slew(), None, "a zero-length one neither");
     e.announce.date_offset_ns = 5 * S - 1;
     assert!(e.announce.as_slew().is_some());
+}
+
+// ---- dantesync#119 ROZHODNUTÉ issuecomment-5842590141: the slew cap ----------------------------
+
+#[test]
+fn a_backward_correction_beyond_twice_the_bound_is_too_large_to_slew_119() {
+    let bound = DEFAULT_STEP_BOUND_NS; // 50 ms → the cap is 100 ms
+    assert_eq!(slew_cap_ns(bound), 100 * MS);
+    assert_eq!(
+        correction_kind(-100 * MS, bound),
+        CorrectionKind::Slew,
+        "at the cap: slew"
+    );
+    assert_eq!(
+        correction_kind(-100 * MS - 1, bound),
+        CorrectionKind::TooLargeToSlew,
+        "one ns past it: a step"
+    );
+    assert_eq!(
+        correction_kind(-3 * S, bound),
+        CorrectionKind::TooLargeToSlew
+    );
+    // The cap follows the configured bound.
+    assert_eq!(
+        correction_kind(-41 * MS, 20 * MS),
+        CorrectionKind::TooLargeToSlew
+    );
+    assert_eq!(correction_kind(-40 * MS, 20 * MS), CorrectionKind::Slew);
+}
+
+#[test]
+fn a_master_booted_3_s_ahead_steps_the_fleet_back_60_ms_ahead_slews_119() {
+    // −3 s (a boot-time NTP failure): an abnormal state, one coordinated step, never 8 h of slew.
+    let d = 1_000 * S;
+    let mut a = DateAuthority::new(d, 0, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS);
+    a.on_utc_error(-3 * S, 10 * S);
+    let ann = a.on_utc_error(-3 * S, 20 * S).expect("announced");
+    assert_eq!(ann.slew, None, "not a slew");
+    assert_eq!(ann.date_offset_ns, d - 3 * S);
+    assert_eq!(ann.effective_ptp_ns, 20 * S + MIN_STEP_LEAD_NS);
+    assert_eq!(a.pending_step_ns(21 * S), Some(-3 * S));
+    assert!(a.slew_in_progress(21 * S).is_none());
+    // −60 ms (normal drift): a slew.
+    let mut b = DateAuthority::new(d, 0, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS);
+    b.on_utc_error(-60 * MS, 10 * S);
+    let ann = b.on_utc_error(-60 * MS, 20 * S).expect("announced");
+    assert!(ann.as_slew().is_some());
+    assert_eq!(b.pending_step_ns(21 * S), None);
+    // A joined follower schedules the too-large one as a coordinated step at its instant.
+    let mut f = DateFollower::new();
+    f.on_announce(in_effect(d, 1), d, d + 15 * S);
+    let big = DateAnnounce {
+        date_offset_ns: d - 3 * S,
+        effective_ptp_ns: 25 * S,
+        seq: 2,
+        slew: None,
+    };
+    assert_eq!(
+        f.on_announce(big, d, d + 21 * S),
+        FollowAction::Scheduled {
+            delta_ns: -3 * S,
+            effective_wall_ns: d + 25 * S
+        }
+    );
+}
+
+#[test]
+fn a_running_slew_is_not_extended_past_the_cap_the_rest_is_stepped_after_it_119() {
+    let mut a = DateAuthority::new(0, 0, 50 * MS, MIN_STEP_LEAD_NS);
+    a.on_utc_error(-60 * MS, S);
+    let first = a.on_utc_error(-60 * MS, 2 * S).unwrap().as_slew().unwrap();
+    // 100 s in, UTC jumps back 250 ms: the need left once the slew has paid is −250 ms.
+    let p = first.start_ptp_ns + 100 * S;
+    let r = -60 * MS - a.in_effect_ns(p) - 250 * MS;
+    assert_eq!(a.on_utc_error(r, p), None);
+    assert_eq!(
+        a.on_utc_error(r, p + 10 * S),
+        None,
+        "never extended past the cap"
+    );
+    assert_eq!(a.seq(), 2);
+    let end = first.end_ptp_ns();
+    let ann = a
+        .on_utc_error(-250 * MS, end + S)
+        .expect("stepped after it");
+    assert_eq!(ann.slew, None);
+    assert_eq!(ann.date_offset_ns, -60 * MS - 250 * MS);
 }

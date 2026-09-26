@@ -40,8 +40,8 @@
 //! words differ from a forward-only run by numerical noise only).
 
 use dantesync::date_offset::{
-    same_time_base, DateAnnounce, DateAuthority, DateFollower, FollowAction, SlewSpec, StepKind,
-    DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
+    same_time_base, slew_cap_ns, DateAnnounce, DateAuthority, DateFollower, FollowAction, SlewSpec,
+    StepKind, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
 };
 use dantesync::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 

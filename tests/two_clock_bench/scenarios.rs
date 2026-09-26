@@ -60,11 +60,14 @@ fn check(sc: &Scenario, r: &RunResult) {
         !r.announced.is_empty() || !r.announced_slews.is_empty(),
         "[{label}] the authority never announced a date change"
     );
-    // #119: THE FLEET DATE NEVER STEPS BACKWARDS. Every announced step is forward, every backward
-    // correction is a slew, and no box ever applied a backward coordinated (or late) step.
+    // #119: THE FLEET DATE NEVER STEPS BACKWARDS for a normal correction. Every announced step is
+    // forward, or backward beyond the slew cap (an abnormal state: ROZHODNUTÉ 5842590141), every
+    // other backward correction is a slew, and no box applied any other backward step.
+    let cap = slew_cap_ns(DEFAULT_STEP_BOUND_NS);
+    let beyond_cap = |d: i64| d > 0 || d < -cap;
     assert!(
-        r.announced.iter().all(|a| a.1 > 0),
-        "[{label}] a backward step was announced: {:?}",
+        r.announced.iter().all(|a| beyond_cap(a.1)),
+        "[{label}] a backward step within the slew cap was announced: {:?}",
         r.announced
     );
     assert!(
@@ -77,7 +80,7 @@ fn check(sc: &Scenario, r: &RunResult) {
             steps
                 .iter()
                 .filter(|s| s.2 != StepKind::Join)
-                .all(|s| s.1 > 0 || (sc.gm_change_in_master_outage && s.1.abs() < MS)),
+                .all(|s| beyond_cap(s.1) || (sc.gm_change_in_master_outage && s.1.abs() < MS)),
             "[{label}] box {i} stepped backwards: {steps:?}"
         );
     }
@@ -291,20 +294,17 @@ fn a_fleet_ahead_of_utc_slews_back_never_steps_back_and_keeps_its_relative_phase
 
 #[test]
 fn a_slew_is_extended_and_runs_through_a_grandmaster_change_and_reboot_119() {
-    // UTC (the upstream) steps back by 80 ms one minute before the grandmaster changes, again
-    // 100 s later (the first slew is still running: the authority EXTENDS it), and one minute
-    // before the grandmaster reboots. Every box must keep slewing together through the re-anchor
-    // of both grandmaster events: no backward step, no wall ever running back, the relative
-    // phase within 50 µs, and the fleet back within the bound of UTC afterwards.
-    let mut sc = Scenario::plain(
-        "UTC -15 ppm + UTC jumps back around the GM change and reboot",
-        -15.0,
-        true,
-    );
+    // UTC (the upstream) steps back by 60 ms one minute before the grandmaster changes, by 70 ms
+    // 40 s later (the first slew is still running: the authority EXTENDS it), and by 60 ms one
+    // minute before the grandmaster reboots. UTC runs with grandmaster A (0 ppm) and −3 ppm
+    // against B, so every correction stays within the slew cap. Every box must keep slewing
+    // together through the re-anchor of both grandmaster events: no backward step, no wall ever
+    // running back, the relative phase within 50 µs, and the fleet back on UTC afterwards.
+    let mut sc = Scenario::plain("UTC jumps back around the GM change and reboot", 0.0, true);
     sc.utc_jumps = vec![
-        (GM_CHANGE_AT_WINDOW - 120, -80 * MS),
-        (GM_CHANGE_AT_WINDOW + 80, -80 * MS),
-        (GM_REBOOT_AT_WINDOW - 120, -80 * MS),
+        (GM_CHANGE_AT_WINDOW - 120, -60 * MS),
+        (GM_CHANGE_AT_WINDOW - 40, -70 * MS),
+        (GM_REBOOT_AT_WINDOW - 120, -60 * MS),
     ];
     let r = run(&sc);
     check(&sc, &r);
@@ -392,4 +392,53 @@ fn a_long_master_outage_and_a_grandmaster_change_during_one_keep_the_fleet_on_ut
     };
     let r = run(&sc);
     check(&sc, &r);
+}
+
+#[test]
+fn a_master_booted_3_s_ahead_is_stepped_back_once_60_ms_ahead_is_slewed_119() {
+    // ROZHODNUTÉ issuecomment-5842590141: a backward correction beyond the slew cap (2 × 50 ms)
+    // is an abnormal state — a master that booted on a bad NTP reading — and is ONE coordinated
+    // step on every box (an hours-long slew would keep the fleet date wrong). A normal one slews.
+    let mut big = Scenario::plain("master boots 3 s AHEAD of UTC: stepped", 8.0, true);
+    big.master_boot_err_ns = 3 * S;
+    let r = run(&big);
+    check(&big, &r);
+    let back: Vec<&(u32, i64)> = r.announced.iter().filter(|a| a.1 < 0).collect();
+    assert_eq!(back.len(), 1, "one backward step: {:?}", r.announced);
+    assert!(back[0].1 < -2 * S, "the ~3 s correction: {:?}", back[0]);
+    for (i, steps) in r.steps.iter().enumerate() {
+        let taken: Vec<&Step> = steps
+            .iter()
+            .filter(|s| s.2 == StepKind::Coordinated && s.0 == back[0].0)
+            .collect();
+        assert_eq!(
+            taken.len(),
+            1,
+            "box {i} took the coordinated backward step: {steps:?}"
+        );
+        assert_eq!(taken[0].1, back[0].1, "box {i}: the same size");
+    }
+    assert!(
+        r.announced_slews.is_empty(),
+        "never slewed for hours: {:?}",
+        r.announced_slews
+    );
+
+    let mut small = Scenario::plain("master boots 60 ms AHEAD of UTC: slewed", 8.0, true);
+    small.master_boot_err_ns = 60 * MS;
+    let r = run(&small);
+    check(&small, &r);
+    assert!(
+        r.announced.iter().all(|a| a.1 > 0),
+        "no backward step: {:?}",
+        r.announced
+    );
+    assert!(
+        r.announced_slews
+            .iter()
+            .any(|a| (-110 * MS..-50 * MS).contains(&a.1)),
+        "the boot error was slewed: {:?}",
+        r.announced_slews
+    );
+    assert_eq!(r.wall_went_back, 0);
 }
