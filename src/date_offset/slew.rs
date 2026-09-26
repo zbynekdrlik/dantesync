@@ -221,3 +221,6 @@ pub fn solve_displacement(h: &HeldSlew, anchor_ns: i64, wall_ns: i64) -> i64 {
 
 /// A bound on the fixed-point rounds of [`solve_displacement`] (it settles in ≤ 4 at 500 ppm).
 const SOLVE_MAX_ROUNDS: usize = 16;
+
+#[cfg(test)]
+mod tests;

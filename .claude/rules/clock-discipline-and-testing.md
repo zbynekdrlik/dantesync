@@ -12,7 +12,12 @@ paths:
   - "src/date_offset/tests.rs"
   - "src/time_server/tests.rs"
   - "tests/two_clock_bench.rs"
+  - "tests/two_clock_bench/scenarios.rs"
   - "tests/simulation_e2e.rs"
+  - "src/date_offset/slew.rs"
+  - "src/date_offset/slew/tests.rs"
+  - "src/controller/date_sync/slew.rs"
+  - "src/controller/date_sync/slew/tests.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
