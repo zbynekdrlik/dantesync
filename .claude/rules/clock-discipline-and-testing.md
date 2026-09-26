@@ -288,14 +288,26 @@ of Dante audio at a −51 ms fleet step, and nothing at the forward ones (camera
   NTP-derived rate term by design. The −15 ppm run proves the slew: no backward step, no wall
   ever running back, relative phase (each wall + its own path delay) ≤ 50 µs while slewing
   (measured 10 µs), and the words within 0.001 ppm of the forward-only run (measured 0.0004).
-- **Recovering PTP time from the wall is exact to 1 ns, not better:** under the floored
-  schedule two adjacent PTP instants can give the same wall. Tests compare with ± 1 ns.
+  A UTC-jump scenario (the upstream steps back 80 ms, twice around the grandmaster change and
+  once before its reboot) extends a running slew and runs slews THROUGH both grandmaster
+  events; a steady drift alone never extends one (the slew outruns it).
+- **Solve `D`(wall) to a FIXED POINT, never a fixed round count** (`solve_displacement`: iterate
+  until unchanged). With 3 rounds, 6 % of instants at 500 ppm / 1 s missed by 1 ns, the master's
+  exact "on the fleet line" test then failed at such an instant, its own scheduler skipped an
+  extension, and it would have re-aligned with a backward Join after the slew (review round 1).
+  A test that builds a wall from the schedule still compares with ± 1 ns: under the floored
+  schedule two adjacent PTP instants can give the same wall.
+- **The master slews WITH the fleet it announced to.** While the authority's slew runs,
+  `realign_master_to_fleet` only calls `catch_up_fleet_slew`: a slew (or an extension) its own
+  scheduler missed is handed to it again, accepted only within the absorb tolerance — never a
+  step. The promoted form of the slew a box still runs, heard a hair before its own end, is
+  ignored: freezing there would schedule a µs step BACKWARDS.
 - **Known limits (accepted):** a box that first hears a slew after its whole lead catches up
   with a counted LATE step, which can be backward (as any late step); the master re-aligns to
   the fleet only after a running slew ends; the local NTP fallback path (no authority heard) is
   uncoordinated and unchanged.
-- **Rollout: the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of the v2
-  extension and would step back at the slew's start.
+- **Rollout (v1.10.0): the NTP master LAST** — a ≤ 1.9.0 follower decodes only the v1 part of
+  the v2 extension and would step back at the slew's start.
 
 ## Seed every simulated noise source — a statistic under an unseeded RNG fails at random
 

@@ -5,7 +5,7 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.9.1] - 2026-09-26
+## [1.10.0] - 2026-09-26
 
 ### Changed
 
@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sample is de-slewed before either servo reads it, so the phase lock is not disturbed. A box that
   joins mid-slew slews only the remaining part; a re-announce is idempotent; a slew in progress
   absorbs a new correction (extended only while ≥ one lead is left; a forward need waits for its
-  end). `/status` adds `date_slew_active`, `date_slew_remaining_ms`, `date_slew_ppm`
+  end); the NTP master catches up with a slew its own scheduler missed (within the absorb
+  tolerance, never a step). `/status` adds `date_slew_active`, `date_slew_remaining_ms`, `date_slew_ppm`
   (+ `date_slew_from_ns` / `date_slew_to_ns`); the journal logs `[DATE] slew START` and
   `[DATE] slew DONE`. The 31900 extension is now v2 (flags bit 1 = slew, its ppm in bytes 2-3,
   its start offset appended): the DSYX reply is 112 bytes against the 64-byte padded request.
