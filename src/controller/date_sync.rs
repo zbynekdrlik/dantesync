@@ -120,6 +120,11 @@ pub(super) struct DateSync {
     pub(super) falling_behind_warned_at: Option<Instant>,
     /// dantesync#119 follow-up — the micro-corrections' paused state last logged (no fresh UTC).
     pub(super) micro_paused_logged: bool,
+    /// dantesync#119 (1.11.1) — the phase-lock error of the last window before a clock step, until
+    /// the first window after it has measured the step's phase jump.
+    pub(super) step_phase_ref_ns: Option<i64>,
+    /// dantesync#119 (1.11.1) — the last step's measured phase jump (`/status`).
+    pub(super) last_step_phase_jump_ns: Option<i64>,
 }
 
 impl DateSync {
@@ -188,6 +193,8 @@ impl DateSync {
             falling_behind_logged: false,
             falling_behind_warned_at: None,
             micro_paused_logged: false,
+            step_phase_ref_ns: None,
+            last_step_phase_jump_ns: None,
         }
     }
 

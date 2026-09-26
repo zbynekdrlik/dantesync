@@ -354,6 +354,13 @@ pub struct SyncStatus {
     /// free at the grandmaster's rate until UTC is back.
     #[serde(default)]
     pub date_micro_paused: bool,
+    /// dantesync#119 (1.11.1): how far the PTP phase-lock error moved across the last clock step
+    /// this node applied (µs: the first phase-lock window after the step minus the last one
+    /// before it). An exact step reads a few µs (the samples' noise); a step that landed short
+    /// reads minus its shortfall — which the phase lock would have paid back through the rate.
+    /// `null` before the first step measured.
+    #[serde(default)]
+    pub date_step_phase_jump_us: Option<f64>,
 
     // ========================================================================
     // PTP phase lock (dantesync#117) — additive.
@@ -465,6 +472,7 @@ impl Default for SyncStatus {
             date_correction_rate_ms_per_min: None,
             date_correction_falling_behind: false,
             date_micro_paused: false,
+            date_step_phase_jump_us: None,
             // #117: unknown until the controller publishes
             clock_discipline: String::new(),
             rate_source: String::new(),
@@ -974,6 +982,28 @@ mod tests {
         assert_eq!(back.date_micro_last_us, Some(-500));
         assert_eq!(back.date_correction_rate_ms_per_min, Some(1.06));
         assert!(back.date_correction_falling_behind);
+    }
+
+    /// dantesync#119 (1.11.1): the step's phase jump is additive — a 1.11.0 blob reads `null`, and
+    /// a value round-trips.
+    #[test]
+    fn test_sync_status_date_step_phase_jump_is_additive_119() {
+        let v1110 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+            "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+            "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+            "date_micro_active":true,"date_micro_last_us":500,"date_micro_paused":false}"#;
+        let restored: SyncStatus =
+            serde_json::from_str(v1110).expect("v1.11.0 JSON must still deserialize");
+        assert_eq!(restored.date_step_phase_jump_us, None);
+
+        let st = SyncStatus {
+            date_step_phase_jump_us: Some(-3.5),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&st).expect("serialize failed");
+        assert!(json.contains("\"date_step_phase_jump_us\":-3.5"), "{json}");
+        let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(back.date_step_phase_jump_us, Some(-3.5));
     }
 
     #[test]

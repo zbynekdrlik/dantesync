@@ -3,6 +3,7 @@
 //! This module includes comprehensive diagnostics to verify that frequency
 //! adjustment actually affects clock speed.
 
+use super::step::{self, ClockReading, StepLead, StepOps};
 use super::SystemClock;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
@@ -17,7 +18,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::{
-    GetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime, SetSystemTimeAdjustmentPrecise,
+    GetSystemTimeAdjustmentPrecise, GetSystemTimeAsFileTime, GetSystemTimePreciseAsFileTime,
+    SetSystemTimeAdjustmentPrecise,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -49,9 +51,85 @@ extern "system" {
     fn NtSetSystemTime(new_time: *const i64, old_time: *mut i64) -> i32;
 }
 
+fn filetime_u64(ft: windows::Win32::Foundation::FILETIME) -> u64 {
+    (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64)
+}
+
+/// dantesync#119 (1.11.1) -- Windows under the step law (`super::step`): the coarse and the precise
+/// system time, and QPC at the system time's rate as the step-immune reference.
+struct WindowsStepOps {
+    perf_frequency: i64,
+    increment: u64,
+    adjustment: u64,
+}
+
+impl WindowsStepOps {
+    /// The QPC-to-system-time rate is read once per step: nothing changes the adjustment while
+    /// the step runs (only this daemon writes it, from the same thread).
+    fn new(perf_frequency: i64) -> Self {
+        let (mut adj, mut inc, mut disabled) = (0u64, 0u64, BOOL(0));
+        let read = unsafe { GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled) };
+        if let Err(e) = read {
+            warn!(
+                "[StepClock] GetSystemTimeAdjustmentPrecise failed ({}) -- measuring the step at \
+                 the nominal rate (off by at most the frequency word over the ~0.1 s call)",
+                e
+            );
+            (adj, inc) = (1, 1);
+        }
+        WindowsStepOps {
+            perf_frequency,
+            increment: inc,
+            adjustment: adj,
+        }
+    }
+}
+
+impl StepOps for WindowsStepOps {
+    fn read(&mut self) -> ClockReading {
+        let mut qpc: i64 = 0;
+        // QueryPerformanceCounter cannot fail since Windows XP (documented); a failure would read
+        // 0 and show up as an absurd realized step in the step log, never silently.
+        // The coarse read first, so it can never be ahead of the precise one read after it.
+        let (coarse, precise) = unsafe {
+            let coarse = filetime_u64(GetSystemTimeAsFileTime());
+            let _ = QueryPerformanceCounter(&mut qpc);
+            (coarse, filetime_u64(GetSystemTimePreciseAsFileTime()))
+        };
+        ClockReading {
+            coarse_ns: super::filetime_to_unix_ns(coarse),
+            precise_ns: super::filetime_to_unix_ns(precise),
+            reference_ns: super::qpc_to_reference_ns(
+                qpc,
+                self.perf_frequency,
+                self.increment,
+                self.adjustment,
+            ),
+        }
+    }
+
+    fn set(&mut self, target_ns: i64) -> std::result::Result<(), String> {
+        // #80: NtSetSystemTime takes the target as a raw FILETIME (100 ns ticks) -- no SYSTEMTIME
+        // intermediate, so no millisecond quantization. Requires SeSystemtimePrivilege, enabled
+        // at construction. NT_SUCCESS(status) is `status >= 0`.
+        let new_time = super::unix_ns_to_filetime(target_ns) as i64;
+        let mut previous_time: i64 = 0;
+        let status = unsafe { NtSetSystemTime(&new_time, &mut previous_time) };
+        if status < 0 {
+            return Err(format!(
+                "NtSetSystemTime failed with NTSTATUS 0x{:08X}",
+                status as u32
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct WindowsClock {
     original_increment: u64,
     perf_frequency: i64,
+    /// dantesync#119: the learned read->set latency of a step (`super::step`).
+    step_lead: StepLead,
 
     // Diagnostic tracking
     adjustment_count: u64,
@@ -118,6 +196,7 @@ impl WindowsClock {
         let clock = WindowsClock {
             original_increment: inc,
             perf_frequency: perf_freq,
+            step_lead: StepLead::default(),
             adjustment_count: 0,
             last_adjustment: inc,
             last_requested_ppm: 0.0,
@@ -340,69 +419,26 @@ impl SystemClock for WindowsClock {
         Ok(())
     }
 
+    /// dantesync#119 (1.11.1): the step law (`super::step::step_wall`) -- the wall moves by
+    /// exactly `offset`, measured against QPC. The read-modify-write this replaces read the
+    /// COARSE system time and so landed short by the clock-interrupt lag on every step.
     fn step_clock(&mut self, offset: Duration, sign: i8) -> Result<()> {
-        let sign_str = if sign > 0 { "+" } else { "-" };
-        info!(
-            "[StepClock] Stepping by {}{:.3}ms",
-            sign_str,
-            offset.as_secs_f64() * 1000.0
-        );
+        let magnitude = i64::try_from(offset.as_nanos())
+            .map_err(|_| anyhow!("a clock step of {:?} does not fit the time axis", offset))?;
+        let requested = if sign > 0 { magnitude } else { -magnitude };
+        let mut ops = WindowsStepOps::new(self.perf_frequency);
+        let out =
+            step::step_wall(&mut ops, &mut self.step_lead, requested).map_err(|e| anyhow!(e))?;
+        super::log_step_outcome(&out, self.step_lead);
 
+        // Reset the frequency-effectiveness measurement baseline after the step.
+        let mut pc: i64 = 0;
         unsafe {
-            let ft = GetSystemTimeAsFileTime();
-            let before_u64 = (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64);
-
-            let offset_100ns = offset.as_nanos() as u64 / 100;
-            let target_100ns = super::compute_step_target_100ns(before_u64, offset, sign)?;
-
-            // #80: NtSetSystemTime takes the target directly as a raw FILETIME
-            // (100ns-tick i64), with NO SYSTEMTIME intermediate -- unlike the
-            // legacy SetSystemTime Win32 API this replaces, which silently
-            // discarded up to ~1ms of the computed target on every step
-            // (SYSTEMTIME.wMilliseconds has no field finer than whole
-            // milliseconds). Same precision model as SetSystemTimeAdjustmentPrecise
-            // already uses for the frequency path in this same file. Requires
-            // SeSystemtimePrivilege, already enabled at construction -- no new
-            // privilege, no new attack surface versus the call it replaces.
-            let new_time_i64 = target_100ns as i64;
-            let mut previous_time_i64: i64 = 0;
-            let status = NtSetSystemTime(&new_time_i64, &mut previous_time_i64);
-            // NT_SUCCESS(status) is conventionally `status >= 0` (a positive value is an
-            // informational/warning code, still "success"); `status < 0` is the idiomatic
-            // check, used here rather than `!= 0` (review finding, #80) -- no informational
-            // NTSTATUS is documented for this specific call, so this is mostly a correctness
-            // nicety, but it avoids ever misreporting a benign non-zero success as a failure.
-            if status < 0 {
-                return Err(anyhow!(
-                    "NtSetSystemTime failed with NTSTATUS 0x{:08X}",
-                    status as u32
-                ));
-            }
-
-            // Verify
-            let ft_after = GetSystemTimeAsFileTime();
-            let after_u64 =
-                (ft_after.dwHighDateTime as u64) << 32 | (ft_after.dwLowDateTime as u64);
-            let actual_step = after_u64 as i64 - before_u64 as i64;
-            let expected_step = if sign > 0 {
-                offset_100ns as i64
-            } else {
-                -(offset_100ns as i64)
-            };
-
-            info!(
-                "[StepClock] Actual step: {} (expected: {})",
-                actual_step, expected_step
-            );
-
-            // Reset measurement baseline after step
-            let mut pc: i64 = 0;
             let _ = QueryPerformanceCounter(&mut pc);
-            self.baseline_perf_counter = pc;
-            self.baseline_filetime = after_u64;
-            self.last_measurement_time = Instant::now();
+            self.baseline_filetime = filetime_u64(GetSystemTimeAsFileTime());
         }
-
+        self.baseline_perf_counter = pc;
+        self.last_measurement_time = Instant::now();
         Ok(())
     }
 }
@@ -556,5 +592,37 @@ mod tests {
         let offset = Duration::from_micros(1);
         let offset_100ns = offset.as_nanos() as u64 / 100;
         assert_eq!(offset_100ns, 10);
+    }
+
+    /// dantesync#119: on a real Windows box (the CI leg) the step law's two clocks agree while
+    /// nothing steps -- the precise system time and QPC at the system-time rate advance together.
+    /// A unit slip (100 ns vs ns, a QPC frequency mix-up) would be off by orders of magnitude.
+    #[test]
+    fn the_step_references_advance_together_on_windows_119() {
+        use super::super::step::StepOps;
+        let mut freq: i64 = 0;
+        unsafe {
+            windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq).unwrap();
+        }
+        let mut ops = super::WindowsStepOps::new(freq);
+        let a = ops.read();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let b = ops.read();
+        let d_precise = b.precise_ns - a.precise_ns;
+        let d_reference = b.reference_ns - a.reference_ns;
+        assert!(
+            (190_000_000..1_000_000_000).contains(&d_reference),
+            "the reference advanced {d_reference} ns in a 200 ms sleep"
+        );
+        assert!(
+            (d_precise - d_reference).abs() < 100_000,
+            "precise {d_precise} ns vs reference {d_reference} ns"
+        );
+        // The coarse clock is the precise one at the last clock interrupt: never ahead of it,
+        // never more than one (default 15.6 ms) tick behind.
+        assert!(
+            (0..16_000_000).contains(&(b.precise_ns - b.coarse_ns)),
+            "{b:?}"
+        );
     }
 }

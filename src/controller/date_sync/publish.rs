@@ -130,5 +130,6 @@ where
         status.last_date_step_ts = ds.last_step.map(|s| s.1);
         status.last_date_step_kind = ds.last_step.map(|s| s.2.to_string()).unwrap_or_default();
         status.date_steps_late = ds.follower.late_steps();
+        status.date_step_phase_jump_us = None;
     }
 }
