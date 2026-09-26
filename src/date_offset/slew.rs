@@ -167,6 +167,7 @@ impl DateSlew {
                 from_ns: self.from_ns,
                 ppm: self.ppm,
             }),
+            micro: false,
         }
     }
 }

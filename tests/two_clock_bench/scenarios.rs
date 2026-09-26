@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// The same announces (seq for seq), each applied within the absorb tolerance of its announced
+/// size. #119 follow-up: a micro step a box scheduled right after its re-anchor on a new time base
+/// also carries that re-anchor's residual (tens of µs) — the step lands the box exactly on the
+/// fleet D, as an absorb would have; with a step every 20 s that coincidence now happens.
+fn same_steps(got: &[(u32, i64)], want: &[(u32, i64)]) -> bool {
+    got.len() == want.len()
+        && got.iter().zip(want).all(|(g, w)| {
+            g.0 == w.0 && (g.1 - w.1).abs() <= dantesync::date_offset::ABSORB_TOLERANCE_NS
+        })
+}
+
 fn check(sc: &Scenario, r: &RunResult) {
     let label = sc.label;
     let offline_scenario = !sc.master_ptp_offline.is_empty();
@@ -75,6 +86,18 @@ fn check(sc: &Scenario, r: &RunResult) {
         "[{label}] a slew is only for a backward correction: {:?}",
         r.announced_slews
     );
+    // #119 follow-up: every correction is a micro-correction (≤ 500 µs) or the abnormal one
+    // beyond the cap — never anything in between (the old 50 ms events).
+    assert!(
+        r.corrections
+            .iter()
+            .all(|c| c.1.abs() <= MICRO_STEP_NS || c.1.abs() > cap),
+        "[{label}] a correction between the micro step and the cap: {:?}",
+        r.corrections
+            .iter()
+            .filter(|c| c.1.abs() > MICRO_STEP_NS && c.1.abs() <= cap)
+            .collect::<Vec<_>>()
+    );
     for (i, steps) in r.steps.iter().enumerate() {
         assert!(
             steps
@@ -110,12 +133,14 @@ fn check(sc: &Scenario, r: &RunResult) {
         r.steps[0]
     );
     assert!(
-        master_coord.iter().all(|c| r.announced.contains(c)),
+        master_coord
+            .iter()
+            .all(|c| r.announced.iter().any(|a| same_steps(&[*c], &[*a]))),
         "[{label}] the master stepped something it never announced"
     );
     if !offline_scenario {
-        assert_eq!(
-            master_coord, r.announced,
+        assert!(
+            same_steps(&master_coord, &r.announced),
             "[{label}] the master skipped an announce"
         );
     }
@@ -142,9 +167,20 @@ fn check(sc: &Scenario, r: &RunResult) {
             rest.iter().all(|s| s.2 == StepKind::Coordinated),
             "[{label}] box {i} made an uncoordinated step: {rest:?}"
         );
-        let got: Vec<(u32, i64)> = rest.iter().map(|s| (s.0, s.1)).collect();
-        assert_eq!(
-            got, r.announced,
+        // A step re-announced by a grandmaster rebase counts under the seq it was announced as.
+        let got: Vec<(u32, i64)> = rest
+            .iter()
+            .map(|s| {
+                let seq = r
+                    .renamed_steps
+                    .iter()
+                    .find(|(_, new)| *new == s.0)
+                    .map_or(s.0, |(old, _)| *old);
+                (seq, s.1)
+            })
+            .collect();
+        assert!(
+            same_steps(&got, &r.announced),
             "[{label}] box {i} did not take exactly the announced steps"
         );
     }
@@ -278,12 +314,28 @@ fn a_fleet_ahead_of_utc_slews_back_never_steps_back_and_keeps_its_relative_phase
     }
     // The law: the slew is decoupled from the phase lock, so its words match a run whose date
     // only steps up to numerical noise (the de-slewed schedule vs the integrated rate term).
+    // #119 follow-up: the windows after each grandmaster event are left out. There every box removes
+    // its re-anchor residual (tens of µs): as an absorb the phase lock slews out over ~2 min, or —
+    // when a micro STEP of the other run is due just then — inside that step. Which one depends on
+    // the date's timing by construction; it is the phase lock removing a PTP residual, not the slew.
     let plus = run(&Scenario::plain("UTC +8 ppm vs GM", 8.0, false));
+    let after_gm_event = |k: usize| {
+        let k = k as u64;
+        [GM_CHANGE_AT_WINDOW, GM_REBOOT_AT_WINDOW]
+            .iter()
+            .any(|&e| (e..e + 1_200).contains(&k))
+    };
     let worst = r
         .words
         .iter()
         .zip(&plus.words)
-        .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+        .flat_map(|(a, b)| {
+            a.iter()
+                .zip(b)
+                .enumerate()
+                .filter(|(k, _)| !after_gm_event(*k))
+                .map(|(_, (x, y))| (x - y).abs())
+        })
         .fold(0.0f64, f64::max);
     println!("[slew] worst word difference vs the forward-only run: {worst:.6} ppm");
     assert!(
@@ -293,29 +345,29 @@ fn a_fleet_ahead_of_utc_slews_back_never_steps_back_and_keeps_its_relative_phase
 }
 
 #[test]
-fn a_slew_is_extended_and_runs_through_a_grandmaster_change_and_reboot_119() {
-    // UTC (the upstream) steps back by 60 ms one minute before the grandmaster changes, by 70 ms
-    // 40 s later (the first slew is still running: the authority EXTENDS it), and by 60 ms one
-    // minute before the grandmaster reboots. UTC runs with grandmaster A (0 ppm) and −3 ppm
-    // against B, so every correction stays within the slew cap. Every box must keep slewing
-    // together through the re-anchor of both grandmaster events: no backward step, no wall ever
-    // running back, the relative phase within 50 µs, and the fleet back on UTC afterwards.
+fn micro_slews_run_through_a_grandmaster_change_and_reboot_119() {
+    // UTC (the upstream) steps back by 20 ms three minutes before the grandmaster changes, by 10
+    // ms more a minute later, and by 20 ms three minutes before the grandmaster reboots. Each is
+    // worked off in backward micro-corrections (slowed to 25 ppm, so a slew is held — scheduled or
+    // running — almost all the time while the fleet catches up), so both grandmaster events fall
+    // inside a slew. Every box must keep slewing together through the re-anchor of both events:
+    // no backward step, no wall ever running back, the relative phase within 50 µs, and the fleet
+    // back on UTC afterwards.
     let mut sc = Scenario::plain("UTC jumps back around the GM change and reboot", 0.0, true);
+    sc.slew_ppm = 25;
     sc.utc_jumps = vec![
-        (GM_CHANGE_AT_WINDOW - 120, -60 * MS),
-        (GM_CHANGE_AT_WINDOW - 40, -70 * MS),
-        (GM_REBOOT_AT_WINDOW - 120, -60 * MS),
+        (GM_CHANGE_AT_WINDOW - 360, -20 * MS),
+        (GM_CHANGE_AT_WINDOW - 240, -10 * MS),
+        (GM_REBOOT_AT_WINDOW - 360, -20 * MS),
     ];
     let r = run(&sc);
     check(&sc, &r);
     println!(
-        "[jumps] {} slews, {} extensions, {} GM events while slewing, {} master catch-ups",
+        "[jumps] {} slews, {} GM events while slewing, {} master catch-ups",
         r.announced_slews.len(),
-        r.extensions,
         r.gm_events_in_slew,
         r.master_catch_ups
     );
-    assert!(r.extensions >= 1, "the running slew was extended");
     assert_eq!(
         r.master_catch_ups, 0,
         "on the line the master's own scheduler never misses a slew (exact D)"
@@ -325,6 +377,11 @@ fn a_slew_is_extended_and_runs_through_a_grandmaster_change_and_reboot_119() {
         "both grandmaster events fell inside a slew"
     );
     assert!(r.announced.is_empty(), "no step at all: {:?}", r.announced);
+    assert!(
+        r.announced_slews.iter().all(|a| a.1 >= -MICRO_STEP_NS),
+        "only micro-slews: {:?}",
+        r.announced_slews
+    );
     assert_eq!(r.wall_went_back, 0);
     assert!(
         r.max_relative_phase_in_slew_ns <= 50 * US,
@@ -361,8 +418,7 @@ fn a_multi_second_first_step_and_a_master_only_ptp_outage_stay_coordinated_117_8
         master_boot_err_ns: -3 * S,
         master_ptp_offline: vec![(6 * 3600 * 2, 6 * 3600 * 2 + 1_200)],
         gm_change_in_master_outage: false,
-        utc_jumps: Vec::new(),
-        expects_too_large_step: false,
+        ..Scenario::plain("", 8.0, true)
     };
     let r = run(&sc);
     check(&sc, &r);
@@ -389,8 +445,7 @@ fn a_long_master_outage_and_a_grandmaster_change_during_one_keep_the_fleet_on_ut
             (GM_CHANGE_AT_WINDOW - 3_600, GM_CHANGE_AT_WINDOW + 20),
         ],
         gm_change_in_master_outage: true,
-        utc_jumps: Vec::new(),
-        expects_too_large_step: false,
+        ..Scenario::plain("", 8.0, true)
     };
     let r = run(&sc);
     check(&sc, &r);
@@ -422,13 +477,16 @@ fn a_master_booted_3_s_ahead_is_stepped_back_once_60_ms_ahead_is_slewed_119() {
         assert_eq!(taken[0].1, back[0].1, "box {i}: the same size");
     }
     assert!(
-        r.announced_slews.is_empty(),
-        "never slewed for hours: {:?}",
+        r.announced_slews.iter().all(|a| a.1 >= -MICRO_STEP_NS),
+        "never slewed for hours, only micro-corrections: {:?}",
         r.announced_slews
     );
 
-    let mut small = Scenario::plain("master boots 60 ms AHEAD of UTC: slewed", 8.0, true);
+    // 60 ms ahead (within the cap): worked off in backward micro-slews at the capacity, against
+    // the +8 ppm drift that helps — about half an hour, judged after it.
+    let mut small = Scenario::plain("master boots 60 ms AHEAD of UTC: micro-slewed", 8.0, true);
     small.master_boot_err_ns = 60 * MS;
+    small.settle_windows = 50 * 60 * 2;
     let r = run(&small);
     check(&small, &r);
     assert!(
@@ -437,11 +495,21 @@ fn a_master_booted_3_s_ahead_is_stepped_back_once_60_ms_ahead_is_slewed_119() {
         r.announced
     );
     assert!(
+        r.announced_slews.iter().all(|a| a.1 >= -MICRO_STEP_NS),
+        "only micro-slews: {:?}",
         r.announced_slews
-            .iter()
-            .any(|a| (-110 * MS..-50 * MS).contains(&a.1)),
-        "the boot error was slewed: {:?}",
-        r.announced_slews
+    );
+    // The +8 ppm drift pays part of it; the micro-slews the rest (`check` saw the fleet back on
+    // UTC after the settle window).
+    let slewed: i64 = r.announced_slews.iter().map(|a| a.1).sum();
+    assert!(
+        (-60 * MS..-30 * MS).contains(&slewed),
+        "the boot error was micro-slewed away: {} µs",
+        slewed / US
     );
     assert_eq!(r.wall_went_back, 0);
 }
+
+// A crate root resolves `mod x;` beside itself; see the harness's own `#[path]` note.
+#[path = "micro.rs"]
+mod micro;

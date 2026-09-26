@@ -137,7 +137,14 @@ where
             .anchor_ns()
             .and_then(|a| self.date_sync.follower.slew_remaining_ns(a, now_wall))
             .unwrap_or(0);
-        info!(
+        // #119 follow-up: a micro-slew logs only its end (`micro-slew done`).
+        let level = if self.date_sync.follower.held_slew_is_micro() {
+            log::Level::Debug
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            level,
             "[DATE] slew START: D moves {:+}us at {:+.0} ppm (~{} s), the wall never steps back — \
              word {:+.3}ppm",
             (if term < 0.0 { -remaining } else { remaining }) / 1_000,

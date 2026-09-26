@@ -570,3 +570,55 @@ fn date_slew_ppm_defaults_to_100_and_is_clamped_to_10_500_119() {
         assert_eq!(c.date_offset.slew_ppm(), want, "slew_ppm {raw}");
     }
 }
+
+#[test]
+fn date_micro_step_and_interval_default_to_500_us_and_20_s_and_are_clamped_119() {
+    use crate::date_offset::MicroConfig;
+    // A v1.10.0 config has no micro keys: the defaults.
+    let c: SystemConfig =
+        serde_json::from_str(r#"{"date_offset":{"step_bound_ms":50,"slew_ppm":100}}"#)
+            .expect("parses");
+    assert_eq!(c.date_offset.micro(), MicroConfig::new(500, 20));
+    assert_eq!(c.date_offset.micro().step_ns, 500_000);
+    assert_eq!(c.date_offset.micro().interval_ns, 20_000_000_000);
+    assert_eq!(
+        SystemConfig::default().date_offset.micro(),
+        MicroConfig::default()
+    );
+    for (raw, want) in [
+        ("0", 500),
+        ("10", 50),
+        ("200", 200),
+        ("200.4", 200),
+        ("1000", 1_000),
+        ("5000", 1_000),
+        ("\"big\"", 500),
+        ("-3", 500),
+        ("null", 500),
+    ] {
+        let json = format!(r#"{{"date_offset":{{"micro_step_us":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        assert_eq!(
+            c.date_offset.micro().step_ns,
+            want * 1_000,
+            "micro_step_us {raw}"
+        );
+    }
+    for (raw, want) in [
+        ("0", 20),
+        ("1", 10),
+        ("45", 45),
+        ("600", 600),
+        ("86400", 600),
+        ("[1]", 20),
+        ("-1", 20),
+    ] {
+        let json = format!(r#"{{"date_offset":{{"micro_interval_s":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        assert_eq!(
+            c.date_offset.micro().interval_ns,
+            want * 1_000_000_000,
+            "micro_interval_s {raw}"
+        );
+    }
+}

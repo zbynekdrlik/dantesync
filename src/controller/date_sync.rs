@@ -16,6 +16,13 @@
 //! ([`DateSync::deslew_sample`]). (2) is the decoupling: the phase lock and the rate servo see the
 //! clock as if no slew ran, so neither reads the deliberate rate as grandmaster disagreement, and
 //! the only residual they see is the rate term's switching delay (one loop iteration).
+//!
+//! dantesync#119 follow-up — the fleet date is corrected in MICRO-corrections (≤ 500 µs, at most
+//! one per 20 s, beyond a 2 ms dead band; `crate::date_offset::MicroScheduler`). The master's
+//! loop drives the authority's micro clock ([`PtpController::tick_date_authority`]); every box
+//! applies an increment through the same step / slew paths, logs it quietly as `micro`, keeps it
+//! out of the NTP step-storm count, and publishes `date_micro_*` in `/status`. A drift the
+//! corrections cannot hold raises the loud `date correction falling behind` line.
 
 use super::*;
 use crate::config::{CLOCK_DISCIPLINE_LEGACY, CLOCK_DISCIPLINE_PTP_PHASE_LOCK};
@@ -39,11 +46,16 @@ const AUTHORITY_LOSS: Duration = Duration::from_secs(30);
 /// to step is not re-tried (and re-warned) every second.
 const STEP_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 
-fn step_kind_label(kind: StepKind) -> &'static str {
-    match kind {
-        StepKind::Join => "join",
-        StepKind::Coordinated => "coordinated",
-        StepKind::Late => "late",
+/// #119 follow-up — while the micro-corrections fall behind, the loud line is repeated this often.
+const FALLING_BEHIND_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
+fn step_kind_label(kind: StepKind, micro: bool) -> &'static str {
+    match (kind, micro) {
+        (StepKind::Join, _) => "join",
+        (StepKind::Coordinated, true) => "micro",
+        (StepKind::Coordinated, false) => "coordinated",
+        (StepKind::Late, true) => "late micro",
+        (StepKind::Late, false) => "late",
     }
 }
 
@@ -102,6 +114,13 @@ pub(super) struct DateSync {
     pub(super) slew_write_failed_at: Option<Instant>,
     /// dantesync#119 — the fleet slew the master's catch-up last failed to take (logged once).
     pub(super) slew_catch_up_seq: Option<u32>,
+    /// dantesync#119 follow-up — the micro-correction tuning (the master's authority uses it).
+    pub(super) micro: crate::date_offset::MicroConfig,
+    /// dantesync#119 follow-up — the last micro-correction this box applied (ns, signed).
+    pub(super) last_micro_ns: Option<i64>,
+    /// dantesync#119 follow-up — the falling-behind state last logged, and when it was last warned.
+    pub(super) falling_behind_logged: bool,
+    pub(super) falling_behind_warned_at: Option<Instant>,
 }
 
 impl DateSync {
@@ -165,6 +184,10 @@ impl DateSync {
             slew_start_logged: false,
             slew_write_failed_at: None,
             slew_catch_up_seq: None,
+            micro: config.date_offset.micro(),
+            last_micro_ns: None,
+            falling_behind_logged: false,
+            falling_behind_warned_at: None,
         }
     }
 
@@ -373,6 +396,22 @@ where
                     ds.follower.time_to_due_ns(now_wall).map(|n| n / 1_000_000);
             }
         }
+        // #119 follow-up: the micro-correction state.
+        status.date_offset_micro = anchor.is_some() && published.is_some_and(|p| p.micro);
+        status.date_micro_active =
+            ds.enabled && base.is_some_and(|b| ds.follower.micro_in_flight(b, now_wall));
+        status.date_micro_last_us = ds.last_micro_ns.map(|n| n / 1_000);
+        status.date_correction_rate_ms_per_min = match (ds.authority.as_ref(), anchor) {
+            (Some(a), Some(d)) => a
+                .micro()
+                .correction_rate_ns_per_min(now_wall.wrapping_sub(d))
+                .map(|r| r / 1e6),
+            _ => None,
+        };
+        status.date_correction_falling_behind = ds
+            .authority
+            .as_ref()
+            .is_some_and(|a| a.micro().falling_behind());
         let master = ds.authority.is_some();
         status.date_offset_error_ms = if master {
             ds.master_utc_error_ns.map(|e| e as f64 / 1e6)
@@ -607,55 +646,30 @@ where
                 } else {
                     " (this master is off the fleet line: it re-aligns afterwards)"
                 };
-                match ann.as_slew() {
-                    // #119: a backward correction — a coordinated slew, never a backward step.
-                    Some(sl) => info!(
-                        "[DATE] AUTHORITY: the fleet line is {:+}us off UTC (> {}us) — announcing a \
-                         fleet date SLEW of {:+}us at {} ppm ({} s) from PTP {} (in {} ms), seq {}{}",
-                        fleet_err / 1_000,
-                        self.date_sync.step_bound_ns / 1_000,
-                        sl.to_ns.wrapping_sub(fleet) / 1_000,
-                        sl.ppm,
-                        sl.duration_ns() / 1_000_000_000,
-                        sl.start_ptp_ns,
-                        sl.start_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
-                        ann.seq,
-                        off_line
-                    ),
-                    // #119 ROZHODNUTÉ: a backward step only for a correction beyond the slew cap —
-                    // an abnormal state, logged loudly.
-                    None if ann.date_offset_ns < fleet => warn!(
-                        "[DATE] AUTHORITY: date correction too large to slew: the fleet line is \
-                         {:+}us off UTC (> {}us, the slew cap) — announcing a coordinated BACKWARD \
-                         date step of {:+}us at PTP {} (in {} ms), seq {}{}",
-                        fleet_err / 1_000,
-                        crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000,
-                        ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
-                        ann.effective_ptp_ns,
-                        ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
-                        ann.seq,
-                        off_line
-                    ),
-                    None => info!(
-                        "[DATE] AUTHORITY: the fleet line is {:+}us off UTC (> {}us) — announcing a \
-                         fleet date step of {:+}us at PTP {} (in {} ms), seq {}{}",
-                        fleet_err / 1_000,
-                        self.date_sync.step_bound_ns / 1_000,
-                        ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
-                        ann.effective_ptp_ns,
-                        ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
-                        ann.seq,
-                        off_line
-                    ),
-                }
+                // #119 follow-up: from a reading only the ABNORMAL correction (beyond 2 × the step
+                // bound, typically a master booted on a bad NTP reading) is announced: one
+                // coordinated step, either direction, logged loudly. Normal corrections are the
+                // micro-corrections of `tick_date_authority`.
+                let cause = if ann.date_offset_ns < fleet {
+                    "date correction too large to slew"
+                } else {
+                    "date correction too large for micro-corrections"
+                };
+                warn!(
+                    "[DATE] AUTHORITY: {}: the fleet line is {:+}us off UTC (> {}us, 2 x the step \
+                     bound) — announcing a coordinated date step of {:+}us at PTP {} (in {} ms), \
+                     seq {}{}",
+                    cause,
+                    fleet_err / 1_000,
+                    crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000,
+                    ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
+                    ann.effective_ptp_ns,
+                    ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000,
+                    ann.seq,
+                    off_line
+                );
                 if on_line {
-                    let act = self.date_sync.follower.on_announce(ann, base, now_wall);
-                    debug!("[DATE] master's own scheduler: {:?}", act);
-                    // #119: defensive — on the line D and the authority agree to the ns, so an
-                    // extension changes nothing but the end (the bench asserts exactly that).
-                    if let FollowAction::Absorb { new_anchor_ns } = act {
-                        self.date_sync.core.set_anchor(new_anchor_ns);
-                    }
+                    self.master_schedules_own(ann, base, now_wall);
                 }
             }
             // Publish NOW: the 31900 time server reads this snapshot, and an announce heard only
@@ -684,6 +698,106 @@ where
         false
     }
 
+    /// #88 / #119 — the master's own scheduler takes its authority's announce like every box
+    /// (only while it is on the fleet line: off it, it re-aligns afterwards).
+    fn master_schedules_own(&mut self, ann: DateAnnounce, base: i64, now_wall: i64) {
+        let act = self.date_sync.follower.on_announce(ann, base, now_wall);
+        debug!("[DATE] master's own scheduler: {:?}", act);
+        // Defensive — on the line D and the authority agree to the ns (the bench asserts it).
+        if let FollowAction::Absorb { new_anchor_ns } = act {
+            self.date_sync.core.set_anchor(new_anchor_ns);
+        }
+    }
+
+    /// #119 follow-up — the NTP master's micro-correction clock, every loop iteration: the
+    /// authority decides the next increment on the exact interval (not on the NTP cadence). An
+    /// increment is scheduled on the master's own wall like any announce (only on the fleet line)
+    /// and published at once, so followers hear it within its lead. Also keeps the loud
+    /// `date correction falling behind` line in step with the authority's alarm.
+    pub(super) fn tick_date_authority(&mut self) {
+        if !self.date_sync.enabled || !self.ntp_server_mode || self.date_sync.core.rebase_pending()
+        {
+            return;
+        }
+        let Some(base) = self.date_sync.core.anchor_ns() else {
+            return;
+        };
+        let now_wall = wall_now_ns();
+        // The master's D IN EFFECT (its anchor plus a held slew's displacement).
+        let own = self.date_sync.follower.in_effect_ns(base, now_wall);
+        let now_ptp = now_wall.wrapping_sub(own);
+        let Some(a) = self.date_sync.authority.as_mut() else {
+            return;
+        };
+        let fleet = a.in_effect_ns(now_ptp);
+        let announced = a.on_tick(now_ptp);
+        self.report_falling_behind(now_ptp);
+        let Some(ann) = announced else {
+            return;
+        };
+        let on_line = own == fleet && !self.ptp_offline && !self.in_step_backoff();
+        debug!(
+            "[DATE] AUTHORITY: micro-correction {:+}us ({}) at PTP {}, seq {}{}",
+            ann.date_offset_ns.wrapping_sub(fleet) / 1_000,
+            if ann.as_slew().is_some() {
+                "slew"
+            } else {
+                "step"
+            },
+            ann.effective_ptp_ns,
+            ann.seq,
+            if on_line { "" } else { " (off the fleet line)" }
+        );
+        if on_line {
+            self.master_schedules_own(ann, base, now_wall);
+        }
+        // Publish NOW (see `ntp_under_date_authority`): the 31900 server reads this snapshot.
+        self.update_shared_status();
+    }
+
+    /// #119 follow-up — log the micro-corrections' falling-behind alarm: loudly when it is raised
+    /// (and every [`FALLING_BEHIND_WARN_INTERVAL`] while it stays), once when it clears.
+    fn report_falling_behind(&mut self, now_ptp: i64) {
+        let Some(a) = self.date_sync.authority.as_ref() else {
+            return;
+        };
+        let behind = a.micro().falling_behind();
+        let ds = &self.date_sync;
+        if behind == ds.falling_behind_logged
+            && (!behind
+                || ds
+                    .falling_behind_warned_at
+                    .is_some_and(|t| t.elapsed() < FALLING_BEHIND_WARN_INTERVAL))
+        {
+            return;
+        }
+        let cfg = a.micro().config();
+        let est = a.micro().estimate(now_ptp);
+        if behind {
+            warn!(
+                "[DATE] AUTHORITY: date correction falling behind: the fleet line is {:+.1} ms off \
+                 UTC and drifting {:+.2} ms/min, the micro-corrections hold at most {:.2} ms/min \
+                 ({}us per {} s) — no large step is taken below {} ms; check the grandmaster's \
+                 frequency and the UTC source",
+                est.map(|e| e.error_ns as f64 / 1e6).unwrap_or(0.0),
+                est.map(|e| e.trend_ns_per_s * 60.0 / 1e6).unwrap_or(0.0),
+                cfg.capacity_ns_per_min() as f64 / 1e6,
+                cfg.step_ns / 1_000,
+                cfg.interval_ns / 1_000_000_000,
+                crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000
+            );
+            self.date_sync.falling_behind_warned_at = Some(Instant::now());
+        } else {
+            info!(
+                "[DATE] AUTHORITY: date correction caught up: the fleet line is {:+.1} ms off UTC",
+                est.map(|e| e.error_ns as f64 / 1e6).unwrap_or(0.0)
+            );
+            self.date_sync.falling_behind_warned_at = None;
+        }
+        self.date_sync.falling_behind_logged = behind;
+        self.update_shared_status();
+    }
+
     /// #88 — make the NTP master the fleet date-offset authority once it is anchored, and align
     /// its own scheduler with itself (so its announces are scheduled like everyone's).
     pub(super) fn ensure_date_authority(&mut self) {
@@ -702,22 +816,27 @@ where
             self.date_sync.step_bound_ns,
             self.date_sync.step_lead_ns,
         )
-        .with_slew_ppm(self.date_sync.slew_ppm);
+        .with_slew_ppm(self.date_sync.slew_ppm)
+        .with_micro(self.date_sync.micro);
         let act = self
             .date_sync
             .follower
             .on_announce(authority.announce(), base, now_wall);
         debug!("[DATE] master aligned with its own authority: {:?}", act);
+        let micro = self.date_sync.micro;
         info!(
-            "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns, step bound {} ms, \
-             announce lead {} s — clients step forward together at the announced PTP instant, \
-             and slew backward corrections up to {} ms at {} ppm (a larger one is an abnormal state \
-             and a coordinated step)",
+            "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date is \
+             held within {} ms of UTC by micro-corrections of at most {}us, one per {} s ({:.2} \
+             ms/min): forward a coordinated step, backward a coordinated slew at {} ppm, announced \
+             {} s ahead; only an error beyond {} ms is one coordinated step",
             anchor,
-            self.date_sync.step_bound_ns / 1_000_000,
+            micro.dead_band_ns / 1_000_000,
+            micro.step_ns / 1_000,
+            micro.interval_ns / 1_000_000_000,
+            micro.capacity_ns_per_min() as f64 / 1e6,
+            authority.slew_ppm(),
             self.date_sync.step_lead_ns / 1_000_000_000,
-            crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000,
-            authority.slew_ppm()
+            crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000
         );
         self.date_sync.authority = Some(authority);
     }
@@ -795,17 +914,30 @@ where
         // the slew's schedule at this very instant (its start and end land within one loop
         // iteration on every box, like a coordinated step).
         let now_wall = wall_now_ns();
+        let micro_slew = self.date_sync.follower.held_slew_is_micro();
         if let Some(fold) = self.date_sync.fold_completed_slew(now_wall) {
             self.date_sync.slew_start_logged = false;
-            info!(
-                "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
-                fold / 1_000,
-                self.date_sync
-                    .follower
-                    .adopted_seq()
-                    .map(|q| q.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            );
+            let seq = self
+                .date_sync
+                .follower
+                .adopted_seq()
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            if micro_slew {
+                // #119 follow-up: one quiet line per backward micro-correction.
+                self.date_sync.last_micro_ns = Some(fold);
+                info!(
+                    "[DATE] micro-slew done: D moved {:+}us, no wall step (seq {})",
+                    fold / 1_000,
+                    seq
+                );
+            } else {
+                info!(
+                    "[DATE] slew DONE: D moved {:+}us, no wall step (seq {})",
+                    fold / 1_000,
+                    seq
+                );
+            }
             self.update_shared_status();
         }
         self.apply_slew_edge(now_wall);
@@ -913,6 +1045,16 @@ where
                     effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
                 )
             }
+            // #119 follow-up: a micro-correction is scheduled quietly (it lands as one info line).
+            FollowAction::Scheduled {
+                delta_ns,
+                effective_wall_ns,
+            } if ext.announce.micro => debug!(
+                "[DATE] micro date step {:+}us scheduled (seq {}) in {} ms",
+                delta_ns / 1_000,
+                ext.announce.seq,
+                effective_wall_ns.wrapping_sub(now_wall) / 1_000_000
+            ),
             FollowAction::Scheduled {
                 delta_ns,
                 effective_wall_ns,
@@ -925,6 +1067,17 @@ where
             FollowAction::Step { delta_ns, kind } => {
                 self.apply_date_step(delta_ns, kind, ext.announce.seq)
             }
+            FollowAction::SlewScheduled {
+                amount_ns,
+                start_wall_ns,
+                ppm,
+            } if ext.announce.micro => debug!(
+                "[DATE] micro date slew {:+}us at {} ppm scheduled (seq {}) in {} ms",
+                amount_ns / 1_000,
+                ppm,
+                ext.announce.seq,
+                start_wall_ns.wrapping_sub(now_wall) / 1_000_000
+            ),
             FollowAction::SlewScheduled {
                 amount_ns,
                 start_wall_ns,
@@ -945,7 +1098,10 @@ where
         if delta_ns == 0 {
             return;
         }
-        let label = step_kind_label(kind);
+        // #119 follow-up: a micro-correction (applied at its instant, or late) is labelled `micro`
+        // and kept out of the NTP step-storm count below; a join never is one.
+        let micro = false;
+        let label = step_kind_label(kind, micro);
         let dur = Duration::from_nanos(delta_ns.unsigned_abs());
         let sign: i8 = if delta_ns > 0 { 1 } else { -1 };
         if let Err(e) = self.clock.step_clock(dur, sign) {
@@ -979,6 +1135,9 @@ where
         self.ntp_offset_samples.clear();
         self.ntp_pending_step = None;
         self.date_sync.last_step = Some((delta_ns, (wall_now_ns() / 1_000_000_000) as u64, label));
+        if micro {
+            self.date_sync.last_micro_ns = Some(delta_ns);
+        }
         if kind == StepKind::Late {
             warn!(
                 "[DATE] LATE date step {:+}us (seq {}): the announce was first heard after its \
@@ -994,13 +1153,19 @@ where
                 seq
             );
         }
-        // #91: a date step is this node's NTP-driven step; count it for the storm alarm.
-        self.record_ntp_step_and_check_storm();
+        // #91: a date step is this node's NTP-driven step; count it for the storm alarm — except a
+        // micro-correction: up to 180 an hour is its designed cadence, not a degraded frequency
+        // reference (its own alarm is `date correction falling behind`).
+        if !micro {
+            self.record_ntp_step_and_check_storm();
+        }
         self.update_shared_status();
     }
 }
 
 mod slew;
 
+#[cfg(test)]
+mod micro_tests;
 #[cfg(test)]
 mod tests;

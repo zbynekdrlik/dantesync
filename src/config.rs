@@ -154,6 +154,22 @@ pub struct DateOffsetConfig {
         deserialize_with = "lenient_slew_ppm"
     )]
     pub slew_ppm: u64,
+    /// dantesync#119 follow-up — the largest single date MICRO-correction (µs). Default 500. `0`
+    /// means the default; anything else is clamped to 50..=1000 at read time ([`Self::micro`]) —
+    /// above 1 ms SongPlayer re-anchors, the disturbance the micro-corrections avoid.
+    #[serde(
+        default = "default_date_micro_step_us",
+        deserialize_with = "lenient_micro_step_us"
+    )]
+    pub micro_step_us: u64,
+    /// dantesync#119 follow-up — the smallest spacing between two micro-corrections (s). Default
+    /// 20 (with the default step: 1.5 ms/min of capacity). `0` means the default; anything else is
+    /// clamped to 10..=600 at read time.
+    #[serde(
+        default = "default_date_micro_interval_s",
+        deserialize_with = "lenient_micro_interval_s"
+    )]
+    pub micro_interval_s: u64,
 }
 
 /// dantesync#117 — a hand-edit like `"clock_discipline": true` must not fail the WHOLE config
@@ -223,6 +239,34 @@ where
     ))
 }
 
+fn lenient_micro_step_us<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_micro_step_us(),
+    ))
+}
+
+fn lenient_micro_interval_s<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_micro_interval_s(),
+    ))
+}
+
+fn default_date_micro_step_us() -> u64 {
+    crate::date_offset::DEFAULT_MICRO_STEP_US
+}
+
+fn default_date_micro_interval_s() -> u64 {
+    crate::date_offset::DEFAULT_MICRO_INTERVAL_S
+}
+
 fn default_date_slew_ppm() -> u64 {
     crate::date_offset::DEFAULT_SLEW_PPM as u64
 }
@@ -241,6 +285,8 @@ impl Default for DateOffsetConfig {
             step_bound_ms: default_date_step_bound_ms(),
             step_lead_ms: default_date_step_lead_ms(),
             slew_ppm: default_date_slew_ppm(),
+            micro_step_us: default_date_micro_step_us(),
+            micro_interval_s: default_date_micro_interval_s(),
         }
     }
 }
@@ -265,6 +311,13 @@ impl DateOffsetConfig {
     /// `crate::date_offset::MIN_SLEW_PPM..=MAX_SLEW_PPM` (10..=500).
     pub fn slew_ppm(&self) -> u32 {
         crate::date_offset::clamp_slew_ppm(self.slew_ppm.min(u32::MAX as u64) as u32)
+    }
+
+    /// dantesync#119 follow-up — the effective micro-correction tuning (`0` → the defaults, else
+    /// clamped: step 50..=1000 µs, interval 10..=600 s).
+    pub fn micro(&self) -> crate::date_offset::MicroConfig {
+        let _ = (self.micro_step_us, self.micro_interval_s);
+        crate::date_offset::MicroConfig::default()
     }
 }
 

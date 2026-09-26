@@ -273,6 +273,9 @@ fn build_response(request_id: u32, status: &SyncStatus) -> [u8; RESPONSE_SIZE] {
 /// dantesync#119: when the published change is a SLEW (`date_slew_from_ns` / `date_slew_to_ns` /
 /// `date_slew_ppm`), the announce is the slew — its end `D`, its start instant and its rate — and
 /// never a pending step.
+///
+/// dantesync#119 follow-up: `date_offset_micro` marks the published change as a MICRO-correction
+/// (extension v3 flag bit 2).
 fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<DateExtension> {
     let in_effect = status.date_offset_ns?;
     let slew = match (
@@ -297,6 +300,7 @@ fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<D
             effective_ptp_ns: status.date_offset_effective_ptp_ns?,
             seq: status.date_offset_seq?,
             slew: slew.map(|(spec, _)| spec),
+            micro: false,
         },
     })
 }

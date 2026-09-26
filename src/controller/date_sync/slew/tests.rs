@@ -3,7 +3,8 @@
 //! fold, the master's catch-up and what `/status` publishes. Reuses the `date_sync` test helpers.
 
 use super::super::tests::{
-    authority_reply, one_offset, phase_lock_config, with_authority, PL_GM, PL_PTP_NOW_NS,
+    authority_reply, one_offset, phase_lock_config, readings_then_tick, with_authority, PL_GM,
+    PL_PTP_NOW_NS,
 };
 use super::super::*;
 use crate::clock::MockSystemClock;
@@ -67,6 +68,7 @@ fn follow_slew(
         effective_ptp_ns: 0,
         seq: 1,
         slew: None,
+        micro: false,
     };
     assert_eq!(
         c.date_sync.follower.on_announce(aligned, d, wall),
@@ -91,20 +93,18 @@ fn slew_announce(slew: DateSlew, seq: u32) -> DateAnnounce {
             from_ns: slew.from_ns,
             ppm: slew.ppm,
         }),
+        micro: false,
     }
 }
 
 #[test]
-fn the_master_slews_a_negative_utc_error_and_never_steps_it_back_119() {
+fn the_master_micro_slews_a_negative_utc_error_and_never_steps_it_back_119() {
     let mut ntp = MockNtpSource::new();
     ntp.expect_get_offset()
-        .returning(|| Ok(one_offset(60_000, -1)));
+        .returning(|| Ok(one_offset(7_000, -1)));
     // No step_clock expectation: a backward date step would panic the mock.
     let (mut c, d, _words) = capturing_anchored_controller(true, ntp);
-    for _ in 0..2 {
-        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
-        c.check_ntp_utc_tracking();
-    }
+    readings_then_tick(&mut c);
     let st = c.get_status_shared();
     let st = st.read().expect("status");
     assert_eq!(
@@ -113,19 +113,25 @@ fn the_master_slews_a_negative_utc_error_and_never_steps_it_back_119() {
     );
     assert_eq!(st.date_slew_ppm, Some(100));
     assert_eq!(st.date_slew_from_ns, Some(d));
-    assert_eq!(st.date_slew_to_ns, Some(d - 60_000_000));
+    assert_eq!(
+        st.date_slew_to_ns,
+        Some(d - 500_000),
+        "one micro-correction"
+    );
     assert_eq!(st.date_offset_seq, Some(2));
+    assert!(st.date_offset_micro, "published as a micro-correction");
+    assert!(st.date_micro_active, "in flight on the master too");
     assert!(
         !st.date_slew_active,
         "scheduled a lead ahead, not running yet"
     );
-    assert_eq!(st.date_slew_remaining_ms, Some(60.0));
+    assert_eq!(st.date_slew_remaining_ms, Some(0.5));
     assert_eq!(st.date_offset_ns, Some(d), "D unchanged before the start");
     let start = st.date_offset_effective_ptp_ns.expect("start instant");
     let lead = start - (wall_now_ns() - d);
     assert!(
-        (4_000_000_000..=5_000_000_000).contains(&lead),
-        "the slew starts a lead ahead: {lead} ns"
+        (9_000_000_000..=10_000_000_000).contains(&lead),
+        "the micro-slew starts two leads ahead: {lead} ns"
     );
     // The master's own scheduler holds it: it slews with the fleet.
     assert!(c.date_sync.follower.held_slew().is_some());
@@ -274,13 +280,10 @@ fn the_slew_starts_and_ends_on_the_loop_not_at_the_next_ptp_window_119() {
 fn the_master_catches_up_with_a_fleet_slew_its_own_scheduler_missed_119() {
     let mut ntp = MockNtpSource::new();
     ntp.expect_get_offset()
-        .returning(|| Ok(one_offset(60_000, -1)));
+        .returning(|| Ok(one_offset(7_000, -1)));
     // No step_clock expectation: the catch-up never steps.
     let (mut c, d, _words) = capturing_anchored_controller(true, ntp);
-    for _ in 0..2 {
-        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
-        c.check_ntp_utc_tracking();
-    }
+    readings_then_tick(&mut c);
     let fleet_slew = c.date_sync.follower.held_slew().expect("scheduled").slew;
     // Its own scheduler missed the announce (as if the master was in its step backoff then).
     c.date_sync.follower = DateFollower::new();
@@ -290,6 +293,7 @@ fn the_master_catches_up_with_a_fleet_slew_its_own_scheduler_missed_119() {
         effective_ptp_ns: 0,
         seq: 1,
         slew: None,
+        micro: false,
     };
     c.date_sync.follower.on_announce(aligned, d, wall);
     assert!(c.date_sync.follower.held_slew().is_none());
@@ -468,6 +472,10 @@ fn a_master_booted_seconds_ahead_announces_one_coordinated_step_not_a_slew_119()
     assert_eq!(st.date_slew_ppm, None, "not published as a slew");
     assert_eq!(st.date_slew_from_ns, None);
     assert!(!st.date_slew_active);
+    assert!(
+        !st.date_offset_micro,
+        "the abnormal correction is not a micro one"
+    );
     assert_eq!(st.date_offset_ns, Some(d), "in effect only at the instant");
     assert!(c.date_sync.follower.held_slew().is_none());
     assert_eq!(
