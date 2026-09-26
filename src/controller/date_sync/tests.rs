@@ -1033,16 +1033,21 @@ fn a_running_slew_is_one_rate_term_in_the_one_frequency_word_and_is_deslewed_119
         "the servo's own word never carries the slew"
     );
 
-    // Every PTP sample is de-slewed: on the slewed line, the phase lock reads exactly its anchor.
-    let wall = wall_now_ns();
-    let d_eff = c.date_sync.d_in_effect(wall).unwrap();
-    let t1 = wall - d_eff; // a sample on the fleet line (zero path delay)
-    let (t2_lock, _) = c.date_sync.deslew_sample(wall);
-    assert!(
-        ((t2_lock - t1) - anchor).abs() <= 1,
-        "the phase lock sees no slew: {} ns",
-        (t2_lock - t1) - anchor
-    );
+    // Every PTP sample is de-slewed: a sample on the slewed line (zero path delay) — built from
+    // the slew's own SCHEDULE at chosen PTP instants, not from the controller's solve — reads
+    // exactly the anchor, i.e. the phase lock sees no slew at all.
+    let held = c.date_sync.follower.held_slew().expect("held");
+    let p_now = wall_now_ns() - c.date_sync.d_in_effect(wall_now_ns()).unwrap();
+    for dt in [0, 1_000_000_000, 10_000_000_000, 400_000_000_000] {
+        let p = p_now + dt + 123_457;
+        let wall = p + anchor + held.displacement_at_ptp(p);
+        let (t2_lock, _) = c.date_sync.deslew_sample(wall);
+        assert!(
+            ((t2_lock - p) - anchor).abs() <= 1,
+            "the phase lock sees the slew at +{dt} ns: {} ns",
+            (t2_lock - p) - anchor
+        );
+    }
 
     c.update_shared_status();
     let st = c.get_status_shared();
@@ -1058,11 +1063,12 @@ fn the_slew_starts_and_ends_on_the_loop_not_at_the_next_ptp_window_119() {
     let (mut c, d, words) = capturing_anchored_controller(false, MockNtpSource::new());
     let pi = c.applied_freq_ppm;
     let now_ptp = wall_now_ns() - d;
-    // A 2 µs slew at 100 ppm (20 ms), starting 30 ms from now.
+    // A 20 µs slew at 100 ppm (200 ms), starting 100 ms from now: wide enough that a scheduler
+    // stall of the test thread cannot skip the whole slew.
     let slew = DateSlew {
         from_ns: d,
-        to_ns: d - 2_000,
-        start_ptp_ns: now_ptp + 30_000_000,
+        to_ns: d - 20_000,
+        start_ptp_ns: now_ptp + 100_000_000,
         ppm: 100,
     };
     assert!(matches!(
@@ -1088,10 +1094,42 @@ fn the_slew_starts_and_ends_on_the_loop_not_at_the_next_ptp_window_119() {
     assert!((seen[1] - pi).abs() < 1e-9, "end: {seen:?}");
     assert_eq!(
         c.date_sync.core.anchor_ns(),
-        Some(d - 2_000),
+        Some(d - 20_000),
         "the paid amount folded into the anchor"
     );
     assert_eq!(c.date_sync.slew_rate_ppm(wall_now_ns()), 0.0);
+}
+
+#[test]
+fn the_master_catches_up_with_a_fleet_slew_its_own_scheduler_missed_119() {
+    let mut ntp = MockNtpSource::new();
+    ntp.expect_get_offset()
+        .returning(|| Ok(one_offset(60_000, -1)));
+    // No step_clock expectation: the catch-up never steps.
+    let (mut c, d, _words) = capturing_anchored_controller(true, ntp);
+    for _ in 0..2 {
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+    }
+    let fleet_slew = c.date_sync.follower.held_slew().expect("scheduled").slew;
+    // Its own scheduler missed the announce (as if the master was in its step backoff then).
+    c.date_sync.follower = DateFollower::new();
+    let wall = wall_now_ns();
+    let aligned = DateAnnounce {
+        date_offset_ns: d,
+        effective_ptp_ns: 0,
+        seq: 1,
+        slew: None,
+    };
+    c.date_sync.follower.on_announce(aligned, d, wall);
+    assert!(c.date_sync.follower.held_slew().is_none());
+    c.service_date_offset();
+    assert_eq!(
+        c.date_sync.follower.held_slew().map(|h| h.slew),
+        Some(fleet_slew),
+        "the master slews with the fleet it announced to"
+    );
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d), "no step, no jump");
 }
 
 #[test]

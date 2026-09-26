@@ -47,6 +47,12 @@
 //! and removes the scheduled displacement from every PTP measurement, so neither servo reads it as
 //! grandmaster disagreement (`controller/date_sync.rs`).
 
+mod slew;
+pub use slew::{
+    clamp_slew_ppm, correction_kind, solve_displacement, CorrectionKind, DateSlew, HeldSlew,
+    SlewSpec, DEFAULT_SLEW_PPM, MAX_SLEW_PPM, MIN_SLEW_PPM,
+};
+
 /// Version of the 31900 reply extension carried by this build (2 = v1 + the #119 slew fields).
 pub const EXT_VERSION: u8 = 2;
 
@@ -93,27 +99,6 @@ pub const EXT_FLAG_AUTHORITY: u8 = 0x01;
 
 /// Extension flag (v2, dantesync#119): the announce is a coordinated SLEW, not a step.
 pub const EXT_FLAG_SLEW: u8 = 0x02;
-
-/// dantesync#119 — the default slew rate of a backward correction: 100 ppm pays 50 ms in 500 s.
-/// Every box moves by this rate against the Dante tick while a slew runs; camera-box's ASRC takes
-/// it as a rate (it tracks hundreds of ppm) and 100 ppm of pitch is inaudible.
-pub const DEFAULT_SLEW_PPM: u32 = 100;
-
-/// dantesync#119 — the configurable slew rate is clamped to this range. Below 10 ppm a 50 ms
-/// correction takes over 80 minutes and a fast grandmaster-vs-UTC drift could outrun it; above
-/// 500 ppm the slew leaves the ±500 ppm frequency envelope of the servos.
-pub const MIN_SLEW_PPM: u32 = 10;
-pub const MAX_SLEW_PPM: u32 = 500;
-
-/// dantesync#119 — the slew rate actually used for a configured (or received) value: `0` means
-/// the default, anything else is clamped to [`MIN_SLEW_PPM`]..=[`MAX_SLEW_PPM`].
-pub fn clamp_slew_ppm(ppm: u32) -> u32 {
-    if ppm == 0 {
-        DEFAULT_SLEW_PPM
-    } else {
-        ppm.clamp(MIN_SLEW_PPM, MAX_SLEW_PPM)
-    }
-}
 
 /// Default step bound: the master changes `D` only when |UTC − wall| exceeds this (ROZHODNUTÉ Q3).
 pub const DEFAULT_STEP_BOUND_NS: i64 = 50_000_000;
@@ -183,110 +168,6 @@ impl DateAnnounce {
             start_ptp_ns: self.effective_ptp_ns,
             ppm: clamp_slew_ppm(s.ppm),
         })
-    }
-}
-
-/// dantesync#119 — the slew part of an announce (the rest is in [`DateAnnounce`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlewSpec {
-    /// `D` where the slew starts.
-    pub from_ns: i64,
-    /// The slew rate (ppm of PTP time).
-    pub ppm: u32,
-}
-
-/// dantesync#119 — a coordinated date SLEW: `D` moves from `from_ns` to `to_ns` at `ppm`, starting
-/// at the PTP instant `start_ptp_ns`. The whole schedule is a pure function of PTP time, so every
-/// box that holds the same slew has the same `D` at the same PTP instant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DateSlew {
-    pub from_ns: i64,
-    pub to_ns: i64,
-    pub start_ptp_ns: i64,
-    /// Always within [`MIN_SLEW_PPM`]..=[`MAX_SLEW_PPM`] (built through [`clamp_slew_ppm`]).
-    pub ppm: u32,
-}
-
-impl DateSlew {
-    /// `to − from` (negative for the backward corrections this exists for).
-    pub fn amount_ns(&self) -> i64 {
-        self.to_ns.wrapping_sub(self.from_ns)
-    }
-
-    fn rate(&self) -> i128 {
-        clamp_slew_ppm(self.ppm) as i128
-    }
-
-    /// How long the slew runs (PTP ns): `ceil(|amount| / ppm)`, so [`offset_at`](Self::offset_at)
-    /// reaches `to` exactly at [`end_ptp_ns`](Self::end_ptp_ns) and not a nanosecond earlier.
-    pub fn duration_ns(&self) -> i64 {
-        let amount = self.amount_ns().unsigned_abs() as u128;
-        let rate = clamp_slew_ppm(self.ppm) as u128;
-        (amount * 1_000_000).div_ceil(rate).min(i64::MAX as u128) as i64
-    }
-
-    pub fn end_ptp_ns(&self) -> i64 {
-        self.start_ptp_ns.saturating_add(self.duration_ns())
-    }
-
-    /// `D` at the PTP instant `ptp_ns`: `from` up to the start, then `ppm` ns per ms of PTP time
-    /// (floored to the ns) towards `to`, then `to`.
-    pub fn offset_at(&self, ptp_ns: i64) -> i64 {
-        let elapsed = (ptp_ns as i128) - (self.start_ptp_ns as i128);
-        if elapsed <= 0 {
-            return self.from_ns;
-        }
-        let amount = self.amount_ns() as i128;
-        let paid = (elapsed * self.rate() / 1_000_000).min(amount.abs());
-        (self.from_ns as i128 + amount.signum() * paid) as i64
-    }
-
-    /// True while `D` is moving at `ptp_ns` (from the start, up to but excluding the end).
-    pub fn active_at(&self, ptp_ns: i64) -> bool {
-        self.amount_ns() != 0 && ptp_ns >= self.start_ptp_ns && ptp_ns < self.end_ptp_ns()
-    }
-
-    /// True once the slew has paid its whole amount.
-    pub fn complete_at(&self, ptp_ns: i64) -> bool {
-        ptp_ns >= self.end_ptp_ns()
-    }
-
-    /// The rate of `D` (ppm, signed: negative for a backward slew) at `ptp_ns`; 0 outside it.
-    /// This is the extra frequency term every box adds to its word while the slew runs.
-    pub fn rate_ppm_at(&self, ptp_ns: i64) -> f64 {
-        if self.active_at(ptp_ns) {
-            self.amount_ns().signum() as f64 * clamp_slew_ppm(self.ppm) as f64
-        } else {
-            0.0
-        }
-    }
-
-    /// What is still to be paid at `ptp_ns` (ns, ≥ 0).
-    pub fn remaining_ns(&self, ptp_ns: i64) -> i64 {
-        self.to_ns.wrapping_sub(self.offset_at(ptp_ns)).abs()
-    }
-
-    /// The same slew in a time base whose `D` is `shift` larger (a grandmaster change / rebase:
-    /// `ptp_new = ptp_old − shift`), so it runs at the same wall instants.
-    pub fn shifted(&self, shift_ns: i64) -> Self {
-        DateSlew {
-            from_ns: self.from_ns.wrapping_add(shift_ns),
-            to_ns: self.to_ns.wrapping_add(shift_ns),
-            start_ptp_ns: self.start_ptp_ns.wrapping_sub(shift_ns),
-            ppm: self.ppm,
-        }
-    }
-
-    fn announce(&self, seq: u32) -> DateAnnounce {
-        DateAnnounce {
-            date_offset_ns: self.to_ns,
-            effective_ptp_ns: self.start_ptp_ns,
-            seq,
-            slew: Some(SlewSpec {
-                from_ns: self.from_ns,
-                ppm: self.ppm,
-            }),
-        }
     }
 }
 
@@ -640,26 +521,6 @@ impl DateAuthority {
     }
 }
 
-/// dantesync#119 — how a fleet date correction is applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CorrectionKind {
-    /// Every box steps its wall at the announced instant (forward only: the fleet is behind UTC).
-    Step,
-    /// Every box moves `D` down at `slew_ppm` from the announced instant: the wall never runs back.
-    Slew,
-}
-
-/// dantesync#119 — THE direction decision. `correction_ns` is the change of `D` (`UTC − wall`):
-/// positive moves the wall forward, which every consumer tolerates (a forward step lost no audio
-/// on the rig); negative would move it BACKWARDS, which Dante DVS/ASIO turns into lost samples.
-pub fn correction_kind(correction_ns: i64) -> CorrectionKind {
-    if correction_ns >= 0 {
-        CorrectionKind::Step
-    } else {
-        CorrectionKind::Slew
-    }
-}
-
 // ============================================================================
 // THE FOLLOWER (every box, the master included)
 // ============================================================================
@@ -722,50 +583,6 @@ pub struct DueStep {
     pub delta_ns: i64,
 }
 
-/// dantesync#119 — the slew a box follows. Its `D` is `anchor + displacement(ptp)`, with
-/// `displacement = carry + slew.offset_at(ptp) − ref`: the anchor stays the phase lock's base and
-/// the slew moves `D` on top of it until the box folds the paid amount into the anchor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeldSlew {
-    pub slew: DateSlew,
-    /// The slew offset the displacement counts from: its `from` when adopted before the start,
-    /// its offset at the adoption instant when joined mid-way (the "remaining part").
-    pub ref_ns: i64,
-    /// Displacement already accrued by a slew this one replaced (kept, folded together).
-    pub carry_ns: i64,
-}
-
-impl HeldSlew {
-    /// The displacement of `D` from the anchor at the PTP instant `ptp_ns`.
-    pub fn displacement_at_ptp(&self, ptp_ns: i64) -> i64 {
-        self.carry_ns
-            .wrapping_add(self.slew.offset_at(ptp_ns))
-            .wrapping_sub(self.ref_ns)
-    }
-
-    /// The displacement once the slew is complete — what is folded into the anchor.
-    pub fn total_displacement(&self) -> i64 {
-        self.carry_ns
-            .wrapping_add(self.slew.to_ns)
-            .wrapping_sub(self.ref_ns)
-    }
-
-    /// The same displacement, frozen where it is at `ptp_ns`: a zero-length slew, complete at
-    /// once, that carries it (the next [`DateFollower::take_completed_slew`] folds it).
-    fn frozen_at(&self, ptp_ns: i64) -> Self {
-        HeldSlew {
-            slew: DateSlew {
-                from_ns: 0,
-                to_ns: 0,
-                start_ptp_ns: ptp_ns,
-                ppm: self.slew.ppm,
-            },
-            ref_ns: 0,
-            carry_ns: self.displacement_at_ptp(ptp_ns),
-        }
-    }
-}
-
 /// Every box's date-offset step scheduler.
 #[derive(Clone, Debug, Default)]
 pub struct DateFollower {
@@ -808,19 +625,14 @@ impl DateFollower {
 
     /// dantesync#119 — the displacement of `D` from `anchor_ns` at the wall reading `wall_ns`: 0
     /// without a slew. `D` is a function of PTP time and PTP time is `wall − D`, so it is solved
-    /// by fixed-point iteration; the displacement moves at ≤ 500 ppm of PTP time, so three rounds
-    /// converge. Exact to 1 ns: the schedule is floored to whole ns, so at a nanosecond boundary
-    /// two adjacent PTP instants give the same wall. Taken from the WALL (not a sample's `t1`), so
-    /// it stays right while a grandmaster change delivers `t1` in another time base.
+    /// as a fixed point ([`solve_displacement`]): every box and the authority then evaluate the
+    /// SAME PTP instant, to the nanosecond. Taken from the WALL (not a sample's `t1`), so it stays
+    /// right while a grandmaster change delivers `t1` in another time base.
     pub fn displacement_at_wall(&self, anchor_ns: i64, wall_ns: i64) -> i64 {
         let Some(h) = self.held else {
             return 0;
         };
-        let mut d = h.carry_ns;
-        for _ in 0..3 {
-            d = h.displacement_at_ptp(wall_ns.wrapping_sub(anchor_ns).wrapping_sub(d));
-        }
-        d
+        solve_displacement(&h, anchor_ns, wall_ns)
     }
 
     /// dantesync#119 — `D` in effect at `wall_ns` for a box whose phase-lock anchor is `anchor_ns`.
@@ -896,8 +708,9 @@ impl DateFollower {
         self.adopted_seq = None;
     }
 
-    /// Handle an announce from the authority. `own_anchor_ns` is this box's phase-lock anchor
-    /// (its `D`, plus the held slew's displacement while it follows one), `now_wall_ns` its wall.
+    /// Handle an announce from the authority. `own_anchor_ns` is this box's phase-lock anchor —
+    /// its `D` without a held slew, the BASE of `D` with one (`D` = anchor + the slew's
+    /// displacement, [`in_effect_ns`](Self::in_effect_ns)) — and `now_wall_ns` its wall.
     /// The caller must first run [`due`](Self::due) and
     /// [`take_completed_slew`](Self::take_completed_slew) for the same instant, so a step whose
     /// instant has just passed is applied through the coordinated path, not reported late.
@@ -912,9 +725,11 @@ impl DateFollower {
         if let Some(slew) = a.as_slew() {
             return self.on_slew_announce(a.seq, slew, own_anchor_ns, own_d, own_now_ptp);
         }
-        // #119: an announce without a slew while this box still follows one (a new authority
-        // session, or the promoted form of a slew heard a hair before this box's own end):
-        // stop the slew where it is, so `D` stays continuous, and judge the announce from there.
+        // #119: the authority's promoted form of the slew this box still runs (`to` in effect at
+        // its end, same seq), heard a hair before this box's own end: nothing to do — the slew
+        // lands on `to` by itself. (Freezing here would schedule a µs step backwards.)
+        // Any other announce without a slew while this box still follows one (a new authority
+        // session): stop the slew where it is, so `D` stays continuous, and judge it from there.
         self.freeze_slew(own_anchor_ns, now_wall_ns);
         if a.effective_ptp_ns > own_now_ptp {
             // A pending coordinated step. Only a box already aligned with the authority can

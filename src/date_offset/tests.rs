@@ -1050,3 +1050,58 @@ fn every_box_holding_the_same_slew_has_the_same_d_at_the_same_ptp_instant_119() 
         }
     }
 }
+
+#[test]
+fn the_solved_d_is_exactly_the_schedule_at_the_solved_ptp_instant_119() {
+    // The master's own "on the fleet line" test compares its D in effect with the authority's
+    // schedule at the PTP instant derived from that D: they must agree to the NANOSECOND, for
+    // any rate and amount (a 1 ns miss at such an instant used to skip the master's own
+    // scheduling of an extension).
+    for (ppm, amount) in [
+        (100u32, 51 * MS),
+        (100, S),
+        (500, 51 * MS),
+        (500, S),
+        (10, 3 * S),
+    ] {
+        let d = 1_790_000_000 * S;
+        let sl = slew(d, d - amount, 1_000 * S, ppm);
+        let mut f = DateFollower::new();
+        f.on_announce(in_effect(d, 1), d, d + 10 * S);
+        f.on_announce(sl.announce(2), d, d + 20 * S);
+        let mut wall = d + 900 * S;
+        let step = sl.duration_ns() / 50_000 + 7_919;
+        for _ in 0..60_000 {
+            let own = f.in_effect_ns(d, wall);
+            assert_eq!(
+                sl.offset_at(wall - own),
+                own,
+                "ppm {ppm} amount {amount} wall {wall}"
+            );
+            wall += step;
+        }
+    }
+}
+
+#[test]
+fn the_promoted_form_heard_just_before_this_boxs_own_end_changes_nothing_119() {
+    let mut f = DateFollower::new();
+    let d = 100 * S;
+    f.on_announce(in_effect(d, 1), d, d + 10 * S);
+    let sl = slew(d, d - 50 * MS, 20 * S, 100);
+    f.on_announce(sl.announce(2), d, d + 15 * S);
+    // The authority promoted at its own end (PTP 520 s); this box is 3 µs short of it.
+    let promoted = DateAnnounce {
+        date_offset_ns: d - 50 * MS,
+        effective_ptp_ns: sl.end_ptp_ns(),
+        seq: 2,
+        slew: None,
+    };
+    let p = sl.end_ptp_ns() - 3 * US;
+    let wall = p + sl.offset_at(p);
+    assert_eq!(f.on_announce(promoted, d, wall), FollowAction::None);
+    assert_eq!(f.pending(), None, "never a step, however small");
+    assert!(f.held_slew().is_some(), "the slew runs on to its end");
+    let wall_end = sl.end_ptp_ns() + sl.to_ns + US;
+    assert_eq!(f.take_completed_slew(d, wall_end), Some(-50 * MS));
+}
