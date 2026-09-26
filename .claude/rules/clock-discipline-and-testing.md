@@ -697,9 +697,10 @@ working tree.
 Issue 80's own investigation (strih's steady-state "drag" -- corrections that looked right in
 cadence but never converged) found its root cause not by adding new diagnostics, but by grepping
 what was ALREADY being logged for a completely different original purpose:
-`WindowsClock::step_clock()` has always logged `[StepClock] Actual step: X (expected: Y)` (a
+until 1.11.1 `WindowsClock::step_clock()` logged `[StepClock] Actual step: X (expected: Y)` (a
 before/after `GetSystemTimeAsFileTime()` sanity check, presumably added to confirm the step syscall
-did SOMETHING) -- nobody had ever checked whether `X` and `Y` actually MATCH. They didn't, by a
+did SOMETHING; replaced by the step law's `[StepClock] stepped …` line, see the #119 1.11.1
+section) -- nobody had ever checked whether `X` and `Y` actually MATCH. They didn't, by a
 large and inconsistent margin, and that exact shortfall pattern (27.6%-116.7% delivered, no fixed
 ratio) was the whole proof of a millisecond-quantization bug once checked against `SYSTEMTIME`'s
 own field width. **Before reaching for new instrumentation on a live clock-daemon mystery, grep the

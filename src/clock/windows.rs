@@ -188,9 +188,7 @@ impl WindowsClock {
         let (baseline_pc, baseline_ft) = unsafe {
             let mut pc: i64 = 0;
             QueryPerformanceCounter(&mut pc)?;
-            let ft = GetSystemTimeAsFileTime();
-            let ft_u64 = (ft.dwHighDateTime as u64) << 32 | (ft.dwLowDateTime as u64);
-            (pc, ft_u64)
+            (pc, filetime_u64(GetSystemTimeAsFileTime()))
         };
 
         let clock = WindowsClock {
@@ -313,9 +311,7 @@ impl WindowsClock {
                 return;
             }
 
-            let current_ft = GetSystemTimeAsFileTime();
-            let current_ft_u64 =
-                (current_ft.dwHighDateTime as u64) << 32 | (current_ft.dwLowDateTime as u64);
+            let current_ft_u64 = filetime_u64(GetSystemTimeAsFileTime());
 
             // Calculate elapsed times
             let pc_elapsed = current_pc - self.baseline_perf_counter;

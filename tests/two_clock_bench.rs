@@ -173,6 +173,8 @@ use world::*;
 #[path = "two_clock_bench/windows.rs"]
 mod windows;
 use windows::*;
+#[path = "two_clock_bench/box_ops.rs"]
+mod box_ops;
 
 struct Box_ {
     osc_ppm: f64,
@@ -265,31 +267,6 @@ struct RunResult {
     rate_audits: Vec<RateAudit>,
     /// #119 (1.11.1): per box, the largest |requested − realized| of a step (0 on an ideal box).
     max_step_residual_ns: Vec<i64>,
-}
-
-/// What each box hears: the grandmaster's UUID and its time base. The grandmaster CHANGES (to
-/// another device: another UUID, uptime and oscillator) at `GM_CHANGE_AT_WINDOW`, and that new
-/// grandmaster REBOOTS under the same UUID (its uptime restarts) at `GM_REBOOT_AT_WINDOW`. Each box
-/// notices each event a few windows apart. At the change the MASTER is last, so followers
-/// re-anchor while it still publishes a `D` in the old base (refused by the anchor grandmaster in
-/// the extension). At the reboot the master is FIRST, so it publishes a `D` in the new base while
-/// some followers are still in the old one under the SAME UUID: only the time-base check
-/// (`same_time_base`) stops those from taking a multi-day "late" step.
-fn gm_view<'a>(
-    w: u64,
-    lags: (u64, u64),
-    a: &'a Clock,
-    b_pre: &'a Clock,
-    b_post: &'a Clock,
-) -> (u8, &'a Clock) {
-    let (change_lag, reboot_lag) = lags;
-    if w < GM_CHANGE_AT_WINDOW + change_lag {
-        (1, a)
-    } else if w < GM_REBOOT_AT_WINDOW + reboot_lag {
-        (2, b_pre)
-    } else {
-        (2, b_post)
-    }
 }
 
 /// Everything one bench run evolves: the true clocks, the boxes, the master's authority and its
@@ -975,73 +952,6 @@ fn run(sc: &Scenario) -> RunResult {
         bench.audit_rates(w);
     }
     bench.into_result()
-}
-
-impl Box_ {
-    fn wall_ns(&self) -> i64 {
-        self.wall.ns + self.stepped + self.slewed_ns
-    }
-
-    /// #119: `D` in effect (the anchor plus the held slew's displacement at the wall).
-    fn d_in_effect(&self) -> i64 {
-        let anchor = self.core.anchor_ns().expect("anchored");
-        self.follower.in_effect_ns(anchor, self.wall_ns())
-    }
-
-    /// #119: the held slew's displacement at the current wall (0 before the first anchor).
-    fn slew_displacement(&self) -> i64 {
-        match self.core.anchor_ns() {
-            Some(anchor) => self.follower.displacement_at_wall(anchor, self.wall_ns()),
-            None => 0,
-        }
-    }
-
-    /// #119: integrate the slew's rate term over one window, switching it at the PTP instants
-    /// where the slew starts and ends (PTP time advances at the true rate to ≪ 1 ns per window:
-    /// the grandmasters run at 0 and +3 ppm).
-    fn advance_slew(&mut self, true_dt_ns: f64) {
-        let (Some(anchor), Some(h)) = (self.core.anchor_ns(), self.follower.held_slew()) else {
-            return;
-        };
-        let p0 = self.follower.now_ptp_ns(anchor, self.wall_ns()) as f64;
-        let p1 = p0 + true_dt_ns;
-        let on = (h.slew.start_ptp_ns as f64).max(p0);
-        let off = (h.slew.end_ptp_ns() as f64).min(p1);
-        if off > on {
-            let rate_ppm = h.slew.amount_ns().signum() as f64 * h.slew.ppm as f64;
-            let d = rate_ppm * 1e-6 * (off - on) + self.slew_frac;
-            let whole = d.floor();
-            self.slew_frac = d - whole;
-            self.slewed_ns += whole as i64;
-        }
-    }
-
-    /// Step the wall and move D with it (the controller's `apply_date_step`), recording it; with
-    /// `grace`, the next 2 s of PTP windows are dropped as the controller does after any step.
-    fn apply_step(
-        &mut self,
-        seq: u32,
-        delta_ns: i64,
-        kind: StepKind,
-        t_ns: f64,
-        w: u64,
-        grace: bool,
-    ) {
-        // #119 (1.11.1): a Windows box's wall moves by what the step law realizes against the
-        // Windows clock model; D moves by the REQUESTED amount, as `apply_date_step` does.
-        let realized = match self.win.as_mut() {
-            Some(win) => win.step(t_ns, delta_ns),
-            None => delta_ns,
-        };
-        self.stepped += realized;
-        self.last_landing = Some((t_ns, realized));
-        self.core.note_step(delta_ns);
-        self.fresh = false;
-        self.steps.push((seq, delta_ns, kind, t_ns));
-        if grace {
-            self.grace_until = w + 1 + GRACE_WINDOWS;
-        }
-    }
 }
 
 // A crate root resolves `mod x;` beside itself (`tests/x.rs`), which cargo would also build as a
