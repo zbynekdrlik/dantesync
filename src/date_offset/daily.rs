@@ -276,6 +276,12 @@ impl DailyScheduler {
         }
     }
 
+    /// An EMERGENCY step was announced: the fleet wall will read `post_step_wall_ns` once it has
+    /// landed (review round 2).
+    pub fn on_emergency_step(&mut self, post_step_wall_ns: i64) {
+        let _ = post_step_wall_ns;
+    }
+
     /// A nightly step of `amount_ns` was announced to land at the fleet wall `landing_wall_ns`.
     pub fn record_step(&mut self, landing_wall_ns: i64, amount_ns: i64) {
         self.last_step = Some((landing_wall_ns, amount_ns));

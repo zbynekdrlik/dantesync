@@ -179,6 +179,29 @@ fn an_error_beyond_the_emergency_cap_is_stepped_at_once_119() {
 }
 
 #[test]
+fn a_master_booted_6_h_ahead_is_stepped_back_at_once_and_still_steps_the_next_night_119() {
+    // Review round 2: the emergency (the case it exists for: a bad boot) steps the fleet wall
+    // back across a night; the next window must still step, and nothing is reported missed.
+    let a = daily_authority(at(4, 0), DailyConfig::default());
+    let mut l = Loop::new(a, -6 * 3_600 * S, 17.6);
+    l.run(30, |_| false);
+    assert_eq!(l.steps.len(), 1, "the emergency: {:?}", l.steps);
+    assert!(l.steps[0].1 < -6 * 3_600 * S + S);
+    // From ~22:00 (fleet) to past the next 02:00.
+    l.run(5 * 3_600, |_| false);
+    assert_eq!(l.steps.len(), 2, "the next night stepped: {:?}", l.steps);
+    let tod = (l.steps[1].2 - DAY0).rem_euclid(86_400 * S);
+    assert_eq!(tod, 2 * 3_600 * S, "when the window opens");
+    assert!(
+        l.events
+            .iter()
+            .all(|e| matches!(e, DailyDecision::Step { .. })),
+        "no missed / skipped night: {:?}",
+        l.events
+    );
+}
+
+#[test]
 fn a_utc_outage_over_the_window_steps_when_utc_returns_inside_it_else_the_next_night_119() {
     // UTC down 01:55 – 02:12: the step is made at the first fresh estimate after 02:12.
     let a = daily_authority(at(12, 0), DailyConfig::default());

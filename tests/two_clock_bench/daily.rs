@@ -159,6 +159,7 @@ fn a_6_s_utc_jump_is_stepped_at_once_as_an_emergency_119() {
     let tods = announce_tods_s(&r);
     println!("[emergency] corrections {:?} at {tods:?} s", r.corrections);
     assert_eq!(r.corrections.len(), 2, "the emergency, then the night");
+    assert_eq!(r.wall_went_back, 0, "a forward emergency");
     let (at_w, size) = r.corrections[0];
     assert!(
         (jump_w..jump_w + 3 * NTP_INTERVAL_WINDOWS).contains(&at_w),
@@ -176,6 +177,7 @@ fn a_6_s_utc_jump_is_stepped_at_once_as_an_emergency_119() {
         r.corrections[1].1
     );
     assert!(r.max_relative_phase_ns <= 50 * US);
+    assert_eq!(r.wall_went_back, 0);
 }
 
 #[test]
@@ -238,6 +240,7 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_else_the_next_night_119()
         r.corrections[0].1
     );
     assert!(r.max_relative_phase_ns <= 50 * US);
+    assert_eq!(r.wall_went_back, 0);
 }
 
 #[test]
@@ -257,6 +260,7 @@ fn a_master_only_ptp_outage_in_daily_mode_keeps_the_master_near_the_fleet_line_1
         .collect();
     println!("[master outage] the master's re-joins: {joins:?}");
     assert_eq!(joins.len(), 1, "one re-join once PTP is back: {joins:?}");
+    assert_eq!(r.wall_went_back, 0);
     assert!(
         joins.iter().all(|s| s.1.abs() < MS),
         "the master stayed near the fleet line: {joins:?}"
@@ -296,4 +300,24 @@ fn a_master_without_ptp_over_the_window_still_takes_the_nightly_step_with_the_fl
         joins.iter().all(|s| s.1.abs() < MS),
         "it re-joined the fleet line with its free-run error only: {joins:?}"
     );
+    // Review round 2: its off-line landing is off the fleet's by its free-run error only (the
+    // re-join measures that error), never by more.
+    let mut fleet: Vec<f64> = r.steps[1..]
+        .iter()
+        .flatten()
+        .filter(|s| s.2 == StepKind::Coordinated && s.0 == seq)
+        .map(|s| s.3)
+        .collect();
+    fleet.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = fleet[fleet.len() / 2];
+    let off = (own[0].3 - median).abs();
+    let free_run = joins.iter().map(|s| s.1.abs()).max().unwrap_or(0) as f64;
+    println!(
+        "[master outage over the window] landing {off:.0} ns off the fleet, re-join {free_run} ns"
+    );
+    assert!(
+        off <= free_run + 50_000.0,
+        "the master landed {off} ns off the fleet, more than its free-run error {free_run} ns"
+    );
+    assert_eq!(r.wall_went_back, 0);
 }

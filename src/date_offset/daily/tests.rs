@@ -199,6 +199,46 @@ fn a_window_that_closed_while_the_scheduler_was_not_asked_is_reported_once_119()
 }
 
 #[test]
+fn an_emergency_step_back_across_a_night_never_hides_the_next_window_119() {
+    // Review round 2: a master booted 6 h ahead (fleet wall 04:00) marks the 02:00 window it
+    // first sees as handled; the emergency step back to 22:00 must not make the next 02:00 look
+    // handled too — nor report the night it jumped over as missed.
+    let mut d = DailyScheduler::new(DailyConfig::default());
+    assert_eq!(d.decide(at(4, 0, 0), None), DailyDecision::Idle);
+    d.on_emergency_step(at(4, 0, 5) - 6 * 3_600 * S);
+    for t in [at(22, 0, 5) - 86_400 * S, at(23, 0, 0) - 86_400 * S] {
+        assert_eq!(d.decide(t, est(MS * 50)), DailyDecision::Idle, "{t}");
+    }
+    assert_eq!(
+        d.next_window_wall_ns(at(23, 0, 0) - 86_400 * S),
+        at(2, 0, 0)
+    );
+    assert_eq!(
+        d.decide(at(2, 0, 0), est(MS * 70)),
+        DailyDecision::Step { amount_ns: 70 * MS },
+        "the next night steps"
+    );
+    // A FORWARD emergency jump over a window is not a missed night either (it just corrected
+    // the whole error): silent, and the next window still steps.
+    let mut d = DailyScheduler::new(DailyConfig::default());
+    assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
+    d.on_emergency_step(at(1, 0, 5) + 3 * 3_600 * S);
+    assert_eq!(d.decide(at(4, 0, 5), est(MS * 5)), DailyDecision::Idle);
+    assert_eq!(
+        d.decide(at(2, 0, 0) + 86_400 * S, est(MS * 90)),
+        DailyDecision::Step { amount_ns: 90 * MS }
+    );
+    // An emergency step that lands INSIDE an open window leaves that window to decide.
+    let mut d = DailyScheduler::new(DailyConfig::default());
+    assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
+    d.on_emergency_step(at(2, 5, 0));
+    assert_eq!(
+        d.decide(at(2, 5, 0), est(MS * 30)),
+        DailyDecision::Step { amount_ns: 30 * MS }
+    );
+}
+
+#[test]
 fn a_backward_step_across_the_window_start_never_decides_the_night_again_119() {
     // Review round 1: a step lands the fleet wall BEFORE the window start it was decided in (a
     // backward step larger than the landing's distance from the start, possible once

@@ -215,6 +215,50 @@ fn a_daily_master_without_ptp_takes_its_own_nightly_step_with_the_fleet_119() {
 }
 
 #[test]
+fn an_off_line_daily_masters_failed_step_is_retried_after_the_backoff_119() {
+    // Review round 2: with no PTP there is no re-alignment window, so a failed own step would
+    // leave the master a whole nightly step off the fleet until PTP returns. It re-joins the
+    // fleet line after the backoff (there is no phase error to measure without PTP).
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen = calls.clone();
+    let mut clock = MockSystemClock::new();
+    clock
+        .expect_step_clock()
+        .times(2)
+        .withf(|dur, sg| *dur == Duration::from_millis(300) && *sg == 1)
+        .returning(move |_, _| {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(anyhow::anyhow!("clock refused"))
+            } else {
+                Ok(())
+            }
+        });
+    let start_s = now_s() - 1;
+    let (mut c, d) = anchored_controller_with(clock, ntp_at(300_000), true, daily_config(start_s));
+    c.ptp_offline = true;
+    c.service_date_offset();
+    readings_then_tick(&mut c);
+    let due = c
+        .date_sync
+        .follower
+        .due(wall_now_ns() + 11 * S)
+        .expect("scheduled on its own wall");
+    c.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d), "the step failed");
+    // Inside the backoff nothing happens; after it, one re-join onto the fleet line.
+    c.service_date_offset();
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d));
+    c.date_sync.step_failed_at = Some(Instant::now() - Duration::from_secs(11));
+    c.service_date_offset();
+    assert_eq!(
+        c.date_sync.core.anchor_ns(),
+        Some(d + 300_000_000),
+        "back on the fleet line"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
 fn the_configured_mode_reaches_the_authority_and_micro_stays_micro_119() {
     let (c, _d) = anchored_controller_with(
         MockSystemClock::new(),
