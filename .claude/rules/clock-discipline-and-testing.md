@@ -39,6 +39,11 @@ paths:
   - "src/controller/date_sync/daily_tests.rs"
   - "tests/two_clock_bench/daily.rs"
   - "tests/two_clock_bench/measure.rs"
+  - "src/ptp_phase_lock/freq_step.rs"
+  - "src/ptp_phase_lock/freq_step/tests.rs"
+  - "src/controller/date_sync/freq_step.rs"
+  - "src/controller/date_sync/freq_step_tests.rs"
+  - "tests/two_clock_bench/freq_step.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -889,6 +894,20 @@ fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the c
   a run of spaces. CI caught one in a config warning. Write `\\` or use a raw string, then grep
   the result for 8+ spaces inside a string literal.
 
+**Three more from a camera-box session working a dantesync worktree (camera-box issue 1372, v1.14):**
+- Stage with explicit paths, never the all-files flag. The global staging guard reads the
+  SESSION's checkout (camera-box), not the `cd` target: an all-files stage in the dantesync
+  worktree was refused for a camera-box untracked file, and the whole Bash call (its heredoc
+  writes included) did not run. The guard also matches words in a heredoc body, so write rule text
+  that names staging commands with the `Edit`/`Write` tool, not a Bash heredoc.
+- A slice tracked on a CAMERA-BOX issue: write "camera-box issue N" in commit messages and PR
+  bodies, never `#N`. In this repo the commit gate would look for a dantesync design marker for
+  `#N`, and a PR body's `#N` points at the wrong repo. A scope like `feat(freq-step):` passes.
+- The standalone `rustc` replica covers the pure modules AND the whole two-clock bench: build the
+  lib with `--crate-type lib --crate-name dantesync` into an rlib, then run
+  `rustc --test tests/two_clock_bench.rs --extern dantesync=<rlib> -O` (25+ bench tests in ~20 s).
+  Prove each RED on it by stubbing the new behaviour in a copy of the file, commit, restore.
+
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually
 verify a branch, **open a PR to `master`** (that fires the `pull_request` CI); monitor it to green;
@@ -930,3 +949,102 @@ steps every ~40-70s = the LOCKED deadband (healthy, chasing only the GM's own re
 #91 storm the PEAK was small tight-threshold steps (0.35-1.2ms), while the "+2.7ms" quoted in the issue
 body was the later recovering/locked phase — so grep the log for BOTH regimes before concluding which
 one a reported step size represents.
+
+## camera-box issue 1372 (v1.14) — a grandmaster FREQUENCY step is a detector + a re-seed, never faster gains
+
+A Dante leader re-election steps the grandmaster's frequency (~25 ppm on the rig, 29.9.2026) under
+the same identity on the video VLAN, so no re-anchor path sees it, and the ~100 s PI took 8-12
+minutes to follow. `src/ptp_phase_lock/freq_step.rs` detects it and the core re-seeds the integrator.
+What was learned building it:
+
+- **Measure the OPEN-LOOP phase, never the slope of `e`.** `p = e − ∫ word dt` has the oscillator's
+  rate against the grandmaster as its slope whatever the loop commanded; the unlearned frequency is
+  `slope(p) + I`. A slope of raw `e` also contains the loop's own proportional slew: re-engaging
+  1 ms off reads as a "clean" 20 ppm step, and after a re-seed the phase being recovered reads as a
+  step of the opposite sign. `p` needs the TRUE elapsed `dt` (the controller's grandmaster-time `dt`
+  spans a post-step grace; the fleet bench passes a constant `WINDOW_S`, which after a grace leaves a
+  small level shift in `p` that the linearity test rejects — harmless there, wrong in production).
+- **`|s| > 6σ` does not reject a level shift.** A median jump A in the middle of a 20 s ring reads as
+  a slope of 1.5·A / 20 s with `|s|/σ ≈ 1.7·√N ≈ 11`: every path-delay change or step-landing residual
+  ≥ ~100 µs would re-seed a false step (and its reversal 30 s later). The ring must also be LINEAR:
+  the largest partial F of a level shift or a slope change at any split (suffix sums, O(N)) ≤ 15. The
+  same test is what makes the estimate unbiased: it waits until the ring holds no pre-step windows.
+  A single outlier can never pass (its slope is ≤ √3 standard errors).
+- **…and the F test alone is not enough under heavy noise (review round 1).** At 40-60 µs sample
+  noise it has too little power against a 60-120 µs path change (false re-seeds in up to 10 of 60
+  seeded events). The discriminator that holds is the SHIFTED slope: fit the line together with the
+  best level-shift split and require the unlearned frequency to survive it (same sign, ≥ the
+  minimum). A genuine step keeps its slope; a shift loses it. With it: 1 false event in 1000 at a
+  5 ppm minimum, none in 1000 at 6 (an upper-bound reading, not a shown difference) — so
+  `FSTEP_MIN_PPM` is 6. Pinned by the bench's
+  `a_path_change_under_heavy_noise_or_an_absorb_is_not_a_step_1372` (RED without the shifted slope).
+- **Two structures in one ring (review round 2).** A path change in two stages a few seconds apart
+  still passed (13-23 of 25 seeded runs at 20-30 µs): the partial F used the residual left after ONE
+  split as its noise, which the second stage inflates, and the one-shift slope removed only half the
+  stair. Two fixes, each measured: the F denominator is the WHITE noise from successive differences
+  of the residuals, `Σ(r_i − r_{i−1})² / 2(n − 1)` (a three-stage 3 × 70 µs change at 20 µs noise:
+  17 → 4 of 25), and the frequency must also survive the best PAIR of level shifts (a 2 × 2 system on
+  the residualized split regressors, O(N²) only for a candidate): two-stage changes 0 of 25 at 20-30
+  µs, 1-2 of 25 at 50 µs. Pinned by `a_path_change_in_two_stages_is_not_a_step_1372` and
+  `the_linearity_noise_is_the_white_noise_not_the_unexplained_structure` (both RED before).
+- **The limit that stays: a ring cannot tell a slow path change from a frequency change.** A delay
+  that ramps at ≥ ~6 µs/s (the minimum, as a slope) for ≥ ~15 s IS a frequency change as far as `e`
+  shows, at any noise (review round 3, 25 seeded runs: 150 µs / 15 s re-seeds in 5 / 14 / 16 at 20 /
+  30 / 50 µs; 300 µs / 20 s in 24-25 of 25, as 14-17 ppm; review round 4), and so can three or more
+  stages. The false event roughly doubles the phase excursion (bench, 300 µs / 20 s: peak 624 µs
+  against ~348 µs without it) and is reversed ~32 s later (the learned frequency back within 1 ppm
+  by ≤ 54 s; a seed that is not re-seeded takes 161 s, like the plain PI); near the minimum
+  (6-7 ppm) it may not be — the PI learns part during the holdoff, the rest is under the minimum
+  and decays through the PI (~6 min > 1 ppm; 3 of 25 at 140 µs / 20 s). Pinned as BOUNDS (≤ 2
+  events of opposite signs, back ≤ 240 s, phase < 1000 µs) by
+  `a_path_ramp_the_ring_cannot_tell_from_a_step_is_bounded_and_reversed_1372`; it stays green if the
+  false event is ever removed. A longer ring would see more of it and follow a real step later; keep
+  the 20 s. The linearity noise assumes per-window white noise: a correlated delay wander (AR(1) per
+  window, ρ 0.8) does not block a genuine confirmation but slows it (typically ~25 s, about 1 run in
+  10 after 60-90 s; the estimate typically 1-4 ppm off, the rest learned by the PI).
+- **The two-shift slope costs sensitivity near the minimum.** Its spread is ~2 ppm at 30-50 µs noise
+  (the plain slope ~0.5): 6-7 ppm steps are followed only in part, ≥ ~8 ppm reliably.
+- **Why the core does not (yet) remove a known `D` move from the open-loop phase.** The absorbs and
+  the master re-align (`controller/date_sync.rs` re-align, `follow.rs`, `micro.rs`, `slew.rs:257`)
+  move `D` by a known Δ with no wall move, so `applied_us −= Δ` inside `set_anchor` would keep `p`
+  exactly continuous — but the #119 slew fold (`controller/date_sync/slew.rs:67`) also calls
+  `set_anchor`, and there `e` is continuous by construction (the de-slew displacement moves into
+  `D`): the same compensation would CREATE a level shift. Doing it needs the fold on its own
+  non-compensating method (one call site). Left statistical because an absorb is ≤ 100 µs and
+  happens at a join, where the shift tests reject it (the bench's absorb cases); worth doing if
+  `freq_steps` ever counts one.
+- **Keep the per-window cost to a sum pass.** The first version ran the full split scan with seven
+  fresh `Vec`s on every engaged window of every bench box: CI's Test job went 3:01 → 6:57 and
+  Coverage 6:49 → 18:06 (runs 36591942048 → 36607528697; the bench needs tarpaulin
+  `--timeout 300`). The line fit is now allocation-free (`fit_line`), and the split scan
+  (`split_test`) runs only for a window whose slope already says "step" — the result is identical,
+  the steady state never scans: Test 2:52, Coverage 10:07 (run 36612323337; the extra bench cases
+  keep Coverage above the baseline).
+- **A residual floor (1 µs) in the fit** keeps a noiseless simulated ring from turning floating-point
+  rounding into a linearity verdict. Real timestamps are never better than that.
+- **The phase the step left is retired along a decaying reference, not by the PI.** Re-seeding the
+  integrator exactly and letting the PI trim ~400 µs swings the integrator by ~ω·e0/e ≈ 1.5 ppm and
+  overshoots ~54 µs. The PI tracks `e − r` and the word carries `−r/τ` (τ 20 s) as feed-forward.
+- **Say which frequency you mean.** "Within 1 ppm in 21.5 s" is the LEARNED frequency (the
+  integrator). The APPLIED word also carries the pull: right after the re-seed it runs ≈ |e0|/τ
+  (~23 ppm for 25 ppm) past the new frequency, in the step's direction, decaying with τ; it is within
+  1 ppm again after ≈ τ·ln(|e0|/τ) (the bench asserts its 20 s mean within 1 ppm from ≤ 120 s,
+  measured 95.5 s). τ = 30 s would lower that peak to ~15 ppm and still meet the 120 s phase target
+  (~90-94 s); the total buffer movement a downstream ASRC sees is |e0| either way.
+- **Without a confirmed step the word must be the plain PI's, bit for bit** (the pull branch is taken
+  only while `r ≠ 0`). Tests pin it against a plain-PI mirror built from the module's public
+  constants: `without_a_confirmed_step_…_bit_for_bit_1372` and the bench's noise / wander cases.
+- **Size the parameters by a seeded simulation first.** A Python reference of the exact algorithm
+  (scratch, not committed) chose confirm = 6 (with 3, one of 20 runs at 30 µs sample noise settled to
+  1 ppm only after 146 s) and F ≤ 15 (the null's p99 is 15-17). At 50 µs sample noise a 20 s ring
+  cannot measure a small step to 1 ppm (σ ≈ 0.8 ppm): a 7-10 ppm step may be re-seeded coarsely and
+  the PI trims the rest — still faster than before. The review replicated the algorithm on its own
+  and found the heavy-noise false re-seed above: have the reviewer sweep the noise the rule itself
+  names, not only the bench's 20 µs.
+- **A fleet-bench flip must stay forward-only for the bit-identity pair.** Slow grandmaster A down
+  (the fleet falls further behind UTC, every correction is a forward step); a flip that makes the
+  fleet run ahead of UTC turns corrections into slews, whose rate term is in the words by design.
+  The bench's full `check()` is for its 24 h runs (it expects the grandmaster change and reboot, and a
+  UTC drift inside the micro capacity): the flip test asserts the phase / rate envelopes itself.
+- **Replica:** the pure module is a directory now; symlink `src/ptp_phase_lock/` beside
+  `src/ptp_phase_lock.rs` in the scratch crate, or `mod freq_step;` does not resolve.

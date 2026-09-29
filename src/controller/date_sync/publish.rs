@@ -150,5 +150,9 @@ where
         } else {
             None
         };
+        // camera-box issue 1372: the grandmaster frequency steps the phase lock followed.
+        status.freq_steps = ds.core.freq_steps();
+        status.last_freq_step_ppm = ds.core.last_freq_step().map(|s| s.step_ppm);
+        status.last_freq_step_ts = ds.last_freq_step_ts;
     }
 }

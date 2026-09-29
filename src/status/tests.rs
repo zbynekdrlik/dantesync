@@ -604,6 +604,44 @@ fn test_sync_status_ptp_liveness_fields_are_additive_112() {
     assert_eq!(partial.last_ts, None);
 }
 
+/// camera-box issue 1372: the frequency-step fields are additive. A 1.13.0 blob reads 0 / `null`,
+/// and every value round-trips under its documented name.
+#[test]
+fn test_sync_status_freq_step_fields_are_additive_1372() {
+    let v1130 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+        "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+        "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+        "ptp_phase_locked":true,"last_ptp_rx_age_s":0,"ptp_rx_pps":16.0}"#;
+    let restored: SyncStatus =
+        serde_json::from_str(v1130).expect("v1.13.0 JSON must still deserialize");
+    assert_eq!(restored.freq_steps, 0);
+    assert_eq!(restored.last_freq_step_ppm, None);
+    assert_eq!(restored.last_freq_step_ts, None);
+
+    let st = SyncStatus {
+        freq_steps: 3,
+        last_freq_step_ppm: Some(-24.75),
+        last_freq_step_ts: Some(1_790_700_000),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&st).expect("serialize failed");
+    for field in [
+        r#""freq_steps":3"#,
+        r#""last_freq_step_ppm":-24.75"#,
+        r#""last_freq_step_ts":1790700000"#,
+    ] {
+        assert!(json.contains(field), "{field} in {json}");
+    }
+    let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+    assert_eq!(back.freq_steps, 3);
+    assert_eq!(back.last_freq_step_ppm, Some(-24.75));
+    assert_eq!(back.last_freq_step_ts, Some(1_790_700_000));
+    // Nothing followed yet: an explicit null, never a plausible-looking 0.
+    let fresh = serde_json::to_string(&SyncStatus::default()).expect("serialize failed");
+    assert!(fresh.contains(r#""last_freq_step_ppm":null"#), "{fresh}");
+    assert!(fresh.contains(r#""freq_steps":0"#), "{fresh}");
+}
+
 #[test]
 fn test_to_json_bytes_matches_serde_json_to_vec() {
     // #47: the HTTP status endpoint and the named pipe must serve byte-identical

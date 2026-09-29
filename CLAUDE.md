@@ -120,7 +120,10 @@ is running.
   the decoupling proof by the bit-identical two-clock bench,
   the local fallback, seeding every simulated noise source, the standalone-`rustc` replica as a
   second local net; v1.12: the date corrected ONCE A NIGHT by default, `correction = "daily"`,
-  the micro mode kept byte-identical, the master's own PTP outage in daily mode) →
+  the micro mode kept byte-identical, the master's own PTP outage in daily mode; v1.14: a
+  grandmaster FREQUENCY step followed in seconds — the open-loop-phase detector, the linearity
+  test and the shifted slope against level shifts, the integrator re-seed, the decaying phase pull
+  and its applied-rate transient) →
   `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
   `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)

@@ -146,6 +146,9 @@ pub(super) struct DateSync {
     /// NTP steps) while its wall free-ran, so once PTP is back it re-joins the fleet line on the
     /// measured error even though its `D` never left it (`realign_master_to_fleet`).
     pub(super) master_outage_realign: bool,
+    /// camera-box issue 1372 — the wall epoch (s) of the last grandmaster frequency step the phase
+    /// lock followed (`/status` `last_freq_step_ts`).
+    pub(super) last_freq_step_ts: Option<u64>,
 }
 
 impl DateSync {
@@ -222,6 +225,7 @@ impl DateSync {
             last_step_phase_jump_ns: None,
             correction,
             master_outage_realign: false,
+            last_freq_step_ts: None,
         }
     }
 
@@ -335,6 +339,7 @@ where
             .core
             .on_window(median_ns, locked, total_correction, dt);
         self.handle_phase_anchor_event(out.event);
+        self.note_freq_step(out.freq_step);
         self.date_sync
             .measure_step_phase_jump(out.error_ns, out.event);
         self.date_sync.fresh_window = out.error_ns.is_some();
@@ -955,12 +960,15 @@ where
 
 mod daily;
 mod follow;
+mod freq_step;
 mod micro;
 mod publish;
 mod slew;
 
 #[cfg(test)]
 mod daily_tests;
+#[cfg(test)]
+mod freq_step_tests;
 #[cfg(test)]
 mod micro_tests;
 #[cfg(test)]
