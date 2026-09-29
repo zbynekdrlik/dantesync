@@ -135,8 +135,10 @@ is running.
 - PTP liveness (#112 — one definition of "PTP is stale", the honest `/status` while stale
   (`is_locked=false`, `mode="NTP-only"`, `last_ptp_rx_age_s`/`ptp_rx_pps`/`rejoin`), the
   `PtpNetwork::rejoin` contract (re-open only the receive path, close first, same selection as
-  startup, never a clock/servo/date touch), the pure 10→30→60→120→300 s schedule, the finding that
-  `D` is anchored once per process, the per-socket-loopback-address test trick) →
+  startup, never a clock/servo/date touch), the home-address interface choice (a re-plugged NIC's
+  new ifindex loses to tailscale/docker in the listing order), liveness = Sync/Follow_Up only, the
+  pure 10→30→60→120→300 s schedule, the finding that `D` is anchored once per process, the
+  per-socket-loopback-address test trick) →
   `.claude/rules/ptp-liveness-rejoin.md` (auto-loads on its `paths:`)
 - DSCP marking of timesync sockets (#52 — which sockets are markable per platform: Linux ntp_server
   reply YES, Linux rsntp client NO handle, Windows filters IP_TOS; the `dscp<<2` TOS-byte math;

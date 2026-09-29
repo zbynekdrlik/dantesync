@@ -30,10 +30,14 @@ offset `D` from its own NTP-stepped wall: 29.9.2026, −19.8 ms, every box stepp
 
 ## The contract
 
-- **One definition of stale:** `PtpController::ptp_stale_at` = no ALLOWED PTP packet (one that
-  passed `gm_allowlist`) for more than `PTP_TIMEOUT_SECS` (10 s). The offline edge, the clock
-  alarm (`sample_clock_health`), the re-join and `/status` all use it. Do not add a second
-  threshold; `ptp_rejoin::REJOIN_AFTER` is pinned to it by a `const _: () = assert!(..)`.
+- **One definition of stale:** `PtpController::ptp_stale_at` = no ALLOWED PTP packet for more
+  than `PTP_TIMEOUT_SECS` (10 s). An allowed PTP packet is a **Sync or a Follow_Up** (the
+  grandmaster's time) from a source `gm_allowlist` allows — `note_allowed_ptp_packet` is called in
+  those two match arms only, never for a runt datagram or another follower's Delay_Req (with the
+  default empty allowlist every source is allowed, and that traffic must not hide a dead GM). The
+  offline edge, the clock alarm (`sample_clock_health`), the re-join and `/status` all use it. Do
+  not add a second threshold; `ptp_rejoin::REJOIN_AFTER` is pinned to it by a
+  `const _: () = assert!(..)`.
 - **While stale `/status` says so:** `is_locked=false`, `mode="NTP-only"` (the offline edge's own
   name; the tray's orange "PTP offline"; the 31900 reply's mode 5; every camera-box gate reads a
   non-LOCK/NANO mode as degraded), `settled=false`. `offset_ns` keeps the last value, flagged by
@@ -51,13 +55,25 @@ offset `D` from its own NTP-stepped wall: 29.9.2026, −19.8 ms, every box stepp
   scratch after the next allowed packet (`note_allowed_ptp_packet` resets it). It runs at the top
   of `process_loop_iteration`, BEFORE `recv_packet`: a dead Npcap handle errors every receive, and
   the `?` would otherwise return before the re-join.
-- **Every backend implements `rejoin`** (the trait method has no default on purpose): resolve the
-  interface NOW (a resolve failure keeps the old path), close the old sockets / capture FIRST (the
-  new pair binds the same ports; the old membership may belong to a dead netdev), then open again
-  through the SAME selection code as startup (`open_pair` on Linux, `open_ptp_capture` on Npcap —
-  never a second, diverging copy). An open failure leaves no path (`recv_packet` → `Ok(None)`)
-  until the next attempt. `changed` compares with the LAST SUCCESSFUL join, kept through a failed
-  attempt.
+- **Every backend implements `rejoin`** (the trait method has no default on purpose): select the
+  interface NOW (a selection failure keeps the old path), close the old sockets / capture FIRST
+  (the old membership may belong to a dead netdev, and two pairs are never open at once; the old
+  one was deaf anyway, a re-join only runs while stale), then open again through the SAME code as
+  startup (`open_pair` on Linux, `open_ptp_capture` on Npcap — never a second, diverging copy). An
+  open failure leaves no path (`recv_packet` → `Ok(None)`) until the next attempt. `changed`
+  compares with the LAST SUCCESSFUL join, kept through a failed attempt.
+- **Which interface: the home address first (review round 1).** `net::get_default_interface`
+  returns the first bindable IPv4 in the kernel's listing order (≈ ifindex). A re-plugged USB NIC
+  comes back as a new netdev with a new, HIGHER ifindex and often a new name (strih-lx:
+  `enx6c1ff766154b` → `enx002427159965`, same 10.77.9.202), so on a box that also has tailscale0,
+  wg0, docker0 or bridges (dev1) the resolver answers one of those and every re-join "succeeds"
+  there. So each backend keeps a **home address** — the startup address, then the address of any
+  join that RECEIVES a packet (updated in `recv_packet`) — and a re-join first joins the interface
+  that carries it now (`net::interface_with_ip` on Linux/Winsock; on Npcap `device_with_ip`, after
+  the issue-1073 trusted-subnet rule and before the name fallback). Only when no interface carries
+  it (a DHCP move) does it fall back to the startup resolver. A join that receives nothing (a
+  fallback onto tailscale0 while the NIC is still unplugged) never becomes the home. On Npcap the
+  device is selected BEFORE the old capture is dropped (`select_rejoin_device`).
 
 ## Is `D` re-derived at re-lock? (the finding, 29.9.2026)
 
@@ -75,11 +91,16 @@ re-join exists.
   `use crate::traits::RejoinOutcome;` with a local struct and drop the serde derives.
 - The Linux backend's tests use REAL non-blocking UDP sockets through a scripted
   `PtpSocketFactory`. 319/320 need root, so each fake socket binds an ephemeral port on its OWN
-  loopback address (`127.0.1.N`): with one shared `127.0.0.1` the kernel may hand a new socket
-  the port an old one just released, and a "the old address is free" probe flakes. "Closed first"
-  is checked at the moment each new socket opens (`free_at_open`), not afterwards. An std-only
-  `rustc` replica (an `anyhow` shim, `recv_from` in place of the nix `recvmsg`) runs them
-  locally: build it from a copy with `//!` turned into `//` and the three crate uses swapped for
-  local modules.
+  loopback address, taken from ONE process-wide counter (`127.0.x.y`; tests run in parallel
+  threads): with one shared `127.0.0.1` the kernel may hand a new socket the port an old one just
+  released, and a "the old address is free" probe flakes. "Closed first" is checked at the moment
+  each new socket opens (`free_at_open`), not afterwards. An std-only `rustc` replica (an `anyhow`
+  shim, `recv_from` in place of the nix `recvmsg`, a `net` stub with `interface_with_ip`) runs them
+  locally: build it from a copy with `//!` turned into `//` and the crate uses swapped for local
+  modules.
+- Controller tests cannot move an `Instant` forward, so a "went quiet N s ago" state is made by
+  re-writing the receive history IN TIME ORDER (a fresh `RxWindow`, then one packet N s ago —
+  `went_quiet`), never by recording a backdated packet after a current one: the window would count
+  the current one and report a rate while stale.
 - The controller glue and the Windows backends compile only on CI: the RED push is the first
   compile. Check the RED run fails exactly the expected tests before writing GREEN.

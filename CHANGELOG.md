@@ -19,15 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     120 and every 300 s while it stays silent. After the next allowed packet the schedule
     starts from scratch. One `[NET] no PTP announce for Ns -- re-joining PTP multicast (attempt
     k)` line per attempt. A failed attempt is logged and retried, never fatal.
-    - Linux: the interface is resolved again, both sockets are closed first, then joined again
+    - Linux: both sockets are closed, then joined again
       (`Joined Multicast Groups on <if> (<ip>) - Kernel timestamping (rejoin)`). A NIC that
-      came back under the same name as a new netdev had lost the old membership.
-    - Windows: the Npcap capture is re-opened through the same interface selection as at
-      startup (a fresh `Found device:` line). A swapped NIC left a dead handle.
+      came back as a new netdev had lost the old membership.
+    - Windows: the Npcap capture is re-opened (a fresh `Found device:` line). A swapped NIC left
+      a dead handle. The device is chosen before the old capture is dropped, so a failed choice
+      keeps it.
+    - **Which interface.** First the one that now carries the address PTP was last received on,
+      under whatever name it came back with. A re-plugged USB NIC gets a new, higher interface
+      index, and the startup choice (the first interface in the list) could then be tailscale,
+      docker or a bridge. Only when no interface carries that address does the startup choice
+      apply (on Windows the `gm_allowlist` subnet rule still comes first).
   - **A re-join never touches the clock or the date.** The servos, the phase lock and the fleet
     date offset D stay as they are. On the master, a loss, the re-join and the re-acquisition
     keep D and `date_offset_seq`; the master only steps its own wall back onto the fleet line
     (one join step), as after any PTP outage.
+  - **PTP liveness is the grandmaster's time.** Only a Sync or a Follow_Up from an allowed source
+    counts; a runt datagram or another device's Delay_Req no longer keeps a node "live".
   - **`/status` is honest while PTP is stale:** `is_locked=false`, `mode="NTP-only"` (the
     tray's orange "PTP offline"), `settled=false`. The last `offset_ns` is kept; its age says it
     is old. `=== UNLOCKED === (no PTP packets for 10s)` and `=== LOCKED === (PTP packets back
@@ -38,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/status`, all additive:
   - `last_ptp_rx_age_s`: seconds since the last allowed PTP packet; `null` before the first.
   - `ptp_rx_pps`: allowed PTP packets per second over the last 10 s (a Dante grandmaster sends
-    about 16).
+    about 16; it saturates at 2000 under a packet storm).
   - `rejoin`: `attempts`, `last_ts`, `last_iface`, `last_ip`, `last_error`.
 
 ## [1.12.0] - 2026-09-26
