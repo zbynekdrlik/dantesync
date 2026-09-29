@@ -894,6 +894,20 @@ fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the c
   a run of spaces. CI caught one in a config warning. Write `\\` or use a raw string, then grep
   the result for 8+ spaces inside a string literal.
 
+**Three more from a camera-box session working a dantesync worktree (camera-box issue 1372, v1.14):**
+- Stage with explicit paths, never the all-files flag. The global staging guard reads the
+  SESSION's checkout (camera-box), not the `cd` target: an all-files stage in the dantesync
+  worktree was refused for a camera-box untracked file, and the whole Bash call (its heredoc
+  writes included) did not run. The guard also matches words in a heredoc body, so write rule text
+  that names staging commands with the `Edit`/`Write` tool, not a Bash heredoc.
+- A slice tracked on a CAMERA-BOX issue: write "camera-box issue N" in commit messages and PR
+  bodies, never `#N`. In this repo the commit gate would look for a dantesync design marker for
+  `#N`, and a PR body's `#N` points at the wrong repo. A scope like `feat(freq-step):` passes.
+- The standalone `rustc` replica covers the pure modules AND the whole two-clock bench: build the
+  lib with `--crate-type lib --crate-name dantesync` into an rlib, then run
+  `rustc --test tests/two_clock_bench.rs --extern dantesync=<rlib> -O` (25+ bench tests in ~20 s).
+  Prove each RED on it by stubbing the new behaviour in a copy of the file, commit, restore.
+
 **Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
 ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually
 verify a branch, **open a PR to `master`** (that fires the `pull_request` CI); monitor it to green;
