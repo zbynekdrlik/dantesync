@@ -5,6 +5,38 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-09-29
+
+### Fixed
+
+- **A grandmaster FREQUENCY step is followed in seconds, not minutes (camera-box issue 1372).**
+  On 29.9.2026 the audio-VLAN Dante leader flipped four times between two devices whose clocks
+  differ by ~25 ppm, and the video-VLAN grandmaster followed it under the same identity. The
+  phase lock's PI is deliberately slow (critically damped, ~100 s), so every node took ~8-12
+  minutes to follow each flip, with a phase error near 1 ms; for all that time every OBS media
+  clock was off the Dante tick while the Dante audio devices had followed at once.
+  - **The detector.** Over the last 20 s of engaged windows the phase lock fits a line to the
+    OPEN-LOOP phase (the phase error minus the integral of the word it applied), whose slope is
+    the oscillator's rate against the grandmaster whatever the loop commanded. The frequency the
+    integrator has not learned is a step when it is at least 5 ppm, at least 6 standard errors
+    of the slope, and the window is LINEAR: no level shift and no slope change inside it explains
+    it better (so a delay spike or a path-delay change is never a step, and the estimate waits
+    until the window is past the step). Six consecutive windows confirm it; then nothing for 30 s.
+  - **The response.** The integrator jumps by the measured error (at most 100 ppm per event), and
+    the phase the step left (~400 us for 25 ppm) is pulled back along a decaying reference
+    (tau 20 s) whose rate the word carries as feed-forward, so the recovery neither disturbs the
+    learned frequency nor overshoots. No wall step; the fleet date offset `D` and
+    `date_offset_seq` are untouched. Without a confirmed step the frequency word is exactly the
+    plain PI's.
+  - One `[PHASE-LOCK] frequency step: +25.0ppm over 20s (fit σ ...) -- integrator re-seeded I a
+    -> b ...` line per event; `/status` gains `freq_steps`, `last_freq_step_ppm` (the step
+    followed; positive = the grandmaster sped up) and `last_freq_step_ts` (additive).
+  - Two-clock bench, 25 ppm step at 20 us sample noise: confirmed within 22 s, the learned
+    frequency within 1 ppm from 21.5 s, the phase within 50 us from 71.5 s (the plain PI: 501 s
+    and a 928 us peak). Three hours of 30 us noise with a heavy tail and a 0.1 ppm/min wander:
+    no detection. A six-box fleet follows a flip within 21 s, walls within 59 us, with frequency
+    words bit-identical across two UTC scenarios.
+
 ## [1.13.0] - 2026-09-29
 
 ### Fixed

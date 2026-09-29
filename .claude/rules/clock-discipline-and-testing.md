@@ -39,6 +39,11 @@ paths:
   - "src/controller/date_sync/daily_tests.rs"
   - "tests/two_clock_bench/daily.rs"
   - "tests/two_clock_bench/measure.rs"
+  - "src/ptp_phase_lock/freq_step.rs"
+  - "src/ptp_phase_lock/freq_step/tests.rs"
+  - "src/controller/date_sync/freq_step.rs"
+  - "src/controller/date_sync/freq_step_tests.rs"
+  - "tests/two_clock_bench/freq_step.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -930,3 +935,44 @@ steps every ~40-70s = the LOCKED deadband (healthy, chasing only the GM's own re
 #91 storm the PEAK was small tight-threshold steps (0.35-1.2ms), while the "+2.7ms" quoted in the issue
 body was the later recovering/locked phase — so grep the log for BOTH regimes before concluding which
 one a reported step size represents.
+
+## camera-box issue 1372 (v1.14) — a grandmaster FREQUENCY step is a detector + a re-seed, never faster gains
+
+A Dante leader re-election steps the grandmaster's frequency (~25 ppm on the rig, 29.9.2026) under
+the same identity on the video VLAN, so no re-anchor path sees it, and the ~100 s PI took 8-12
+minutes to follow. `src/ptp_phase_lock/freq_step.rs` detects it and the core re-seeds the integrator.
+What was learned building it:
+
+- **Measure the OPEN-LOOP phase, never the slope of `e`.** `p = e − ∫ word dt` has the oscillator's
+  rate against the grandmaster as its slope whatever the loop commanded; the unlearned frequency is
+  `slope(p) + I`. A slope of raw `e` also contains the loop's own proportional slew: re-engaging
+  1 ms off reads as a "clean" 20 ppm step, and after a re-seed the phase being recovered reads as a
+  step of the opposite sign. `p` needs the TRUE elapsed `dt` (the controller's grandmaster-time `dt`
+  spans a post-step grace; the fleet bench passes a constant `WINDOW_S`, which after a grace leaves a
+  small level shift in `p` that the linearity test rejects — harmless there, wrong in production).
+- **`|s| > 6σ` does not reject a level shift.** A median jump A in the middle of a 20 s ring reads as
+  a slope of 1.5·A / 20 s with `|s|/σ ≈ 1.7·√N ≈ 11`: every path-delay change or step-landing residual
+  ≥ ~100 µs would re-seed a false step (and its reversal 30 s later). The ring must also be LINEAR:
+  the largest partial F of a level shift or a slope change at any split (suffix sums, O(N)) ≤ 15. The
+  same test is what makes the estimate unbiased: it waits until the ring holds no pre-step windows.
+  A single outlier can never pass (its slope is ≤ √3 standard errors).
+- **A residual floor (1 µs) in the fit** keeps a noiseless simulated ring from turning floating-point
+  rounding into a linearity verdict. Real timestamps are never better than that.
+- **The phase the step left is retired along a decaying reference, not by the PI.** Re-seeding the
+  integrator exactly and letting the PI trim ~400 µs swings the integrator by ~ω·e0/e ≈ 1.5 ppm and
+  overshoots ~54 µs. The PI tracks `e − r` and the word carries `−r/τ` (τ 20 s) as feed-forward.
+- **Without a confirmed step the word must be the plain PI's, bit for bit** (the pull branch is taken
+  only while `r ≠ 0`). Tests pin it against a plain-PI mirror built from the module's public
+  constants: `without_a_confirmed_step_…_bit_for_bit_1372` and the bench's noise / wander cases.
+- **Size the parameters by a seeded simulation first.** A Python reference of the exact algorithm
+  (scratch, not committed) chose confirm = 6 (with 3, one of 20 runs at 30 µs sample noise settled to
+  1 ppm only after 146 s) and F ≤ 15 (the null's p99 is 15-17). At 50 µs sample noise a 20 s ring
+  cannot measure a small step to 1 ppm (σ ≈ 0.8 ppm): a 7-10 ppm step may be re-seeded coarsely and
+  the PI trims the rest — still faster than before.
+- **A fleet-bench flip must stay forward-only for the bit-identity pair.** Slow grandmaster A down
+  (the fleet falls further behind UTC, every correction is a forward step); a flip that makes the
+  fleet run ahead of UTC turns corrections into slews, whose rate term is in the words by design.
+  The bench's full `check()` is for its 24 h runs (it expects the grandmaster change and reboot, and a
+  UTC drift inside the micro capacity): the flip test asserts the phase / rate envelopes itself.
+- **Replica:** the pure module is a directory now; symlink `src/ptp_phase_lock/` beside
+  `src/ptp_phase_lock.rs` in the scratch crate, or `mod freq_step;` does not resolve.
