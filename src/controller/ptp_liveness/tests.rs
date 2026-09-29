@@ -367,8 +367,12 @@ fn a_follow_up_from_the_grandmaster_is_ptp_liveness_112() {
         .returning(|| Ok(Some((ptp_packet(2), 60, SystemTime::now(), Some(GM)))));
     net.expect_recv_packet().returning(|| Ok(None));
     let (mut c, _st) = controller(net);
-    let before = c.last_ptp_packet;
+    let before = Instant::now() - Duration::from_secs(5);
+    c.last_ptp_packet = before;
     c.process_loop_iteration().expect("a Follow_Up");
-    assert!(c.last_ptp_packet > before);
+    assert!(
+        c.last_ptp_packet > before,
+        "the Follow_Up refreshed PTP liveness"
+    );
     assert_eq!(c.ptp_liveness.rx.age_s(Instant::now()), Some(0));
 }
