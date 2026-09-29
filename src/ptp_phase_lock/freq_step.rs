@@ -107,8 +107,78 @@ pub struct RingFit {
 /// Fit a line to `(t s, p µs)` points (time strictly increasing) and test it for linearity.
 /// `None` below [`FSTEP_MIN_POINTS`] or when the times do not spread.
 pub fn fit_ring(points: &[(f64, f64)]) -> Option<RingFit> {
-    let _ = points;
-    None
+    let n = points.len();
+    if n < FSTEP_MIN_POINTS {
+        return None;
+    }
+    let nf = n as f64;
+    let t_mean = points.iter().map(|&(t, _)| t).sum::<f64>() / nf;
+    let p_mean = points.iter().map(|&(_, p)| p).sum::<f64>() / nf;
+    let tc: Vec<f64> = points.iter().map(|&(t, _)| t - t_mean).collect();
+    let sxx: f64 = tc.iter().map(|x| x * x).sum();
+    if !sxx.is_finite() || sxx <= 0.0 {
+        return None;
+    }
+    let slope = tc
+        .iter()
+        .zip(points)
+        .map(|(x, &(_, p))| x * (p - p_mean))
+        .sum::<f64>()
+        / sxx;
+    let resid: Vec<f64> = tc
+        .iter()
+        .zip(points)
+        .map(|(x, &(_, p))| p - p_mean - slope * x)
+        .collect();
+    let sse: f64 = resid.iter().map(|r| r * r).sum();
+    let floor = FSTEP_FIT_FLOOR_US * FSTEP_FIT_FLOOR_US;
+    let sigma = ((sse / (nf - 2.0)).max(floor) / sxx).sqrt();
+
+    // Suffix sums over i >= k of: 1, tc, tc², r, tc·r.
+    let mut s_n = vec![0.0; n + 1];
+    let mut s_t = vec![0.0; n + 1];
+    let mut s_tt = vec![0.0; n + 1];
+    let mut s_r = vec![0.0; n + 1];
+    let mut s_tr = vec![0.0; n + 1];
+    for i in (0..n).rev() {
+        s_n[i] = s_n[i + 1] + 1.0;
+        s_t[i] = s_t[i + 1] + tc[i];
+        s_tt[i] = s_tt[i + 1] + tc[i] * tc[i];
+        s_r[i] = s_r[i + 1] + resid[i];
+        s_tr[i] = s_tr[i + 1] + tc[i] * resid[i];
+    }
+    // The reduction of the residual sum of squares when one more regressor x is added to the line:
+    // (Σ x·r)² / |x without its projection on (1, t)|² — the residuals are already orthogonal to
+    // (1, t), so Σ x̃·r = Σ x·r.
+    let reduction = |sum_x: f64, sum_xx: f64, sum_xt: f64, sum_xr: f64| -> f64 {
+        let den = sum_xx - sum_x * sum_x / nf - sum_xt * sum_xt / sxx;
+        if den > 1e-9 {
+            sum_xr * sum_xr / den
+        } else {
+            0.0
+        }
+    };
+    let mut best = 0.0f64;
+    for k in FSTEP_SPLIT_EDGE..=(n - FSTEP_SPLIT_EDGE) {
+        let nk = s_n[k];
+        // A level shift: x = 1 for i >= k.
+        best = best.max(reduction(nk, nk, s_t[k], s_r[k]));
+        // A slope change at the knot t[k-1]: x = t − t[k-1] for i >= k.
+        let knot = tc[k - 1];
+        let sh = s_t[k] - nk * knot;
+        let shh = s_tt[k] - 2.0 * knot * s_t[k] + nk * knot * knot;
+        let sht = s_tt[k] - knot * s_t[k];
+        let shr = s_tr[k] - knot * s_r[k];
+        best = best.max(reduction(sh, shh, sht, shr));
+    }
+    let rest = ((sse - best) / (nf - 3.0)).max(floor);
+    Some(RingFit {
+        slope_ppm: slope,
+        sigma_ppm: sigma,
+        linearity_f: best / rest,
+        points: n,
+        span_s: points[n - 1].0 - points[0].0,
+    })
 }
 
 /// A confirmed frequency step, as measured.
@@ -178,8 +248,77 @@ impl FreqStepDetector {
         dt_s: f64,
         integrator_ppm: f64,
     ) -> Option<FreqStepEstimate> {
-        let _ = (e_us, dt_s, integrator_ppm);
-        None
+        let elapsed = if dt_s.is_finite() {
+            dt_s.clamp(0.0, DT_MAX_S)
+        } else {
+            0.0
+        };
+        self.holdoff_s = (self.holdoff_s - elapsed).max(0.0);
+        let last_word = match self.last_word_ppm {
+            Some(w) if (DT_MIN_S..=DT_MAX_S).contains(&dt_s) => w,
+            _ => {
+                // First window after a restart, or a gap the ring cannot represent: restart here.
+                self.reset();
+                if e_us.is_finite() {
+                    self.ring.push_back((0.0, e_us));
+                }
+                return None;
+            }
+        };
+        if !e_us.is_finite() {
+            self.reset();
+            return None;
+        }
+        self.clock_s += dt_s;
+        self.applied_us += last_word * dt_s;
+        let now = self.clock_s;
+        self.ring.push_back((now, e_us - self.applied_us));
+        while self.ring.len() > FSTEP_MAX_POINTS
+            || self
+                .ring
+                .front()
+                .is_some_and(|&(t, _)| now - t > FSTEP_WINDOW_S + 1e-9)
+        {
+            self.ring.pop_front();
+        }
+        let judged = self.holdoff_s <= 0.0 && self.clock_s >= FSTEP_WINDOW_S - 1e-9;
+        let fit = if judged {
+            fit_ring(self.ring.make_contiguous())
+        } else {
+            None
+        };
+        let Some(fit) = fit else {
+            self.run_sign = 0;
+            self.run_len = 0;
+            return None;
+        };
+        let error = fit.slope_ppm + integrator_ppm;
+        let candidate = error.abs() >= FSTEP_MIN_PPM
+            && error.abs() >= FSTEP_SIGMAS * fit.sigma_ppm
+            && fit.linearity_f <= FSTEP_LINEARITY_F_MAX;
+        if !candidate {
+            self.run_sign = 0;
+            self.run_len = 0;
+            return None;
+        }
+        let sign: i8 = if error > 0.0 { 1 } else { -1 };
+        if sign != self.run_sign {
+            self.run_sign = sign;
+            self.run_len = 0;
+        }
+        self.run_len += 1;
+        if self.run_len < FSTEP_CONFIRM {
+            return None;
+        }
+        self.reset();
+        self.holdoff_s = FSTEP_HOLDOFF_S;
+        Some(FreqStepEstimate {
+            error_ppm: error,
+            sigma_ppm: fit.sigma_ppm,
+            linearity_f: fit.linearity_f,
+            span_s: fit.span_s,
+            points: fit.points,
+        })
     }
 }
 

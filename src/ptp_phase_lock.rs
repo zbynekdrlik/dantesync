@@ -369,17 +369,66 @@ impl PhaseLockCore {
         } else {
             DT_MIN_S
         };
-        let e_us = (e_ns as f64 / 1_000.0).clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
-        // offset = local − master: a fast local clock GROWS e, so the correction is negative.
-        self.i_ppm = (self.i_ppm - K_I_PER_S2 * e_us * dt).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
-        let f = (self.i_ppm - K_P_PER_S * e_us).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+        let e_raw_us = e_ns as f64 / 1_000.0;
+        // camera-box issue 1372: a confirmed grandmaster frequency step re-seeds the integrator.
+        let freq_step = self
+            .fstep
+            .observe(e_raw_us, dt_s, self.i_ppm)
+            .map(|est| self.follow_freq_step(est, e_raw_us));
+        let f = if self.pull_us != 0.0 {
+            self.pulled_word(e_raw_us, dt)
+        } else {
+            let e_us = e_raw_us.clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
+            // offset = local − master: a fast local clock GROWS e, so the correction is negative.
+            self.i_ppm =
+                (self.i_ppm - K_I_PER_S2 * e_us * dt).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+            (self.i_ppm - K_P_PER_S * e_us).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM)
+        };
+        self.fstep.note_word(f);
         self.last_freq_ppm = f;
         WindowOutcome {
             freq_ppm: Some(f),
             error_ns: Some(e_ns),
             event,
-            freq_step: None,
+            freq_step,
         }
+    }
+
+    /// Follow a confirmed step: the integrator jumps by the measured error (bounded), and the phase
+    /// error the step left becomes the pull reference. No wall step, `D` untouched.
+    fn follow_freq_step(&mut self, est: FreqStepEstimate, e_us: f64) -> FreqStep {
+        let before = self.i_ppm;
+        let step_ppm = (-est.error_ppm).clamp(-FSTEP_MAX_PPM, FSTEP_MAX_PPM);
+        self.i_ppm = (before + step_ppm).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+        self.pull_us = e_us.clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
+        let followed = FreqStep {
+            step_ppm,
+            error_ppm: est.error_ppm,
+            sigma_ppm: est.sigma_ppm,
+            linearity_f: est.linearity_f,
+            span_s: est.span_s,
+            integrator_before_ppm: before,
+            integrator_after_ppm: self.i_ppm,
+            pull_us: self.pull_us,
+        };
+        self.freq_steps = self.freq_steps.saturating_add(1);
+        self.last_freq_step = Some(followed);
+        followed
+    }
+
+    /// The word while a followed step's phase is retired: the PI tracks `e − r` (so it sees no
+    /// error when the phase follows the reference) and the word carries the reference's own rate
+    /// `−r/τ` as feed-forward. The reference then decays by one window.
+    fn pulled_word(&mut self, e_raw_us: f64, dt: f64) -> f64 {
+        let e_us = (e_raw_us - self.pull_us).clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
+        let pull_rate = -self.pull_us / FSTEP_PULL_TAU_S;
+        self.i_ppm = (self.i_ppm - K_I_PER_S2 * e_us * dt).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+        let f = (self.i_ppm - K_P_PER_S * e_us + pull_rate).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+        self.pull_us *= (-dt / FSTEP_PULL_TAU_S).exp();
+        if self.pull_us.abs() < FSTEP_PULL_DONE_US {
+            self.pull_us = 0.0;
+        }
+        f
     }
 }
 
