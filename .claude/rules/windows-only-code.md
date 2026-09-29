@@ -91,8 +91,17 @@ inside a `#[cfg(test)] mod tests` block, invisible to a bins-only check). Always
 touching a file this rule is scoped to: bins-only would have shipped v1.8.22's regression again even
 with this exact local-check habit already in place.
 
-This is a `cargo check`/`cargo clippy` invocation, so it's allowed under this project's Tier-0
-local-build policy without a bypass. It is NOT a substitute for the real MSVC build (different
+**STALE since airuleset issue 557 (2026-08-20): this recipe is BLOCKED on dev1** — the Tier-0
+hook refuses every compiling cargo shape, `cargo check --target …` included. What still works
+locally (dantesync issue 112): put the Windows decision in a plain cross-platform function (e.g.
+`net::choose_capture_device`, `net::home_to_look_up`, tested on Linux CI), and compile a copy of the
+remaining `#[cfg(windows)]` glue as a standalone `rustc --edition 2021 --test` replica with stub
+types for the one or two crate types it touches (the round-3 reviewer compiled the Npcap
+`select_ptp_device` match + the Winsock `recv_packet` restructure that way, and ran
+`clippy-driver -D warnings -A dead_code` on it). Otherwise the Windows CI job is the first compile:
+push the RED commit alone and read its Windows log before writing GREEN.
+
+When it was allowed (before issue 557) it was NOT a substitute for the real MSVC build (different
 target triple, and `pcap`/`windows-service`/`tray-icon`'s actual linking is still unverified) — but
 it is free, fast, and catches the large majority of mistakes (wrong types, missing `?`, borrow
 errors, wrong trait bounds) that would otherwise only surface after pushing and waiting for the
