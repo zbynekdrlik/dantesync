@@ -20,6 +20,14 @@
 use super::*;
 use crate::ptp_rejoin::{rejoin_delay, RejoinSchedule, RejoinStatus, RxWindow};
 
+/// `/status.mode` while PTP is stale (no allowed packet for `PTP_TIMEOUT_SECS`), whatever the servo
+/// last reached: the name the offline edge always wrote, which the tray shows as its orange
+/// "PTP offline" state and every camera-box gate reads as not locked.
+pub(super) const PTP_STALE_MODE: &str = "NTP-only";
+
+// The first PTP re-join comes at the same staleness the alarm and /status use.
+const _: () = assert!(crate::ptp_rejoin::REJOIN_AFTER.as_secs() == PTP_TIMEOUT_SECS);
+
 /// All PTP-liveness state of one controller.
 #[derive(Default)]
 pub(super) struct PtpLiveness {
@@ -41,6 +49,63 @@ where
     /// first packet the silence counts from the start.
     pub(super) fn ptp_stale_at(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_ptp_packet) > Duration::from_secs(PTP_TIMEOUT_SECS)
+    }
+
+    /// Check PTP status and handle offline mode: the offline edge (PTP stale) and the online edge
+    /// (the next allowed packet), every loop iteration.
+    pub(super) fn check_ptp_status(&mut self) {
+        if self.ptp_stale_at(Instant::now()) {
+            if !self.ptp_offline {
+                self.ptp_offline = true;
+                // #112: the servo keeps its lock state through the outage (the learned frequency
+                // is held), but nothing PTP-derived is live any more: /status says so.
+                if self.is_locked || self.in_nano_mode {
+                    info!(
+                        "[PTP] === UNLOCKED === (no PTP packets for {}s) -- /status reports {} \
+                         until they return",
+                        PTP_TIMEOUT_SECS, PTP_STALE_MODE
+                    );
+                }
+                if !self.ptp_offline_logged {
+                    // camera-box issue 1073: if packets ARE arriving but are being
+                    // dropped by the allowlist, the grandmaster is not offline —
+                    // it is present and blocked by (a likely mis-set) config. Say
+                    // so, instead of the misleading "masters may be offline".
+                    if self.gm_dropped_since_accepted > 0 {
+                        warn!(
+                            "[PTP] No ALLOWED packets for {}s, but {} packet(s) from \
+                             non-allowlisted source(s) were dropped — the grandmaster may be \
+                             present but blocked by config.gm_allowlist; verify the allowlist",
+                            PTP_TIMEOUT_SECS, self.gm_dropped_since_accepted
+                        );
+                    } else {
+                        warn!(
+                            "[PTP] No packets received for {}s - PTP masters may be offline",
+                            PTP_TIMEOUT_SECS
+                        );
+                    }
+                    info!("[PTP] Continuing with NTP-only time sync");
+                    self.ptp_offline_logged = true;
+                }
+                // #117: drop every pre-outage measurement and hold the phase lock's learned
+                // frequency through the free-run (a no-op under the legacy discipline).
+                self.on_ptp_offline_edge();
+                // Update status to reflect offline state
+                if let Ok(mut status) = self.status_shared.write() {
+                    status.settled = false;
+                    status.is_locked = false;
+                    status.mode = PTP_STALE_MODE.to_string();
+                }
+            }
+        } else if self.ptp_offline {
+            // PTP came back online
+            self.ptp_offline = false;
+            self.ptp_offline_logged = false;
+            info!("[PTP] Packets received - PTP sync resumed");
+            if self.is_locked || self.in_nano_mode {
+                info!("[PTP] === LOCKED === (PTP packets back; the servo held its lock through the outage)");
+            }
+        }
     }
 
     /// An allowed PTP packet (one that passed the `gm_allowlist`) arrived at `now`: PTP is live,
