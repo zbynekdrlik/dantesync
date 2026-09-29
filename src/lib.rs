@@ -18,6 +18,9 @@ pub mod status;
 pub mod time_server;
 pub mod traits;
 
+#[cfg(unix)]
+pub mod net_linux;
+
 #[cfg(windows)]
 pub mod net_pcap;
 

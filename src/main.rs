@@ -13,13 +13,7 @@ use anyhow::anyhow;
 #[cfg(unix)]
 use nix::fcntl::{flock, FlockArg};
 #[cfg(unix)]
-use std::io::ErrorKind;
-#[cfg(unix)]
-use std::net::UdpSocket;
-#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
-use std::time::SystemTime;
 
 #[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
@@ -76,10 +70,10 @@ use windows_service::{
 };
 
 // Use library crate modules
+#[cfg(unix)]
+use dantesync::net_linux;
 #[cfg(windows)]
 use dantesync::net_pcap;
-#[cfg(unix)]
-use dantesync::ptp;
 use dantesync::{
     clock, config, controller, http_status, net, ntp, ntp_server, status, time_server, traits,
 };
@@ -89,8 +83,6 @@ use controller::PtpController;
 use serde::{Deserialize, Serialize};
 use status::SyncStatus;
 use traits::NtpSource;
-#[cfg(unix)]
-use traits::PtpNetwork;
 
 /// Simplified configuration - only NTP server needs to be managed
 /// All other parameters auto-adjust based on platform defaults
@@ -294,62 +286,6 @@ struct RealNtpSource {
 impl NtpSource for RealNtpSource {
     fn get_offset(&self) -> Result<ntp::NtpMeasurement> {
         self.client.get_offset()
-    }
-}
-
-// Legacy UDP-based PTP network (used on Linux with kernel timestamping)
-#[cfg(unix)]
-struct RealPtpNetwork {
-    sock_event: UdpSocket,
-    sock_general: UdpSocket,
-}
-
-#[cfg(unix)]
-impl PtpNetwork for RealPtpNetwork {
-    fn recv_packet(
-        &mut self,
-    ) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<std::net::Ipv4Addr>)>> {
-        let mut buf = [0u8; 2048];
-
-        // Check Event Socket first
-        match net::recv_with_timestamp(&self.sock_event, &mut buf) {
-            Ok(Some((size, ts, source_ip))) => {
-                return Ok(Some((buf[..size].to_vec(), size, ts, source_ip)));
-            }
-            Ok(None) => {} // Continue to check general
-            Err(e) => return Err(e),
-        }
-
-        // Check General Socket
-        match net::recv_with_timestamp(&self.sock_general, &mut buf) {
-            Ok(Some((size, ts, source_ip))) => {
-                return Ok(Some((buf[..size].to_vec(), size, ts, source_ip)));
-            }
-            Ok(None) => {} // No data on either socket
-            Err(e) => return Err(e),
-        }
-
-        Ok(None)
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        // Drain buffers to prevent processing old packets after a clock step
-        let mut buf = [0u8; 2048];
-        loop {
-            match self.sock_event.recv_from(&mut buf) {
-                Ok(_) => continue,
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-        loop {
-            match self.sock_general.recv_from(&mut buf) {
-                Ok(_) => continue,
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-        Ok(())
     }
 }
 
@@ -694,21 +630,10 @@ fn run_sync_loop(
     };
 
     // Platform-specific network setup
+    // Linux: the event + general sockets join the PTP group (IGMP) with kernel timestamping
+    // (`net_linux`, which logs the "Joined Multicast Groups on ..." line).
     #[cfg(unix)]
-    let network = {
-        // Create sockets to join multicast groups (IGMP) with kernel timestamping
-        let sock_event = net::create_multicast_socket(ptp::PTP_EVENT_PORT, iface_ip)?;
-        let sock_general = net::create_multicast_socket(ptp::PTP_GENERAL_PORT, iface_ip)?;
-        info!(
-            "Joined Multicast Groups on {} ({}) - Kernel timestamping",
-            iface_name, iface_ip
-        );
-
-        RealPtpNetwork {
-            sock_event,
-            sock_general,
-        }
-    };
+    let network = net_linux::UdpPtpNetwork::join(net_linux::KernelSockets, iface_name, iface_ip)?;
 
     #[cfg(windows)]
     let network = {
