@@ -346,6 +346,11 @@ fn only_a_sync_or_follow_up_is_ptp_liveness_not_a_runt_or_a_delay_req_112() {
         c.last_ptp_packet, quiet_since,
         "neither refreshed PTP liveness"
     );
+    assert_eq!(
+        c.ptp_liveness.schedule.attempts(),
+        1,
+        "and neither restarted the re-join schedule"
+    );
     assert!(c.ptp_stale_at(Instant::now()));
     assert_eq!(
         c.ptp_liveness.rx.age_s(Instant::now()),
@@ -375,4 +380,37 @@ fn a_follow_up_from_the_grandmaster_is_ptp_liveness_112() {
         "the Follow_Up refreshed PTP liveness"
     );
     assert_eq!(c.ptp_liveness.rx.age_s(Instant::now()), Some(0));
+}
+
+#[test]
+fn a_followers_delay_req_neither_names_the_grandmaster_nor_clears_the_drop_count_112() {
+    // A restricting allowlist on the rig subnet. A foreign grandmaster's Sync is dropped (the
+    // drop count says so), then another rig follower's Delay_Req arrives from an allowed address.
+    // It is not the grandmaster: `gm_source_ip` must not name it, and the "present but blocked
+    // by gm_allowlist" evidence must survive it.
+    let foreign: Ipv4Addr = Ipv4Addr::new(10, 77, 7, 109);
+    let follower: Ipv4Addr = Ipv4Addr::new(10, 77, 9, 50);
+    let mut net = MockPtpNetwork::new();
+    net.expect_recv_packet()
+        .times(1)
+        .returning(move || Ok(Some((ptp_packet(0), 60, SystemTime::now(), Some(foreign)))));
+    net.expect_recv_packet()
+        .times(1)
+        .returning(move || Ok(Some((ptp_packet(1), 60, SystemTime::now(), Some(follower)))));
+    net.expect_recv_packet().returning(|| Ok(None));
+    let status = Arc::new(RwLock::new(SyncStatus::default()));
+    let mut config = SystemConfig::default();
+    config.gm_allowlist = vec!["10.77.9.0/24".to_string()];
+    let mut c = PtpController::new(
+        MockSystemClock::new(),
+        net,
+        MockNtpSource::new(),
+        status,
+        config,
+    );
+    c.clock_alarm_notifier = Box::new(QuietNotifier);
+    c.process_loop_iteration().expect("a dropped Sync");
+    c.process_loop_iteration().expect("a follower's Delay_Req");
+    assert_eq!(c.gm_dropped_since_accepted, 1);
+    assert_eq!(c.current_sync_source_ip, None);
 }

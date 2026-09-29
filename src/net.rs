@@ -61,6 +61,26 @@ pub fn interface_with_ip(ip: Ipv4Addr) -> Option<String> {
         .map(|iface| iface.name)
 }
 
+/// dantesync#112 — the Windows PTP capture choice, pure so Linux CI tests it. `by_rule` is
+/// `net_pcap::find_ptp_capture_device`'s answer: `Ok((device, Some(ip)))` when the trusted
+/// grandmaster subnet of `gm_allowlist` picks one device (camera-box issue 1073; it always wins),
+/// `Ok((device, None))` for the name fallback. `home` is the device that carries the address PTP
+/// was last received on, when a re-join looks for one (startup passes `None`): after a NIC swap
+/// the adapter comes back as another device under another name, so it comes before the name
+/// fallback. Returns the device and the address to join on (`None` = the device's first IPv4).
+pub fn choose_capture_device<D>(
+    by_rule: Result<(D, Option<Ipv4Addr>)>,
+    home: Option<(D, Ipv4Addr)>,
+) -> Result<(D, Option<Ipv4Addr>)> {
+    match by_rule {
+        Ok((device, Some(ip))) => Ok((device, Some(ip))),
+        by_name => match home {
+            Some((device, ip)) => Ok((device, Some(ip))),
+            None => by_name,
+        },
+    }
+}
+
 fn is_ip_bindable(ip: Ipv4Addr) -> bool {
     let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
@@ -216,6 +236,44 @@ mod tests {
             interface_with_ip(Ipv4Addr::LOCALHOST),
             None,
             "never loopback"
+        );
+    }
+
+    const HOME: Ipv4Addr = Ipv4Addr::new(10, 77, 9, 204);
+
+    #[test]
+    fn the_trusted_subnet_rule_wins_over_the_home_device_112() {
+        let rule = Ok(("rig-nic", Some(Ipv4Addr::new(10, 77, 9, 205))));
+        let got = choose_capture_device(rule, Some(("old-home-nic", HOME))).expect("a device");
+        assert_eq!(got, ("rig-nic", Some(Ipv4Addr::new(10, 77, 9, 205))));
+    }
+
+    #[test]
+    fn the_home_device_wins_over_the_name_fallback_112() {
+        let by_name = Ok(("default-nic", None));
+        let got = choose_capture_device(by_name, Some(("swapped-nic", HOME))).expect("a device");
+        assert_eq!(got, ("swapped-nic", Some(HOME)));
+    }
+
+    #[test]
+    fn the_home_device_is_used_when_the_name_fallback_found_nothing_112() {
+        let by_name: Result<(&str, Option<Ipv4Addr>)> =
+            Err(anyhow!("Interface 'Ethernet' not found"));
+        let got = choose_capture_device(by_name, Some(("swapped-nic", HOME))).expect("a device");
+        assert_eq!(got, ("swapped-nic", Some(HOME)));
+    }
+
+    #[test]
+    fn without_a_home_device_the_startup_choice_stands_112() {
+        let by_name = Ok(("default-nic", None));
+        assert_eq!(
+            choose_capture_device(by_name, None).expect("a device"),
+            ("default-nic", None)
+        );
+        let none: Result<(&str, Option<Ipv4Addr>)> = Err(anyhow!("Interface 'Ethernet' not found"));
+        assert!(
+            choose_capture_device(none, None).is_err(),
+            "nothing to join: the caller keeps its old capture"
         );
     }
 

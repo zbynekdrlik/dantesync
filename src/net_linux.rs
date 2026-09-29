@@ -500,9 +500,10 @@ mod tests {
         net.rejoin().expect("the 3rd re-join");
         let a = addrs(&net);
         let event = a[a.len() - 2];
+        let sync = time_message();
         assert_eq!(
-            round_trip(&mut net, event, b"sync").as_deref(),
-            Some(&b"sync"[..])
+            round_trip(&mut net, event, &sync).as_deref(),
+            Some(&sync[..])
         );
         net.factory.carrying.insert(ETH0, "eth0".to_string());
         net.factory
@@ -513,6 +514,52 @@ mod tests {
             net.interface(),
             Some(("eth1-renamed", ETH1)),
             "the address PTP was last received on wins over the startup one"
+        );
+    }
+
+    /// A PTPv1 Sync, 60 bytes: a time message.
+    fn time_message() -> Vec<u8> {
+        let mut buf = vec![0u8; 60];
+        buf[1] = 0x01; // versionPTP = 1
+        buf[32] = 0x00; // control = Sync
+        buf
+    }
+
+    #[test]
+    fn a_stray_datagram_on_a_fallback_join_never_moves_the_home_112() {
+        // The NIC is unplugged, the re-join falls back to tailscale0, and something that is not
+        // the grandmaster's time reaches the socket there (the sockets bind INADDR_ANY:319/320):
+        // a runt, another follower's Delay_Req. The home must stay eth0's address, or every later
+        // re-join would stay on tailscale0.
+        let mut script = ScriptedSockets::default();
+        script
+            .interfaces
+            .push_back(Ok(("tailscale0".to_string(), TAILSCALE)));
+        let mut net = joined(script);
+        net.rejoin().expect("the fallback join");
+        let a = addrs(&net);
+        let event = a[a.len() - 2];
+        let mut delay_req = time_message();
+        delay_req[32] = 0x01;
+        for stray in [vec![0x10], delay_req] {
+            assert_eq!(
+                round_trip(&mut net, event, &stray).as_deref(),
+                Some(&stray[..]),
+                "delivered like any datagram"
+            );
+        }
+
+        net.factory
+            .carrying
+            .insert(TAILSCALE, "tailscale0".to_string());
+        net.factory
+            .carrying
+            .insert(ETH0, "enx002427159965".to_string());
+        net.rejoin().expect("the 2nd re-join");
+        assert_eq!(
+            net.interface(),
+            Some(("enx002427159965", ETH0)),
+            "the home is still where PTP was last received"
         );
     }
 
