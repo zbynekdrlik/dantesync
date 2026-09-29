@@ -31,6 +31,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// this file; its state is the one `date_sync` field.
 mod date_sync;
 
+/// dantesync#112 — PTP liveness: the multicast re-join while no allowed PTP packet comes, and the
+/// honest `/status` meanwhile. A child module like `date_sync`; its state is the one
+/// `ptp_liveness` field.
+mod ptp_liveness;
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -837,6 +842,10 @@ where
     /// authority on the NTP master, a follower's scheduler and poll source). One sub-struct, owned
     /// by `controller/date_sync.rs`.
     date_sync: date_sync::DateSync,
+
+    /// dantesync#112 — the PTP re-join schedule, the receive rate and `/status.rejoin`, owned by
+    /// `controller/ptp_liveness.rs`.
+    ptp_liveness: ptp_liveness::PtpLiveness,
 }
 
 struct PendingSync {
@@ -1025,6 +1034,7 @@ where
             phase_slew_alarm_active: false,
             phase_slew_preserve_streak: 0,
             date_sync,
+            ptp_liveness: ptp_liveness::PtpLiveness::default(),
         }
     }
 
@@ -2094,6 +2104,10 @@ where
         // Check PTP status first (handles timeout detection for NTP-only fallback)
         self.check_ptp_status();
 
+        // #112: re-join the PTP multicast group while no allowed packet comes. Before the receive,
+        // so a dead capture handle whose receive errors every iteration is still re-opened.
+        self.maybe_rejoin_ptp(Instant::now());
+
         // #88: apply a coordinated date step the moment its instant arrives, and follow the
         // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
         // step lands within one loop period of the announced instant on every box.
@@ -2166,7 +2180,7 @@ where
         }
 
         // Packet received - update last_ptp_packet timestamp and source IP
-        self.last_ptp_packet = Instant::now();
+        self.note_allowed_ptp_packet(Instant::now());
         // An allowed packet arrived: clear the drop-since-accepted counter so the
         // offline log and any future warning reflect only the CURRENT gap.
         self.gm_dropped_since_accepted = 0;

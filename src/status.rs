@@ -1,4 +1,5 @@
 use crate::clock_alarm::ClockAlarmStatus;
+use crate::ptp_rejoin::RejoinStatus;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
@@ -48,8 +49,9 @@ pub struct SyncStatus {
     /// Used for NTP status display in tray menu
     pub ntp_offset_us: i64,
 
-    /// Current operating mode: "ACQ" (acquiring), "PROD" (production), "LOCK" (locked), "NTP-only"
-    /// Used for status display and icon state
+    /// Current operating mode: "ACQ" (acquiring), "PROD" (production), "LOCK" (locked), "NANO",
+    /// "NTP-only" (dantesync#112: no allowed PTP packet for 10 s, whatever the servo last reached;
+    /// `is_locked` is then false). Used for status display and icon state
     pub mode: String,
 
     /// True when this node's UTC alignment is NOT being maintained.
@@ -406,6 +408,26 @@ pub struct SyncStatus {
     /// fleet time line.
     #[serde(default)]
     pub ptp_phase_error_us: Option<f64>,
+
+    // ========================================================================
+    // PTP liveness (dantesync#112) — additive.
+    // ========================================================================
+    /// dantesync#112: whole seconds since the last ALLOWED PTP packet (one that passed the
+    /// `gm_allowlist`); `null` when none has come since the process started. Above 10 the node is
+    /// PTP-stale: `is_locked` is false and `mode` is `"NTP-only"`, while `offset_ns` still holds the
+    /// last measured value. Read this before trusting any PTP-derived field.
+    #[serde(default)]
+    pub last_ptp_rx_age_s: Option<u64>,
+
+    /// dantesync#112: allowed PTP packets per second over the last 10 s (a Dante grandmaster sends
+    /// about 16: 8 Sync + 8 Follow_Up). 0 while stale.
+    #[serde(default)]
+    pub ptp_rx_pps: f64,
+
+    /// dantesync#112: the PTP multicast re-joins this process made (attempts, the last one's
+    /// time, the interface/IP it joined on, its error).
+    #[serde(default)]
+    pub rejoin: RejoinStatus,
 }
 
 fn default_clock_alarm_interval_s() -> u64 {
@@ -501,6 +523,10 @@ impl Default for SyncStatus {
             rate_source: String::new(),
             ptp_phase_locked: false,
             ptp_phase_error_us: None,
+            // #112: no packet yet, no re-join yet
+            last_ptp_rx_age_s: None,
+            ptp_rx_pps: 0.0,
+            rejoin: RejoinStatus::default(),
         }
     }
 }

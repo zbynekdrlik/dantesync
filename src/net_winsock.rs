@@ -562,6 +562,12 @@ impl crate::traits::PtpNetwork for WinsockPtpNetwork {
         // No state to reset for Winsock sockets
         Ok(())
     }
+
+    fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
+        Err(anyhow!(
+            "PTP re-join is not implemented yet (dantesync#112)"
+        ))
+    }
 }
 
 #[cfg(test)]

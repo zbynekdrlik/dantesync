@@ -4,7 +4,7 @@ use dantesync::config::SystemConfig;
 use dantesync::controller::PtpController;
 use dantesync::ntp::NtpMeasurement;
 use dantesync::status::SyncStatus;
-use dantesync::traits::{NtpSource, PtpNetwork};
+use dantesync::traits::{NtpSource, PtpNetwork, RejoinOutcome};
 use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::sync::{Arc, RwLock};
@@ -172,6 +172,16 @@ impl PtpNetwork for StatefulNetwork {
 
     fn reset(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    /// dantesync#112: the simulated grandmaster never goes quiet, so the controller never asks;
+    /// the simulated network is always joined.
+    fn rejoin(&mut self) -> Result<RejoinOutcome> {
+        Ok(RejoinOutcome {
+            iface: "sim0".to_string(),
+            ip: std::net::Ipv4Addr::LOCALHOST,
+            changed: false,
+        })
     }
 }
 

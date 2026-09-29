@@ -483,6 +483,12 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
         // Npcap doesn't need explicit reset
         Ok(())
     }
+
+    fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
+        Err(anyhow!(
+            "PTP re-join is not implemented yet (dantesync#112)"
+        ))
+    }
 }
 
 // ============================================================================
