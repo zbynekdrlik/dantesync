@@ -47,6 +47,11 @@ pub const REJOIN_BACKOFF: [Duration; 4] = [
 /// The window of `/status.ptp_rx_pps`.
 pub const RX_RATE_WINDOW: Duration = Duration::from_secs(10);
 
+/// At most this many arrivals are kept (a grandmaster sends ~16 a second, so ~160 in a window): a
+/// storm on 319/320 from an allowed source cannot grow the window without bound. Above it
+/// `ptp_rx_pps` saturates at `RX_WINDOW_MAX_ARRIVALS / 10` (2000), which still reads as a storm.
+pub const RX_WINDOW_MAX_ARRIVALS: usize = 20_000;
+
 /// The wait before attempt `attempt` (1-based) of one silence: [`REJOIN_AFTER`] from the last
 /// packet for the first, [`REJOIN_BACKOFF`] from the previous attempt for every later one.
 pub fn rejoin_delay(attempt: u32) -> Duration {
@@ -304,6 +309,23 @@ mod tests {
             rx.arrivals.len()
         );
         assert!((rx.pps(t0 + ms(59_999)) - 1_000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_packet_storm_cannot_grow_the_rate_window_without_bound_112() {
+        let t0 = Instant::now();
+        let mut rx = RxWindow::new();
+        // 50 000 packets in half a second, all inside the window.
+        for i in 0..50_000u64 {
+            rx.record(t0 + Duration::from_micros(i * 10));
+        }
+        assert_eq!(rx.arrivals.len(), RX_WINDOW_MAX_ARRIVALS);
+        assert_eq!(
+            rx.pps(t0 + ms(500)),
+            RX_WINDOW_MAX_ARRIVALS as f64 / 10.0,
+            "saturated: still a storm"
+        );
+        assert_eq!(rx.age_s(t0 + ms(500)), Some(0));
     }
 
     #[test]

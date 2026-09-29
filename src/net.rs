@@ -46,6 +46,21 @@ pub fn get_default_interface() -> Result<(String, Ipv4Addr)> {
     Err(anyhow!("No suitable IPv4 interface found"))
 }
 
+/// dantesync#112 — the name of the interface that carries exactly `ip` now (never loopback), if
+/// any. The PTP re-join looks for the NIC it last received PTP on this way: a NIC that is re-plugged
+/// (USB) comes back with a new, higher ifindex, often under a new name, so the listing-ordered
+/// [`get_default_interface`] may put another interface (tailscale, docker, a bridge) first.
+pub fn interface_with_ip(ip: Ipv4Addr) -> Option<String> {
+    if ip.is_loopback() {
+        return None;
+    }
+    let ifaces = if_addrs::get_if_addrs().ok()?;
+    ifaces
+        .into_iter()
+        .find(|iface| iface.ip() == IpAddr::V4(ip))
+        .map(|iface| iface.name)
+}
+
 fn is_ip_bindable(ip: Ipv4Addr) -> bool {
     let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
@@ -184,6 +199,24 @@ mod tests {
             assert!(!ip.is_loopback(), "Should not return loopback address");
         }
         // Error case is acceptable on minimal test environments
+    }
+
+    /// dantesync#112: the interface carrying an address is found by that address.
+    #[test]
+    fn interface_with_ip_finds_the_interface_by_its_address_112() {
+        if let Ok((name, ip)) = get_default_interface() {
+            assert_eq!(interface_with_ip(ip), Some(name));
+        }
+        assert_eq!(
+            interface_with_ip(Ipv4Addr::new(192, 0, 2, 1)),
+            None,
+            "TEST-NET-1 is on no interface"
+        );
+        assert_eq!(
+            interface_with_ip(Ipv4Addr::LOCALHOST),
+            None,
+            "never loopback"
+        );
     }
 
     /// Test is_ip_bindable with loopback (should always work)

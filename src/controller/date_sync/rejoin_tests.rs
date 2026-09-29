@@ -62,7 +62,10 @@ fn a_ptp_loss_rejoin_and_re_acquire_keep_the_fleet_d_and_its_seq_on_the_master_1
         };
         assert!(seq0.is_some(), "the master publishes its authority's seq");
 
-        // The NIC is re-plugged: no PTP packet for 11 s. The loop re-joins; no restart.
+        // The NIC is re-plugged: no PTP packet for 11 s. The loop re-joins; no restart. (An
+        // `Instant` cannot move forward, so the receive history is re-written in time order:
+        // the last packet came 11 s ago.)
+        c.ptp_liveness.rx = crate::ptp_rejoin::RxWindow::new();
         c.note_allowed_ptp_packet(Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 1));
         c.check_ptp_status();
         c.maybe_rejoin_ptp(Instant::now());

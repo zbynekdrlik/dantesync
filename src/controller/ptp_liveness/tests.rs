@@ -57,6 +57,14 @@ fn ms(millis: u64) -> Duration {
     Duration::from_millis(millis)
 }
 
+/// A 60-byte PTPv1 datagram with the given control byte (0 Sync, 1 Delay_Req, 2 Follow_Up).
+fn ptp_packet(control: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 60];
+    buf[0] = 0x10; // PTPv1
+    buf[32] = control;
+    buf
+}
+
 /// The packets stopped `secs` ago. An `Instant` cannot be moved forward, so the receive history is
 /// re-written instead: the last allowed packet came `secs` ago, and none after it (the loop only
 /// ever records arrivals in time order).
@@ -131,7 +139,7 @@ fn the_loop_rejoins_before_it_receives_and_a_received_packet_resets_the_schedule
     });
     net.expect_recv_packet()
         .times(1)
-        .returning(|| Ok(Some((vec![0x10, 0x02], 2, SystemTime::now(), Some(GM)))));
+        .returning(|| Ok(Some((ptp_packet(0), 60, SystemTime::now(), Some(GM)))));
     net.expect_recv_packet().returning(|| Ok(None));
     let (mut c, st) = controller(net);
     c.last_ptp_packet = Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 5);
@@ -312,4 +320,55 @@ fn the_receive_rate_counts_allowed_packets_only_112() {
         st.ptp_rx_pps
     );
     assert_eq!(st.last_ptp_rx_age_s, Some(0));
+}
+
+#[test]
+fn only_a_sync_or_follow_up_is_ptp_liveness_not_a_runt_or_a_delay_req_112() {
+    // The grandmaster is gone, but other traffic from an allowed source still reaches 319/320
+    // (an empty allowlist allows every source): a runt datagram and another follower's
+    // Delay_Req. Neither is the grandmaster's time, so PTP stays stale and the re-join goes on.
+    let count = Arc::new(AtomicU32::new(0));
+    let mut net = counting_network(count.clone());
+    net.expect_recv_packet()
+        .times(1)
+        .returning(|| Ok(Some((vec![0x10, 0x02], 2, SystemTime::now(), Some(GM)))));
+    net.expect_recv_packet()
+        .times(1)
+        .returning(|| Ok(Some((ptp_packet(1), 60, SystemTime::now(), Some(GM)))));
+    net.expect_recv_packet().returning(|| Ok(None));
+    let (mut c, _st) = controller(net);
+    let quiet_since = Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 5);
+    c.last_ptp_packet = quiet_since;
+
+    c.process_loop_iteration().expect("a runt is no error");
+    c.process_loop_iteration().expect("a Delay_Req is no error");
+    assert_eq!(
+        c.last_ptp_packet, quiet_since,
+        "neither refreshed PTP liveness"
+    );
+    assert!(c.ptp_stale_at(Instant::now()));
+    assert_eq!(
+        c.ptp_liveness.rx.age_s(Instant::now()),
+        None,
+        "nothing counted"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "the re-join schedule runs on"
+    );
+}
+
+#[test]
+fn a_follow_up_from_the_grandmaster_is_ptp_liveness_112() {
+    let mut net = MockPtpNetwork::new();
+    net.expect_recv_packet()
+        .times(1)
+        .returning(|| Ok(Some((ptp_packet(2), 60, SystemTime::now(), Some(GM)))));
+    net.expect_recv_packet().returning(|| Ok(None));
+    let (mut c, _st) = controller(net);
+    let before = c.last_ptp_packet;
+    c.process_loop_iteration().expect("a Follow_Up");
+    assert!(c.last_ptp_packet > before);
+    assert_eq!(c.ptp_liveness.rx.age_s(Instant::now()), Some(0));
 }

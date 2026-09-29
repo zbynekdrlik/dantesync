@@ -24,6 +24,8 @@ use std::time::SystemTime;
 pub trait PtpSocketFactory {
     /// The interface to join the PTP group on, as `(name, IPv4)`, resolved now.
     fn resolve_interface(&mut self) -> Result<(String, Ipv4Addr)>;
+    /// The name of the interface that carries exactly `ip` now, if any.
+    fn interface_carrying(&mut self, ip: Ipv4Addr) -> Option<String>;
     /// One non-blocking PTP socket bound to `port` and joined to the PTP multicast group on `ip`.
     fn open(&mut self, port: u16, ip: Ipv4Addr) -> Result<UdpSocket>;
 }
@@ -35,6 +37,10 @@ pub struct KernelSockets;
 impl PtpSocketFactory for KernelSockets {
     fn resolve_interface(&mut self) -> Result<(String, Ipv4Addr)> {
         net::get_default_interface()
+    }
+
+    fn interface_carrying(&mut self, ip: Ipv4Addr) -> Option<String> {
+        net::interface_with_ip(ip)
     }
 
     fn open(&mut self, port: u16, ip: Ipv4Addr) -> Result<UdpSocket> {
@@ -160,20 +166,32 @@ impl<F: PtpSocketFactory> PtpNetwork for UdpPtpNetwork<F> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    /// The two OS boundaries, scripted. The resolver answers from a queue. The opener binds a
-    /// REAL non-blocking UDP socket on loopback (319/320 need root, so an ephemeral port) and can
-    /// be told to fail on one port. Every socket gets its own loopback address (127.0.1.N), so a
-    /// released address can never be taken again by a later socket of the same test.
+    /// Loopback addresses handed out so far, over EVERY test of this binary (they run in
+    /// parallel): each socket gets its own 127.0.x.y, so no test can take an address another
+    /// one just released and fool its "is it free?" probe.
+    static LOOPBACKS: AtomicU32 = AtomicU32::new(0);
+
+    fn next_loopback() -> Ipv4Addr {
+        let n = LOOPBACKS.fetch_add(1, Ordering::SeqCst);
+        Ipv4Addr::new(127, 0, (1 + n / 250) as u8, (1 + n % 250) as u8)
+    }
+
+    /// The two OS boundaries, scripted. The resolver answers from a queue; `carrying` says which
+    /// interface carries an address now. The opener binds a REAL non-blocking UDP socket on its
+    /// own loopback address (319/320 need root, so an ephemeral port) and can be told to fail on
+    /// one port.
     #[derive(Default)]
     struct ScriptedSockets {
         interfaces: VecDeque<Result<(String, Ipv4Addr)>>,
+        /// How often the startup resolver was asked.
+        resolves: u32,
+        carrying: HashMap<Ipv4Addr, String>,
         fail_port: Option<u16>,
-        /// Sockets bound so far (the next one binds 127.0.1.`binds + 1`).
-        binds: u8,
         /// `(port, ip, the socket's own address)` of every socket opened.
         opened: Vec<(u16, Ipv4Addr, SocketAddr)>,
         /// Addresses that must already be released whenever a socket is opened.
@@ -184,9 +202,14 @@ mod tests {
 
     impl PtpSocketFactory for ScriptedSockets {
         fn resolve_interface(&mut self) -> Result<(String, Ipv4Addr)> {
+            self.resolves += 1;
             self.interfaces
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow!("No suitable IPv4 interface found")))
+        }
+
+        fn interface_carrying(&mut self, ip: Ipv4Addr) -> Option<String> {
+            self.carrying.get(&ip).cloned()
         }
 
         fn open(&mut self, port: u16, ip: Ipv4Addr) -> Result<UdpSocket> {
@@ -195,8 +218,7 @@ mod tests {
             if self.fail_port == Some(port) {
                 return Err(anyhow!("cannot join the PTP group on {ip}: No such device"));
             }
-            self.binds += 1;
-            let sock = UdpSocket::bind((Ipv4Addr::new(127, 0, 1, self.binds), 0))?;
+            let sock = UdpSocket::bind((next_loopback(), 0))?;
             sock.set_nonblocking(true)?;
             self.opened.push((port, ip, sock.local_addr()?));
             Ok(sock)
@@ -394,6 +416,91 @@ mod tests {
         assert_eq!(
             round_trip(&mut net, new[4], b"fup").as_deref(),
             Some(&b"fup"[..])
+        );
+    }
+
+    const TAILSCALE: Ipv4Addr = Ipv4Addr::new(100, 104, 8, 125);
+
+    #[test]
+    fn a_re_plugged_nic_that_kept_its_address_is_joined_before_the_listing_order_112() {
+        // The USB NIC came back as a new netdev (a new, higher ifindex, here also a new name)
+        // with its old address. The listing-ordered resolver would now answer tailscale0.
+        let mut script = ScriptedSockets::default();
+        script
+            .interfaces
+            .push_back(Ok(("tailscale0".to_string(), TAILSCALE)));
+        script.carrying.insert(ETH0, "enx002427159965".to_string());
+        let mut net = joined(script);
+
+        let out = net.rejoin().expect("the re-join");
+        assert_eq!(
+            out,
+            RejoinOutcome {
+                iface: "enx002427159965".to_string(),
+                ip: ETH0,
+                changed: true
+            },
+            "joined again where PTP was last received, under the NIC's new name"
+        );
+        assert_eq!(net.factory.resolves, 0, "the resolver was not needed");
+    }
+
+    #[test]
+    fn with_its_address_nowhere_the_re_join_falls_back_to_the_startup_resolver_112() {
+        // A DHCP move: the old address is gone from every interface.
+        let mut script = ScriptedSockets::default();
+        script
+            .interfaces
+            .push_back(Ok(("enp2s0".to_string(), ETH1)));
+        let mut net = joined(script);
+        let out = net.rejoin().expect("the re-join");
+        assert_eq!((out.iface.as_str(), out.ip), ("enp2s0", ETH1));
+        assert_eq!(net.factory.resolves, 1);
+    }
+
+    #[test]
+    fn the_home_address_follows_the_join_that_received_ptp_112() {
+        let mut script = ScriptedSockets::default();
+        // 1st re-join: the NIC is still unplugged, the resolver answers tailscale0.
+        script
+            .interfaces
+            .push_back(Ok(("tailscale0".to_string(), TAILSCALE)));
+        let mut net = joined(script);
+        net.rejoin().expect("the fallback join");
+        assert_eq!(net.interface(), Some(("tailscale0", TAILSCALE)));
+
+        // Nothing is received there, so the home is still eth0's address: once the NIC is back
+        // (under a new name), the 2nd re-join goes there, not to tailscale0 again.
+        net.factory
+            .carrying
+            .insert(TAILSCALE, "tailscale0".to_string());
+        net.factory
+            .carrying
+            .insert(ETH0, "enx002427159965".to_string());
+        net.rejoin().expect("the 2nd re-join");
+        assert_eq!(net.interface(), Some(("enx002427159965", ETH0)));
+
+        // A later move to eth1 that DOES receive PTP makes eth1's address the home.
+        net.factory.carrying.clear();
+        net.factory
+            .interfaces
+            .push_back(Ok(("eth1".to_string(), ETH1)));
+        net.rejoin().expect("the 3rd re-join");
+        let a = addrs(&net);
+        let event = a[a.len() - 2];
+        assert_eq!(
+            round_trip(&mut net, event, b"sync").as_deref(),
+            Some(&b"sync"[..])
+        );
+        net.factory.carrying.insert(ETH0, "eth0".to_string());
+        net.factory
+            .carrying
+            .insert(ETH1, "eth1-renamed".to_string());
+        net.rejoin().expect("the 4th re-join");
+        assert_eq!(
+            net.interface(),
+            Some(("eth1-renamed", ETH1)),
+            "the address PTP was last received on wins over the startup one"
         );
     }
 
