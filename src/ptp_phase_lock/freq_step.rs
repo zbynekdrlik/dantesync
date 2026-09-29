@@ -35,6 +35,11 @@
 //!   delay change or a step's landing residual would otherwise be re-seeded as a false step. The
 //!   same test waits until the ring holds only post-step windows, so the estimate is not biased by
 //!   a kink inside it;
+//! - the frequency is still there with the most likely level shift explained away: the slope of
+//!   the line fitted together with the best level-shift split must leave an unlearned frequency of
+//!   the same sign and at least [`FSTEP_MIN_PPM`]. At 40-60 µs of sample noise the F test alone has
+//!   too little power against a 60-120 µs path-delay change (a false re-seed in up to 10 of 60
+//!   seeded events); this slope removes it, while a genuine step keeps its slope;
 //!
 //! and the candidate holds with the same sign for [`FSTEP_CONFIRM`] consecutive windows. A single
 //! outlier cannot pass: its slope is at most √3 standard errors.
@@ -55,8 +60,10 @@ use std::collections::VecDeque;
 pub const FSTEP_WINDOW_S: f64 = 20.0;
 
 /// The smallest unlearned frequency (ppm) that is a step. The PI follows oscillator wander (a
-/// fraction of a ppm per minute) and a ramp leaves at most a few tenths of a ppm unlearned.
-pub const FSTEP_MIN_PPM: f64 = 5.0;
+/// fraction of a ppm per minute) and a ramp leaves at most a few tenths of a ppm unlearned. Six
+/// rather than five: at 50-60 µs of sample noise a 60-120 µs path-delay change still passed as a
+/// ~5 ppm step in 1 of 1000 seeded events at 5 ppm, none at 6. Smaller steps stay with the PI.
+pub const FSTEP_MIN_PPM: f64 = 6.0;
 
 /// The unlearned frequency must also be this many standard errors of the fitted slope.
 pub const FSTEP_SIGMAS: f64 = 6.0;
@@ -359,12 +366,16 @@ impl FreqStepDetector {
         // slope, so the steady state never pays for it.
         let slope_says_step =
             error.abs() >= FSTEP_MIN_PPM && error.abs() >= FSTEP_SIGMAS * line.sigma_ppm;
-        let (linearity_f, _shifted_slope) = if slope_says_step {
+        let (linearity_f, shifted_slope) = if slope_says_step {
             split_test(self.ring.make_contiguous(), &line)
         } else {
             (f64::INFINITY, line.slope_ppm)
         };
-        let candidate = slope_says_step && linearity_f <= FSTEP_LINEARITY_F_MAX;
+        let shifted_error = shifted_slope + integrator_ppm;
+        let candidate = slope_says_step
+            && linearity_f <= FSTEP_LINEARITY_F_MAX
+            && shifted_error.abs() >= FSTEP_MIN_PPM
+            && shifted_error.signum() == error.signum();
         if !candidate {
             self.run_sign = 0;
             self.run_len = 0;
