@@ -35,14 +35,23 @@
 //!   delay change or a step's landing residual would otherwise be re-seeded as a false step. The
 //!   same test waits until the ring holds only post-step windows, so the estimate is not biased by
 //!   a kink inside it;
-//! - the frequency is still there with the most likely level shift explained away: the slope of
-//!   the line fitted together with the best level-shift split must leave an unlearned frequency of
-//!   the same sign and at least [`FSTEP_MIN_PPM`]. At 40-60 µs of sample noise the F test alone has
-//!   too little power against a 60-120 µs path-delay change (a false re-seed in up to 10 of 60
-//!   seeded events); this slope removes it, while a genuine step keeps its slope;
+//! - the frequency is still there with the most likely one and two level shifts explained away:
+//!   the slope of the line fitted together with the best level-shift split, and with the best
+//!   pair of splits, must each leave an unlearned frequency of the same sign and at least
+//!   [`FSTEP_MIN_PPM`]. At 40-60 µs of sample noise the F test alone has too little power against a
+//!   60-120 µs path-delay change (a false re-seed in up to 10 of 60 seeded events), and a change in
+//!   two stages 5-10 s apart passed in up to 23 of 25 even at 20-30 µs; a genuine step keeps its
+//!   slope through both;
 //!
 //! and the candidate holds with the same sign for [`FSTEP_CONFIRM`] consecutive windows. A single
 //! outlier cannot pass: its slope is at most √3 standard errors.
+//!
+//! What it cannot tell apart, inside a 20 s ring: a path delay that RAMPS (≥ ~150 µs over
+//! ~10-15 s) under ≥ 30-50 µs of sample noise, or changes in three or more stages, looks like a
+//! frequency change while it lasts (measured on a seeded replica: 1-11 of 25 ramps at 30-50 µs,
+//! 4 of 25 three-stage 3 × 70 µs changes at 20 µs). Such a false re-seed is bounded (≤ the path
+//! change's apparent slope, typically 6-13 ppm) and undone after the holdoff, when the ring shows
+//! the frequency the loop now misses.
 //!
 //! The line fit runs on every engaged window without allocating; the split scan runs only for a
 //! window whose slope already passes the first test (never in the steady state).
@@ -178,7 +187,8 @@ pub fn fit_line<'a>(points: impl Iterator<Item = &'a (f64, f64)> + Clone) -> Opt
 /// The linearity test of a fitted line (see [`split_test`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SplitTest {
-    /// The largest partial F of a level shift or a slope change at any split.
+    /// The largest partial F of a level shift or a slope change at any split, against the white
+    /// noise of the residuals estimated from their successive differences.
     pub linearity_f: f64,
     /// The slope of the line fitted together with the best level-shift split (ppm).
     pub one_shift_slope_ppm: f64,
@@ -189,6 +199,11 @@ pub struct SplitTest {
 /// The linearity test of a fitted line: the largest partial F of a level shift or a slope change
 /// at any split keeping [`FSTEP_SPLIT_EDGE`] points on each side, and the slope with the most
 /// likely one, and the most likely two, level shifts explained.
+///
+/// The F denominator is the white noise estimated from successive differences of the residuals,
+/// `Σ (r_i − r_{i−1})² / 2(n − 1)`, not the residual left after the best split: a second structure
+/// in the ring (a path change in two stages) would otherwise inflate that residual and hide the
+/// first.
 pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> SplitTest {
     let n = points.len();
     if n != line.points || n < 2 * FSTEP_SPLIT_EDGE {
@@ -280,8 +295,7 @@ pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> SplitTest {
         }
     }
     let floor = FSTEP_FIT_FLOOR_US * FSTEP_FIT_FLOOR_US;
-    let _ = diff_sq;
-    let noise = ((line.sse - best) / (nf - 3.0)).max(floor);
+    let noise = (diff_sq / (2.0 * (nf - 1.0))).max(floor);
     SplitTest {
         linearity_f: best / noise,
         one_shift_slope_ppm: one_shift,
@@ -430,7 +444,7 @@ impl FreqStepDetector {
                 two_shift_slope_ppm: line.slope_ppm,
             }
         };
-        // The frequency must survive the most likely level shift explained away.
+        // The frequency must survive the most likely one and two level shifts explained away.
         let survives = |slope: f64| {
             let e = slope + integrator_ppm;
             e.abs() >= FSTEP_MIN_PPM && e.signum() == error.signum()
@@ -438,7 +452,8 @@ impl FreqStepDetector {
         let linearity_f = split.linearity_f;
         let candidate = slope_says_step
             && linearity_f <= FSTEP_LINEARITY_F_MAX
-            && survives(split.one_shift_slope_ppm);
+            && survives(split.one_shift_slope_ppm)
+            && survives(split.two_shift_slope_ppm);
         if !candidate {
             self.run_sign = 0;
             self.run_len = 0;
