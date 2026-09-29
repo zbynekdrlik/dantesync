@@ -787,3 +787,12 @@ canary evidence before continuing.
   - round 1: refactor `c9cc06e`, RED `a59a661`, GREEN `2eb79d9`, docs `719bd99`;
   - round 2: RED `bd81692` + `8133b32`, test fix `1f4966f`, GREEN `ee52c21`, refactor `7f86b69`, ci `c644b54` (tarpaulin `--timeout 300`), docs `fc8341e`.
 - CI run 36275731361: all green.
+
+## #112 PTP re-join + honest /status while PTP is stale (v1.13.0, draft PR #124, branch `issue-112-ptp-rejoin`)
+
+- Main design: issuecomment-5890924672 (Approach 1). My validation: 5891179234; anchors + the D finding: 5891190441.
+- Finding: D is anchored once per process; a re-engagement after an outage is `Realigned` (the master steps its own wall back, the fleet D and seq stay). The 29.9 fleet step came from a RESTART. No derivation change; a master test pins it (daily + micro).
+- `PtpNetwork::rejoin` on every backend (Linux moved from `main.rs` to `src/net_linux.rs` for a testable socket seam; Npcap's startup selection is one `open_ptp_capture`; Winsock re-creates its pair). Pure schedule in `src/ptp_rejoin.rs` (10, +30, +60, +120, then every 300 s), glue in `src/controller/ptp_liveness.rs`, called before the receive.
+- `/status` while stale: `is_locked=false`, `mode="NTP-only"`, `settled=false`; new `last_ptp_rx_age_s`, `ptp_rx_pps`, `rejoin`.
+- Commits: bump `caa695f`, refactor `2a0fed8`, RED `dd01617` (CI run 36576220207: exactly the 11 expected failures on Linux and Windows), test fix `649890d` (unused mut), GREEN `7d61f47`, docs (this).
+- Local net (Tier-0): `cargo fmt --check`, a `rustc --test` replica of `ptp_rejoin.rs` (8/8) and an std-only replica of `net_linux.rs` (6/6 GREEN, 4 RED on the stub).
