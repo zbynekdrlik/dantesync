@@ -80,8 +80,8 @@ pub struct WinsockPtpNetwork {
     timestamping_enabled: bool,
     /// dantesync#112: the interface address the sockets joined on (what a re-join compares with).
     interface_ip: Ipv4Addr,
-    /// dantesync#112: the address PTP was last received on; the interface that carries it is
-    /// where a re-join goes first.
+    /// dantesync#112: the address the grandmaster's time (`ptp::is_time_message`) was last
+    /// received on; the interface that carries it is where a re-join goes first.
     home_ip: Ipv4Addr,
 }
 

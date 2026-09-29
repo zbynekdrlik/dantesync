@@ -90,8 +90,9 @@ pub struct UdpPtpNetwork<F: PtpSocketFactory = KernelSockets> {
     /// `(name, IPv4)` of the last join that worked, kept through a failed re-join: what a re-join's
     /// `changed` compares with.
     last_join: (String, Ipv4Addr),
-    /// The address PTP was last received on (the startup one until a packet arrives on a later
-    /// join): the interface that carries it is where a re-join goes first.
+    /// The address the grandmaster's time was last received on (the startup one until a time
+    /// message, `ptp::is_time_message`, arrives on a later join): the interface that carries it is
+    /// where a re-join goes first.
     home_ip: Ipv4Addr,
 }
 

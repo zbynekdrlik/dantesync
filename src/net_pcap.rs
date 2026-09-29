@@ -377,10 +377,8 @@ fn select_ptp_device(
     // chosen device, so they land on the NIC that reaches the rig GM.
     let by_rule = find_ptp_capture_device(gm_allowlist, interface_name);
     // Only a re-join without a trusted-subnet match looks for the home device.
-    let home_device = match (&by_rule, home) {
-        (Ok((_, Some(_))), _) | (_, None) => None,
-        (_, Some(ip)) => device_with_ip(ip).map(|device| (device, ip)),
-    };
+    let home_device = crate::net::home_to_look_up(&by_rule, home)
+        .and_then(|ip| device_with_ip(ip).map(|device| (device, ip)));
     let (device, chosen_ip) = crate::net::choose_capture_device(by_rule, home_device)?;
     info!("Found device: {} ({:?})", device.name, device.desc);
 
@@ -445,8 +443,9 @@ pub struct NpcapPtpNetwork {
     gm_allowlist: crate::gm_filter::GmAllowlist,
     /// `(device, IPv4)` of the last capture that opened: what a re-join's `changed` compares with.
     last_join: (String, Ipv4Addr),
-    /// The address PTP was last received on (the startup one until a packet arrives on a later
-    /// capture): the device that carries it comes before the name fallback in a re-join.
+    /// The address the grandmaster's time was last received on (the startup one until a time
+    /// message, `ptp::is_time_message`, arrives on a later capture): the device that carries it
+    /// comes before the name fallback in a re-join.
     home_ip: Ipv4Addr,
 }
 

@@ -81,6 +81,19 @@ pub fn choose_capture_device<D>(
     }
 }
 
+/// dantesync#112 — whether [`choose_capture_device`] needs the home device looked up: only on a
+/// re-join (`home` is `Some`) whose trusted-subnet rule found no unique device (it would win
+/// anyway). Returns the address to look the device up by.
+pub fn home_to_look_up<D>(
+    by_rule: &Result<(D, Option<Ipv4Addr>)>,
+    home: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    match by_rule {
+        Ok((_, Some(_))) => None,
+        _ => home,
+    }
+}
+
 fn is_ip_bindable(ip: Ipv4Addr) -> bool {
     let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
@@ -261,6 +274,27 @@ mod tests {
             Err(anyhow!("Interface 'Ethernet' not found"));
         let got = choose_capture_device(by_name, Some(("swapped-nic", HOME))).expect("a device");
         assert_eq!(got, ("swapped-nic", Some(HOME)));
+    }
+
+    #[test]
+    fn the_home_device_is_looked_up_only_on_a_re_join_without_a_trusted_subnet_match_112() {
+        let trusted: Result<(&str, Option<Ipv4Addr>)> =
+            Ok(("rig-nic", Some(Ipv4Addr::new(10, 77, 9, 205))));
+        let by_name: Result<(&str, Option<Ipv4Addr>)> = Ok(("default-nic", None));
+        let none: Result<(&str, Option<Ipv4Addr>)> = Err(anyhow!("not found"));
+        assert_eq!(
+            home_to_look_up(&trusted, Some(HOME)),
+            None,
+            "the rule wins anyway"
+        );
+        assert_eq!(home_to_look_up(&by_name, Some(HOME)), Some(HOME));
+        assert_eq!(home_to_look_up(&none, Some(HOME)), Some(HOME));
+        assert_eq!(
+            home_to_look_up(&by_name, None),
+            None,
+            "the startup has no home"
+        );
+        assert_eq!(home_to_look_up(&none, None), None);
     }
 
     #[test]

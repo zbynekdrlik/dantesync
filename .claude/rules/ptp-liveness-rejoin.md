@@ -73,7 +73,8 @@ offset `D` from its own NTP-stepped wall: 29.9.2026, −19.8 ms, every box stepp
   `enx6c1ff766154b` → `enx002427159965`, same 10.77.9.202), so on a box that also has tailscale0,
   wg0, docker0 or bridges (dev1) the resolver answers one of those and every re-join "succeeds"
   there. So each backend keeps a **home address** — the startup address, then the address of any
-  join that RECEIVES a packet (updated in `recv_packet`) — and a re-join first joins the interface
+  join that receives a TIME MESSAGE (`ptp::is_time_message`, updated in `recv_packet`) — and a
+  re-join first joins the interface
   that carries it now (`net::interface_with_ip` on Linux/Winsock; on Npcap `device_with_ip`, after
   the issue-1073 trusted-subnet rule and before the name fallback — the pure order is
   `net::choose_capture_device`, one `select_ptp_device(hint, allowlist, home)` serves startup
@@ -82,10 +83,19 @@ offset `D` from its own NTP-stepped wall: 29.9.2026, −19.8 ms, every box stepp
   sockets bind INADDR_ANY:319/320, so a runt or a Delay_Req can reach a fallback join (tailscale0
   while the NIC is unplugged), and making that the home would pin every later re-join there. On
   Npcap the device is selected BEFORE the old capture is dropped.
-- **Known limit (not in this change):** a DHCP move to a new address on a multi-interface Linux box
-  still falls back to the listing-ordered resolver, like a restart does. Choosing by the trusted
-  grandmaster's subnet on Linux (the Windows issue-1073 rule) needs the allowlist-filtered
-  grandmaster address in the backend, i.e. a change of the decided `rejoin` signature.
+- **Known limits on Linux (not in this change), one root: the Linux backend does not know the
+  trusted grandmaster.**
+  - A DHCP move to a new address on a multi-interface box still falls back to the listing-ordered
+    resolver, like a restart does.
+  - The backend moves the home on a time message BEFORE the controller's `gm_allowlist` check. On
+    a dual-homed box with a restricting allowlist whose OTHER NIC carries a foreign PTPv1
+    grandmaster, a re-join that falls back to that NIC (the home NIC unplugged at that moment)
+    makes it the home, and later re-joins stay there (the controller drops its packets: stale;
+    a restart recovers). Npcap is not affected: its trusted-subnet rule always wins.
+  - Both go away once the Linux backend chooses by the trusted grandmaster (the Windows
+    issue-1073 rule), which needs the allowlist-filtered grandmaster in the backend: a new trait
+    method or a change of the decided `rejoin` signature (every `MockPtpNetwork` test that feeds
+    a Sync would then need the new expectation) -- a decision for the main session.
 
 ## Is `D` re-derived at re-lock? (the finding, 29.9.2026)
 
