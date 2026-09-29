@@ -36,9 +36,10 @@ pub trait PtpNetwork {
         Ok(())
     }
 
-    /// dantesync#112 — open the PTP receive path again, on the interface the startup selection
-    /// picks NOW: re-resolve the interface, drop the old sockets / capture (and with them the
-    /// multicast membership, which may belong to a netdev that is gone), then join again.
+    /// dantesync#112 — open the PTP receive path again: select the interface NOW (first the one
+    /// that carries the address the grandmaster's time was last received on, else the startup
+    /// selection), drop the old sockets / capture (and with them the multicast membership, which
+    /// may belong to a netdev that is gone), then join again.
     ///
     /// The controller calls it when no allowed PTP packet has come for 10 s, then on a backoff
     /// (`crate::ptp_rejoin`). It never touches the clock. An `Err` when the interface cannot be

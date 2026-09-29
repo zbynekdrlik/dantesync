@@ -6,10 +6,11 @@
 //! (`net_pcap`, `net_winsock`) so it can be unit-tested through its [`PtpSocketFactory`] seam:
 //! the interface resolver and the socket opener are its two OS boundaries.
 //!
-//! dantesync#112: [`PtpNetwork::rejoin`] re-resolves the interface and joins again. A USB NIC that
-//! is re-plugged comes back under the same name and IP but as a new netdev; the kernel dropped the
-//! old socket's multicast membership with the old netdev, and before this nothing ever joined
-//! again (only a service restart recovered).
+//! dantesync#112: [`PtpNetwork::rejoin`] joins again, first on the interface that now carries the
+//! home address (where the grandmaster's time was last received), else on the startup resolver's
+//! choice. A USB NIC that is re-plugged comes back as a new netdev (a new, higher ifindex, often a
+//! new name); the kernel dropped the old socket's multicast membership with the old netdev, and
+//! before this nothing ever joined again (only a service restart recovered).
 
 use crate::net;
 use crate::ptp::{PTP_EVENT_PORT, PTP_GENERAL_PORT};
@@ -133,8 +134,12 @@ impl<F: PtpSocketFactory> PtpNetwork for UdpPtpNetwork<F> {
         let Some((size, ts, source_ip)) = received else {
             return Ok(None);
         };
-        // dantesync#112: PTP arrives on this join, so its address is the home a re-join looks for.
-        self.home_ip = joined_ip;
+        // dantesync#112: the grandmaster's time arrives on this join, so its address is the home a
+        // re-join looks for. Nothing else moves it: the sockets bind INADDR_ANY:319/320, and a
+        // stray datagram on a fallback join must not make that join the home.
+        if crate::ptp::is_time_message(&buf[..size]) {
+            self.home_ip = joined_ip;
+        }
         Ok(Some((buf[..size].to_vec(), size, ts, source_ip)))
     }
 

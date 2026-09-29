@@ -578,10 +578,12 @@ impl crate::traits::PtpNetwork for WinsockPtpNetwork {
             Some(packet) => Some(packet),
             None => self.recv_with_timestamp(self.socket_320)?,
         };
-        if received.is_some() {
-            // dantesync#112: PTP arrives on this join, so its address is the home a re-join
-            // looks for.
-            self.home_ip = self.interface_ip;
+        if let Some((data, ..)) = &received {
+            // dantesync#112: the grandmaster's time arrives on this join, so its address is the
+            // home a re-join looks for (nothing else moves it).
+            if crate::ptp::is_time_message(data) {
+                self.home_ip = self.interface_ip;
+            }
         }
         Ok(received)
     }
@@ -591,7 +593,8 @@ impl crate::traits::PtpNetwork for WinsockPtpNetwork {
         Ok(())
     }
 
-    /// dantesync#112 — the same socket re-create as the startup, on the default interface NOW.
+    /// dantesync#112 — the same socket re-create as the startup: on the interface that carries the
+    /// home address now, else on the default interface.
     fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
         // The interface that carries the home address first (a re-plugged NIC may come back
         // behind other interfaces in the listing order), else the startup resolver. When neither

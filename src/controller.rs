@@ -2134,17 +2134,21 @@ where
             }
         }
 
-        // Packet received from an allowed source - update its source IP. (#112: PTP liveness is
-        // refreshed below, by the grandmaster's Sync / Follow_Up only.)
-        // An allowed packet arrived: clear the drop-since-accepted counter so the
-        // offline log and any future warning reflect only the CURRENT gap.
-        self.gm_dropped_since_accepted = 0;
-        if source_ip.is_some() {
-            self.current_sync_source_ip = source_ip;
-        }
-
         if size < PtpV1Header::SIZE {
             return Ok(());
+        }
+
+        // #112: only the grandmaster's time (a Sync or a Follow_Up, `ptp::is_time_message`) from
+        // an allowed source is PTP liveness, names the grandmaster (its source IP) and clears the
+        // drop-since-accepted counter (so the offline log and any future warning reflect only the
+        // CURRENT gap). A runt or another follower's Delay_Req (an empty allowlist allows every
+        // source) never hides a dead grandmaster or poses as it.
+        if crate::ptp::is_time_message(&buf[..size]) {
+            self.note_allowed_ptp_packet(Instant::now());
+            self.gm_dropped_since_accepted = 0;
+            if source_ip.is_some() {
+                self.current_sync_source_ip = source_ip;
+            }
         }
 
         let header = match PtpV1Header::parse(&buf[..size]) {
@@ -2152,17 +2156,9 @@ where
             Err(_) => return Ok(()),
         };
 
-        // #112: only the grandmaster's time messages are PTP liveness; a runt datagram or another
-        // follower's Delay_Req (an empty allowlist allows every source) never hides a dead GM.
         match header.message_type {
-            PtpV1Control::Sync => {
-                self.note_allowed_ptp_packet(Instant::now());
-                self.handle_sync_message(&header, &buf[..size], t2)
-            }
-            PtpV1Control::FollowUp => {
-                self.note_allowed_ptp_packet(Instant::now());
-                self.handle_followup_message(&header, &buf[..size])
-            }
+            PtpV1Control::Sync => self.handle_sync_message(&header, &buf[..size], t2),
+            PtpV1Control::FollowUp => self.handle_followup_message(&header, &buf[..size]),
             _ => {}
         }
 

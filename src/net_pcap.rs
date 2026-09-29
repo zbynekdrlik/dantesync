@@ -362,23 +362,33 @@ struct PtpCapture {
     iface_ip: Ipv4Addr,
 }
 
-/// Select the PTP capture device and the IPv4 to join on at startup.
+/// Select the PTP capture device and the IPv4 to join on: the trusted grandmaster subnet of
+/// `gm_allowlist` (camera-box issue 1073), then (a re-join, dantesync#112) the device that carries
+/// `home`, then the name fallback -- the pure order is `net::choose_capture_device`. The startup
+/// passes `home = None`.
 fn select_ptp_device(
     interface_name: &str,
     gm_allowlist: &crate::gm_filter::GmAllowlist,
+    home: Option<Ipv4Addr>,
 ) -> Result<(Device, Ipv4Addr)> {
     // camera-box issue 1073: on a multi-homed box prefer the interface on the
     // trusted grandmaster subnet (gm_allowlist); otherwise the historical
     // name-based selection. Both the IGMP join and the capture use the
     // chosen device, so they land on the NIC that reaches the rig GM.
-    let (device, matched_ip) = find_ptp_capture_device(gm_allowlist, interface_name)?;
+    let by_rule = find_ptp_capture_device(gm_allowlist, interface_name);
+    // Only a re-join without a trusted-subnet match looks for the home device.
+    let home_device = match (&by_rule, home) {
+        (Ok((_, Some(_))), _) | (_, None) => None,
+        (_, Some(ip)) => device_with_ip(ip).map(|device| (device, ip)),
+    };
+    let (device, chosen_ip) = crate::net::choose_capture_device(by_rule, home_device)?;
     info!("Found device: {} ({:?})", device.name, device.desc);
 
     // Extract interface IP for the multicast join. Prefer the allowlist-MATCHED
     // address (review 🔵: on a multi-IP NIC device_ipv4's first address could
-    // differ from the trusted one we selected on); fall back to the device's
-    // first IPv4 on the name-based path.
-    let iface_ip = match matched_ip {
+    // differ from the trusted one we selected on) or the home address; fall back
+    // to the device's first IPv4 on the name-based path.
+    let iface_ip = match chosen_ip {
         Some(ip) => ip,
         None => device_ipv4(&device)?,
     };
@@ -446,7 +456,7 @@ impl NpcapPtpNetwork {
             "Initializing Npcap capture (default-interface hint: {})",
             interface_name
         );
-        let (device, ip) = select_ptp_device(interface_name, gm_allowlist)?;
+        let (device, ip) = select_ptp_device(interface_name, gm_allowlist, None)?;
         let open = open_ptp_capture(device, ip)?;
 
         // Assume HostHighPrec is available on modern Npcap (1.20+)
@@ -467,31 +477,6 @@ impl NpcapPtpNetwork {
             last_join,
             home_ip: ip,
         })
-    }
-
-    /// dantesync#112 — the re-join's device: the trusted-subnet rule first (camera-box issue
-    /// 1073), then the device that still carries the home address (a replaced NIC comes back as
-    /// another device under another name), then the name fallback.
-    fn select_rejoin_device(&self) -> Result<(Device, Ipv4Addr)> {
-        match find_ptp_capture_device(&self.gm_allowlist, &self.hint) {
-            Ok((device, Some(ip))) => {
-                info!("Found device: {} ({:?})", device.name, device.desc);
-                Ok((device, ip))
-            }
-            by_name => {
-                if let Some(device) = device_with_ip(self.home_ip) {
-                    info!(
-                        "Found device: {} ({:?}) -- it carries {}, where PTP was last received",
-                        device.name, device.desc, self.home_ip
-                    );
-                    return Ok((device, self.home_ip));
-                }
-                let (device, _) = by_name?;
-                info!("Found device: {} ({:?})", device.name, device.desc);
-                let ip = device_ipv4(&device)?;
-                Ok((device, ip))
-            }
-        }
     }
 }
 
@@ -546,9 +531,11 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                         "[Npcap] PTP payload {} bytes from {}",
                         payload_len, source_ip
                     );
-                    // dantesync#112: PTP arrives on this capture, so its address is the home a
-                    // re-join looks for.
-                    self.home_ip = joined_ip;
+                    // dantesync#112: the grandmaster's time arrives on this capture, so its
+                    // address is the home a re-join looks for (nothing else moves it).
+                    if crate::ptp::is_time_message(&result) {
+                        self.home_ip = joined_ip;
+                    }
                     Ok(Some((result, payload_len, ts, Some(source_ip))))
                 } else {
                     Ok(None)
@@ -571,8 +558,9 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
     }
 
     /// dantesync#112 — re-open the capture after a NIC swap (a dead handle keeps failing with
-    /// ERROR_DEVICE_REMOVED) or any other silence: the same selection as the startup, on the
-    /// default interface and the allowlist resolved NOW.
+    /// ERROR_DEVICE_REMOVED) or any other silence: the startup selection with the home address
+    /// (the trusted subnet, then the device that carries the home address, then the name
+    /// fallback), on the default interface and the allowlist resolved NOW.
     fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
         // A replaced NIC is another adapter under another name, so the name-based fallback
         // re-reads the default interface; the old hint stays when none resolves.
@@ -594,7 +582,7 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
             );
         }
         // Select BEFORE dropping anything: a selection failure keeps the old capture.
-        let (device, ip) = self.select_rejoin_device()?;
+        let (device, ip) = select_ptp_device(&self.hint, &self.gm_allowlist, Some(self.home_ip))?;
         // Then drop the old (possibly dead) handle and its IGMP membership, and open on the
         // selected device. When the new capture cannot open, there is none until the next attempt.
         self.open = None;
