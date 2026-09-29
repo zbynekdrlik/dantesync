@@ -57,6 +57,15 @@ fn ms(millis: u64) -> Duration {
     Duration::from_millis(millis)
 }
 
+/// The packets stopped `secs` ago. An `Instant` cannot be moved forward, so the receive history is
+/// re-written instead: the last allowed packet came `secs` ago, and none after it (the loop only
+/// ever records arrivals in time order).
+fn went_quiet(c: &mut TestController, secs: u64) {
+    let last = Instant::now() - Duration::from_secs(secs);
+    c.ptp_liveness.rx = crate::ptp_rejoin::RxWindow::new();
+    c.note_allowed_ptp_packet(last);
+}
+
 #[test]
 fn packets_stop_then_one_rejoin_at_ten_seconds_then_the_backoff_112() {
     let count = Arc::new(AtomicU32::new(0));
@@ -221,7 +230,7 @@ fn while_ptp_is_stale_status_is_not_locked_and_lock_returns_with_the_packets_112
 
     // The grandmaster goes quiet: the offline edge, then the 10 s status tick (which used to
     // write LOCK straight back over the edge's "NTP-only").
-    c.note_allowed_ptp_packet(Instant::now() - Duration::from_secs(PTP_TIMEOUT_SECS + 2));
+    went_quiet(&mut c, PTP_TIMEOUT_SECS + 2);
     c.check_ptp_status();
     c.tick_status();
     {
