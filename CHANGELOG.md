@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     keep D and `date_offset_seq`; the master only steps its own wall back onto the fleet line
     (one join step), as after any PTP outage.
   - **PTP liveness is the grandmaster's time.** Only a Sync or a Follow_Up from an allowed source
-    counts; a runt datagram or another device's Delay_Req no longer keeps a node "live".
+    counts; a runt datagram or another device's Delay_Req no longer keeps a node "live". The same
+    rule decides `gm_source_ip`: another follower's Delay_Req no longer shows up as the
+    grandmaster.
   - **`/status` is honest while PTP is stale:** `is_locked=false`, `mode="NTP-only"` (the
     tray's orange "PTP offline"), `settled=false`. The last `offset_ns` is kept; its age says it
     is old. `=== UNLOCKED === (no PTP packets for 10s)` and `=== LOCKED === (PTP packets back

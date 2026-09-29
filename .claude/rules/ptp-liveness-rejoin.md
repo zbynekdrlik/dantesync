@@ -31,20 +31,25 @@ offset `D` from its own NTP-stepped wall: 29.9.2026, −19.8 ms, every box stepp
 ## The contract
 
 - **One definition of stale:** `PtpController::ptp_stale_at` = no ALLOWED PTP packet for more
-  than `PTP_TIMEOUT_SECS` (10 s). An allowed PTP packet is a **Sync or a Follow_Up** (the
-  grandmaster's time) from a source `gm_allowlist` allows — `note_allowed_ptp_packet` is called in
-  those two match arms only, never for a runt datagram or another follower's Delay_Req (with the
-  default empty allowlist every source is allowed, and that traffic must not hide a dead GM). The
-  offline edge, the clock alarm (`sample_clock_health`), the re-join and `/status` all use it. Do
-  not add a second threshold; `ptp_rejoin::REJOIN_AFTER` is pinned to it by a
-  `const _: () = assert!(..)`.
+  than `PTP_TIMEOUT_SECS` (10 s). An allowed PTP packet is a **time message** — `ptp::is_time_message`,
+  a whole PTPv1 header whose control is Sync or Follow_Up (the grandmaster's time) — from a source
+  `gm_allowlist` allows. That ONE predicate gates, in one block of `process_loop_iteration`, PTP
+  liveness (`note_allowed_ptp_packet`), the grandmaster's source IP (`gm_source_ip`) and the
+  dropped-foreign-GM count reset; and it gates every backend's home-address write. A runt, another
+  follower's Delay_Req (with the default empty allowlist every source is allowed; every PTPv1
+  follower multicasts Delay_Req to 319) or any stray datagram never counts, never poses as the
+  grandmaster and never moves the home. The offline edge, the clock alarm (`sample_clock_health`),
+  the re-join and `/status` all use this staleness. Do not add a second threshold;
+  `ptp_rejoin::REJOIN_AFTER` is pinned to it by a `const _: () = assert!(..)`.
 - **While stale `/status` says so:** `is_locked=false`, `mode="NTP-only"` (the offline edge's own
   name; the tray's orange "PTP offline"; the 31900 reply's mode 5; every camera-box gate reads a
   non-LOCK/NANO mode as degraded), `settled=false`. `offset_ns` keeps the last value, flagged by
-  `last_ptp_rx_age_s`. The INTERNAL servo lock (`self.is_locked`, the held learned frequency) is
-  deliberately NOT cleared: when the packets return the node publishes LOCK again at once and the
-  phase lock re-engages on its next window, exactly as after any brief outage. Only the published
-  view is gated.
+  `last_ptp_rx_age_s`. The INTERNAL servo lock (`self.is_locked`, the rate servo's lock with its
+  gradual unlock; the learned frequency is held) is deliberately NOT cleared: when the packets
+  return the node publishes that lock again at once, as the decided design says ("LOCK returns
+  with the packets"), and the phase lock re-engages on its next window. No post-outage window
+  re-validates it first — the published LOCK is the servo's lock, as always; only staleness gates
+  it.
 - **The re-join (`PtpNetwork::rejoin`) re-opens ONLY the receive path.** No clock call, no servo or
   measurement reset (`reset_ptp_measurement_after_step` is for clock steps), no date-offset change.
   `controller/date_sync/rejoin_tests.rs` pins it on a master in daily AND micro mode: loss → re-join
@@ -70,10 +75,17 @@ offset `D` from its own NTP-stepped wall: 29.9.2026, −19.8 ms, every box stepp
   there. So each backend keeps a **home address** — the startup address, then the address of any
   join that RECEIVES a packet (updated in `recv_packet`) — and a re-join first joins the interface
   that carries it now (`net::interface_with_ip` on Linux/Winsock; on Npcap `device_with_ip`, after
-  the issue-1073 trusted-subnet rule and before the name fallback). Only when no interface carries
-  it (a DHCP move) does it fall back to the startup resolver. A join that receives nothing (a
-  fallback onto tailscale0 while the NIC is still unplugged) never becomes the home. On Npcap the
-  device is selected BEFORE the old capture is dropped (`select_rejoin_device`).
+  the issue-1073 trusted-subnet rule and before the name fallback — the pure order is
+  `net::choose_capture_device`, one `select_ptp_device(hint, allowlist, home)` serves startup
+  (`home = None`) and re-join). Only when no interface carries it (a DHCP move) does it fall back
+  to the startup resolver. Only a TIME MESSAGE moves the home (review round 2): the Linux/Winsock
+  sockets bind INADDR_ANY:319/320, so a runt or a Delay_Req can reach a fallback join (tailscale0
+  while the NIC is unplugged), and making that the home would pin every later re-join there. On
+  Npcap the device is selected BEFORE the old capture is dropped.
+- **Known limit (not in this change):** a DHCP move to a new address on a multi-interface Linux box
+  still falls back to the listing-ordered resolver, like a restart does. Choosing by the trusted
+  grandmaster's subnet on Linux (the Windows issue-1073 rule) needs the allowlist-filtered
+  grandmaster address in the backend, i.e. a change of the decided `rejoin` signature.
 
 ## Is `D` re-derived at re-lock? (the finding, 29.9.2026)
 
