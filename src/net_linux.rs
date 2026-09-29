@@ -5,11 +5,16 @@
 //! It was `RealPtpNetwork` in `main.rs`. It lives here beside the other platform backends
 //! (`net_pcap`, `net_winsock`) so it can be unit-tested through its [`PtpSocketFactory`] seam:
 //! the interface resolver and the socket opener are its two OS boundaries.
+//!
+//! dantesync#112: [`PtpNetwork::rejoin`] re-resolves the interface and joins again. A USB NIC that
+//! is re-plugged comes back under the same name and IP but as a new netdev; the kernel dropped the
+//! old socket's multicast membership with the old netdev, and before this nothing ever joined
+//! again (only a service restart recovered).
 
 use crate::net;
 use crate::ptp::{PTP_EVENT_PORT, PTP_GENERAL_PORT};
 use crate::traits::{PtpNetwork, RejoinOutcome};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use log::info;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -72,14 +77,19 @@ fn drain(sock: &UdpSocket) {
 /// Linux PTP network: kernel-timestamped UDP multicast sockets.
 pub struct UdpPtpNetwork<F: PtpSocketFactory = KernelSockets> {
     factory: F,
+    /// `None` after a re-join could not open the new pair: nothing is received until the next
+    /// attempt.
     joined: Option<Joined>,
+    /// `(name, IPv4)` of the last join that worked, kept through a failed re-join: what a re-join's
+    /// `changed` compares with.
+    last_join: (String, Ipv4Addr),
 }
 
 impl<F: PtpSocketFactory> UdpPtpNetwork<F> {
     /// Join on an interface the caller already resolved (startup waits for one with its own
     /// retry loop).
     pub fn join(mut factory: F, iface: String, ip: Ipv4Addr) -> Result<Self> {
-        let joined = open_pair(&mut factory, iface, ip)?;
+        let joined = open_pair(&mut factory, iface.clone(), ip)?;
         info!(
             "Joined Multicast Groups on {} ({}) - Kernel timestamping",
             joined.iface, joined.ip
@@ -87,6 +97,7 @@ impl<F: PtpSocketFactory> UdpPtpNetwork<F> {
         Ok(UdpPtpNetwork {
             factory,
             joined: Some(joined),
+            last_join: (iface, ip),
         })
     }
 
@@ -126,15 +137,29 @@ impl<F: PtpSocketFactory> PtpNetwork for UdpPtpNetwork<F> {
     }
 
     fn rejoin(&mut self) -> Result<RejoinOutcome> {
-        Err(anyhow!(
-            "PTP re-join is not implemented yet (dantesync#112)"
-        ))
+        // The interface NOW: a replaced NIC may come back under another name or address. When
+        // none resolves, the old pair stays (there is nothing better to join on).
+        let (iface, ip) = self.factory.resolve_interface()?;
+        // Close both old sockets FIRST: their membership may belong to a netdev that is gone, and
+        // the new pair binds the same ports.
+        self.joined = None;
+        // When the new pair cannot open, there are no sockets until the next attempt.
+        let joined = open_pair(&mut self.factory, iface.clone(), ip)?;
+        info!(
+            "Joined Multicast Groups on {} ({}) - Kernel timestamping (rejoin)",
+            iface, ip
+        );
+        let changed = self.last_join.0 != iface || self.last_join.1 != ip;
+        self.joined = Some(joined);
+        self.last_join = (iface.clone(), ip);
+        Ok(RejoinOutcome { iface, ip, changed })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use std::collections::VecDeque;
     use std::net::SocketAddr;
     use std::time::Duration;

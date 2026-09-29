@@ -575,6 +575,14 @@ const NTP_STEP_STORM_WARN_INTERVAL: Duration = Duration::from_secs(300);
 // PTP offline detection
 const PTP_TIMEOUT_SECS: u64 = 10; // Consider PTP offline after 10s without packets
 
+/// dantesync#112 — `/status.mode` while PTP is stale (no allowed packet for `PTP_TIMEOUT_SECS`),
+/// whatever the servo last reached: the name the offline edge always wrote, which the tray shows
+/// as its orange "PTP offline" state and every camera-box gate reads as not locked.
+const PTP_STALE_MODE: &str = "NTP-only";
+
+// dantesync#112: the first PTP re-join comes at the same staleness the alarm and /status use.
+const _: () = assert!(crate::ptp_rejoin::REJOIN_AFTER.as_secs() == PTP_TIMEOUT_SECS);
+
 /// dantesync#113 — periodic re-resolution cadence for `gm_allowlist` hostname
 /// entries, so a DNS/lease change propagates without a service restart.
 const GM_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -1214,11 +1222,18 @@ where
     /// Stepping time does NOT affect the Dante-tuned frequency!
     /// Check PTP status and handle offline mode
     fn check_ptp_status(&mut self) {
-        let elapsed = self.last_ptp_packet.elapsed();
-
-        if elapsed > Duration::from_secs(PTP_TIMEOUT_SECS) {
+        if self.ptp_stale_at(Instant::now()) {
             if !self.ptp_offline {
                 self.ptp_offline = true;
+                // #112: the servo keeps its lock state through the outage (the learned frequency
+                // is held), but nothing PTP-derived is live any more: /status says so.
+                if self.is_locked || self.in_nano_mode {
+                    info!(
+                        "[PTP] === UNLOCKED === (no PTP packets for {}s) -- /status reports {} \
+                         until they return",
+                        PTP_TIMEOUT_SECS, PTP_STALE_MODE
+                    );
+                }
                 if !self.ptp_offline_logged {
                     // camera-box issue 1073: if packets ARE arriving but are being
                     // dropped by the allowlist, the grandmaster is not offline —
@@ -1246,7 +1261,8 @@ where
                 // Update status to reflect offline state
                 if let Ok(mut status) = self.status_shared.write() {
                     status.settled = false;
-                    status.mode = "NTP-only".to_string();
+                    status.is_locked = false;
+                    status.mode = PTP_STALE_MODE.to_string();
                 }
             }
         } else if self.ptp_offline {
@@ -1254,6 +1270,9 @@ where
             self.ptp_offline = false;
             self.ptp_offline_logged = false;
             info!("[PTP] Packets received - PTP sync resumed");
+            if self.is_locked || self.in_nano_mode {
+                info!("[PTP] === LOCKED === (PTP packets back; the servo held its lock through the outage)");
+            }
         }
     }
 
@@ -2050,7 +2069,7 @@ where
 
     /// #114: sample the current Dante-clock health for the alarm decision.
     fn sample_clock_health(&self) -> ClockHealth {
-        let ptp_stale = self.last_ptp_packet.elapsed() > Duration::from_secs(PTP_TIMEOUT_SECS);
+        let ptp_stale = self.ptp_stale_at(Instant::now());
         // mode ∈ {LOCK, NANO} — the genuinely PTP-locked modes.
         let mode_locked = self.in_nano_mode || self.is_locked;
         // A grandmaster source is present AND permitted by the (resolved) allowlist.
@@ -2938,6 +2957,11 @@ where
     }
 
     fn update_shared_status(&self) {
+        let now = Instant::now();
+        // #112: while no allowed PTP packet comes, nothing PTP-derived is live: the node is not
+        // locked (and not settled), whatever the servo last reached. The last offset stays,
+        // flagged by `last_ptp_rx_age_s`.
+        let stale = self.ptp_stale_at(now);
         if let Ok(mut status) = self.status_shared.write() {
             // Core fields
             status.offset_ns = self.last_phase_offset_ns;
@@ -2948,16 +2972,18 @@ where
             // compare gm_source_ip against the resolved set (and see loud failures).
             status.gm_allowlist_resolved = self.gm_allowlist.resolved_ips().to_vec();
             status.gm_allowlist_unresolved = self.gm_allowlist.unresolved_hostnames().to_vec();
-            status.settled = self.clock_settled;
+            status.settled = self.clock_settled && !stale;
             status.updated_ts = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
 
             // Extended fields for tray app
-            status.is_locked = self.is_locked;
+            status.is_locked = self.is_locked && !stale;
             status.smoothed_rate_ppm = self.smoothed_rate_ppm;
-            status.mode = if self.in_nano_mode {
+            status.mode = if stale {
+                PTP_STALE_MODE.to_string()
+            } else if self.in_nano_mode {
                 "NANO".to_string()
             } else if self.is_locked {
                 "LOCK".to_string()
@@ -3052,6 +3078,8 @@ where
 
             // #117 / #88: the discipline, the phase lock and the fleet date offset.
             self.publish_date_status(&mut status);
+            // #112: the PTP packet age, the receive rate and the re-joins.
+            self.publish_ptp_liveness(&mut status, now);
         }
     }
 }

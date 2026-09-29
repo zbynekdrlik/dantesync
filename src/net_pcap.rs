@@ -350,13 +350,78 @@ pub(crate) fn pcap_ts_to_systemtime(ts_sec: i64, ts_usec: i64) -> SystemTime {
     UNIX_EPOCH + duration
 }
 
-/// PTP network using Npcap with HostHighPrec timestamps
-pub struct NpcapPtpNetwork {
+/// One open PTP capture: the pcap handle, the socket that holds the IGMP membership, and where
+/// they were opened.
+struct PtpCapture {
     capture: Capture<Active>,
     // Keep the socket alive for IGMP multicast membership (dropped on close);
     // ONE ephemeral-port socket holds the 224.0.1.129 membership (dantesync#109).
     _igmp_sock: UdpSocket,
+    /// The Npcap device name (a replaced NIC is another device) and the IPv4 joined on.
+    device_name: String,
+    iface_ip: Ipv4Addr,
+}
+
+/// Select the PTP capture device and open the capture and the IGMP membership on it. The startup
+/// and the re-join (dantesync#112) both go through here, so both select the same way.
+fn open_ptp_capture(
+    interface_name: &str,
+    gm_allowlist: &crate::gm_filter::GmAllowlist,
+) -> Result<PtpCapture> {
+    // camera-box issue 1073: on a multi-homed box prefer the interface on the
+    // trusted grandmaster subnet (gm_allowlist); otherwise the historical
+    // name-based selection. Both the IGMP join and the capture below use the
+    // chosen device, so they land on the NIC that reaches the rig GM.
+    let (device, matched_ip) = find_ptp_capture_device(gm_allowlist, interface_name)?;
+    info!("Found device: {} ({:?})", device.name, device.desc);
+
+    // Extract interface IP for the multicast join. Prefer the allowlist-MATCHED
+    // address (review 🔵: on a multi-IP NIC device_ipv4's first address could
+    // differ from the trusted one we selected on); fall back to the device's
+    // first IPv4 on the name-based path.
+    let iface_ip = match matched_ip {
+        Some(ip) => ip,
+        None => device_ipv4(&device)?,
+    };
+    info!("Using interface IP {} for multicast join", iface_ip);
+
+    // CRITICAL: Join the multicast group via ONE ephemeral-port socket to
+    // trigger IGMP membership (dantesync#109: NOT bound to 319/320, so a
+    // Dante Virtual Soundcard ptp.exe on the same host keeps both PTP ports).
+    let igmp_sock = join_multicast(iface_ip)?;
+    info!(
+        "Joined PTP multicast group 224.0.1.129 on {} via an ephemeral-port IGMP socket \
+         (ports 319/320 left free for a DVS ptp.exe on the same host — dantesync#109)",
+        iface_ip
+    );
+
+    // Apply BPF filter to only capture PTP multicast. The IGMP-join socket
+    // above binds an ephemeral port, not 319/320, so DVS keeps exclusive
+    // ownership of both PTP ports (dantesync#109); this filter only scopes
+    // which packets pcap decodes and never claims a port.
+    let ptp_filter = "udp and dst host 224.0.1.129 and (dst port 319 or dst port 320)";
+    let capture = open_hiprec_capture(&device, ptp_filter)?;
+
+    Ok(PtpCapture {
+        capture,
+        _igmp_sock: igmp_sock,
+        device_name: device.name,
+        iface_ip,
+    })
+}
+
+/// PTP network using Npcap with HostHighPrec timestamps
+pub struct NpcapPtpNetwork {
+    /// dantesync#112: `None` after a re-join could not open a capture; nothing is received until
+    /// the next attempt.
+    open: Option<PtpCapture>,
     using_hiprec: bool,
+    /// The default-interface hint the device is selected with (the name-based fallback).
+    hint: String,
+    /// The trusted-source allowlist the device is selected by (camera-box issue 1073).
+    gm_allowlist: crate::gm_filter::GmAllowlist,
+    /// `(device, IPv4)` of the last capture that opened: what a re-join's `changed` compares with.
+    last_join: (String, Ipv4Addr),
 }
 
 impl NpcapPtpNetwork {
@@ -365,40 +430,7 @@ impl NpcapPtpNetwork {
             "Initializing Npcap capture (default-interface hint: {})",
             interface_name
         );
-
-        // camera-box issue 1073: on a multi-homed box prefer the interface on the
-        // trusted grandmaster subnet (gm_allowlist); otherwise the historical
-        // name-based selection. Both the IGMP join and the capture below use the
-        // chosen device, so they land on the NIC that reaches the rig GM.
-        let (device, matched_ip) = find_ptp_capture_device(gm_allowlist, interface_name)?;
-        info!("Found device: {} ({:?})", device.name, device.desc);
-
-        // Extract interface IP for the multicast join. Prefer the allowlist-MATCHED
-        // address (review 🔵: on a multi-IP NIC device_ipv4's first address could
-        // differ from the trusted one we selected on); fall back to the device's
-        // first IPv4 on the name-based path.
-        let iface_ip = match matched_ip {
-            Some(ip) => ip,
-            None => device_ipv4(&device)?,
-        };
-        info!("Using interface IP {} for multicast join", iface_ip);
-
-        // CRITICAL: Join the multicast group via ONE ephemeral-port socket to
-        // trigger IGMP membership (dantesync#109: NOT bound to 319/320, so a
-        // Dante Virtual Soundcard ptp.exe on the same host keeps both PTP ports).
-        let igmp_sock = join_multicast(iface_ip)?;
-        info!(
-            "Joined PTP multicast group 224.0.1.129 on {} via an ephemeral-port IGMP socket \
-             (ports 319/320 left free for a DVS ptp.exe on the same host — dantesync#109)",
-            iface_ip
-        );
-
-        // Apply BPF filter to only capture PTP multicast. The IGMP-join socket
-        // above binds an ephemeral port, not 319/320, so DVS keeps exclusive
-        // ownership of both PTP ports (dantesync#109); this filter only scopes
-        // which packets pcap decodes and never claims a port.
-        let ptp_filter = "udp and dst host 224.0.1.129 and (dst port 319 or dst port 320)";
-        let capture = open_hiprec_capture(&device, ptp_filter)?;
+        let open = open_ptp_capture(interface_name, gm_allowlist)?;
 
         // Assume HostHighPrec is available on modern Npcap (1.20+)
         let using_hiprec = true;
@@ -409,24 +441,31 @@ impl NpcapPtpNetwork {
             warn!("Npcap capture using default timestamps (may drift from system time)");
         }
 
+        let last_join = (open.device_name.clone(), open.iface_ip);
         Ok(NpcapPtpNetwork {
-            capture,
-            _igmp_sock: igmp_sock,
+            open: Some(open),
             using_hiprec,
+            hint: interface_name.to_string(),
+            gm_allowlist: gm_allowlist.clone(),
+            last_join,
         })
     }
 }
 
 impl crate::traits::PtpNetwork for NpcapPtpNetwork {
     fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
-        match self.capture.next_packet() {
+        let using_hiprec = self.using_hiprec;
+        let Some(open) = self.open.as_mut() else {
+            return Ok(None);
+        };
+        match open.capture.next_packet() {
             Ok(packet) => {
                 let data = packet.data;
 
                 // Use Npcap's HostHighPrec timestamps - these are both precise AND synced
                 // with system time (using KeQuerySystemTimePrecise on Windows 8+)
                 let header = packet.header;
-                let ts = if self.using_hiprec {
+                let ts = if using_hiprec {
                     // Npcap provides high-precision timestamps synced with system time
                     let ts =
                         pcap_ts_to_systemtime(header.ts.tv_sec as i64, header.ts.tv_usec as i64);
@@ -484,10 +523,39 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
         Ok(())
     }
 
+    /// dantesync#112 — re-open the capture after a NIC swap (a dead handle keeps failing with
+    /// ERROR_DEVICE_REMOVED) or any other silence: the same selection as the startup, on the
+    /// default interface and the allowlist resolved NOW.
     fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
-        Err(anyhow!(
-            "PTP re-join is not implemented yet (dantesync#112)"
-        ))
+        // A replaced NIC is another adapter under another name, so the name-based fallback
+        // re-reads the default interface; the old hint stays when none resolves.
+        match crate::net::get_default_interface() {
+            Ok((name, _)) => self.hint = name,
+            Err(e) => warn!(
+                "[NET] no default interface ({}); re-joining with the hint {}",
+                e, self.hint
+            ),
+        }
+        // Hostname allowlist entries are resolved again, like at startup, so the capture NIC is
+        // chosen on the grandmaster's CURRENT subnet.
+        if self.gm_allowlist.has_hostnames() {
+            let outcome = self.gm_allowlist.resolve(&crate::gm_filter::StdResolver);
+            info!(
+                "gm_allowlist: re-join hostname resolution {:?} (unresolved: {:?})",
+                outcome.new_resolved,
+                self.gm_allowlist.unresolved_hostnames()
+            );
+        }
+        // Drop the old (possibly dead) handle and its IGMP membership FIRST. When the new capture
+        // cannot open, there is none until the next attempt.
+        self.open = None;
+        let open = open_ptp_capture(&self.hint, &self.gm_allowlist)?;
+        let (iface, ip) = (open.device_name.clone(), open.iface_ip);
+        info!("Npcap PTP capture re-opened on {} ({}) (rejoin)", iface, ip);
+        let changed = self.last_join.0 != iface || self.last_join.1 != ip;
+        self.last_join = (iface.clone(), ip);
+        self.open = Some(open);
+        Ok(crate::traits::RejoinOutcome { iface, ip, changed })
     }
 }
 

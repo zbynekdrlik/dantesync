@@ -784,6 +784,17 @@ fn run_sync_loop(
                             env!("CARGO_PKG_VERSION"),
                             status.offset_ns as f64 / 1000.0
                         )
+                    } else if status.mode == "NTP-only" {
+                        // dantesync#112: no allowed PTP packet for 10 s; the loop re-joins.
+                        let last = match status.last_ptp_rx_age_s {
+                            Some(age) => format!("last {}s ago", age),
+                            None => "none since start".to_string(),
+                        };
+                        format!(
+                            "v{} | No PTP packets ({}) | NTP-only, re-joining",
+                            env!("CARGO_PKG_VERSION"),
+                            last
+                        )
                     } else {
                         format!("v{} | Settling...", env!("CARGO_PKG_VERSION"))
                     };
