@@ -252,7 +252,7 @@ fn while_ptp_is_stale_status_is_not_locked_and_lock_returns_with_the_packets_112
 
 #[test]
 fn a_node_that_never_heard_ptp_reports_no_packet_age_112() {
-    let (mut c, st) = controller(MockPtpNetwork::new());
+    let (c, st) = controller(MockPtpNetwork::new());
     c.update_shared_status();
     let st = st.read().expect("status");
     assert_eq!(
