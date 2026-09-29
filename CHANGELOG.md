@@ -20,27 +20,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the oscillator's rate against the grandmaster whatever the loop commanded. The frequency the
     integrator has not learned is a step when it is at least 6 ppm, at least 6 standard errors
     of the slope, the window is LINEAR (no level shift and no slope change inside it explains it
-    better, so the estimate waits until the window is past the step), and the frequency is still
-    there with the most likely level shift explained away (so a delay spike, a path-delay change
-    or an offset absorbed into `D` is never a step, also under 50-60 us of timestamp noise). Six
-    consecutive windows confirm it; then nothing for 30 s. Smaller steps stay with the PI.
+    better, measured against the white noise of the window, so the estimate waits until the window
+    is past the step), and the frequency is still there with the most likely one and two level
+    shifts explained away (so a delay spike, a path-delay change, one in two stages, or an offset
+    absorbed into `D` is not a step). Six consecutive windows confirm it; then nothing for 30 s.
+    Smaller steps stay with the PI. What a 20 s window cannot tell from a frequency change: a
+    path delay that ramps over 10-15 s under heavy timestamp noise, or changes in three or more
+    stages; such a false re-seed is bounded and undone after the holdoff.
   - **The response.** The integrator jumps by the measured error (at most 100 ppm per event), and
     the phase the step left (~400 us for 25 ppm) is pulled back along a decaying reference
     (tau 20 s) whose rate the word carries as feed-forward, so the recovery neither disturbs the
     learned frequency nor overshoots. No wall step; the fleet date offset `D` and
     `date_offset_seq` are untouched. Without a confirmed step the frequency word is exactly the
     plain PI's. The applied rate carries that pull: right after the re-seed the word runs up to
-    ~|e0|/tau (~22 ppm for a 25 ppm step) past the new frequency, in the step's direction, and
+    ~|e0|/tau (~23 ppm for a 25 ppm step) past the new frequency, in the step's direction, and
     decays with tau; its 20 s mean is within 1 ppm of the grandmaster about 95 s after the step.
   - One `[PHASE-LOCK] frequency step: +25.0ppm over 20s (fit σ ...) -- integrator re-seeded I a
     -> b ...` line per event; `/status` gains `freq_steps`, `last_freq_step_ppm` (the step
     followed; positive = the grandmaster sped up) and `last_freq_step_ts` (additive).
   - Two-clock bench, 25 ppm step at 20 us sample noise: confirmed within 22 s, the learned
-    frequency within 1 ppm from 21.5 s, the phase within 50 us from 71.5 s, the applied word's
+    frequency within 1 ppm from 21.5 s, the phase within 50 us from 82 s, the applied word's
     20 s mean within 1 ppm from 95.5 s (the plain PI: the learned frequency after 501 s, a 928 us
     phase peak). The same with a new grandmaster (identity change + 25 ppm). Three hours of 30 us
-    noise with a heavy tail, a 0.1 ppm/min wander, 60-120 us path changes under 50 us noise and a
-    100 us absorb into `D`: no detection. A six-box fleet follows a flip within 21 s, walls within
+    noise with a heavy tail, a 0.1 ppm/min wander, 60-120 us path changes under 50 us noise, path
+    changes in two stages at 20-30 us noise and a 100 us absorb into `D`: no detection. A six-box fleet follows a flip within 21 s, walls within
     59 us, with frequency words bit-identical across two UTC scenarios.
 
 ## [1.13.0] - 2026-09-29

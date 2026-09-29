@@ -961,13 +961,37 @@ What was learned building it:
   seeded events). The discriminator that holds is the SHIFTED slope: fit the line together with the
   best level-shift split and require the unlearned frequency to survive it (same sign, ≥ the
   minimum). A genuine step keeps its slope; a shift loses it. With it: 1 false event in 1000 at a
-  5 ppm minimum, none at 6 — so `FSTEP_MIN_PPM` is 6. Pinned by the bench's
+  5 ppm minimum, none in 1000 at 6 (an upper-bound reading, not a shown difference) — so
+  `FSTEP_MIN_PPM` is 6. Pinned by the bench's
   `a_path_change_under_heavy_noise_or_an_absorb_is_not_a_step_1372` (RED without the shifted slope).
+- **Two structures in one ring (review round 2).** A path change in two stages a few seconds apart
+  still passed (13-23 of 25 seeded runs at 20-30 µs): the partial F used the residual left after ONE
+  split as its noise, which the second stage inflates, and the one-shift slope removed only half the
+  stair. Two fixes, each measured: the F denominator is the WHITE noise from successive differences
+  of the residuals, `Σ(r_i − r_{i−1})² / 2(n − 1)` (a three-stage 3 × 70 µs change at 20 µs noise:
+  17 → 4 of 25), and the frequency must also survive the best PAIR of level shifts (a 2 × 2 system on
+  the residualized split regressors, O(N²) only for a candidate): two-stage changes 0 of 25 at 20-30
+  µs, 1-2 of 25 at 50 µs. Pinned by `a_path_change_in_two_stages_is_not_a_step_1372` and
+  `the_linearity_noise_is_the_white_noise_not_the_unexplained_structure` (both RED before).
+- **The limit that stays: a ring cannot tell a slow path change from a frequency change.** A delay
+  that ramps ≥ ~150 µs over 10-15 s under 30-50 µs noise (1-11 of 25), or changes in three or more
+  stages, can still re-seed. Such an event is bounded by the path change's apparent slope and undone
+  after the 30 s holdoff (the ring then shows the frequency the loop misses). A longer ring would see
+  it and would follow a real step later; keep the 20 s.
+- **Why the core does not remove a known `D` move from the open-loop phase.** The absorb and the
+  master re-align move `D` by a known amount through `set_anchor`, so `applied_us −= Δ` would keep
+  `p` continuous — but the #119 slew fold (`controller/date_sync/slew.rs`) also calls `set_anchor`,
+  and there `e` is continuous by construction (the de-slew displacement moves into `D`): the same
+  compensation would CREATE a level shift. Telling them apart needs a second anchor API through five
+  controller call sites; the statistical path covers the absorb (≤ 100 µs, at a join), pinned by the
+  bench's absorb cases.
 - **Keep the per-window cost to a sum pass.** The first version ran the full split scan with seven
-  fresh `Vec`s on every engaged window of every bench box: CI's integration tests went 2:18 → 5:39
-  and tarpaulin 3:38 → 14:43 (runs 36591942048 vs 36607528697; the bench needs `--timeout 300`). The
-  line fit is now allocation-free (`fit_line`), and the split scan (`split_test`) runs only for a
-  window whose slope already says "step" — the result is identical, the steady state never scans.
+  fresh `Vec`s on every engaged window of every bench box: CI's Test job went 3:01 → 6:57 and
+  Coverage 6:49 → 18:06 (runs 36591942048 → 36607528697; the bench needs tarpaulin
+  `--timeout 300`). The line fit is now allocation-free (`fit_line`), and the split scan
+  (`split_test`) runs only for a window whose slope already says "step" — the result is identical,
+  the steady state never scans: Test 2:52, Coverage 10:07 (run 36612323337; the extra bench cases
+  keep Coverage above the baseline).
 - **A residual floor (1 µs) in the fit** keeps a noiseless simulated ring from turning floating-point
   rounding into a linearity verdict. Real timestamps are never better than that.
 - **The phase the step left is retired along a decaying reference, not by the PI.** Re-seeding the
@@ -975,7 +999,7 @@ What was learned building it:
   overshoots ~54 µs. The PI tracks `e − r` and the word carries `−r/τ` (τ 20 s) as feed-forward.
 - **Say which frequency you mean.** "Within 1 ppm in 21.5 s" is the LEARNED frequency (the
   integrator). The APPLIED word also carries the pull: right after the re-seed it runs ≈ |e0|/τ
-  (~22 ppm for 25 ppm) past the new frequency, in the step's direction, decaying with τ; it is within
+  (~23 ppm for 25 ppm) past the new frequency, in the step's direction, decaying with τ; it is within
   1 ppm again after ≈ τ·ln(|e0|/τ) (the bench asserts its 20 s mean within 1 ppm from ≤ 120 s,
   measured 95.5 s). τ = 30 s would lower that peak to ~15 ppm and still meet the 120 s phase target
   (~90-94 s); the total buffer movement a downstream ASRC sees is |e0| either way.
