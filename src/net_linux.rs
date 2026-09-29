@@ -89,6 +89,9 @@ pub struct UdpPtpNetwork<F: PtpSocketFactory = KernelSockets> {
     /// `(name, IPv4)` of the last join that worked, kept through a failed re-join: what a re-join's
     /// `changed` compares with.
     last_join: (String, Ipv4Addr),
+    /// The address PTP was last received on (the startup one until a packet arrives on a later
+    /// join): the interface that carries it is where a re-join goes first.
+    home_ip: Ipv4Addr,
 }
 
 impl<F: PtpSocketFactory> UdpPtpNetwork<F> {
@@ -104,6 +107,7 @@ impl<F: PtpSocketFactory> UdpPtpNetwork<F> {
             factory,
             joined: Some(joined),
             last_join: (iface, ip),
+            home_ip: ip,
         })
     }
 
@@ -120,17 +124,18 @@ impl<F: PtpSocketFactory> PtpNetwork for UdpPtpNetwork<F> {
         };
         let mut buf = [0u8; 2048];
 
-        // Check Event Socket first
-        if let Some((size, ts, source_ip)) = net::recv_with_timestamp(&joined.event, &mut buf)? {
-            return Ok(Some((buf[..size].to_vec(), size, ts, source_ip)));
-        }
-
-        // Check General Socket
-        if let Some((size, ts, source_ip)) = net::recv_with_timestamp(&joined.general, &mut buf)? {
-            return Ok(Some((buf[..size].to_vec(), size, ts, source_ip)));
-        }
-
-        Ok(None)
+        // Check Event Socket first, then General Socket
+        let received = match net::recv_with_timestamp(&joined.event, &mut buf)? {
+            Some(got) => Some(got),
+            None => net::recv_with_timestamp(&joined.general, &mut buf)?,
+        };
+        let joined_ip = joined.ip;
+        let Some((size, ts, source_ip)) = received else {
+            return Ok(None);
+        };
+        // dantesync#112: PTP arrives on this join, so its address is the home a re-join looks for.
+        self.home_ip = joined_ip;
+        Ok(Some((buf[..size].to_vec(), size, ts, source_ip)))
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -143,11 +148,18 @@ impl<F: PtpSocketFactory> PtpNetwork for UdpPtpNetwork<F> {
     }
 
     fn rejoin(&mut self) -> Result<RejoinOutcome> {
-        // The interface NOW: a replaced NIC may come back under another name or address. When
-        // none resolves, the old pair stays (there is nothing better to join on).
-        let (iface, ip) = self.factory.resolve_interface()?;
-        // Close both old sockets FIRST: their membership may belong to a netdev that is gone, and
-        // the new pair binds the same ports.
+        // The interface NOW. First the one that carries the home address (where PTP was last
+        // received): a re-plugged NIC comes back with a new, higher ifindex and often a new name,
+        // and the listing-ordered startup resolver may answer another interface first (tailscale,
+        // docker, a bridge). Only when no interface carries it, the startup resolver (a DHCP move
+        // to a new address); when that finds none either, the old pair stays.
+        let (iface, ip) = match self.factory.interface_carrying(self.home_ip) {
+            Some(name) => (name, self.home_ip),
+            None => self.factory.resolve_interface()?,
+        };
+        // Close both old sockets FIRST: their membership may belong to a netdev that is gone,
+        // and two pairs are never open at once. (The old pair was deaf anyway: a re-join only
+        // runs while PTP is stale.)
         self.joined = None;
         // When the new pair cannot open, there are no sockets until the next attempt.
         let joined = open_pair(&mut self.factory, iface.clone(), ip)?;

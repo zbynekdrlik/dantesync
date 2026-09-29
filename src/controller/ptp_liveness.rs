@@ -7,7 +7,8 @@
 //!
 //! - "stale" has ONE definition, `ptp_stale_at` (no allowed PTP packet for more than
 //!   `PTP_TIMEOUT_SECS`), shared by the offline edge, the clock alarm, the re-join and
-//!   `/status`;
+//!   `/status`. An allowed PTP packet is a Sync or a Follow_Up (the grandmaster's time) from a
+//!   source the `gm_allowlist` allows; a runt or another follower's Delay_Req is not;
 //! - while stale, `/status` reports `is_locked=false` and `mode="NTP-only"`, keeps the last
 //!   offset, and says how old it is (`last_ptp_rx_age_s`);
 //! - the loop re-joins on the pure schedule of `crate::ptp_rejoin` through
@@ -108,8 +109,9 @@ where
         }
     }
 
-    /// An allowed PTP packet (one that passed the `gm_allowlist`) arrived at `now`: PTP is live,
-    /// the packet is counted, and the next silence is re-joined from scratch.
+    /// An allowed PTP packet (a Sync or a Follow_Up from a source the `gm_allowlist` allows)
+    /// arrived at `now`: PTP is live, the packet is counted, and the next silence is re-joined
+    /// from scratch.
     pub(super) fn note_allowed_ptp_packet(&mut self, now: Instant) {
         self.last_ptp_packet = now;
         self.ptp_liveness.rx.record(now);

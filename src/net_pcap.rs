@@ -362,15 +362,14 @@ struct PtpCapture {
     iface_ip: Ipv4Addr,
 }
 
-/// Select the PTP capture device and open the capture and the IGMP membership on it. The startup
-/// and the re-join (dantesync#112) both go through here, so both select the same way.
-fn open_ptp_capture(
+/// Select the PTP capture device and the IPv4 to join on at startup.
+fn select_ptp_device(
     interface_name: &str,
     gm_allowlist: &crate::gm_filter::GmAllowlist,
-) -> Result<PtpCapture> {
+) -> Result<(Device, Ipv4Addr)> {
     // camera-box issue 1073: on a multi-homed box prefer the interface on the
     // trusted grandmaster subnet (gm_allowlist); otherwise the historical
-    // name-based selection. Both the IGMP join and the capture below use the
+    // name-based selection. Both the IGMP join and the capture use the
     // chosen device, so they land on the NIC that reaches the rig GM.
     let (device, matched_ip) = find_ptp_capture_device(gm_allowlist, interface_name)?;
     info!("Found device: {} ({:?})", device.name, device.desc);
@@ -384,7 +383,21 @@ fn open_ptp_capture(
         None => device_ipv4(&device)?,
     };
     info!("Using interface IP {} for multicast join", iface_ip);
+    Ok((device, iface_ip))
+}
 
+/// dantesync#112 — the capture device that carries exactly `ip` now, if any.
+fn device_with_ip(ip: Ipv4Addr) -> Option<Device> {
+    list_devices_guarded().ok()?.into_iter().find(|d| {
+        d.addresses
+            .iter()
+            .any(|a| a.addr == std::net::IpAddr::V4(ip))
+    })
+}
+
+/// Open the PTP capture and the IGMP membership on the selected device. The startup and the
+/// re-join (dantesync#112) both open through here.
+fn open_ptp_capture(device: Device, iface_ip: Ipv4Addr) -> Result<PtpCapture> {
     // CRITICAL: Join the multicast group via ONE ephemeral-port socket to
     // trigger IGMP membership (dantesync#109: NOT bound to 319/320, so a
     // Dante Virtual Soundcard ptp.exe on the same host keeps both PTP ports).
@@ -422,6 +435,9 @@ pub struct NpcapPtpNetwork {
     gm_allowlist: crate::gm_filter::GmAllowlist,
     /// `(device, IPv4)` of the last capture that opened: what a re-join's `changed` compares with.
     last_join: (String, Ipv4Addr),
+    /// The address PTP was last received on (the startup one until a packet arrives on a later
+    /// capture): the device that carries it comes before the name fallback in a re-join.
+    home_ip: Ipv4Addr,
 }
 
 impl NpcapPtpNetwork {
@@ -430,7 +446,8 @@ impl NpcapPtpNetwork {
             "Initializing Npcap capture (default-interface hint: {})",
             interface_name
         );
-        let open = open_ptp_capture(interface_name, gm_allowlist)?;
+        let (device, ip) = select_ptp_device(interface_name, gm_allowlist)?;
+        let open = open_ptp_capture(device, ip)?;
 
         // Assume HostHighPrec is available on modern Npcap (1.20+)
         let using_hiprec = true;
@@ -448,7 +465,33 @@ impl NpcapPtpNetwork {
             hint: interface_name.to_string(),
             gm_allowlist: gm_allowlist.clone(),
             last_join,
+            home_ip: ip,
         })
+    }
+
+    /// dantesync#112 — the re-join's device: the trusted-subnet rule first (camera-box issue
+    /// 1073), then the device that still carries the home address (a replaced NIC comes back as
+    /// another device under another name), then the name fallback.
+    fn select_rejoin_device(&self) -> Result<(Device, Ipv4Addr)> {
+        match find_ptp_capture_device(&self.gm_allowlist, &self.hint) {
+            Ok((device, Some(ip))) => {
+                info!("Found device: {} ({:?})", device.name, device.desc);
+                Ok((device, ip))
+            }
+            by_name => {
+                if let Some(device) = device_with_ip(self.home_ip) {
+                    info!(
+                        "Found device: {} ({:?}) -- it carries {}, where PTP was last received",
+                        device.name, device.desc, self.home_ip
+                    );
+                    return Ok((device, self.home_ip));
+                }
+                let (device, _) = by_name?;
+                info!("Found device: {} ({:?})", device.name, device.desc);
+                let ip = device_ipv4(&device)?;
+                Ok((device, ip))
+            }
+        }
     }
 }
 
@@ -458,6 +501,7 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
         let Some(open) = self.open.as_mut() else {
             return Ok(None);
         };
+        let joined_ip = open.iface_ip;
         match open.capture.next_packet() {
             Ok(packet) => {
                 let data = packet.data;
@@ -502,6 +546,9 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                         "[Npcap] PTP payload {} bytes from {}",
                         payload_len, source_ip
                     );
+                    // dantesync#112: PTP arrives on this capture, so its address is the home a
+                    // re-join looks for.
+                    self.home_ip = joined_ip;
                     Ok(Some((result, payload_len, ts, Some(source_ip))))
                 } else {
                     Ok(None)
@@ -546,10 +593,12 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                 self.gm_allowlist.unresolved_hostnames()
             );
         }
-        // Drop the old (possibly dead) handle and its IGMP membership FIRST. When the new capture
-        // cannot open, there is none until the next attempt.
+        // Select BEFORE dropping anything: a selection failure keeps the old capture.
+        let (device, ip) = self.select_rejoin_device()?;
+        // Then drop the old (possibly dead) handle and its IGMP membership, and open on the
+        // selected device. When the new capture cannot open, there is none until the next attempt.
         self.open = None;
-        let open = open_ptp_capture(&self.hint, &self.gm_allowlist)?;
+        let open = open_ptp_capture(device, ip)?;
         let (iface, ip) = (open.device_name.clone(), open.iface_ip);
         info!("Npcap PTP capture re-opened on {} ({}) (rejoin)", iface, ip);
         let changed = self.last_join.0 != iface || self.last_join.1 != ip;

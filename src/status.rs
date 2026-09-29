@@ -412,10 +412,11 @@ pub struct SyncStatus {
     // ========================================================================
     // PTP liveness (dantesync#112) — additive.
     // ========================================================================
-    /// dantesync#112: whole seconds since the last ALLOWED PTP packet (one that passed the
-    /// `gm_allowlist`); `null` when none has come since the process started. Above 10 the node is
-    /// PTP-stale: `is_locked` is false and `mode` is `"NTP-only"`, while `offset_ns` still holds the
-    /// last measured value. Read this before trusting any PTP-derived field.
+    /// dantesync#112: whole seconds since the last ALLOWED PTP packet (a Sync or a Follow_Up from
+    /// a source the `gm_allowlist` allows); `null` when none has come since the process started.
+    /// Above 10 the node is PTP-stale: `is_locked` is false and `mode` is `"NTP-only"`, while
+    /// `offset_ns` still holds the last measured value. Read this before trusting any PTP-derived
+    /// field.
     #[serde(default)]
     pub last_ptp_rx_age_s: Option<u64>,
 

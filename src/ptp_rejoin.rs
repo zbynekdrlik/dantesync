@@ -6,8 +6,9 @@
 //! joined again: only a service restart recovered, and on the fleet's NTP master a restart
 //! re-derives the fleet date offset (every box steps).
 //!
-//! The controller already knows when PTP is gone. No allowed PTP packet for `PTP_TIMEOUT_SECS`
-//! (10 s) is the `ptp_stale` of the clock alarm. This module decides, from that one signal, when
+//! The controller already knows when PTP is gone. No allowed PTP packet (a Sync or a Follow_Up
+//! from a source the `gm_allowlist` allows) for `PTP_TIMEOUT_SECS` (10 s) is the `ptp_stale` of
+//! the clock alarm. This module decides, from that one signal, when
 //! to re-join (`PtpNetwork::rejoin`):
 //!
 //! - the first attempt once the silence reaches [`REJOIN_AFTER`];
@@ -121,7 +122,8 @@ impl RxWindow {
     }
 
     /// One allowed packet arrived at `now` (arrivals come in time order). Arrivals older than
-    /// the window are dropped here, so the memory stays bounded by the packet rate.
+    /// the window are dropped here, and at most [`RX_WINDOW_MAX_ARRIVALS`] are kept, so the memory
+    /// stays bounded even under a packet storm.
     pub fn record(&mut self, now: Instant) {
         self.last = Some(now);
         self.arrivals.push_back(now);
@@ -131,6 +133,9 @@ impl RxWindow {
             } else {
                 break;
             }
+        }
+        while self.arrivals.len() > RX_WINDOW_MAX_ARRIVALS {
+            self.arrivals.pop_front();
         }
     }
 

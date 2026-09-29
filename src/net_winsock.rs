@@ -80,6 +80,9 @@ pub struct WinsockPtpNetwork {
     timestamping_enabled: bool,
     /// dantesync#112: the interface address the sockets joined on (what a re-join compares with).
     interface_ip: Ipv4Addr,
+    /// dantesync#112: the address PTP was last received on; the interface that carries it is
+    /// where a re-join goes first.
+    home_ip: Ipv4Addr,
 }
 
 impl WinsockPtpNetwork {
@@ -133,6 +136,7 @@ impl WinsockPtpNetwork {
             qpc_frequency,
             timestamping_enabled,
             interface_ip,
+            home_ip: interface_ip,
         })
     }
 
@@ -570,11 +574,16 @@ impl crate::traits::PtpNetwork for WinsockPtpNetwork {
             return Ok(None);
         }
         // Try event port first (319), then general port (320)
-        if let Some(packet) = self.recv_with_timestamp(self.socket_319)? {
-            return Ok(Some(packet));
+        let received = match self.recv_with_timestamp(self.socket_319)? {
+            Some(packet) => Some(packet),
+            None => self.recv_with_timestamp(self.socket_320)?,
+        };
+        if received.is_some() {
+            // dantesync#112: PTP arrives on this join, so its address is the home a re-join
+            // looks for.
+            self.home_ip = self.interface_ip;
         }
-
-        self.recv_with_timestamp(self.socket_320)
+        Ok(received)
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -584,11 +593,16 @@ impl crate::traits::PtpNetwork for WinsockPtpNetwork {
 
     /// dantesync#112 — the same socket re-create as the startup, on the default interface NOW.
     fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
-        // When no interface resolves, the old sockets stay (nothing better to join on).
-        let (iface, ip) = crate::net::get_default_interface()?;
-        // Close both old sockets FIRST: their membership may belong to a NIC that is gone, and
-        // the new pair binds the same ports. When the new pair cannot open, there is none until
-        // the next attempt.
+        // The interface that carries the home address first (a re-plugged NIC may come back
+        // behind other interfaces in the listing order), else the startup resolver. When neither
+        // finds one, the old sockets stay (nothing better to join on).
+        let (iface, ip) = match crate::net::interface_with_ip(self.home_ip) {
+            Some(name) => (name, self.home_ip),
+            None => crate::net::get_default_interface()?,
+        };
+        // Close both old sockets FIRST: their membership may belong to a NIC that is gone, and two
+        // pairs are never open at once. When the new pair cannot open, there is none until the
+        // next attempt.
         self.close_sockets();
         let socket_319 = Self::create_ptp_socket(PTP_EVENT_PORT, ip)?;
         let socket_320 = match Self::create_ptp_socket(PTP_GENERAL_PORT, ip) {
