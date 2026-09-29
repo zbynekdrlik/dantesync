@@ -281,9 +281,10 @@ fn step_at(at: u64, ppm: f64) -> impl Fn(u64) -> f64 {
 
 #[test]
 fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
-    let after = 1_800; // 15 minutes after the step
-                       // (confirm s, learned-frequency settle s, phase settle s, applied-word 20 s-mean settle s,
-                       // the applied word's largest excursion after the re-seed in ppm)
+    // 15 minutes after the step.
+    let after = 1_800;
+    // (confirm s, learned-frequency settle s, phase settle s, applied-word 20 s-mean settle s,
+    // the applied word's largest excursion from the re-seed window on, in ppm)
     let mut worst_core = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut plain_settle = f64::INFINITY;
     let mut plain_peak_us = 0.0f64;
@@ -329,7 +330,7 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
                 w_settle <= 120.0,
                 "{label}: the applied word's 20 s mean within 1 ppm only from {w_settle} s"
             );
-            let excursion = r.word_err_ppm[(w + 1) as usize..]
+            let excursion = r.word_err_ppm[w as usize..]
                 .iter()
                 .fold(0.0f64, |m, v| m.max(v.abs()));
             // 6: D never moved, nothing re-anchored.
@@ -588,6 +589,51 @@ fn a_path_change_under_heavy_noise_or_an_absorb_is_not_a_step_1372() {
                     r.steps
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn a_path_change_in_two_stages_is_not_a_step_1372() {
+    // Review round 2: two path changes a few seconds apart — the second one sits inside the ring
+    // with the first, so neither the F test against the residual after one split nor the slope
+    // with ONE shift explained saw through it (a false re-seed in 13-23 of 25 seeded replica runs
+    // at 20-30 µs). The white-noise F and the two-shift slope do.
+    let at = LOCKED_WINDOWS;
+    let cases = [
+        (20_000.0, 75.0, 75.0, 14),
+        (20_000.0, 100.0, 100.0, 20),
+        (20_000.0, 80.0, 90.0, 16),
+        (30_000.0, 90.0, 90.0, 18),
+        (30_000.0, 70.0, 70.0, 12),
+    ];
+    for (sigma_ns, first_us, second_us, gap) in cases {
+        let noise = Noise {
+            sigma_ns,
+            tail_fraction: 0.0,
+            tail_mean_ns: 0.0,
+        };
+        for seed in 0..6u64 {
+            let r = run_world(
+                &mut core(),
+                LOCKED_WINDOWS + 600,
+                300 + seed,
+                noise,
+                |_| 0.0,
+                |_| BOX_OSC_PPM,
+                move |w| {
+                    let first = if w >= at { first_us } else { 0.0 };
+                    let second = if w >= at + gap { second_us } else { 0.0 };
+                    PATH_DELAY_NS + (first + second) * 1_000.0
+                },
+                Events::default(),
+            );
+            assert!(
+                r.steps.is_empty(),
+                "{first_us} + {second_us} us {gap} windows apart at {} us noise, seed {seed}: {:?}",
+                sigma_ns / 1_000.0,
+                r.steps
+            );
         }
     }
 }

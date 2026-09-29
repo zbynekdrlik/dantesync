@@ -70,7 +70,7 @@ pub mod freq_step;
 
 pub use freq_step::{
     fit_line, fit_ring, split_test, FreqStepDetector, FreqStepEstimate, LineFit, RingFit,
-    FSTEP_CONFIRM, FSTEP_HOLDOFF_S, FSTEP_LINEARITY_F_MAX, FSTEP_MAX_PPM, FSTEP_MIN_PPM,
+    SplitTest, FSTEP_CONFIRM, FSTEP_HOLDOFF_S, FSTEP_LINEARITY_F_MAX, FSTEP_MAX_PPM, FSTEP_MIN_PPM,
     FSTEP_SIGMAS, FSTEP_WINDOW_S,
 };
 

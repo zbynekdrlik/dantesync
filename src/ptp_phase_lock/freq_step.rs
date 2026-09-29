@@ -110,9 +110,10 @@ pub struct RingFit {
     pub sigma_ppm: f64,
     /// The largest partial F of a level shift or a slope change inside the ring.
     pub linearity_f: f64,
-    /// The slope of the line fitted together with the best level-shift split (ppm): what is left
-    /// of the slope once the most likely level shift is explained away.
+    /// The slope with the most likely level shift explained away (ppm).
     pub shifted_slope_ppm: f64,
+    /// The slope with the most likely two level shifts explained away (ppm).
+    pub two_shift_slope_ppm: f64,
     pub points: usize,
     pub span_s: f64,
 }
@@ -174,22 +175,39 @@ pub fn fit_line<'a>(points: impl Iterator<Item = &'a (f64, f64)> + Clone) -> Opt
     })
 }
 
+/// The linearity test of a fitted line (see [`split_test`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplitTest {
+    /// The largest partial F of a level shift or a slope change at any split.
+    pub linearity_f: f64,
+    /// The slope of the line fitted together with the best level-shift split (ppm).
+    pub one_shift_slope_ppm: f64,
+    /// The slope of the line fitted together with the best PAIR of level-shift splits (ppm).
+    pub two_shift_slope_ppm: f64,
+}
+
 /// The linearity test of a fitted line: the largest partial F of a level shift or a slope change
-/// at any split keeping [`FSTEP_SPLIT_EDGE`] points on each side, and the slope with the best
-/// level shift explained. Returns `(linearity_f, shifted_slope_ppm)`.
-pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> (f64, f64) {
+/// at any split keeping [`FSTEP_SPLIT_EDGE`] points on each side, and the slope with the most
+/// likely one, and the most likely two, level shifts explained.
+pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> SplitTest {
     let n = points.len();
     if n != line.points || n < 2 * FSTEP_SPLIT_EDGE {
-        return (f64::INFINITY, line.slope_ppm);
+        return SplitTest {
+            linearity_f: f64::INFINITY,
+            one_shift_slope_ppm: line.slope_ppm,
+            two_shift_slope_ppm: line.slope_ppm,
+        };
     }
     let nf = n as f64;
     let sxx = line.sxx;
-    // Suffix sums over i >= k of: 1, t, t², r, t·r (t centered, r the line's residual).
+    // Suffix sums over i >= k of: 1, t, t², r, t·r (t centered, r the line's residual), and the
+    // squared successive differences of r.
     let mut s_n = vec![0.0; n + 1];
     let mut s_t = vec![0.0; n + 1];
     let mut s_tt = vec![0.0; n + 1];
     let mut s_r = vec![0.0; n + 1];
     let mut s_tr = vec![0.0; n + 1];
+    let (mut diff_sq, mut r_next) = (0.0f64, None::<f64>);
     for i in (0..n).rev() {
         let t = points[i].0 - line.t_mean;
         let r = points[i].1 - line.p_mean - line.slope_ppm * t;
@@ -198,25 +216,31 @@ pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> (f64, f64) {
         s_tt[i] = s_tt[i + 1] + t * t;
         s_r[i] = s_r[i + 1] + r;
         s_tr[i] = s_tr[i + 1] + t * r;
+        if let Some(rn) = r_next {
+            diff_sq += (rn - r) * (rn - r);
+        }
+        r_next = Some(r);
     }
     // Adding one regressor x to the line: its coefficient is (Σ x·r) / |x̃|², the residual sum of
     // squares falls by (Σ x·r)² / |x̃|², where x̃ is x without its projection on (1, t) — the
-    // residuals are already orthogonal to (1, t), so Σ x̃·r = Σ x·r.
+    // residuals are already orthogonal to (1, t), so Σ x̃·r = Σ x·r. With it the slope becomes
+    // b − c·Σx·t / Sxx.
     let residualized = |sum_x: f64, sum_xx: f64, sum_xt: f64| -> f64 {
         sum_xx - sum_x * sum_x / nf - sum_xt * sum_xt / sxx
     };
+    let splits = FSTEP_SPLIT_EDGE..=(n - FSTEP_SPLIT_EDGE);
     let mut best = 0.0f64;
-    let (mut best_shift, mut shifted_slope) = (0.0f64, line.slope_ppm);
-    for k in FSTEP_SPLIT_EDGE..=(n - FSTEP_SPLIT_EDGE) {
+    let (mut best_one, mut one_shift) = (0.0f64, line.slope_ppm);
+    for k in splits.clone() {
         let nk = s_n[k];
-        // A level shift: x = 1 for i >= k. With it, the slope becomes b − c·Σx·t / Sxx.
+        // A level shift: x = 1 for i >= k.
         let den = residualized(nk, nk, s_t[k]);
         if den > 1e-9 {
             let reduction = s_r[k] * s_r[k] / den;
             best = best.max(reduction);
-            if reduction > best_shift {
-                best_shift = reduction;
-                shifted_slope = line.slope_ppm - (s_r[k] / den) * s_t[k] / sxx;
+            if reduction > best_one {
+                best_one = reduction;
+                one_shift = line.slope_ppm - (s_r[k] / den) * s_t[k] / sxx;
             }
         }
         // A slope change at the knot t[k-1]: x = t − t[k-1] for i >= k.
@@ -230,21 +254,52 @@ pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> (f64, f64) {
             best = best.max(shr * shr / den);
         }
     }
+    // Two level shifts at j < k, fitted together: a 2×2 system on the residualized regressors
+    // (z_j·z_k = the count of i >= k).
+    let (mut best_two, mut two_shift) = (0.0f64, one_shift);
+    for j in splits.clone() {
+        let aa = residualized(s_n[j], s_n[j], s_t[j]);
+        if aa <= 1e-9 {
+            continue;
+        }
+        for k in (j + 1)..=*splits.end() {
+            let cc = residualized(s_n[k], s_n[k], s_t[k]);
+            let bb = s_n[k] - s_n[j] * s_n[k] / nf - s_t[j] * s_t[k] / sxx;
+            let det = aa * cc - bb * bb;
+            if cc <= 1e-9 || det <= 1e-9 * aa * cc {
+                continue;
+            }
+            let (u, v) = (s_r[j], s_r[k]);
+            let cj = (u * cc - v * bb) / det;
+            let ck = (v * aa - u * bb) / det;
+            let reduction = cj * u + ck * v;
+            if reduction > best_two {
+                best_two = reduction;
+                two_shift = line.slope_ppm - (cj * s_t[j] + ck * s_t[k]) / sxx;
+            }
+        }
+    }
     let floor = FSTEP_FIT_FLOOR_US * FSTEP_FIT_FLOOR_US;
-    let rest = ((line.sse - best) / (nf - 3.0)).max(floor);
-    (best / rest, shifted_slope)
+    let _ = diff_sq;
+    let noise = ((line.sse - best) / (nf - 3.0)).max(floor);
+    SplitTest {
+        linearity_f: best / noise,
+        one_shift_slope_ppm: one_shift,
+        two_shift_slope_ppm: two_shift,
+    }
 }
 
 /// Fit a line to `(t s, p µs)` points (time strictly increasing) and test it for linearity.
 /// `None` below [`FSTEP_MIN_POINTS`] or when the times do not spread.
 pub fn fit_ring(points: &[(f64, f64)]) -> Option<RingFit> {
     let line = fit_line(points.iter())?;
-    let (linearity_f, shifted_slope_ppm) = split_test(points, &line);
+    let split = split_test(points, &line);
     Some(RingFit {
         slope_ppm: line.slope_ppm,
         sigma_ppm: line.sigma_ppm,
-        linearity_f,
-        shifted_slope_ppm,
+        linearity_f: split.linearity_f,
+        shifted_slope_ppm: split.one_shift_slope_ppm,
+        two_shift_slope_ppm: split.two_shift_slope_ppm,
         points: line.points,
         span_s: line.span_s,
     })
@@ -366,16 +421,24 @@ impl FreqStepDetector {
         // slope, so the steady state never pays for it.
         let slope_says_step =
             error.abs() >= FSTEP_MIN_PPM && error.abs() >= FSTEP_SIGMAS * line.sigma_ppm;
-        let (linearity_f, shifted_slope) = if slope_says_step {
+        let split = if slope_says_step {
             split_test(self.ring.make_contiguous(), &line)
         } else {
-            (f64::INFINITY, line.slope_ppm)
+            SplitTest {
+                linearity_f: f64::INFINITY,
+                one_shift_slope_ppm: line.slope_ppm,
+                two_shift_slope_ppm: line.slope_ppm,
+            }
         };
-        let shifted_error = shifted_slope + integrator_ppm;
+        // The frequency must survive the most likely level shift explained away.
+        let survives = |slope: f64| {
+            let e = slope + integrator_ppm;
+            e.abs() >= FSTEP_MIN_PPM && e.signum() == error.signum()
+        };
+        let linearity_f = split.linearity_f;
         let candidate = slope_says_step
             && linearity_f <= FSTEP_LINEARITY_F_MAX
-            && shifted_error.abs() >= FSTEP_MIN_PPM
-            && shifted_error.signum() == error.signum();
+            && survives(split.one_shift_slope_ppm);
         if !candidate {
             self.run_sign = 0;
             self.run_len = 0;

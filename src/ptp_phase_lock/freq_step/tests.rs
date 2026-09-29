@@ -45,8 +45,9 @@ fn a_level_shift_reads_as_a_clean_slope_but_fails_the_linearity_test() {
     // What a plain `|s| > 6σ` test would see: 1.5·A / 20 s ≈ 7.5 ppm, many standard errors.
     assert!(fit.slope_ppm > 5.0, "{fit:?}");
     assert!(fit.slope_ppm > FSTEP_SIGMAS * fit.sigma_ppm, "{fit:?}");
-    // The linearity test sees the jump …
-    assert!(fit.linearity_f > 100.0 * FSTEP_LINEARITY_F_MAX, "{fit:?}");
+    // The linearity test sees the jump (noiseless, F ≈ N(N − 1)/8 ≈ 205 whatever its size: the
+    // white-noise estimate from successive differences then holds only the jump's own one) …
+    assert!(fit.linearity_f > 10.0 * FSTEP_LINEARITY_F_MAX, "{fit:?}");
     // … and with the jump explained nothing of the slope is left.
     assert!(fit.shifted_slope_ppm.abs() < 1e-6, "{fit:?}");
 }
@@ -64,16 +65,81 @@ fn the_shifted_slope_keeps_a_real_slope_and_removes_only_the_shift() {
 }
 
 #[test]
-fn the_cheap_line_fit_agrees_with_the_full_ring_fit() {
-    let pts = ring(41, -7.5, |t| 30.0 * (1.3 * t).sin());
+fn the_cheap_line_fit_matches_a_plain_two_pass_fit() {
+    // `fit_line` keeps only sums (sse = syy − b·sxy); compare with the plain residual sum.
+    let pts = ring(41, -7.5, |t| 30.0 * (1.3 * t).sin() + 1.0e7);
     let line = fit_line(pts.iter()).unwrap();
-    let full = fit_ring(&pts).unwrap();
-    assert_eq!(line.slope_ppm, full.slope_ppm);
-    assert_eq!(line.sigma_ppm, full.sigma_ppm);
+    let n = pts.len() as f64;
+    let tm = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let pm = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx: f64 = pts.iter().map(|p| (p.0 - tm) * (p.0 - tm)).sum();
+    let b = pts.iter().map(|p| (p.0 - tm) * (p.1 - pm)).sum::<f64>() / sxx;
+    let sse: f64 = pts
+        .iter()
+        .map(|p| {
+            let r = p.1 - pm - b * (p.0 - tm);
+            r * r
+        })
+        .sum();
+    let sigma = (sse / (n - 2.0) / sxx).sqrt();
+    assert!((line.slope_ppm - b).abs() < 1e-9, "{line:?} vs {b}");
+    assert!(
+        (line.sigma_ppm - sigma).abs() < 1e-9 * sigma.max(1.0),
+        "{line:?} vs {sigma}"
+    );
     assert_eq!((line.points, line.span_s), (41, 20.0));
     // The split test refuses a line that is not the fit of these points.
     let short = &pts[..30];
-    assert_eq!(split_test(short, &line).0, f64::INFINITY);
+    assert_eq!(split_test(short, &line).linearity_f, f64::INFINITY);
+}
+
+#[test]
+fn two_level_shifts_are_explained_by_the_two_shift_slope() {
+    // A 3 ppm line with two 80 µs path changes 7 s apart: one shift explained still leaves a
+    // step-sized slope, two leave the true one.
+    let fit = fit_ring(&ring(41, 3.0, |t| {
+        80.0 * (f64::from(u8::from(t >= 6.5)) + f64::from(u8::from(t >= 13.5)))
+    }))
+    .unwrap();
+    assert!(fit.slope_ppm > FSTEP_MIN_PPM + 3.0, "{fit:?}");
+    assert!(fit.shifted_slope_ppm > 3.0 + 1.0, "{fit:?}");
+    assert!((fit.two_shift_slope_ppm - 3.0).abs() < 1e-6, "{fit:?}");
+    // A genuine line keeps its slope through both.
+    let fit = fit_ring(&ring(41, 25.0, |_| 0.0)).unwrap();
+    assert!((fit.two_shift_slope_ppm - 25.0).abs() < 1e-6, "{fit:?}");
+}
+
+#[test]
+fn the_linearity_noise_is_the_white_noise_not_the_unexplained_structure() {
+    // White noise on a line: the successive-difference estimate is ~the noise variance, so a
+    // single split explains only noise (F small).
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut noise = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 11) as f64 / (1u64 << 53) as f64 * 40.0 - 20.0
+    };
+    let pts: Vec<(f64, f64)> = ring(41, 25.0, |_| 0.0)
+        .into_iter()
+        .map(|(t, p)| (t, p + noise()))
+        .collect();
+    assert!(fit_ring(&pts).unwrap().linearity_f < FSTEP_LINEARITY_F_MAX);
+    // A path change in THREE stages: after the best single split the rest is still structure,
+    // which the old residual-based denominator counted as noise. Against the white noise the
+    // split stands out.
+    let stairs: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|&(t, p)| {
+            let stages = [5.0, 10.0, 15.0].iter().filter(|&&at| t >= at).count();
+            (t, p + 70.0 * stages as f64)
+        })
+        .collect();
+    assert!(
+        fit_ring(&stairs).unwrap().linearity_f > FSTEP_LINEARITY_F_MAX,
+        "{:?}",
+        fit_ring(&stairs)
+    );
 }
 
 #[test]
