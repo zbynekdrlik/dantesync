@@ -15,12 +15,14 @@
 //!    frequency (the integrator) is within 1 ppm of the new one from 30 s after the step on, and
 //!    the phase error under 50 µs from 120 s on. The plain PI needs more than 5 minutes for the
 //!    1 ppm (measured ~8 min). The APPLIED word also carries the pull that retires the phase the
-//!    step left (≈ |e0|/τ ≈ 20 ppm right after the re-seed, decaying with τ): its 20 s mean is
+//!    step left (≈ |e0|/τ ≈ 23 ppm right after the re-seed, decaying with τ): its 20 s mean is
 //!    within 1 ppm of the grandmaster from ≤ 120 s on.
 //! 2. Noise alone — 30 µs, and a heavy tail — confirms nothing over hours, and the words are the
 //!    plain PI's, bit for bit.
 //! 3. A single 500 µs delay spike, and a lasting path-delay change — also 60-120 µs changes under
-//!    50 µs of sample noise, and a small offset absorbed into `D` — are not steps.
+//!    50 µs of sample noise, changes in two stages, and a small offset absorbed into `D` — are not
+//!    steps. A path delay that RAMPS for longer than the ring can tell apart is the known limit:
+//!    it may be re-seeded, and then it is reversed and bounded.
 //! 4. A slow 0.1 ppm/min wander is not a step, and the words are the plain PI's, bit for bit.
 //! 5. Back-to-back steps (+25, then −25 two minutes later) are both followed.
 //! 6. `D` never moves and no window re-anchors: the date layer is not involved at all. A step that
@@ -380,6 +382,8 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
         "the plain PI took only {plain_settle} s: the bench no longer shows the problem"
     );
     assert!(plain_peak_us > 500.0, "{plain_peak_us}");
+    // The pull's rate is bounded by the phase the step left over τ (~450 µs / 20 s here).
+    assert!(worst_core.4 <= 30.0, "word excursion {} ppm", worst_core.4);
 }
 
 #[test]
@@ -636,6 +640,57 @@ fn a_path_change_in_two_stages_is_not_a_step_1372() {
             );
         }
     }
+}
+
+#[test]
+fn a_path_ramp_the_ring_cannot_tell_from_a_step_is_bounded_and_reversed_1372() {
+    // The known limit (review round 3): a path delay that ramps 300 µs over 20 s reads, inside a
+    // 20 s ring, exactly like a 15 ppm frequency change. It may be re-seeded; what must hold is that
+    // it is reversed once the ramp ends (the ring then shows the frequency the loop misses), that
+    // nothing chases itself (at most the event and its reversal), and that the learned frequency
+    // is back on the grandmaster's within minutes. Pinned as bounds, so removing the false event
+    // later keeps the test green.
+    let at = LOCKED_WINDOWS;
+    let ramp_windows = 40u64;
+    let mut worst = (0usize, 0.0f64, 0.0f64); // (events, learned-frequency settle s, peak |e| µs)
+    for seed in 0..6u64 {
+        let r = run_world(
+            &mut core(),
+            LOCKED_WINDOWS + 1_200,
+            400 + seed,
+            BENCH_NOISE,
+            |_| 0.0,
+            |_| BOX_OSC_PPM,
+            move |w| {
+                let into = w.saturating_sub(at).min(ramp_windows) as f64 / ramp_windows as f64;
+                PATH_DELAY_NS + if w >= at { 300_000.0 * into } else { 0.0 }
+            },
+            Events::default(),
+        );
+        assert!(r.steps.len() <= 2, "seed {seed}: {:?}", r.steps);
+        if let [(_, a), (_, b)] = r.steps[..] {
+            assert!(
+                a.step_ppm * b.step_ppm < 0.0,
+                "a reversal, never a chase: {a:?} {b:?}"
+            );
+        }
+        let f_settle = settles(&r.freq_err_ppm, at, 1.0).expect("the learned frequency returns");
+        assert!(f_settle <= 240.0, "seed {seed}: {f_settle} s");
+        let peak = r.phase_err_us[at as usize..]
+            .iter()
+            .fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(peak < 1_000.0, "seed {seed}: {peak} us");
+        worst = (
+            worst.0.max(r.steps.len()),
+            worst.1.max(f_settle),
+            worst.2.max(peak),
+        );
+    }
+    eprintln!(
+        "300 us path ramp over 20 s: <= {} events, learned frequency back within 1 ppm from <= \
+         {:.1} s, true phase peak <= {:.0} us",
+        worst.0, worst.1, worst.2
+    );
 }
 
 #[test]

@@ -125,21 +125,18 @@ fn the_linearity_noise_is_the_white_noise_not_the_unexplained_structure() {
         .map(|(t, p)| (t, p + noise()))
         .collect();
     assert!(fit_ring(&pts).unwrap().linearity_f < FSTEP_LINEARITY_F_MAX);
-    // A path change in THREE stages: after the best single split the rest is still structure,
-    // which the old residual-based denominator counted as noise. Against the white noise the
-    // split stands out.
+    // A path change in two stages: after the best single split the rest is still structure,
+    // which a residual-based denominator counts as noise (F 14.3 here, under the bound). Against
+    // the white noise the split stands out (F ≈ 27).
     let stairs: Vec<(f64, f64)> = pts
         .iter()
         .map(|&(t, p)| {
-            let stages = [5.0, 10.0, 15.0].iter().filter(|&&at| t >= at).count();
-            (t, p + 70.0 * stages as f64)
+            let stages = [6.5, 13.5].iter().filter(|&&at| t >= at).count();
+            (t, p + 100.0 * stages as f64)
         })
         .collect();
-    assert!(
-        fit_ring(&stairs).unwrap().linearity_f > FSTEP_LINEARITY_F_MAX,
-        "{:?}",
-        fit_ring(&stairs)
-    );
+    let f = fit_ring(&stairs).unwrap().linearity_f;
+    assert!(f > 1.5 * FSTEP_LINEARITY_F_MAX, "{f}");
 }
 
 #[test]

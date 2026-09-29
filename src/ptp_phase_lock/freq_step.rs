@@ -40,18 +40,26 @@
 //!   pair of splits, must each leave an unlearned frequency of the same sign and at least
 //!   [`FSTEP_MIN_PPM`]. At 40-60 µs of sample noise the F test alone has too little power against a
 //!   60-120 µs path-delay change (a false re-seed in up to 10 of 60 seeded events), and a change in
-//!   two stages 5-10 s apart passed in up to 23 of 25 even at 20-30 µs; a genuine step keeps its
-//!   slope through both;
+//!   two stages 5-10 s apart passed in up to 23 of 25 even at 20-30 µs. A genuine step of ≥ ~8 ppm
+//!   keeps its slope through both; the two-shift slope's spread (~2 ppm at 30-50 µs of noise)
+//!   leaves a 6-7 ppm step partly to the PI;
 //!
 //! and the candidate holds with the same sign for [`FSTEP_CONFIRM`] consecutive windows. A single
 //! outlier cannot pass: its slope is at most √3 standard errors.
 //!
-//! What it cannot tell apart, inside a 20 s ring: a path delay that RAMPS (≥ ~150 µs over
-//! ~10-15 s) under ≥ 30-50 µs of sample noise, or changes in three or more stages, looks like a
-//! frequency change while it lasts (measured on a seeded replica: 1-11 of 25 ramps at 30-50 µs,
-//! 4 of 25 three-stage 3 × 70 µs changes at 20 µs). Such a false re-seed is bounded (≤ the path
-//! change's apparent slope, typically 6-13 ppm) and undone after the holdoff, when the ring shows
-//! the frequency the loop now misses.
+//! What it cannot tell apart, inside a 20 s ring: a path delay that RAMPS at ≥ ~6 µs/s (the
+//! minimum, as a slope) for ≥ ~15 s is a frequency change as far as `e` can show, at any noise, and
+//! so can be a change in three or more stages. Measured on a seeded replica (25 runs): 150 µs over
+//! 15 s re-seeds in 5 / 14 / 16 of 25 at 20 / 30 / 50 µs of sample noise; 300 µs over 20 s in every
+//! run, as a 15-17 ppm step; three 70 µs stages at 20 µs noise in 4 of 25. Such a false re-seed
+//! roughly doubles the phase excursion the path change causes, and is reversed ~30 s later, when
+//! the ring shows the frequency the loop then misses (bench: learned frequency back within 1 ppm
+//! ≤ 161 s after a 300 µs / 20 s ramp, phase peak ≤ 624 µs). One near the minimum (6-7 ppm) may
+//! not be reversed: the PI learns part of it during the holdoff, the rest is under the minimum and
+//! decays through the PI (the integrator > 1 ppm off for ~6 min, as after any 6 ppm error).
+//! The linearity noise assumes per-window white noise; a correlated delay wander (AR(1), ρ 0.8,
+//! 15 µs on top of 20 µs samples) still lets a 25 ppm step through, later (≤ 60 s) and ~2 ppm less
+//! exactly (the reviewer's replica).
 //!
 //! The line fit runs on every engaged window without allocating; the split scan runs only for a
 //! window whose slope already passes the first test (never in the steady state).
@@ -71,7 +79,8 @@ pub const FSTEP_WINDOW_S: f64 = 20.0;
 /// The smallest unlearned frequency (ppm) that is a step. The PI follows oscillator wander (a
 /// fraction of a ppm per minute) and a ramp leaves at most a few tenths of a ppm unlearned. Six
 /// rather than five: at 50-60 µs of sample noise a 60-120 µs path-delay change still passed as a
-/// ~5 ppm step in 1 of 1000 seeded events at 5 ppm, none at 6. Smaller steps stay with the PI.
+/// ~5 ppm step in 1 of 1000 seeded events at 5 ppm, none in 1000 at 6. Smaller steps stay with the
+/// PI; steps of 6-7 ppm are followed only in part, ≥ ~8 ppm reliably.
 pub const FSTEP_MIN_PPM: f64 = 6.0;
 
 /// The unlearned frequency must also be this many standard errors of the fitted slope.

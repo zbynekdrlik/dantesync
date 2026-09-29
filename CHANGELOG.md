@@ -24,9 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     is past the step), and the frequency is still there with the most likely one and two level
     shifts explained away (so a delay spike, a path-delay change, one in two stages, or an offset
     absorbed into `D` is not a step). Six consecutive windows confirm it; then nothing for 30 s.
-    Smaller steps stay with the PI. What a 20 s window cannot tell from a frequency change: a
-    path delay that ramps over 10-15 s under heavy timestamp noise, or changes in three or more
-    stages; such a false re-seed is bounded and undone after the holdoff.
+    Steps of 6-7 ppm are followed only in part and smaller ones stay with the PI; >= ~8 ppm is
+    followed reliably. What a 20 s window cannot tell from a frequency change: a path delay that
+    ramps at >= ~6 us/s for >= ~15 s (at any timestamp noise), or changes in three or more
+    stages. Such a false re-seed roughly doubles the phase excursion the path change causes and
+    is reversed ~30 s later; one near the 6 ppm minimum may instead decay through the PI.
   - **The response.** The integrator jumps by the measured error (at most 100 ppm per event), and
     the phase the step left (~400 us for 25 ppm) is pulled back along a decaying reference
     (tau 20 s) whose rate the word carries as feed-forward, so the recovery neither disturbs the
@@ -41,9 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Two-clock bench, 25 ppm step at 20 us sample noise: confirmed within 22 s, the learned
     frequency within 1 ppm from 21.5 s, the phase within 50 us from 82 s, the applied word's
     20 s mean within 1 ppm from 95.5 s (the plain PI: the learned frequency after 501 s, a 928 us
-    phase peak). The same with a new grandmaster (identity change + 25 ppm). Three hours of 30 us
-    noise with a heavy tail, a 0.1 ppm/min wander, 60-120 us path changes under 50 us noise, path
-    changes in two stages at 20-30 us noise and a 100 us absorb into `D`: no detection. A six-box fleet follows a flip within 21 s, walls within
+    phase peak). The same with a new grandmaster (identity change + 25 ppm). No detection under
+    three hours of 30 us noise with a heavy tail, a 0.1 ppm/min wander, 60-120 us path changes
+    under 50 us noise, path changes in two stages at 20-30 us noise, or a 100 us absorb into `D`.
+    A 300 us path ramp over 20 s: at most the false event and its reversal, the learned frequency
+    back within 1 ppm by 161 s. A six-box fleet follows a flip within 21 s, walls within
     59 us, with frequency words bit-identical across two UTC scenarios.
 
 ## [1.13.0] - 2026-09-29
