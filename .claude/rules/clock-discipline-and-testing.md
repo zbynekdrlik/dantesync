@@ -976,14 +976,18 @@ What was learned building it:
 - **The limit that stays: a ring cannot tell a slow path change from a frequency change.** A delay
   that ramps at ≥ ~6 µs/s (the minimum, as a slope) for ≥ ~15 s IS a frequency change as far as `e`
   shows, at any noise (review round 3, 25 seeded runs: 150 µs / 15 s re-seeds in 5 / 14 / 16 at 20 /
-  30 / 50 µs; 300 µs / 20 s in every run, as 15-17 ppm), and so can three or more stages. The false
-  event roughly doubles the phase excursion (bench: peak ≤ 624 µs for 300 µs / 20 s) and is reversed
-  ~30 s later; near the minimum (6-7 ppm) it may not be — the PI learns part during the holdoff, the
-  rest is under the minimum and decays through the PI (~6 min > 1 ppm). Pinned as bounds by
-  `a_path_ramp_the_ring_cannot_tell_from_a_step_is_bounded_and_reversed_1372`. A longer ring would
-  see more of it and follow a real step later; keep the 20 s. The linearity noise assumes per-window
-  white noise: a correlated delay wander (AR(1) ρ 0.8) delays a genuine confirmation (≤ 60 s) but
-  does not block it.
+  30 / 50 µs; 300 µs / 20 s in 24-25 of 25, as 14-17 ppm; review round 4), and so can three or more
+  stages. The false event roughly doubles the phase excursion (bench, 300 µs / 20 s: peak 624 µs
+  against ~348 µs without it) and is reversed ~32 s later (the learned frequency back within 1 ppm
+  by ≤ 54 s; a seed that is not re-seeded takes 161 s, like the plain PI); near the minimum
+  (6-7 ppm) it may not be — the PI learns part during the holdoff, the rest is under the minimum
+  and decays through the PI (~6 min > 1 ppm; 3 of 25 at 140 µs / 20 s). Pinned as BOUNDS (≤ 2
+  events of opposite signs, back ≤ 240 s, phase < 1000 µs) by
+  `a_path_ramp_the_ring_cannot_tell_from_a_step_is_bounded_and_reversed_1372`; it stays green if the
+  false event is ever removed. A longer ring would see more of it and follow a real step later; keep
+  the 20 s. The linearity noise assumes per-window white noise: a correlated delay wander (AR(1) per
+  window, ρ 0.8) does not block a genuine confirmation but slows it (typically ~25 s, about 1 run in
+  10 after 60-90 s; the estimate typically 1-4 ppm off, the rest learned by the PI).
 - **The two-shift slope costs sensitivity near the minimum.** Its spread is ~2 ppm at 30-50 µs noise
   (the plain slope ~0.5): 6-7 ppm steps are followed only in part, ≥ ~8 ppm reliably.
 - **Why the core does not (yet) remove a known `D` move from the open-loop phase.** The absorbs and

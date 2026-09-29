@@ -46,9 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     phase peak). The same with a new grandmaster (identity change + 25 ppm). No detection under
     three hours of 30 us noise with a heavy tail, a 0.1 ppm/min wander, 60-120 us path changes
     under 50 us noise, path changes in two stages at 20-30 us noise, or a 100 us absorb into `D`.
-    A 300 us path ramp over 20 s: at most the false event and its reversal, the learned frequency
-    back within 1 ppm by 161 s. A six-box fleet follows a flip within 21 s, walls within
-    59 us, with frequency words bit-identical across two UTC scenarios.
+    A 300 us path ramp over 20 s (the known limit): at most the false event and its reversal;
+    measured on 6 seeds, 5 re-seeded and reversed with the learned frequency back within 1 ppm by
+    54 s, the sixth (not re-seeded) by 161 s like the plain PI. A six-box fleet follows a flip
+    within 21 s, walls within 59 us, with frequency words bit-identical across two UTC scenarios.
 
 ## [1.13.0] - 2026-09-29
 

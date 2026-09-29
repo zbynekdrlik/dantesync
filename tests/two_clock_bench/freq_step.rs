@@ -22,7 +22,8 @@
 //! 3. A single 500 µs delay spike, and a lasting path-delay change — also 60-120 µs changes under
 //!    50 µs of sample noise, changes in two stages, and a small offset absorbed into `D` — are not
 //!    steps. A path delay that RAMPS for longer than the ring can tell apart is the known limit:
-//!    it may be re-seeded, and then it is reversed and bounded.
+//!    it may be re-seeded, and is then reversed — or, near the 6 ppm minimum, left to decay
+//!    through the PI (~6 min) — within bounds.
 //! 4. A slow 0.1 ppm/min wander is not a step, and the words are the plain PI's, bit for bit.
 //! 5. Back-to-back steps (+25, then −25 two minutes later) are both followed.
 //! 6. `D` never moves and no window re-anchors: the date layer is not involved at all. A step that
