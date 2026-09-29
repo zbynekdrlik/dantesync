@@ -11,15 +11,21 @@
 //!
 //! Proven (the seven cases of the design, comment 5894821454 on camera-box issue 1372):
 //!
-//! 1. A 25 ppm step (either sign, several noise seeds) is confirmed within 30 s; the integrator is
-//!    within 1 ppm of the new frequency from 30 s after the step on, and the phase error under
-//!    50 µs from 120 s on. The plain PI needs more than 5 minutes for the 1 ppm (measured ~8 min).
+//! 1. A 25 ppm step (either sign, several noise seeds) is confirmed within 30 s; the LEARNED
+//!    frequency (the integrator) is within 1 ppm of the new one from 30 s after the step on, and
+//!    the phase error under 50 µs from 120 s on. The plain PI needs more than 5 minutes for the
+//!    1 ppm (measured ~8 min). The APPLIED word also carries the pull that retires the phase the
+//!    step left (≈ |e0|/τ ≈ 20 ppm right after the re-seed, decaying with τ): its 20 s mean is
+//!    within 1 ppm of the grandmaster from ≤ 120 s on.
 //! 2. Noise alone — 30 µs, and a heavy tail — confirms nothing over hours, and the words are the
 //!    plain PI's, bit for bit.
-//! 3. A single 500 µs delay spike, and a lasting path-delay change, are not steps.
+//! 3. A single 500 µs delay spike, and a lasting path-delay change — also 60-120 µs changes under
+//!    50 µs of sample noise, and a small offset absorbed into `D` — are not steps.
 //! 4. A slow 0.1 ppm/min wander is not a step, and the words are the plain PI's, bit for bit.
 //! 5. Back-to-back steps (+25, then −25 two minutes later) are both followed.
-//! 6. `D` never moves and no window re-anchors: the date layer is not involved at all.
+//! 6. `D` never moves and no window re-anchors: the date layer is not involved at all. A step that
+//!    comes WITH an identity change (the audio VLAN: the new leader is another device) re-anchors
+//!    once and is followed after it just the same.
 //! 7. (The NTP-independence bench above still asserts bit-identical words across two UTC
 //!    scenarios with the detector inside the core.)
 
@@ -53,6 +59,17 @@ const BENCH_NOISE: Noise = Noise {
     tail_fraction: 0.0,
     tail_mean_ns: 0.0,
 };
+
+/// Scripted events of a world besides the rates and the path delay.
+#[derive(Clone, Copy, Default)]
+struct Events {
+    /// The grandmaster CHANGES identity at this window (another device, another uptime): the box
+    /// re-anchors `D` on it, as the controller's UUID-change path does (`request_rebase`).
+    identity_change_at: Option<u64>,
+    /// The date layer absorbs this offset (ns) into `D` at this window, with no wall step (a
+    /// follower's join inside the absorb tolerance): a level shift of the phase error.
+    absorb_at: Option<(u64, i64)>,
+}
 
 /// The law before the frequency-step follow: the same PI on the same error, with nothing else.
 struct PlainPi {
@@ -109,6 +126,19 @@ impl Law {
             Law::Plain(p) => p.anchor_ns,
         }
     }
+    fn request_rebase(&mut self) {
+        match self {
+            Law::Core(c) => c.request_rebase(),
+            Law::Plain(p) => p.anchor_ns = None,
+        }
+    }
+    fn absorb(&mut self, delta_ns: i64) {
+        let anchor = self.anchor_ns().expect("anchored") + delta_ns;
+        match self {
+            Law::Core(c) => c.set_anchor(anchor),
+            Law::Plain(p) => p.anchor_ns = Some(anchor),
+        }
+    }
 }
 
 /// One world, one law.
@@ -117,6 +147,8 @@ struct Run {
     words: Vec<f64>,
     /// Every window's integrator error vs the frequency it should hold (ppm).
     freq_err_ppm: Vec<f64>,
+    /// Every window's APPLIED word vs the frequency it should hold (ppm): the rate the clock runs.
+    word_err_ppm: Vec<f64>,
     /// Every window's TRUE phase error (µs): the box's `t2 − t1 − D` without the noise.
     phase_err_us: Vec<f64>,
     /// (window, the step) for every followed step.
@@ -129,6 +161,7 @@ struct Run {
 
 /// Run `windows` windows. `gm_ppm(w)` is the grandmaster's rate and `osc_ppm(w)` the box's
 /// oscillator during window `w`; `delay_ns(w)` the path delay of window `w`'s samples.
+#[allow(clippy::too_many_arguments)]
 fn run_world(
     law: &mut Law,
     windows: u64,
@@ -137,6 +170,7 @@ fn run_world(
     gm_ppm: impl Fn(u64) -> f64,
     osc_ppm: impl Fn(u64) -> f64,
     delay_ns: impl Fn(u64) -> f64,
+    events: Events,
 ) -> Run {
     let mut rng = Rng(0x5DEE_CE66_D1CE_4E5B ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut gm = Clock {
@@ -152,12 +186,24 @@ fn run_world(
     let mut out = Run {
         words: Vec::new(),
         freq_err_ppm: Vec::new(),
+        word_err_ppm: Vec::new(),
         phase_err_us: Vec::new(),
         steps: Vec::new(),
         anchor_events: 0,
         anchors: (None, None),
     };
     for w in 0..windows {
+        if events.identity_change_at == Some(w) {
+            // Another device: three more days of uptime, and the box re-anchors on it.
+            gm.ns += 3 * 86_400 * S;
+            prev_gm = gm.ns;
+            law.request_rebase();
+        }
+        if let Some((at, delta)) = events.absorb_at {
+            if at == w {
+                law.absorb(delta);
+            }
+        }
         gm.advance(TRUE_DT_NS, gm_ppm(w));
         wall.advance(TRUE_DT_NS, osc_ppm(w) + word);
         let delay = delay_ns(w);
@@ -187,8 +233,9 @@ fn run_world(
         word = next_word;
         out.words.push(word);
         // The frequency the integrator should hold: the grandmaster's rate minus the oscillator's.
-        out.freq_err_ppm
-            .push(law.integrator_ppm() - (gm_ppm(w + 1) - osc_ppm(w + 1)));
+        let truth = gm_ppm(w + 1) - osc_ppm(w + 1);
+        out.freq_err_ppm.push(law.integrator_ppm() - truth);
+        out.word_err_ppm.push(word - truth);
         let anchor = law.anchor_ns().expect("anchored");
         out.phase_err_us
             .push((wall.ns - gm.ns + PATH_DELAY_NS as i64 - anchor) as f64 / 1_000.0);
@@ -219,6 +266,15 @@ fn settles(series: &[f64], from: u64, bound: f64) -> Option<f64> {
     }
 }
 
+/// The 20 s (40-window) moving mean of `series`, aligned to the window that ends each mean.
+fn mean_20s(series: &[f64]) -> Vec<f64> {
+    const N: usize = 40;
+    let mut out = vec![f64::INFINITY; (N - 1).min(series.len())];
+    out.extend(series.windows(N).map(|w| w.iter().sum::<f64>() / N as f64));
+    out.truncate(series.len());
+    out
+}
+
 fn step_at(at: u64, ppm: f64) -> impl Fn(u64) -> f64 {
     move |w| if w >= at { ppm } else { 0.0 }
 }
@@ -226,7 +282,9 @@ fn step_at(at: u64, ppm: f64) -> impl Fn(u64) -> f64 {
 #[test]
 fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
     let after = 1_800; // 15 minutes after the step
-    let mut worst_core = (0.0f64, 0.0f64, 0.0f64); // (confirm s, freq settle s, phase settle s)
+                       // (confirm s, learned-frequency settle s, phase settle s, applied-word 20 s-mean settle s,
+                       // the applied word's largest excursion after the re-seed in ppm)
+    let mut worst_core = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut plain_settle = f64::INFINITY;
     let mut plain_peak_us = 0.0f64;
     for seed in 0..6u64 {
@@ -241,6 +299,7 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
                 &gm,
                 |_| BOX_OSC_PPM,
                 |_| PATH_DELAY_NS,
+                Events::default(),
             );
             let label = format!("seed {seed}, step {:+}", sign * STEP_PPM);
             assert_eq!(r.steps.len(), 1, "{label}: exactly one step followed");
@@ -261,6 +320,18 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
                 e_settle <= 120.0,
                 "{label}: |phase error| < 50 us only from {e_settle} s"
             );
+            // The RATE the clock runs: the word also carries the pull that retires the phase the
+            // step left, so its 20 s mean — not the integrator — says when the box ticks with the
+            // grandmaster again.
+            let w_settle =
+                settles(&mean_20s(&r.word_err_ppm), LOCKED_WINDOWS, 1.0).expect("settles");
+            assert!(
+                w_settle <= 120.0,
+                "{label}: the applied word's 20 s mean within 1 ppm only from {w_settle} s"
+            );
+            let excursion = r.word_err_ppm[(w + 1) as usize..]
+                .iter()
+                .fold(0.0f64, |m, v| m.max(v.abs()));
             // 6: D never moved, nothing re-anchored.
             assert_eq!(r.anchors.0, r.anchors.1, "{label}: D moved");
             assert_eq!(r.anchor_events, 0, "{label}");
@@ -268,6 +339,8 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
                 worst_core.0.max(confirm_s),
                 worst_core.1.max(f_settle),
                 worst_core.2.max(e_settle),
+                worst_core.3.max(w_settle),
+                worst_core.4.max(excursion),
             );
 
             let p = run_world(
@@ -278,6 +351,7 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
                 &gm,
                 |_| BOX_OSC_PPM,
                 |_| PATH_DELAY_NS,
+                Events::default(),
             );
             plain_settle =
                 plain_settle.min(settles(&p.freq_err_ppm, LOCKED_WINDOWS, 1.0).unwrap_or(1e9));
@@ -288,9 +362,17 @@ fn a_25_ppm_grandmaster_step_is_followed_in_seconds_not_minutes_1372() {
         }
     }
     eprintln!(
-        "25 ppm step: follow confirmed <= {:.1} s, |f err| < 1 ppm from <= {:.1} s, |e| < 50 us \
-         from <= {:.1} s; the plain PI: |f err| < 1 ppm from >= {:.1} s, phase peak {:.0} us",
-        worst_core.0, worst_core.1, worst_core.2, plain_settle, plain_peak_us
+        "25 ppm step: follow confirmed <= {:.1} s, learned frequency within 1 ppm from <= {:.1} s, \
+         |e| < 50 us from <= {:.1} s, applied word (20 s mean) within 1 ppm from <= {:.1} s, \
+         word excursion after the re-seed <= {:.1} ppm; the plain PI: learned frequency within \
+         1 ppm from >= {:.1} s, phase peak {:.0} us",
+        worst_core.0,
+        worst_core.1,
+        worst_core.2,
+        worst_core.3,
+        worst_core.4,
+        plain_settle,
+        plain_peak_us
     );
     assert!(
         plain_settle > 300.0,
@@ -327,6 +409,7 @@ fn noise_alone_never_confirms_a_step_and_the_words_stay_the_plain_pi_1372() {
                     |_| 0.0,
                     |_| BOX_OSC_PPM,
                     |_| PATH_DELAY_NS,
+                    Events::default(),
                 )
             };
             let r = args(&mut core());
@@ -371,6 +454,7 @@ fn a_delay_spike_or_a_path_delay_change_is_not_a_step_1372() {
                 |_| 0.0,
                 |_| BOX_OSC_PPM,
                 delay,
+                Events::default(),
             );
             assert!(r.steps.is_empty(), "{label}, seed {seed}: {:?}", r.steps);
         }
@@ -390,6 +474,7 @@ fn a_slow_wander_is_not_a_step_and_the_words_stay_the_plain_pi_1372() {
         |_| 0.0,
         osc,
         |_| PATH_DELAY_NS,
+        Events::default(),
     );
     assert!(r.steps.is_empty(), "{:?}", r.steps);
     let p = run_world(
@@ -400,6 +485,7 @@ fn a_slow_wander_is_not_a_step_and_the_words_stay_the_plain_pi_1372() {
         |_| 0.0,
         osc,
         |_| PATH_DELAY_NS,
+        Events::default(),
     );
     assert!(r
         .words
@@ -432,6 +518,7 @@ fn back_to_back_steps_are_both_followed_1372() {
             gm,
             |_| BOX_OSC_PPM,
             |_| PATH_DELAY_NS,
+            Events::default(),
         );
         assert_eq!(r.steps.len(), 2, "seed {seed}: {:?}", r.steps);
         let (w1, s1) = r.steps[0];
@@ -444,6 +531,106 @@ fn back_to_back_steps_are_both_followed_1372() {
         assert!(f_settle <= 30.0, "seed {seed}: {f_settle} s");
         assert_eq!(r.anchors.0, r.anchors.1);
         assert_eq!(r.anchor_events, 0);
+    }
+}
+
+#[test]
+fn a_path_change_under_heavy_noise_or_an_absorb_is_not_a_step_1372() {
+    // 50 µs of sample noise: the F test alone lacks the power to see a 60-120 µs path change,
+    // whose level shift then reads as a 5-9 ppm slope. The shifted slope (the most likely level
+    // shift explained away) keeps it from being re-seeded.
+    let heavy = Noise {
+        sigma_ns: 50_000.0,
+        tail_fraction: 0.0,
+        tail_mean_ns: 0.0,
+    };
+    let at = LOCKED_WINDOWS;
+    for shift_us in [60.0, 80.0, 100.0, 120.0, -80.0] {
+        for seed in 0..6u64 {
+            let r = run_world(
+                &mut core(),
+                LOCKED_WINDOWS + 600,
+                100 + seed,
+                heavy,
+                |_| 0.0,
+                |_| BOX_OSC_PPM,
+                move |w| PATH_DELAY_NS + if w >= at { shift_us * 1_000.0 } else { 0.0 },
+                Events::default(),
+            );
+            assert!(
+                r.steps.is_empty(),
+                "a {shift_us} us path change, seed {seed}: {:?}",
+                r.steps
+            );
+        }
+    }
+    // A follower's join inside the absorb tolerance moves D by up to 100 µs with no wall step:
+    // the same level shift, from the date layer.
+    for (noise, label) in [(BENCH_NOISE, "bench"), (heavy, "heavy")] {
+        for delta_ns in [100_000i64, -100_000, 80_000] {
+            for seed in 0..3u64 {
+                let r = run_world(
+                    &mut core(),
+                    LOCKED_WINDOWS + 600,
+                    200 + seed,
+                    noise,
+                    |_| 0.0,
+                    |_| BOX_OSC_PPM,
+                    |_| PATH_DELAY_NS,
+                    Events {
+                        absorb_at: Some((at, delta_ns)),
+                        ..Events::default()
+                    },
+                );
+                assert!(
+                    r.steps.is_empty(),
+                    "{label} noise, absorb {delta_ns} ns, seed {seed}: {:?}",
+                    r.steps
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_step_that_comes_with_a_new_grandmaster_is_followed_after_the_re_anchor_1372() {
+    // The audio VLAN: the new leader is another device (another identity, uptime and oscillator,
+    // 25 ppm off). The box re-anchors `D` on it at once, then follows its frequency.
+    for seed in 0..4u64 {
+        for sign in [1.0, -1.0] {
+            let r = run_world(
+                &mut core(),
+                LOCKED_WINDOWS + 1_200,
+                seed,
+                BENCH_NOISE,
+                step_at(LOCKED_WINDOWS, sign * STEP_PPM),
+                |_| BOX_OSC_PPM,
+                |_| PATH_DELAY_NS,
+                Events {
+                    identity_change_at: Some(LOCKED_WINDOWS),
+                    ..Events::default()
+                },
+            );
+            let label = format!("seed {seed}, step {:+}", sign * STEP_PPM);
+            assert_eq!(
+                r.anchor_events, 1,
+                "{label}: one re-anchor, on the new grandmaster"
+            );
+            assert_eq!(r.steps.len(), 1, "{label}: {:?}", r.steps);
+            let (w, fs) = r.steps[0];
+            assert!(
+                (w + 1 - LOCKED_WINDOWS) as f64 * WINDOW_S <= 30.0,
+                "{label}: {w}"
+            );
+            assert!(
+                (fs.step_ppm - sign * STEP_PPM).abs() < 1.5,
+                "{label}: {fs:?}"
+            );
+            let f_settle = settles(&r.freq_err_ppm, LOCKED_WINDOWS, 1.0).expect("settles");
+            let e_settle = settles(&r.phase_err_us, LOCKED_WINDOWS, 50.0).expect("settles");
+            assert!(f_settle <= 30.0, "{label}: {f_settle} s");
+            assert!(e_settle <= 120.0, "{label}: {e_settle} s");
+        }
     }
 }
 

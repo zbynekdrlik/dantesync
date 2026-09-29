@@ -69,8 +69,9 @@
 pub mod freq_step;
 
 pub use freq_step::{
-    fit_ring, FreqStepDetector, FreqStepEstimate, RingFit, FSTEP_CONFIRM, FSTEP_HOLDOFF_S,
-    FSTEP_LINEARITY_F_MAX, FSTEP_MAX_PPM, FSTEP_MIN_PPM, FSTEP_SIGMAS, FSTEP_WINDOW_S,
+    fit_line, fit_ring, split_test, FreqStepDetector, FreqStepEstimate, LineFit, RingFit,
+    FSTEP_CONFIRM, FSTEP_HOLDOFF_S, FSTEP_LINEARITY_F_MAX, FSTEP_MAX_PPM, FSTEP_MIN_PPM,
+    FSTEP_SIGMAS, FSTEP_WINDOW_S,
 };
 
 /// Proportional gain, ppm per µs of phase error (i.e. 1/s).
@@ -810,14 +811,28 @@ mod tests {
             }
         }
         assert!(c.pull_us() != 0.0, "a pull is running");
-        // Lock lost: nothing is pulled any more.
+        // Refill the ring for a few windows, so that dropping it is observable.
+        for _ in 0..10 {
+            let out = c.on_window(D + p.e_ns.round() as i64, true, 0.0, DT);
+            p.advance(out.freq_ppm.unwrap(), DT);
+        }
+        assert!(c.fstep.points() >= 9, "{}", c.fstep.points());
+        // Lock lost: nothing is pulled any more and the ring is gone.
         c.on_window(D + p.e_ns.round() as i64, false, 0.0, DT);
         assert_eq!(c.pull_us(), 0.0);
-        // A grandmaster change re-anchors: the ring starts again (no step without a full ring).
+        assert_eq!(c.fstep.points(), 0);
+        // Re-engaged, the ring refills …
+        for _ in 0..10 {
+            let out = c.on_window(D + p.e_ns.round() as i64, true, 0.0, DT);
+            p.advance(out.freq_ppm.unwrap(), DT);
+        }
+        assert!(c.fstep.points() >= 9);
+        // … and a grandmaster change re-anchors: the ring starts again from that window.
         c.request_rebase();
         let out = c.on_window(D + 7 * DISCONTINUITY_NS, true, 2.0, DT);
         assert!(matches!(out.event, AnchorEvent::Rebased { .. }));
         assert_eq!(c.pull_us(), 0.0);
+        assert!(c.fstep.points() <= 1, "{}", c.fstep.points());
         assert_eq!(c.freq_steps(), 1, "the count survives");
     }
 }

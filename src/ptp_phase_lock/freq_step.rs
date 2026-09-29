@@ -39,6 +39,9 @@
 //! and the candidate holds with the same sign for [`FSTEP_CONFIRM`] consecutive windows. A single
 //! outlier cannot pass: its slope is at most √3 standard errors.
 //!
+//! The line fit runs on every engaged window without allocating; the split scan runs only for a
+//! window whose slope already passes the first test (never in the steady state).
+//!
 //! After a confirmed step the ring is cleared and nothing is confirmed for [`FSTEP_HOLDOFF_S`], so
 //! the loop cannot chase itself.
 //!
@@ -91,7 +94,7 @@ pub const FSTEP_FIT_FLOOR_US: f64 = 1.0;
 const DT_MIN_S: f64 = super::DT_MIN_S;
 const DT_MAX_S: f64 = super::DT_MAX_S;
 
-/// A line fitted to the ring of `(t, p)` points.
+/// A line fitted to the ring of `(t, p)` points, with its linearity test.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RingFit {
     /// The slope of `p` (µs/s = ppm).
@@ -100,84 +103,143 @@ pub struct RingFit {
     pub sigma_ppm: f64,
     /// The largest partial F of a level shift or a slope change inside the ring.
     pub linearity_f: f64,
+    /// The slope of the line fitted together with the best level-shift split (ppm): what is left
+    /// of the slope once the most likely level shift is explained away.
+    pub shifted_slope_ppm: f64,
     pub points: usize,
     pub span_s: f64,
 }
 
-/// Fit a line to `(t s, p µs)` points (time strictly increasing) and test it for linearity.
-/// `None` below [`FSTEP_MIN_POINTS`] or when the times do not spread.
-pub fn fit_ring(points: &[(f64, f64)]) -> Option<RingFit> {
-    let n = points.len();
+/// The least-squares line of a ring, from sums only (no allocation: it runs on every window).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineFit {
+    pub slope_ppm: f64,
+    pub sigma_ppm: f64,
+    pub points: usize,
+    pub span_s: f64,
+    t_mean: f64,
+    p_mean: f64,
+    sxx: f64,
+    sse: f64,
+}
+
+/// Fit a line to `(t s, p µs)` points (time strictly increasing). `None` below
+/// [`FSTEP_MIN_POINTS`] or when the times do not spread.
+pub fn fit_line<'a>(points: impl Iterator<Item = &'a (f64, f64)> + Clone) -> Option<LineFit> {
+    let (mut n, mut t_sum, mut p_sum) = (0usize, 0.0f64, 0.0f64);
+    let (mut t_first, mut t_last) = (0.0f64, 0.0f64);
+    for &(t, p) in points.clone() {
+        if n == 0 {
+            t_first = t;
+        }
+        t_last = t;
+        n += 1;
+        t_sum += t;
+        p_sum += p;
+    }
     if n < FSTEP_MIN_POINTS {
         return None;
     }
     let nf = n as f64;
-    let t_mean = points.iter().map(|&(t, _)| t).sum::<f64>() / nf;
-    let p_mean = points.iter().map(|&(_, p)| p).sum::<f64>() / nf;
-    let tc: Vec<f64> = points.iter().map(|&(t, _)| t - t_mean).collect();
-    let sxx: f64 = tc.iter().map(|x| x * x).sum();
+    let (t_mean, p_mean) = (t_sum / nf, p_sum / nf);
+    let (mut sxx, mut sxy, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+    for &(t, p) in points {
+        let (x, y) = (t - t_mean, p - p_mean);
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+    }
     if !sxx.is_finite() || sxx <= 0.0 {
         return None;
     }
-    let slope = tc
-        .iter()
-        .zip(points)
-        .map(|(x, &(_, p))| x * (p - p_mean))
-        .sum::<f64>()
-        / sxx;
-    let resid: Vec<f64> = tc
-        .iter()
-        .zip(points)
-        .map(|(x, &(_, p))| p - p_mean - slope * x)
-        .collect();
-    let sse: f64 = resid.iter().map(|r| r * r).sum();
+    let slope = sxy / sxx;
+    let sse = (syy - slope * sxy).max(0.0);
     let floor = FSTEP_FIT_FLOOR_US * FSTEP_FIT_FLOOR_US;
-    let sigma = ((sse / (nf - 2.0)).max(floor) / sxx).sqrt();
+    Some(LineFit {
+        slope_ppm: slope,
+        sigma_ppm: ((sse / (nf - 2.0)).max(floor) / sxx).sqrt(),
+        points: n,
+        span_s: t_last - t_first,
+        t_mean,
+        p_mean,
+        sxx,
+        sse,
+    })
+}
 
-    // Suffix sums over i >= k of: 1, tc, tc², r, tc·r.
+/// The linearity test of a fitted line: the largest partial F of a level shift or a slope change
+/// at any split keeping [`FSTEP_SPLIT_EDGE`] points on each side, and the slope with the best
+/// level shift explained. Returns `(linearity_f, shifted_slope_ppm)`.
+pub fn split_test(points: &[(f64, f64)], line: &LineFit) -> (f64, f64) {
+    let n = points.len();
+    if n != line.points || n < 2 * FSTEP_SPLIT_EDGE {
+        return (f64::INFINITY, line.slope_ppm);
+    }
+    let nf = n as f64;
+    let sxx = line.sxx;
+    // Suffix sums over i >= k of: 1, t, t², r, t·r (t centered, r the line's residual).
     let mut s_n = vec![0.0; n + 1];
     let mut s_t = vec![0.0; n + 1];
     let mut s_tt = vec![0.0; n + 1];
     let mut s_r = vec![0.0; n + 1];
     let mut s_tr = vec![0.0; n + 1];
     for i in (0..n).rev() {
+        let t = points[i].0 - line.t_mean;
+        let r = points[i].1 - line.p_mean - line.slope_ppm * t;
         s_n[i] = s_n[i + 1] + 1.0;
-        s_t[i] = s_t[i + 1] + tc[i];
-        s_tt[i] = s_tt[i + 1] + tc[i] * tc[i];
-        s_r[i] = s_r[i + 1] + resid[i];
-        s_tr[i] = s_tr[i + 1] + tc[i] * resid[i];
+        s_t[i] = s_t[i + 1] + t;
+        s_tt[i] = s_tt[i + 1] + t * t;
+        s_r[i] = s_r[i + 1] + r;
+        s_tr[i] = s_tr[i + 1] + t * r;
     }
-    // The reduction of the residual sum of squares when one more regressor x is added to the line:
-    // (Σ x·r)² / |x without its projection on (1, t)|² — the residuals are already orthogonal to
-    // (1, t), so Σ x̃·r = Σ x·r.
-    let reduction = |sum_x: f64, sum_xx: f64, sum_xt: f64, sum_xr: f64| -> f64 {
-        let den = sum_xx - sum_x * sum_x / nf - sum_xt * sum_xt / sxx;
-        if den > 1e-9 {
-            sum_xr * sum_xr / den
-        } else {
-            0.0
-        }
+    // Adding one regressor x to the line: its coefficient is (Σ x·r) / |x̃|², the residual sum of
+    // squares falls by (Σ x·r)² / |x̃|², where x̃ is x without its projection on (1, t) — the
+    // residuals are already orthogonal to (1, t), so Σ x̃·r = Σ x·r.
+    let residualized = |sum_x: f64, sum_xx: f64, sum_xt: f64| -> f64 {
+        sum_xx - sum_x * sum_x / nf - sum_xt * sum_xt / sxx
     };
     let mut best = 0.0f64;
+    let (mut best_shift, mut shifted_slope) = (0.0f64, line.slope_ppm);
     for k in FSTEP_SPLIT_EDGE..=(n - FSTEP_SPLIT_EDGE) {
         let nk = s_n[k];
-        // A level shift: x = 1 for i >= k.
-        best = best.max(reduction(nk, nk, s_t[k], s_r[k]));
+        // A level shift: x = 1 for i >= k. With it, the slope becomes b − c·Σx·t / Sxx.
+        let den = residualized(nk, nk, s_t[k]);
+        if den > 1e-9 {
+            let reduction = s_r[k] * s_r[k] / den;
+            best = best.max(reduction);
+            if reduction > best_shift {
+                best_shift = reduction;
+                shifted_slope = line.slope_ppm - (s_r[k] / den) * s_t[k] / sxx;
+            }
+        }
         // A slope change at the knot t[k-1]: x = t − t[k-1] for i >= k.
-        let knot = tc[k - 1];
+        let knot = points[k - 1].0 - line.t_mean;
         let sh = s_t[k] - nk * knot;
         let shh = s_tt[k] - 2.0 * knot * s_t[k] + nk * knot * knot;
         let sht = s_tt[k] - knot * s_t[k];
         let shr = s_tr[k] - knot * s_r[k];
-        best = best.max(reduction(sh, shh, sht, shr));
+        let den = residualized(sh, shh, sht);
+        if den > 1e-9 {
+            best = best.max(shr * shr / den);
+        }
     }
-    let rest = ((sse - best) / (nf - 3.0)).max(floor);
+    let floor = FSTEP_FIT_FLOOR_US * FSTEP_FIT_FLOOR_US;
+    let rest = ((line.sse - best) / (nf - 3.0)).max(floor);
+    (best / rest, shifted_slope)
+}
+
+/// Fit a line to `(t s, p µs)` points (time strictly increasing) and test it for linearity.
+/// `None` below [`FSTEP_MIN_POINTS`] or when the times do not spread.
+pub fn fit_ring(points: &[(f64, f64)]) -> Option<RingFit> {
+    let line = fit_line(points.iter())?;
+    let (linearity_f, shifted_slope_ppm) = split_test(points, &line);
     Some(RingFit {
-        slope_ppm: slope,
-        sigma_ppm: sigma,
-        linearity_f: best / rest,
-        points: n,
-        span_s: points[n - 1].0 - points[0].0,
+        slope_ppm: line.slope_ppm,
+        sigma_ppm: line.sigma_ppm,
+        linearity_f,
+        shifted_slope_ppm,
+        points: line.points,
+        span_s: line.span_s,
     })
 }
 
@@ -282,20 +344,27 @@ impl FreqStepDetector {
             self.ring.pop_front();
         }
         let judged = self.holdoff_s <= 0.0 && self.clock_s >= FSTEP_WINDOW_S - 1e-9;
-        let fit = if judged {
-            fit_ring(self.ring.make_contiguous())
+        let line = if judged {
+            fit_line(self.ring.iter())
         } else {
             None
         };
-        let Some(fit) = fit else {
+        let Some(line) = line else {
             self.run_sign = 0;
             self.run_len = 0;
             return None;
         };
-        let error = fit.slope_ppm + integrator_ppm;
-        let candidate = error.abs() >= FSTEP_MIN_PPM
-            && error.abs() >= FSTEP_SIGMAS * fit.sigma_ppm
-            && fit.linearity_f <= FSTEP_LINEARITY_F_MAX;
+        let error = line.slope_ppm + integrator_ppm;
+        // The cheap test first: the split scan runs only for a window that already has a step's
+        // slope, so the steady state never pays for it.
+        let slope_says_step =
+            error.abs() >= FSTEP_MIN_PPM && error.abs() >= FSTEP_SIGMAS * line.sigma_ppm;
+        let (linearity_f, _shifted_slope) = if slope_says_step {
+            split_test(self.ring.make_contiguous(), &line)
+        } else {
+            (f64::INFINITY, line.slope_ppm)
+        };
+        let candidate = slope_says_step && linearity_f <= FSTEP_LINEARITY_F_MAX;
         if !candidate {
             self.run_sign = 0;
             self.run_len = 0;
@@ -314,10 +383,10 @@ impl FreqStepDetector {
         self.holdoff_s = FSTEP_HOLDOFF_S;
         Some(FreqStepEstimate {
             error_ppm: error,
-            sigma_ppm: fit.sigma_ppm,
-            linearity_f: fit.linearity_f,
-            span_s: fit.span_s,
-            points: fit.points,
+            sigma_ppm: line.sigma_ppm,
+            linearity_f,
+            span_s: line.span_s,
+            points: line.points,
         })
     }
 }
