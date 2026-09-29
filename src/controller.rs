@@ -31,6 +31,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// this file; its state is the one `date_sync` field.
 mod date_sync;
 
+/// dantesync#112 — PTP liveness: the multicast re-join while no allowed PTP packet comes, and the
+/// honest `/status` meanwhile. A child module like `date_sync`; its state is the one
+/// `ptp_liveness` field.
+mod ptp_liveness;
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -837,6 +842,10 @@ where
     /// authority on the NTP master, a follower's scheduler and poll source). One sub-struct, owned
     /// by `controller/date_sync.rs`.
     date_sync: date_sync::DateSync,
+
+    /// dantesync#112 — the PTP re-join schedule, the receive rate and `/status.rejoin`, owned by
+    /// `controller/ptp_liveness.rs`.
+    ptp_liveness: ptp_liveness::PtpLiveness,
 }
 
 struct PendingSync {
@@ -1025,6 +1034,7 @@ where
             phase_slew_alarm_active: false,
             phase_slew_preserve_streak: 0,
             date_sync,
+            ptp_liveness: ptp_liveness::PtpLiveness::default(),
         }
     }
 
@@ -1202,51 +1212,6 @@ where
     /// - adjust_frequency() = SetSystemTimeAdjustmentPrecise() - sets tick rate
     ///
     /// Stepping time does NOT affect the Dante-tuned frequency!
-    /// Check PTP status and handle offline mode
-    fn check_ptp_status(&mut self) {
-        let elapsed = self.last_ptp_packet.elapsed();
-
-        if elapsed > Duration::from_secs(PTP_TIMEOUT_SECS) {
-            if !self.ptp_offline {
-                self.ptp_offline = true;
-                if !self.ptp_offline_logged {
-                    // camera-box issue 1073: if packets ARE arriving but are being
-                    // dropped by the allowlist, the grandmaster is not offline —
-                    // it is present and blocked by (a likely mis-set) config. Say
-                    // so, instead of the misleading "masters may be offline".
-                    if self.gm_dropped_since_accepted > 0 {
-                        warn!(
-                            "[PTP] No ALLOWED packets for {}s, but {} packet(s) from \
-                             non-allowlisted source(s) were dropped — the grandmaster may be \
-                             present but blocked by config.gm_allowlist; verify the allowlist",
-                            PTP_TIMEOUT_SECS, self.gm_dropped_since_accepted
-                        );
-                    } else {
-                        warn!(
-                            "[PTP] No packets received for {}s - PTP masters may be offline",
-                            PTP_TIMEOUT_SECS
-                        );
-                    }
-                    info!("[PTP] Continuing with NTP-only time sync");
-                    self.ptp_offline_logged = true;
-                }
-                // #117: drop every pre-outage measurement and hold the phase lock's learned
-                // frequency through the free-run (a no-op under the legacy discipline).
-                self.on_ptp_offline_edge();
-                // Update status to reflect offline state
-                if let Ok(mut status) = self.status_shared.write() {
-                    status.settled = false;
-                    status.mode = "NTP-only".to_string();
-                }
-            }
-        } else if self.ptp_offline {
-            // PTP came back online
-            self.ptp_offline = false;
-            self.ptp_offline_logged = false;
-            info!("[PTP] Packets received - PTP sync resumed");
-        }
-    }
-
     pub fn check_ntp_utc_tracking(&mut self) {
         // #71: server mode uses a dedicated, UTC-relevant cadence instead of
         // the PTP-vs-Dante-GM lock-quality signal `calculate_adaptive_ntp_interval`
@@ -2040,7 +2005,7 @@ where
 
     /// #114: sample the current Dante-clock health for the alarm decision.
     fn sample_clock_health(&self) -> ClockHealth {
-        let ptp_stale = self.last_ptp_packet.elapsed() > Duration::from_secs(PTP_TIMEOUT_SECS);
+        let ptp_stale = self.ptp_stale_at(Instant::now());
         // mode ∈ {LOCK, NANO} — the genuinely PTP-locked modes.
         let mode_locked = self.in_nano_mode || self.is_locked;
         // A grandmaster source is present AND permitted by the (resolved) allowlist.
@@ -2093,6 +2058,10 @@ where
     pub fn process_loop_iteration(&mut self) -> Result<()> {
         // Check PTP status first (handles timeout detection for NTP-only fallback)
         self.check_ptp_status();
+
+        // #112: re-join the PTP multicast group while no allowed packet comes. Before the receive,
+        // so a dead capture handle whose receive errors every iteration is still re-opened.
+        self.maybe_rejoin_ptp(Instant::now());
 
         // #88: apply a coordinated date step the moment its instant arrives, and follow the
         // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
@@ -2165,17 +2134,21 @@ where
             }
         }
 
-        // Packet received - update last_ptp_packet timestamp and source IP
-        self.last_ptp_packet = Instant::now();
-        // An allowed packet arrived: clear the drop-since-accepted counter so the
-        // offline log and any future warning reflect only the CURRENT gap.
-        self.gm_dropped_since_accepted = 0;
-        if source_ip.is_some() {
-            self.current_sync_source_ip = source_ip;
-        }
-
         if size < PtpV1Header::SIZE {
             return Ok(());
+        }
+
+        // #112: only the grandmaster's time (a Sync or a Follow_Up, `ptp::is_time_message`) from
+        // an allowed source is PTP liveness, names the grandmaster (its source IP) and clears the
+        // drop-since-accepted counter (so the offline log and any future warning reflect only the
+        // CURRENT gap). A runt or another follower's Delay_Req (an empty allowlist allows every
+        // source) never hides a dead grandmaster or poses as it.
+        if crate::ptp::is_time_message(&buf[..size]) {
+            self.note_allowed_ptp_packet(Instant::now());
+            self.gm_dropped_since_accepted = 0;
+            if source_ip.is_some() {
+                self.current_sync_source_ip = source_ip;
+            }
         }
 
         let header = match PtpV1Header::parse(&buf[..size]) {
@@ -2924,6 +2897,11 @@ where
     }
 
     fn update_shared_status(&self) {
+        let now = Instant::now();
+        // #112: while no allowed PTP packet comes, nothing PTP-derived is live: the node is not
+        // locked (and not settled), whatever the servo last reached. The last offset stays,
+        // flagged by `last_ptp_rx_age_s`.
+        let stale = self.ptp_stale_at(now);
         if let Ok(mut status) = self.status_shared.write() {
             // Core fields
             status.offset_ns = self.last_phase_offset_ns;
@@ -2934,16 +2912,18 @@ where
             // compare gm_source_ip against the resolved set (and see loud failures).
             status.gm_allowlist_resolved = self.gm_allowlist.resolved_ips().to_vec();
             status.gm_allowlist_unresolved = self.gm_allowlist.unresolved_hostnames().to_vec();
-            status.settled = self.clock_settled;
+            status.settled = self.clock_settled && !stale;
             status.updated_ts = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
 
             // Extended fields for tray app
-            status.is_locked = self.is_locked;
+            status.is_locked = self.is_locked && !stale;
             status.smoothed_rate_ppm = self.smoothed_rate_ppm;
-            status.mode = if self.in_nano_mode {
+            status.mode = if stale {
+                ptp_liveness::PTP_STALE_MODE.to_string()
+            } else if self.in_nano_mode {
                 "NANO".to_string()
             } else if self.is_locked {
                 "LOCK".to_string()
@@ -3038,6 +3018,8 @@ where
 
             // #117 / #88: the discipline, the phase lock and the fleet date offset.
             self.publish_date_status(&mut status);
+            // #112: the PTP packet age, the receive rate and the re-joins.
+            self.publish_ptp_liveness(&mut status, now);
         }
     }
 }

@@ -81,6 +81,18 @@ impl PtpV1Header {
     }
 }
 
+/// dantesync#112 — a PTP TIME message: a datagram with a whole PTPv1 header whose control is Sync
+/// or Follow_Up, i.e. the grandmaster's time. The ONE definition of "PTP was received": the
+/// controller's liveness (and the grandmaster it names) and the backends' home address both use
+/// it, so a runt, another follower's Delay_Req or any stray datagram on 319/320 counts for neither.
+pub fn is_time_message(buf: &[u8]) -> bool {
+    buf.len() >= PtpV1Header::SIZE
+        && matches!(
+            PtpV1Control::from(buf[32]),
+            PtpV1Control::Sync | PtpV1Control::FollowUp
+        )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct PtpTimestamp {
     pub seconds: u32,
@@ -178,6 +190,25 @@ mod tests {
         assert_eq!(PtpV1Control::from(4), PtpV1Control::Management);
         assert_eq!(PtpV1Control::from(5), PtpV1Control::Other);
         assert_eq!(PtpV1Control::from(99), PtpV1Control::Other);
+    }
+
+    #[test]
+    fn a_time_message_is_a_whole_header_with_sync_or_follow_up_112() {
+        let packet = |control: u8, len: usize| {
+            let mut buf = vec![0u8; len];
+            if len > 32 {
+                buf[32] = control;
+            }
+            buf
+        };
+        assert!(is_time_message(&packet(0, 60)), "Sync");
+        assert!(is_time_message(&packet(2, 44)), "Follow_Up");
+        assert!(is_time_message(&packet(0, 36)), "a whole header is enough");
+        assert!(!is_time_message(&packet(1, 60)), "Delay_Req");
+        assert!(!is_time_message(&packet(3, 60)), "Delay_Resp");
+        assert!(!is_time_message(&packet(4, 60)), "Management");
+        assert!(!is_time_message(&packet(0, 35)), "a runt");
+        assert!(!is_time_message(&[]), "nothing");
     }
 
     #[test]

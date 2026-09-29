@@ -132,6 +132,15 @@ is running.
 - Multi-homed PTP receive interface selection (net.rs/net_pcap.rs/gm_filter.rs — pick the NIC on the
   trusted GM subnet, reuse the #53 selector, pure-logic-in-gm_filter vs Windows-glue split, overlap
   semantics + ambiguity guard) → `.claude/rules/multi-homed-interface-selection.md`
+- PTP liveness (#112 — one definition of "PTP is stale", the honest `/status` while stale
+  (`is_locked=false`, `mode="NTP-only"`, `last_ptp_rx_age_s`/`ptp_rx_pps`/`rejoin`), the
+  `PtpNetwork::rejoin` contract (re-open only the receive path, close first, the home address
+  first then the startup selection, never a clock/servo/date touch), why the home address (a
+  re-plugged NIC's new ifindex loses to tailscale/docker in the listing order), the one
+  `ptp::is_time_message` predicate for liveness / `gm_source_ip` / the home, the pure
+  10→30→60→120→300 s schedule, the finding that `D` is anchored once per process, the
+  per-socket-loopback-address test trick) →
+  `.claude/rules/ptp-liveness-rejoin.md` (auto-loads on its `paths:`)
 - DSCP marking of timesync sockets (#52 — which sockets are markable per platform: Linux ntp_server
   reply YES, Linux rsntp client NO handle, Windows filters IP_TOS; the `dscp<<2` TOS-byte math;
   fail-open; socket2 0.5.10 set_tos) → `.claude/rules/dscp-marking.md` (auto-loads on its `paths:`)
@@ -276,7 +285,8 @@ DanteSync is a high-precision PTP (Precision Time Protocol) synchronization tool
   - `windows.rs` - Uses `SetSystemTimeAdjustmentPrecise` API
 - **`traits.rs`** - `NtpSource` and `PtpNetwork` traits (mockable for testing)
 - **`config.rs`** - `SystemConfig`, `ServoConfig`, `FilterConfig` - tuning parameters with different defaults for Linux vs Windows
-- **`net.rs`** / **`net_pcap.rs`** / **`net_winsock.rs`** - Network utilities (multicast, timestamping, platform-specific packet capture)
+- **`net.rs`** / **`net_linux.rs`** / **`net_pcap.rs`** / **`net_winsock.rs`** - Network utilities (multicast, timestamping) and the platform PTP receive paths (Linux kernel-timestamped UDP, Windows Npcap), each with `PtpNetwork::rejoin` (#112)
+- **`ptp_rejoin.rs`** - The pure PTP re-join schedule, the receive-rate window and `/status.rejoin` (#112); wired by `controller/ptp_liveness.rs`
 - **`ntp.rs`** - NTP client for UTC alignment
 - **`status.rs`** - `SyncStatus` struct shared via IPC to tray app (includes `is_locked`, `smoothed_rate_ppm`, `mode`)
 

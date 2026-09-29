@@ -5,6 +5,52 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-09-29
+
+### Fixed
+
+- **A node no longer reports LOCK with no PTP on the wire, and it re-joins PTP by itself (issue
+  #112).** Before, dev1 and imag showed `mode=LOCK is_locked=true` with a frozen offset for days
+  after their PTP stopped. On 29.9.2026 strih-lx, the fleet's date master, showed it for 18
+  minutes after a USB NIC re-plug. Only a service restart recovered, and on the master that
+  restart re-derives the fleet date offset, so every box steps.
+  - **The re-join.** When no allowed PTP packet has come for 10 s (the staleness the clock
+    alarm already reports), the loop re-opens the PTP receive path, then again after 30, 60,
+    120 and every 300 s while it stays silent. After the next allowed packet the schedule
+    starts from scratch. One `[NET] no PTP announce for Ns -- re-joining PTP multicast (attempt
+    k)` line per attempt. A failed attempt is logged and retried, never fatal.
+    - Linux: both sockets are closed, then joined again
+      (`Joined Multicast Groups on <if> (<ip>) - Kernel timestamping (rejoin)`). A NIC that
+      came back as a new netdev had lost the old membership.
+    - Windows: the Npcap capture is re-opened (a fresh `Found device:` line). A swapped NIC left
+      a dead handle. The device is chosen before the old capture is dropped, so a failed choice
+      keeps it.
+    - **Which interface.** First the one that now carries the address PTP was last received on,
+      under whatever name it came back with. A re-plugged USB NIC gets a new, higher interface
+      index, and the startup choice (the first interface in the list) could then be tailscale,
+      docker or a bridge. Only when no interface carries that address does the startup choice
+      apply (on Windows the `gm_allowlist` subnet rule still comes first).
+  - **A re-join never touches the clock or the date.** The servos, the phase lock and the fleet
+    date offset D stay as they are. On the master, a loss, the re-join and the re-acquisition
+    keep D and `date_offset_seq`; the master only steps its own wall back onto the fleet line
+    (one join step), as after any PTP outage.
+  - **PTP liveness is the grandmaster's time.** Only a Sync or a Follow_Up from an allowed source
+    counts; a runt datagram or another device's Delay_Req no longer keeps a node "live". The same
+    rule decides `gm_source_ip`: another follower's Delay_Req no longer shows up as the
+    grandmaster.
+  - **`/status` is honest while PTP is stale:** `is_locked=false`, `mode="NTP-only"` (the
+    tray's orange "PTP offline"), `settled=false`. The last `offset_ns` is kept; its age says it
+    is old. `=== UNLOCKED === (no PTP packets for 10s)` and `=== LOCKED === (PTP packets back
+    ...)` mark the edges in the journal. LOCK returns with the packets, with no restart.
+
+### Added
+
+- `/status`, all additive:
+  - `last_ptp_rx_age_s`: seconds since the last allowed PTP packet; `null` before the first.
+  - `ptp_rx_pps`: allowed PTP packets per second over the last 10 s (a Dante grandmaster sends
+    about 16; it saturates at 2000 under a packet storm).
+  - `rejoin`: `attempts`, `last_ts`, `last_iface`, `last_ip`, `last_error`.
+
 ## [1.12.0] - 2026-09-26
 
 ### Changed

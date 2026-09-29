@@ -350,13 +350,103 @@ pub(crate) fn pcap_ts_to_systemtime(ts_sec: i64, ts_usec: i64) -> SystemTime {
     UNIX_EPOCH + duration
 }
 
-/// PTP network using Npcap with HostHighPrec timestamps
-pub struct NpcapPtpNetwork {
+/// One open PTP capture: the pcap handle, the socket that holds the IGMP membership, and where
+/// they were opened.
+struct PtpCapture {
     capture: Capture<Active>,
     // Keep the socket alive for IGMP multicast membership (dropped on close);
     // ONE ephemeral-port socket holds the 224.0.1.129 membership (dantesync#109).
     _igmp_sock: UdpSocket,
+    /// The Npcap device name (a replaced NIC is another device) and the IPv4 joined on.
+    device_name: String,
+    iface_ip: Ipv4Addr,
+}
+
+/// Select the PTP capture device and the IPv4 to join on: the trusted grandmaster subnet of
+/// `gm_allowlist` (camera-box issue 1073), then (a re-join, dantesync#112) the device that carries
+/// `home`, then the name fallback -- the pure order is `net::choose_capture_device`. The startup
+/// passes `home = None`.
+fn select_ptp_device(
+    interface_name: &str,
+    gm_allowlist: &crate::gm_filter::GmAllowlist,
+    home: Option<Ipv4Addr>,
+) -> Result<(Device, Ipv4Addr)> {
+    // camera-box issue 1073: on a multi-homed box prefer the interface on the
+    // trusted grandmaster subnet (gm_allowlist); otherwise the historical
+    // name-based selection. Both the IGMP join and the capture use the
+    // chosen device, so they land on the NIC that reaches the rig GM.
+    let by_rule = find_ptp_capture_device(gm_allowlist, interface_name);
+    // Only a re-join without a trusted-subnet match looks for the home device.
+    let home_device = crate::net::home_to_look_up(&by_rule, home)
+        .and_then(|ip| device_with_ip(ip).map(|device| (device, ip)));
+    let (device, chosen_ip) = crate::net::choose_capture_device(by_rule, home_device)?;
+    info!("Found device: {} ({:?})", device.name, device.desc);
+
+    // Extract interface IP for the multicast join. Prefer the allowlist-MATCHED
+    // address (review 🔵: on a multi-IP NIC device_ipv4's first address could
+    // differ from the trusted one we selected on) or the home address; fall back
+    // to the device's first IPv4 on the name-based path.
+    let iface_ip = match chosen_ip {
+        Some(ip) => ip,
+        None => device_ipv4(&device)?,
+    };
+    info!("Using interface IP {} for multicast join", iface_ip);
+    Ok((device, iface_ip))
+}
+
+/// dantesync#112 — the capture device that carries exactly `ip` now, if any.
+fn device_with_ip(ip: Ipv4Addr) -> Option<Device> {
+    list_devices_guarded().ok()?.into_iter().find(|d| {
+        d.addresses
+            .iter()
+            .any(|a| a.addr == std::net::IpAddr::V4(ip))
+    })
+}
+
+/// Open the PTP capture and the IGMP membership on the selected device. The startup and the
+/// re-join (dantesync#112) both open through here.
+fn open_ptp_capture(device: Device, iface_ip: Ipv4Addr) -> Result<PtpCapture> {
+    // CRITICAL: Join the multicast group via ONE ephemeral-port socket to
+    // trigger IGMP membership (dantesync#109: NOT bound to 319/320, so a
+    // Dante Virtual Soundcard ptp.exe on the same host keeps both PTP ports).
+    let igmp_sock = join_multicast(iface_ip)?;
+    info!(
+        "Joined PTP multicast group 224.0.1.129 on {} via an ephemeral-port IGMP socket \
+         (ports 319/320 left free for a DVS ptp.exe on the same host — dantesync#109)",
+        iface_ip
+    );
+
+    // Apply BPF filter to only capture PTP multicast. The IGMP-join socket
+    // above binds an ephemeral port, not 319/320, so DVS keeps exclusive
+    // ownership of both PTP ports (dantesync#109); this filter only scopes
+    // which packets pcap decodes and never claims a port.
+    let ptp_filter = "udp and dst host 224.0.1.129 and (dst port 319 or dst port 320)";
+    let capture = open_hiprec_capture(&device, ptp_filter)?;
+
+    Ok(PtpCapture {
+        capture,
+        _igmp_sock: igmp_sock,
+        device_name: device.name,
+        iface_ip,
+    })
+}
+
+/// PTP network using Npcap with HostHighPrec timestamps
+pub struct NpcapPtpNetwork {
+    /// dantesync#112: `None` after a re-join could not open a capture; nothing is received until
+    /// the next attempt.
+    open: Option<PtpCapture>,
     using_hiprec: bool,
+    /// The default-interface hint the device is selected with (the name-based fallback).
+    hint: String,
+    /// The trusted-source allowlist the device is selected by (camera-box issue 1073).
+    gm_allowlist: crate::gm_filter::GmAllowlist,
+    /// `(device, IPv4)` of the last capture that opened: what a re-join's `changed` compares with.
+    last_join: (String, Ipv4Addr),
+    /// The address the grandmaster's time was last received on (the startup one until a time
+    /// message, `ptp::is_time_message`, arrives on a later capture): the device that carries it
+    /// comes before the name fallback in a re-join.
+    home_ip: Ipv4Addr,
 }
 
 impl NpcapPtpNetwork {
@@ -365,40 +455,8 @@ impl NpcapPtpNetwork {
             "Initializing Npcap capture (default-interface hint: {})",
             interface_name
         );
-
-        // camera-box issue 1073: on a multi-homed box prefer the interface on the
-        // trusted grandmaster subnet (gm_allowlist); otherwise the historical
-        // name-based selection. Both the IGMP join and the capture below use the
-        // chosen device, so they land on the NIC that reaches the rig GM.
-        let (device, matched_ip) = find_ptp_capture_device(gm_allowlist, interface_name)?;
-        info!("Found device: {} ({:?})", device.name, device.desc);
-
-        // Extract interface IP for the multicast join. Prefer the allowlist-MATCHED
-        // address (review 🔵: on a multi-IP NIC device_ipv4's first address could
-        // differ from the trusted one we selected on); fall back to the device's
-        // first IPv4 on the name-based path.
-        let iface_ip = match matched_ip {
-            Some(ip) => ip,
-            None => device_ipv4(&device)?,
-        };
-        info!("Using interface IP {} for multicast join", iface_ip);
-
-        // CRITICAL: Join the multicast group via ONE ephemeral-port socket to
-        // trigger IGMP membership (dantesync#109: NOT bound to 319/320, so a
-        // Dante Virtual Soundcard ptp.exe on the same host keeps both PTP ports).
-        let igmp_sock = join_multicast(iface_ip)?;
-        info!(
-            "Joined PTP multicast group 224.0.1.129 on {} via an ephemeral-port IGMP socket \
-             (ports 319/320 left free for a DVS ptp.exe on the same host — dantesync#109)",
-            iface_ip
-        );
-
-        // Apply BPF filter to only capture PTP multicast. The IGMP-join socket
-        // above binds an ephemeral port, not 319/320, so DVS keeps exclusive
-        // ownership of both PTP ports (dantesync#109); this filter only scopes
-        // which packets pcap decodes and never claims a port.
-        let ptp_filter = "udp and dst host 224.0.1.129 and (dst port 319 or dst port 320)";
-        let capture = open_hiprec_capture(&device, ptp_filter)?;
+        let (device, ip) = select_ptp_device(interface_name, gm_allowlist, None)?;
+        let open = open_ptp_capture(device, ip)?;
 
         // Assume HostHighPrec is available on modern Npcap (1.20+)
         let using_hiprec = true;
@@ -409,24 +467,33 @@ impl NpcapPtpNetwork {
             warn!("Npcap capture using default timestamps (may drift from system time)");
         }
 
+        let last_join = (open.device_name.clone(), open.iface_ip);
         Ok(NpcapPtpNetwork {
-            capture,
-            _igmp_sock: igmp_sock,
+            open: Some(open),
             using_hiprec,
+            hint: interface_name.to_string(),
+            gm_allowlist: gm_allowlist.clone(),
+            last_join,
+            home_ip: ip,
         })
     }
 }
 
 impl crate::traits::PtpNetwork for NpcapPtpNetwork {
     fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
-        match self.capture.next_packet() {
+        let using_hiprec = self.using_hiprec;
+        let Some(open) = self.open.as_mut() else {
+            return Ok(None);
+        };
+        let joined_ip = open.iface_ip;
+        match open.capture.next_packet() {
             Ok(packet) => {
                 let data = packet.data;
 
                 // Use Npcap's HostHighPrec timestamps - these are both precise AND synced
                 // with system time (using KeQuerySystemTimePrecise on Windows 8+)
                 let header = packet.header;
-                let ts = if self.using_hiprec {
+                let ts = if using_hiprec {
                     // Npcap provides high-precision timestamps synced with system time
                     let ts =
                         pcap_ts_to_systemtime(header.ts.tv_sec as i64, header.ts.tv_usec as i64);
@@ -463,6 +530,11 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
                         "[Npcap] PTP payload {} bytes from {}",
                         payload_len, source_ip
                     );
+                    // dantesync#112: the grandmaster's time arrives on this capture, so its
+                    // address is the home a re-join looks for (nothing else moves it).
+                    if crate::ptp::is_time_message(&result) {
+                        self.home_ip = joined_ip;
+                    }
                     Ok(Some((result, payload_len, ts, Some(source_ip))))
                 } else {
                     Ok(None)
@@ -482,6 +554,44 @@ impl crate::traits::PtpNetwork for NpcapPtpNetwork {
     fn reset(&mut self) -> Result<()> {
         // Npcap doesn't need explicit reset
         Ok(())
+    }
+
+    /// dantesync#112 — re-open the capture after a NIC swap (a dead handle keeps failing with
+    /// ERROR_DEVICE_REMOVED) or any other silence: the startup selection with the home address
+    /// (the trusted subnet, then the device that carries the home address, then the name
+    /// fallback), on the default interface and the allowlist resolved NOW.
+    fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
+        // A replaced NIC is another adapter under another name, so the name-based fallback
+        // re-reads the default interface; the old hint stays when none resolves.
+        match crate::net::get_default_interface() {
+            Ok((name, _)) => self.hint = name,
+            Err(e) => warn!(
+                "[NET] no default interface ({}); re-joining with the hint {}",
+                e, self.hint
+            ),
+        }
+        // Hostname allowlist entries are resolved again, like at startup, so the capture NIC is
+        // chosen on the grandmaster's CURRENT subnet.
+        if self.gm_allowlist.has_hostnames() {
+            let outcome = self.gm_allowlist.resolve(&crate::gm_filter::StdResolver);
+            info!(
+                "gm_allowlist: re-join hostname resolution {:?} (unresolved: {:?})",
+                outcome.new_resolved,
+                self.gm_allowlist.unresolved_hostnames()
+            );
+        }
+        // Select BEFORE dropping anything: a selection failure keeps the old capture.
+        let (device, ip) = select_ptp_device(&self.hint, &self.gm_allowlist, Some(self.home_ip))?;
+        // Then drop the old (possibly dead) handle and its IGMP membership, and open on the
+        // selected device. When the new capture cannot open, there is none until the next attempt.
+        self.open = None;
+        let open = open_ptp_capture(device, ip)?;
+        let (iface, ip) = (open.device_name.clone(), open.iface_ip);
+        info!("Npcap PTP capture re-opened on {} ({}) (rejoin)", iface, ip);
+        let changed = self.last_join.0 != iface || self.last_join.1 != ip;
+        self.last_join = (iface.clone(), ip);
+        self.open = Some(open);
+        Ok(crate::traits::RejoinOutcome { iface, ip, changed })
     }
 }
 
@@ -692,268 +802,4 @@ pub fn list_npcap_devices() -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Test PTP constants
-    #[test]
-    fn test_ptp_constants() {
-        assert_eq!(PTP_EVENT_PORT, 319);
-        assert_eq!(PTP_GENERAL_PORT, 320);
-        assert_eq!(PTP_MULTICAST, Ipv4Addr::new(224, 0, 1, 129));
-        assert!(PTP_MULTICAST.is_multicast());
-    }
-
-    /// Test pcap timestamp to SystemTime conversion
-    #[test]
-    fn test_pcap_ts_to_systemtime() {
-        // Unix epoch (1970-01-01 00:00:00)
-        let ts = pcap_ts_to_systemtime(0, 0);
-        assert_eq!(ts, UNIX_EPOCH);
-
-        // 1 second after epoch
-        let ts = pcap_ts_to_systemtime(1, 0);
-        assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1));
-
-        // 1.5 seconds after epoch (with microseconds)
-        let ts = pcap_ts_to_systemtime(1, 500_000);
-        assert_eq!(ts, UNIX_EPOCH + Duration::from_micros(1_500_000));
-
-        // Realistic timestamp (2024-01-01 00:00:00 UTC = 1704067200)
-        let ts = pcap_ts_to_systemtime(1704067200, 0);
-        assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1704067200));
-    }
-
-    /// Test that microseconds are correctly converted to nanoseconds
-    #[test]
-    fn test_pcap_ts_microsecond_precision() {
-        // 123.456789 seconds - but pcap only has microsecond precision
-        let ts = pcap_ts_to_systemtime(123, 456_789);
-
-        // Should be 123 seconds + 456789 microseconds = 456789000 nanoseconds
-        let expected = UNIX_EPOCH + Duration::new(123, 456_789_000);
-        assert_eq!(ts, expected);
-    }
-
-    /// Test Ethernet/IP/UDP header constant
-    #[test]
-    fn test_ethernet_ip_udp_header_size() {
-        // Ethernet header: 14 bytes
-        // IP header: 20 bytes (minimum)
-        // UDP header: 8 bytes
-        // Total: 42 bytes
-        const ETH_IP_UDP_HEADER: usize = 42;
-        assert_eq!(ETH_IP_UDP_HEADER, 14 + 20 + 8);
-    }
-
-    /// Test EtherType detection for IPv4
-    #[test]
-    fn test_ethertype_ipv4() {
-        // IPv4 EtherType is 0x0800
-        let data: [u8; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00];
-        assert_eq!(data[12], 0x08);
-        assert_eq!(data[13], 0x00);
-    }
-
-    /// Test UDP protocol number in IP header
-    #[test]
-    fn test_ip_protocol_udp() {
-        // UDP is protocol number 17
-        // In IP header, protocol is at byte offset 9 (0-indexed)
-        // In full frame, that's offset 14 (ethernet) + 9 = 23
-        let protocol_byte = 17u8;
-        assert_eq!(protocol_byte, 17);
-    }
-
-    /// Test PTP port detection from UDP header
-    #[test]
-    fn test_ptp_port_extraction() {
-        // UDP destination port is at bytes 2-3 of UDP header (big-endian)
-        // In full frame: offset 14 (eth) + 20 (ip) + 2 = 36, 37
-
-        // Port 319 = 0x013F
-        let port_319_bytes: [u8; 2] = [0x01, 0x3F];
-        let port = ((port_319_bytes[0] as u16) << 8) | port_319_bytes[1] as u16;
-        assert_eq!(port, 319);
-
-        // Port 320 = 0x0140
-        let port_320_bytes: [u8; 2] = [0x01, 0x40];
-        let port = ((port_320_bytes[0] as u16) << 8) | port_320_bytes[1] as u16;
-        assert_eq!(port, 320);
-    }
-
-    /// Test simulated PTP packet validation
-    #[test]
-    fn test_simulated_ptp_packet_structure() {
-        // Minimum valid PTP-carrying Ethernet frame
-        // Ethernet (14) + IP (20) + UDP (8) + PTP Sync (44) = 86 bytes
-        const MIN_PTP_FRAME: usize = 42 + 44;
-        assert_eq!(MIN_PTP_FRAME, 86);
-
-        // Create a simulated frame
-        let mut frame = vec![0u8; MIN_PTP_FRAME];
-
-        // Set EtherType to IPv4 (0x0800) at bytes 12-13
-        frame[12] = 0x08;
-        frame[13] = 0x00;
-
-        // Set IP protocol to UDP (17) at byte 23
-        frame[23] = 17;
-
-        // Set UDP destination port to 319 at bytes 36-37
-        frame[36] = 0x01;
-        frame[37] = 0x3F;
-
-        // Verify parsing would succeed
-        assert!(frame[12] == 0x08 && frame[13] == 0x00, "Should be IPv4");
-        assert!(frame[23] == 17, "Should be UDP");
-        let dst_port = ((frame[36] as u16) << 8) | frame[37] as u16;
-        assert!(dst_port == 319 || dst_port == 320, "Should be PTP port");
-    }
-
-    /// #58 RED->GREEN: `wpcap_runtime_available()` must never panic/crash --
-    /// it's the guard that replaces a delay-load crash with a plain bool.
-    #[test]
-    fn test_wpcap_runtime_available_never_panics() {
-        let _ = wpcap_runtime_available();
-    }
-
-    /// #58 regression: on a machine with only the Npcap SDK (every
-    /// `windows-latest` CI runner -- confirmed absent by
-    /// `wpcap_runtime_available()` returning `false` there), constructing
-    /// either capture path must return a graceful `Err`, never crash the
-    /// process. Before this fix, `find_device()` called `Device::list()`
-    /// unconditionally, which triggered the delay-loaded `wpcap.dll` symbol
-    /// resolution and aborted the whole test binary with `0xc06d007e`
-    /// (observed live via `NtpClient::new()` in run 30337735289 -- that is
-    /// the RED this test proves GREEN). On a real box where Npcap IS
-    /// installed this test is a no-op (skipped) -- it is specifically about
-    /// the "runtime missing" degradation path, not normal capture behavior.
-    #[test]
-    fn test_find_device_gracefully_errors_without_npcap_runtime() {
-        if wpcap_runtime_available() {
-            eprintln!(
-                "skipping test_find_device_gracefully_errors_without_npcap_runtime: \
-                 Npcap runtime IS installed on this machine"
-            );
-            return;
-        }
-        let result = find_device("eth0");
-        assert!(
-            result.is_err(),
-            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
-             this used to crash the whole process (#58)"
-        );
-    }
-
-    /// #58 regression: same guard, exercised through the public
-    /// `PcapNtpTransport::new()` entry point (the exact call chain that
-    /// crashed via `NtpClient::new()` in ntp.rs's own `test_ntp_client_new`).
-    #[test]
-    fn test_pcap_ntp_transport_new_gracefully_errors_without_npcap_runtime() {
-        if wpcap_runtime_available() {
-            eprintln!(
-                "skipping test_pcap_ntp_transport_new_gracefully_errors_without_npcap_runtime: \
-                 Npcap runtime IS installed on this machine"
-            );
-            return;
-        }
-        let result = PcapNtpTransport::new(
-            Ipv4Addr::new(127, 0, 0, 1),
-            &crate::dscp::DscpConfig::default(),
-        );
-        assert!(
-            result.is_err(),
-            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
-             this used to crash the whole process (#58)"
-        );
-    }
-
-    /// #58 regression: the PTP capture path (`NpcapPtpNetwork::new`) goes through
-    /// `find_ptp_capture_device` (camera-box issue 1073), which shares the same
-    /// `list_devices_guarded()` #58 guard as `PcapNtpTransport::new` (reaching the
-    /// name-based `find_device()` only on the fallback path) -- same graceful-Err
-    /// expectation when the Npcap runtime is missing.
-    #[test]
-    fn test_npcap_ptp_network_new_gracefully_errors_without_npcap_runtime() {
-        if wpcap_runtime_available() {
-            eprintln!(
-                "skipping test_npcap_ptp_network_new_gracefully_errors_without_npcap_runtime: \
-                 Npcap runtime IS installed on this machine"
-            );
-            return;
-        }
-        let result = NpcapPtpNetwork::new("eth0", &crate::gm_filter::GmAllowlist::default());
-        assert!(
-            result.is_err(),
-            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
-             this used to crash the whole process (#58)"
-        );
-    }
-
-    /// camera-box issue 1073: the new gm_allowlist-aware capture-device selector
-    /// shares the SAME #58 runtime guard (it calls `list_devices_guarded` before
-    /// any real `pcap::` call), so on a runtime-less machine it returns a graceful
-    /// `Err` rather than crashing — with an empty (unrestricted) allowlist, which
-    /// is the byte-identical fallback path.
-    #[test]
-    fn test_find_ptp_capture_device_gracefully_errors_without_npcap_runtime() {
-        if wpcap_runtime_available() {
-            eprintln!(
-                "skipping test_find_ptp_capture_device_gracefully_errors_without_npcap_runtime: \
-                 Npcap runtime IS installed on this machine"
-            );
-            return;
-        }
-        let result = find_ptp_capture_device(&crate::gm_filter::GmAllowlist::default(), "eth0");
-        assert!(
-            result.is_err(),
-            "expected a graceful Err when the Npcap runtime is missing, got Ok"
-        );
-    }
-
-    /// #53 continuation regression: `find_device_for_ntp_server` -- the NEW
-    /// NTP-server-reachability selection path -- goes through the SAME #58
-    /// guard as `find_device`. On a runtime-less machine it must return a
-    /// graceful `Err`, never crash, exactly like the name-based path above.
-    #[test]
-    fn test_find_device_for_ntp_server_gracefully_errors_without_npcap_runtime() {
-        if wpcap_runtime_available() {
-            eprintln!(
-                "skipping test_find_device_for_ntp_server_gracefully_errors_without_npcap_runtime: \
-                 Npcap runtime IS installed on this machine"
-            );
-            return;
-        }
-        let result = find_device_for_ntp_server(Ipv4Addr::new(10, 77, 9, 202));
-        assert!(
-            result.is_err(),
-            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
-             same #58 guard as find_device()"
-        );
-    }
-
-    /// Adversarial-review regression: `list_npcap_devices()` used to call
-    /// `Device::list()` directly, bypassing `list_devices_guarded()` -- so on
-    /// a runtime-less machine it would have crashed the process exactly like
-    /// the pre-#58 `find_device()` used to, instead of returning a graceful
-    /// `Err`. Now routed through the same guard as every other pcap:: entry
-    /// point.
-    #[test]
-    fn test_list_npcap_devices_gracefully_errors_without_npcap_runtime() {
-        if wpcap_runtime_available() {
-            eprintln!(
-                "skipping test_list_npcap_devices_gracefully_errors_without_npcap_runtime: \
-                 Npcap runtime IS installed on this machine"
-            );
-            return;
-        }
-        let result = list_npcap_devices();
-        assert!(
-            result.is_err(),
-            "expected a graceful Err when the Npcap runtime is missing, got Ok -- \
-             list_npcap_devices() must go through the same #58 guard as every other pcap:: entry \
-             point"
-        );
-    }
-}
+mod tests;

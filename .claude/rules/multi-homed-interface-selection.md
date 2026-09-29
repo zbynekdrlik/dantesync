@@ -31,6 +31,13 @@ interface selection MIRRORS it. If you touch the receive path, follow that patte
 config field pinning the interface (rejected — the `gm_allowlist` the operator already sets IS the
 signal, zero extra config).
 
+dantesync issue 112: the startup AND the PTP re-join select through ONE `select_ptp_device(hint,
+allowlist, home)` (startup `home = None`): the trusted-subnet rule, then the device that carries the
+home address (where the grandmaster's time was last received), then the name fallback — the pure
+order is `net::choose_capture_device`. Linux has no trusted-subnet rule (it uses
+`net::get_default_interface`, plus the home address on a re-join): see `ptp-liveness-rejoin.md`'s
+known limits.
+
 ## The pure/Windows split — test the LOGIC in gm_filter, compile-check the glue
 
 `net_pcap.rs` is `#[cfg(windows)]` — a plain Linux `cargo test` SKIPS it, and it needs real pcap

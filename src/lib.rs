@@ -13,10 +13,14 @@ pub mod ntp_server;
 pub mod phase_slew;
 pub mod ptp;
 pub mod ptp_phase_lock;
+pub mod ptp_rejoin;
 pub mod spike_filter;
 pub mod status;
 pub mod time_server;
 pub mod traits;
+
+#[cfg(unix)]
+pub mod net_linux;
 
 #[cfg(windows)]
 pub mod net_pcap;

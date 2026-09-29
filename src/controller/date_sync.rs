@@ -964,4 +964,6 @@ mod daily_tests;
 #[cfg(test)]
 mod micro_tests;
 #[cfg(test)]
+mod rejoin_tests;
+#[cfg(test)]
 mod tests;

@@ -556,6 +556,54 @@ fn test_sync_status_date_daily_fields_are_additive_119() {
     assert_eq!(back.date_daily_last_step_ms, Some(-1_295.25));
 }
 
+/// dantesync#112: the PTP liveness fields are additive. A 1.12.0 blob reads `null` / 0 / the empty
+/// re-join object, and every value round-trips under its documented name.
+#[test]
+fn test_sync_status_ptp_liveness_fields_are_additive_112() {
+    let v1120 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+        "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+        "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+        "date_correction_mode":"daily"}"#;
+    let restored: SyncStatus =
+        serde_json::from_str(v1120).expect("v1.12.0 JSON must still deserialize");
+    assert_eq!(restored.last_ptp_rx_age_s, None);
+    assert_eq!(restored.ptp_rx_pps, 0.0);
+    assert_eq!(restored.rejoin, RejoinStatus::default());
+
+    let st = SyncStatus {
+        is_locked: false,
+        mode: "NTP-only".to_string(),
+        last_ptp_rx_age_s: Some(42),
+        ptp_rx_pps: 0.0,
+        rejoin: RejoinStatus {
+            attempts: 2,
+            last_ts: Some(1_790_688_130),
+            last_iface: Some("enx002427159965".to_string()),
+            last_ip: Some(Ipv4Addr::new(10, 77, 9, 202)),
+            last_error: None,
+        },
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&st).expect("serialize failed");
+    for field in [
+        r#""mode":"NTP-only""#,
+        r#""last_ptp_rx_age_s":42"#,
+        r#""ptp_rx_pps":0.0"#,
+        r#""rejoin":{"attempts":2,"last_ts":1790688130,"last_iface":"enx002427159965","last_ip":"10.77.9.202","last_error":null}"#,
+    ] {
+        assert!(json.contains(field), "{field} in {json}");
+    }
+    let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+    assert_eq!(back.rejoin, st.rejoin);
+    assert_eq!(back.last_ptp_rx_age_s, Some(42));
+
+    // A partial re-join object (an older or newer writer) still parses.
+    let partial: RejoinStatus =
+        serde_json::from_str(r#"{"attempts":3}"#).expect("a partial rejoin object");
+    assert_eq!(partial.attempts, 3);
+    assert_eq!(partial.last_ts, None);
+}
+
 #[test]
 fn test_to_json_bytes_matches_serde_json_to_vec() {
     // #47: the HTTP status endpoint and the named pipe must serve byte-identical

@@ -78,6 +78,11 @@ pub struct WinsockPtpNetwork {
     recv_msg_fn: Option<WsaRecvMsgFn>,
     qpc_frequency: i64,
     timestamping_enabled: bool,
+    /// dantesync#112: the interface address the sockets joined on (what a re-join compares with).
+    interface_ip: Ipv4Addr,
+    /// dantesync#112: the address the grandmaster's time (`ptp::is_time_message`) was last
+    /// received on; the interface that carries it is where a re-join goes first.
+    home_ip: Ipv4Addr,
 }
 
 impl WinsockPtpNetwork {
@@ -130,7 +135,22 @@ impl WinsockPtpNetwork {
             recv_msg_fn,
             qpc_frequency,
             timestamping_enabled,
+            interface_ip,
+            home_ip: interface_ip,
         })
+    }
+
+    /// dantesync#112: close both PTP sockets (each is `INVALID_SOCKET` afterwards, and an invalid
+    /// one is not closed again).
+    fn close_sockets(&mut self) {
+        for sock in [&mut self.socket_319, &mut self.socket_320] {
+            if *sock != INVALID_SOCKET {
+                unsafe {
+                    closesocket(*sock);
+                }
+                *sock = INVALID_SOCKET;
+            }
+        }
     }
 
     fn create_ptp_socket(port: u16, interface_ip: Ipv4Addr) -> Result<SOCKET> {
@@ -539,9 +559,8 @@ impl WinsockPtpNetwork {
 
 impl Drop for WinsockPtpNetwork {
     fn drop(&mut self) {
+        self.close_sockets();
         unsafe {
-            closesocket(self.socket_319);
-            closesocket(self.socket_320);
             WSACleanup();
         }
         info!("Winsock PTP network closed");
@@ -550,17 +569,67 @@ impl Drop for WinsockPtpNetwork {
 
 impl crate::traits::PtpNetwork for WinsockPtpNetwork {
     fn recv_packet(&mut self) -> Result<Option<(Vec<u8>, usize, SystemTime, Option<Ipv4Addr>)>> {
-        // Try event port first (319), then general port (320)
-        if let Some(packet) = self.recv_with_timestamp(self.socket_319)? {
-            return Ok(Some(packet));
+        // dantesync#112: no sockets after a failed re-join; nothing to read until the next one.
+        if self.socket_319 == INVALID_SOCKET || self.socket_320 == INVALID_SOCKET {
+            return Ok(None);
         }
-
-        self.recv_with_timestamp(self.socket_320)
+        // Try event port first (319), then general port (320)
+        let received = match self.recv_with_timestamp(self.socket_319)? {
+            Some(packet) => Some(packet),
+            None => self.recv_with_timestamp(self.socket_320)?,
+        };
+        if let Some((data, ..)) = &received {
+            // dantesync#112: the grandmaster's time arrives on this join, so its address is the
+            // home a re-join looks for (nothing else moves it).
+            if crate::ptp::is_time_message(data) {
+                self.home_ip = self.interface_ip;
+            }
+        }
+        Ok(received)
     }
 
     fn reset(&mut self) -> Result<()> {
         // No state to reset for Winsock sockets
         Ok(())
+    }
+
+    /// dantesync#112 — the same socket re-create as the startup: on the interface that carries the
+    /// home address now, else on the default interface.
+    fn rejoin(&mut self) -> Result<crate::traits::RejoinOutcome> {
+        // The interface that carries the home address first (a re-plugged NIC may come back
+        // behind other interfaces in the listing order), else the startup resolver. When neither
+        // finds one, the old sockets stay (nothing better to join on).
+        let (iface, ip) = match crate::net::interface_with_ip(self.home_ip) {
+            Some(name) => (name, self.home_ip),
+            None => crate::net::get_default_interface()?,
+        };
+        // Close both old sockets FIRST: their membership may belong to a NIC that is gone, and two
+        // pairs are never open at once. When the new pair cannot open, there is none until the
+        // next attempt.
+        self.close_sockets();
+        let socket_319 = Self::create_ptp_socket(PTP_EVENT_PORT, ip)?;
+        let socket_320 = match Self::create_ptp_socket(PTP_GENERAL_PORT, ip) {
+            Ok(sock) => sock,
+            Err(e) => {
+                unsafe {
+                    closesocket(socket_319);
+                }
+                return Err(e);
+            }
+        };
+        let ts_319 = Self::enable_timestamping(socket_319);
+        let ts_320 = Self::enable_timestamping(socket_320);
+        self.timestamping_enabled = ts_319 && ts_320;
+        self.socket_319 = socket_319;
+        self.socket_320 = socket_320;
+        // This backend knows only the address it joined on (no interface name at startup).
+        let changed = self.interface_ip != ip;
+        self.interface_ip = ip;
+        info!(
+            "Winsock PTP network re-joined on {} ({}) (rejoin, ports 319, 320)",
+            iface, ip
+        );
+        Ok(crate::traits::RejoinOutcome { iface, ip, changed })
     }
 }
 
