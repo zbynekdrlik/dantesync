@@ -122,7 +122,8 @@ is running.
   second local net; v1.12: the date corrected ONCE A NIGHT by default, `correction = "daily"`,
   the micro mode kept byte-identical, the master's own PTP outage in daily mode; v1.14: a
   grandmaster FREQUENCY step followed in seconds — the open-loop-phase detector, the linearity
-  test, the integrator re-seed and the decaying phase pull) →
+  test and the shifted slope against level shifts, the integrator re-seed, the decaying phase pull
+  and its applied-rate transient) →
   `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
   `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)

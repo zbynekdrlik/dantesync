@@ -956,11 +956,29 @@ What was learned building it:
   the largest partial F of a level shift or a slope change at any split (suffix sums, O(N)) ≤ 15. The
   same test is what makes the estimate unbiased: it waits until the ring holds no pre-step windows.
   A single outlier can never pass (its slope is ≤ √3 standard errors).
+- **…and the F test alone is not enough under heavy noise (review round 1).** At 40-60 µs sample
+  noise it has too little power against a 60-120 µs path change (false re-seeds in up to 10 of 60
+  seeded events). The discriminator that holds is the SHIFTED slope: fit the line together with the
+  best level-shift split and require the unlearned frequency to survive it (same sign, ≥ the
+  minimum). A genuine step keeps its slope; a shift loses it. With it: 1 false event in 1000 at a
+  5 ppm minimum, none at 6 — so `FSTEP_MIN_PPM` is 6. Pinned by the bench's
+  `a_path_change_under_heavy_noise_or_an_absorb_is_not_a_step_1372` (RED without the shifted slope).
+- **Keep the per-window cost to a sum pass.** The first version ran the full split scan with seven
+  fresh `Vec`s on every engaged window of every bench box: CI's integration tests went 2:18 → 5:39
+  and tarpaulin 3:38 → 14:43 (runs 36591942048 vs 36607528697; the bench needs `--timeout 300`). The
+  line fit is now allocation-free (`fit_line`), and the split scan (`split_test`) runs only for a
+  window whose slope already says "step" — the result is identical, the steady state never scans.
 - **A residual floor (1 µs) in the fit** keeps a noiseless simulated ring from turning floating-point
   rounding into a linearity verdict. Real timestamps are never better than that.
 - **The phase the step left is retired along a decaying reference, not by the PI.** Re-seeding the
   integrator exactly and letting the PI trim ~400 µs swings the integrator by ~ω·e0/e ≈ 1.5 ppm and
   overshoots ~54 µs. The PI tracks `e − r` and the word carries `−r/τ` (τ 20 s) as feed-forward.
+- **Say which frequency you mean.** "Within 1 ppm in 21.5 s" is the LEARNED frequency (the
+  integrator). The APPLIED word also carries the pull: right after the re-seed it runs ≈ |e0|/τ
+  (~22 ppm for 25 ppm) past the new frequency, in the step's direction, decaying with τ; it is within
+  1 ppm again after ≈ τ·ln(|e0|/τ) (the bench asserts its 20 s mean within 1 ppm from ≤ 120 s,
+  measured 95.5 s). τ = 30 s would lower that peak to ~15 ppm and still meet the 120 s phase target
+  (~90-94 s); the total buffer movement a downstream ASRC sees is |e0| either way.
 - **Without a confirmed step the word must be the plain PI's, bit for bit** (the pull branch is taken
   only while `r ≠ 0`). Tests pin it against a plain-PI mirror built from the module's public
   constants: `without_a_confirmed_step_…_bit_for_bit_1372` and the bench's noise / wander cases.
@@ -968,7 +986,9 @@ What was learned building it:
   (scratch, not committed) chose confirm = 6 (with 3, one of 20 runs at 30 µs sample noise settled to
   1 ppm only after 146 s) and F ≤ 15 (the null's p99 is 15-17). At 50 µs sample noise a 20 s ring
   cannot measure a small step to 1 ppm (σ ≈ 0.8 ppm): a 7-10 ppm step may be re-seeded coarsely and
-  the PI trims the rest — still faster than before.
+  the PI trims the rest — still faster than before. The review replicated the algorithm on its own
+  and found the heavy-noise false re-seed above: have the reviewer sweep the noise the rule itself
+  names, not only the bench's 20 µs.
 - **A fleet-bench flip must stay forward-only for the bit-identity pair.** Slow grandmaster A down
   (the fleet falls further behind UTC, every correction is a forward step); a flip that makes the
   fleet run ahead of UTC turns corrections into slews, whose rate term is in the words by design.
