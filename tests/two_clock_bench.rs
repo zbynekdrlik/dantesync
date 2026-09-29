@@ -144,6 +144,9 @@ struct Scenario {
     /// UTC drifting at the same rate against the fleet across the grandmaster change (the daily
     /// scenarios' "48 h at +17.6 ppm").
     gm_b_ppm: f64,
+    /// camera-box issue 1372: grandmaster A's rate STEPS to this (ppm) at this window, under the
+    /// same identity (a Dante leader flip seen on the video VLAN: no re-anchor anywhere).
+    gm_a_flip: Option<(u64, f64)>,
 }
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
@@ -174,6 +177,7 @@ impl Scenario {
             correction: CorrectionMode::Micro,
             utc_outages: Vec::new(),
             gm_b_ppm: GM_B_PPM,
+            gm_a_flip: None,
         }
     }
     fn daily(&self) -> bool {
@@ -188,6 +192,13 @@ impl Scenario {
         self.utc_jumps
             .iter()
             .any(|&(at, _)| (at..at + UTC_JUMP_SETTLE_WINDOWS).contains(&w))
+    }
+    /// Grandmaster A's rate during window `w`.
+    fn gm_a_ppm_at(&self, w: u64) -> f64 {
+        match self.gm_a_flip {
+            Some((at, ppm)) if w >= at => ppm,
+            _ => GM_A_PPM,
+        }
     }
     fn master_offline_at(&self, w: u64) -> bool {
         self.master_ptp_offline
@@ -261,6 +272,9 @@ struct Box_ {
     /// #119 (1.11.1): the rate audit after the settle — the integrator (the learned rate) and the
     /// 20 s mean of the word against the truth (the grandmaster's rate minus the oscillator's).
     rate_audit: RateAudit,
+    /// camera-box issue 1372: every grandmaster frequency step the phase lock followed:
+    /// (window, the step in ppm).
+    freq_steps: Vec<(u64, f64)>,
 }
 
 type Step = (u32, i64, StepKind, f64);
@@ -310,6 +324,8 @@ struct RunResult {
     /// #119 (1.12): the master's wall when each correction was announced (same order as
     /// `corrections`).
     correction_walls: Vec<i64>,
+    /// camera-box issue 1372: per box, every frequency step followed (window, ppm).
+    freq_steps: Vec<Vec<(u64, f64)>>,
 }
 
 /// Everything one bench run evolves: the true clocks, the boxes, the master's authority and its
@@ -429,6 +445,7 @@ impl<'s> Bench<'s> {
                 wander_now_ppm: 0.0,
                 last_landing: None,
                 rate_audit: RateAudit::default(),
+                freq_steps: Vec::new(),
             })
             .collect();
         let n = boxes.len();
@@ -485,7 +502,7 @@ impl<'s> Bench<'s> {
     ///    (the controller polls `due` every loop iteration, 1 ms / 50 µs), so the landing instant
     ///    is resolved below the window.
     fn advance_clocks(&mut self, w: u64, t0_ns: f64) {
-        let (gm_a_ppm, gm_b_ppm) = (GM_A_PPM, self.sc.gm_b_ppm);
+        let (gm_a_ppm, gm_b_ppm) = (self.sc.gm_a_ppm_at(w), self.sc.gm_b_ppm);
         let t_now_s = w as f64 * WINDOW_S;
         let grace = self.sc.grace;
         self.utc.advance(TRUE_DT_NS, self.sc.utc_vs_gm_ppm);
@@ -579,7 +596,7 @@ impl<'s> Bench<'s> {
         for (i, b) in self.boxes.iter_mut().enumerate() {
             let (gm_id, gm) = gm_view(w, b.lag, gm_a, gm_b_pre, gm_b_post);
             let gm_ppm = if gm_id == 1 {
-                GM_A_PPM
+                self.sc.gm_a_ppm_at(w)
             } else {
                 self.sc.gm_b_ppm
             };
@@ -634,6 +651,9 @@ impl<'s> Bench<'s> {
                 if i == 0 {
                     master.rebase = Some((old_ns, new_ns));
                 }
+            }
+            if let Some(fs) = out.freq_step {
+                b.freq_steps.push((w, fs.step_ppm));
             }
             b.word_ppm = out.freq_ppm.expect("locked from the start: always engaged");
             b.words.push(b.word_ppm);
@@ -883,6 +903,7 @@ impl<'s> Bench<'s> {
                 .map(|b| b.win.as_ref().map_or(0, |win| win.max_residual_ns))
                 .collect(),
             correction_walls: self.correction_walls,
+            freq_steps: self.boxes.iter().map(|b| b.freq_steps.clone()).collect(),
         }
     }
 }
@@ -913,3 +934,7 @@ fn run(sc: &Scenario) -> RunResult {
 // test target of its own: the path keeps the scenarios inside this bench.
 #[path = "two_clock_bench/scenarios.rs"]
 mod scenarios;
+
+// camera-box issue 1372 (dantesync slice): a grandmaster FREQUENCY step on two clocks.
+#[path = "two_clock_bench/freq_step.rs"]
+mod freq_step;

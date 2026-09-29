@@ -48,7 +48,30 @@
 //! - The NANO 0.1 µs/s deadband has no equivalent here: the phase term corrects every residual,
 //!   so nothing drifts freely.
 //!
+//! # A grandmaster FREQUENCY step (camera-box issue 1372, dantesync slice)
+//!
+//! A Dante leader re-election moves the grandmaster's frequency by up to ~25 ppm at once, and the
+//! slow PI above would take ~8-12 minutes to follow it (with a phase error near 1 ms on the way).
+//! [`freq_step::FreqStepDetector`] measures the frequency the loop has not learned, from the
+//! open-loop phase over the last 20 s of windows, and confirms a clean step. The core then:
+//!
+//! - re-seeds the integrator by the measured error (bounded to [`FSTEP_MAX_PPM`] per event), so
+//!   the word follows the step at once;
+//! - retires the phase the step left along a decaying reference ([`FSTEP_PULL_TAU_S`]): the PI
+//!   tracks `e − r` and the word carries the reference's own rate `−r/τ`, so the recovery neither
+//!   disturbs the integrator nor overshoots;
+//! - never steps the wall and never touches `D`.
+//!
+//! Without a confirmed step nothing changes: the words are bit-identical to the plain PI.
+//!
 //! Pure (explicit inputs, no I/O, no logging) so the controller and the bench run the same code.
+
+pub mod freq_step;
+
+pub use freq_step::{
+    fit_ring, FreqStepDetector, FreqStepEstimate, RingFit, FSTEP_CONFIRM, FSTEP_HOLDOFF_S,
+    FSTEP_LINEARITY_F_MAX, FSTEP_MAX_PPM, FSTEP_MIN_PPM, FSTEP_SIGMAS, FSTEP_WINDOW_S,
+};
 
 /// Proportional gain, ppm per µs of phase error (i.e. 1/s).
 ///
@@ -87,6 +110,14 @@ pub const REANCHOR_ON_ENGAGE_NS: i64 = 1_000_000;
 pub const DT_MIN_S: f64 = 0.01;
 pub const DT_MAX_S: f64 = 5.0;
 
+/// Time constant (s) of the reference along which the phase a frequency step left is retired.
+/// Its rate `−r/τ` is at most `ERROR_CLAMP_US / τ` = 100 ppm, inside the output clamp; 400 µs
+/// (a 25 ppm step detected after ~20 s) is under 50 µs ~40 s later.
+pub const FSTEP_PULL_TAU_S: f64 = 20.0;
+
+/// Below this (µs) the pull reference is dropped (its rate is then < 0.03 ppm).
+pub const FSTEP_PULL_DONE_US: f64 = 0.5;
+
 /// What happened to the anchor `D` in one window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AnchorEvent {
@@ -112,6 +143,26 @@ pub enum AnchorEvent {
     },
 }
 
+/// A grandmaster frequency step the loop followed (camera-box issue 1372).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FreqStep {
+    /// The step (ppm): the grandmaster's frequency relative to this box moved by this, so the word
+    /// follows it (positive = the grandmaster sped up, the word goes up). Minus the measured error,
+    /// bounded to ±[`FSTEP_MAX_PPM`].
+    pub step_ppm: f64,
+    /// The frequency the loop had not learned, as measured (ppm): the unbounded `−step_ppm`.
+    pub error_ppm: f64,
+    /// The slope's standard error (ppm) and the linearity statistic of the confirming fit.
+    pub sigma_ppm: f64,
+    pub linearity_f: f64,
+    /// Seconds of windows the confirming fit spanned.
+    pub span_s: f64,
+    pub integrator_before_ppm: f64,
+    pub integrator_after_ppm: f64,
+    /// The phase error the step left (µs), retired along the pull reference.
+    pub pull_us: f64,
+}
+
 /// The result of one PTP sample window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowOutcome {
@@ -121,6 +172,8 @@ pub struct WindowOutcome {
     /// `e = (t2 − t1) − D` (ns) once anchored.
     pub error_ns: Option<i64>,
     pub event: AnchorEvent,
+    /// A frequency step confirmed and followed in THIS window (the controller logs it).
+    pub freq_step: Option<FreqStep>,
 }
 
 /// The phase-lock state of one box.
@@ -133,6 +186,12 @@ pub struct PhaseLockCore {
     i_ppm: f64,
     last_error_ns: Option<i64>,
     last_freq_ppm: f64,
+    /// camera-box issue 1372: the frequency-step detector (reads only `e` and the words).
+    fstep: FreqStepDetector,
+    /// The phase (µs) still being retired after a followed frequency step; 0 = none.
+    pull_us: f64,
+    freq_steps: u32,
+    last_freq_step: Option<FreqStep>,
 }
 
 impl PhaseLockCore {
@@ -169,6 +228,21 @@ impl PhaseLockCore {
         self.last_freq_ppm
     }
 
+    /// Grandmaster frequency steps followed since start (camera-box issue 1372).
+    pub fn freq_steps(&self) -> u32 {
+        self.freq_steps
+    }
+
+    /// The last frequency step followed.
+    pub fn last_freq_step(&self) -> Option<FreqStep> {
+        self.last_freq_step
+    }
+
+    /// The phase (µs) still being retired after the last followed step; 0 when none.
+    pub fn pull_us(&self) -> f64 {
+        self.pull_us
+    }
+
     /// Adopt `D` from the date-offset authority (a join or an absorb). The wall is moved by the
     /// caller when the adoption is a step; the anchor simply becomes the authority's value.
     pub fn set_anchor(&mut self, anchor_ns: i64) {
@@ -188,6 +262,14 @@ impl PhaseLockCore {
     /// (`Realigned`) if the wall free-ran more than [`REANCHOR_ON_ENGAGE_NS`] meanwhile.
     pub fn disengage(&mut self) {
         self.engaged = false;
+        self.drop_step_state();
+    }
+
+    /// The frequency-step ring and a running pull belong to one continuous engagement in one time
+    /// base: dropped on a lock loss, an engagement and a re-anchor.
+    fn drop_step_state(&mut self) {
+        self.fstep.reset();
+        self.pull_us = 0.0;
     }
 
     /// The grandmaster (or the sync source) changed: re-anchor `D` from the next window, so the
@@ -223,6 +305,7 @@ impl PhaseLockCore {
                         freq_ppm: None,
                         error_ns: None,
                         event,
+                        freq_step: None,
                     };
                 }
                 self.anchor_ns = Some(median_diff_ns);
@@ -262,17 +345,23 @@ impl PhaseLockCore {
                 // Hand the learned frequency back to the rate servo (the controller copies
                 // `integrator_ppm` into its drift baseline).
                 self.engaged = false;
+                self.drop_step_state();
             }
             return WindowOutcome {
                 freq_ppm: None,
                 error_ns: Some(e_ns),
                 event,
+                freq_step: None,
             };
         }
 
         if !self.engaged {
             self.engaged = true;
             self.i_ppm = rate_servo_freq_ppm.clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+            self.drop_step_state();
+        }
+        if event != AnchorEvent::None {
+            self.drop_step_state();
         }
 
         let dt = if dt_s.is_finite() {
@@ -289,6 +378,7 @@ impl PhaseLockCore {
             freq_ppm: Some(f),
             error_ns: Some(e_ns),
             event,
+            freq_step: None,
         }
     }
 }
@@ -549,5 +639,136 @@ mod tests {
     fn gains_are_critically_damped() {
         let zeta = K_P_PER_S / (2.0 * K_I_PER_S2.sqrt());
         assert!((zeta - 1.0).abs() < 1e-12);
+    }
+
+    // ---- camera-box issue 1372: a grandmaster FREQUENCY step --------------------------------
+
+    /// The law before the frequency-step follow (the plain PI), for the bit-for-bit comparison.
+    fn plain_pi(i_ppm: &mut f64, e_ns: i64, dt: f64) -> f64 {
+        let e_us = (e_ns as f64 / 1_000.0).clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
+        *i_ppm = (*i_ppm - K_I_PER_S2 * e_us * dt).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
+        (*i_ppm - K_P_PER_S * e_us).clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM)
+    }
+
+    #[test]
+    fn without_a_confirmed_step_the_words_are_the_plain_pi_bit_for_bit_1372() {
+        // A 0.4 ppm hand-over error and a 0.1 ppm/min oscillator ramp for 50 minutes.
+        for delay in [0usize, 1, 2] {
+            let mut c = PhaseLockCore::new();
+            let mut p = Plant::new(26.0, delay, -25.6);
+            let mut q = Plant::new(26.0, delay, -25.6);
+            let mut i_ref = -25.6;
+            for n in 0..6_000 {
+                let w = c
+                    .on_window(D + p.e_ns.round() as i64, true, -25.6, DT)
+                    .freq_ppm
+                    .unwrap();
+                let w_ref = plain_pi(&mut i_ref, q.e_ns.round() as i64, DT);
+                assert_eq!(w.to_bits(), w_ref.to_bits(), "delay {delay}, window {n}");
+                let osc = 26.0 + 0.1 * (n as f64 * DT) / 60.0;
+                p.osc_ppm = osc;
+                q.osc_ppm = osc;
+                p.advance(w, DT);
+                q.advance(w_ref, DT);
+            }
+            assert_eq!(c.freq_steps(), 0);
+        }
+    }
+
+    #[test]
+    fn a_frequency_step_re_seeds_the_integrator_in_seconds_and_never_moves_d_1372() {
+        for delay in [0usize, 1] {
+            let mut c = PhaseLockCore::new();
+            let mut p = Plant::new(23.0, delay, -23.0);
+            run(&mut c, &mut p, 1_200, -23.0); // 10 minutes locked
+            let anchor = c.anchor_ns();
+            // The grandmaster speeds up by 25 ppm: the oscillator relative to it drops by 25.
+            p.osc_ppm -= 25.0;
+            let mut followed = Vec::new();
+            for n in 0..1_200 {
+                let out = c.on_window(D + p.e_ns.round() as i64, true, 0.0, DT);
+                assert_eq!(out.event, AnchorEvent::None, "delay {delay}");
+                if let Some(fs) = out.freq_step {
+                    followed.push((n, fs));
+                }
+                p.advance(out.freq_ppm.unwrap(), DT);
+            }
+            assert_eq!(followed.len(), 1, "delay {delay}: {followed:?}");
+            let (n, fs) = followed[0];
+            assert!(
+                (n + 1) as f64 * DT <= 30.0,
+                "delay {delay}: after {n} windows"
+            );
+            assert!((fs.step_ppm - 25.0).abs() < 1.0, "delay {delay}: {fs:?}");
+            assert_eq!(fs.step_ppm, -fs.error_ppm);
+            // The integrator lands on the new frequency (−osc = +2 ppm) at once.
+            assert!(
+                (fs.integrator_after_ppm - 2.0).abs() < 0.5,
+                "delay {delay}: {fs:?}"
+            );
+            assert!(fs.pull_us < -300.0, "the step left ~−400 µs: {fs:?}");
+            assert_eq!(c.last_freq_step(), Some(fs));
+            assert_eq!(c.freq_steps(), 1);
+            // D never moved; the pull finished; the phase and the frequency are back.
+            assert_eq!(c.anchor_ns(), anchor, "delay {delay}");
+            assert_eq!(c.pull_us(), 0.0);
+            assert!(p.e_ns.abs() < 5_000.0, "delay {delay}: e {} ns", p.e_ns);
+            assert!((c.integrator_ppm() - 2.0).abs() < 0.05, "delay {delay}");
+        }
+    }
+
+    #[test]
+    fn the_pull_retires_the_step_phase_without_disturbing_the_integrator_1372() {
+        let mut c = PhaseLockCore::new();
+        let mut p = Plant::new(23.0, 0, -23.0);
+        run(&mut c, &mut p, 1_200, -23.0);
+        p.osc_ppm -= 25.0;
+        let mut after = None;
+        let mut worst_i_err = 0.0f64;
+        for n in 0..1_200 {
+            let out = c.on_window(D + p.e_ns.round() as i64, true, 0.0, DT);
+            if out.freq_step.is_some() {
+                after = Some(n);
+            }
+            if after.is_some() {
+                worst_i_err = worst_i_err.max((c.integrator_ppm() - 2.0).abs());
+            }
+            p.advance(out.freq_ppm.unwrap(), DT);
+            if let Some(a) = after {
+                if n == a + 240 {
+                    // Two minutes after the re-seed the phase is back under 50 µs …
+                    assert!(p.e_ns.abs() < 50_000.0, "e {} ns", p.e_ns);
+                }
+            }
+        }
+        assert!(after.is_some());
+        // … and the integrator never left the new frequency by more than a few tenths of a ppm
+        // (a plain PI trimming ~400 µs would swing it by ~1.5 ppm).
+        assert!(worst_i_err < 0.5, "{worst_i_err}");
+    }
+
+    #[test]
+    fn a_lock_loss_or_a_re_anchor_drops_the_pull_and_the_ring_1372() {
+        let mut c = PhaseLockCore::new();
+        let mut p = Plant::new(23.0, 0, -23.0);
+        run(&mut c, &mut p, 1_200, -23.0);
+        p.osc_ppm -= 25.0;
+        for _ in 0..200 {
+            let out = c.on_window(D + p.e_ns.round() as i64, true, 0.0, DT);
+            p.advance(out.freq_ppm.unwrap(), DT);
+            if out.freq_step.is_some() {
+                break;
+            }
+        }
+        assert!(c.pull_us() != 0.0, "a pull is running");
+        // Lock lost: nothing is pulled any more.
+        c.on_window(D + p.e_ns.round() as i64, false, 0.0, DT);
+        assert_eq!(c.pull_us(), 0.0);
+        // A grandmaster change re-anchors: the ring starts again (no step without a full ring).
+        c.request_rebase();
+        let out = c.on_window(D + 7 * DISCONTINUITY_NS, true, 2.0, DT);
+        assert!(matches!(out.event, AnchorEvent::Rebased { .. }));
+        assert_eq!(c.pull_us(), 0.0);
+        assert_eq!(c.freq_steps(), 1, "the count survives");
     }
 }

@@ -429,6 +429,25 @@ pub struct SyncStatus {
     /// time, the interface/IP it joined on, its error).
     #[serde(default)]
     pub rejoin: RejoinStatus,
+
+    // ========================================================================
+    // Grandmaster frequency-step follow (camera-box issue 1372) — additive.
+    // ========================================================================
+    /// Grandmaster FREQUENCY steps the phase lock detected and followed since the process started
+    /// (a Dante leader re-election can move the grandmaster's frequency by ~25 ppm at once). 0 in
+    /// a pre-1.14 blob.
+    #[serde(default)]
+    pub freq_steps: u32,
+
+    /// The last such step (ppm): how far the frequency word was re-seeded — the grandmaster's
+    /// frequency relative to this node moved by this (positive = the grandmaster sped up).
+    /// Bounded to ±100 per event; `null` until one happens.
+    #[serde(default)]
+    pub last_freq_step_ppm: Option<f64>,
+
+    /// Unix time (s) of the last frequency step followed; `null` until one happens.
+    #[serde(default)]
+    pub last_freq_step_ts: Option<u64>,
 }
 
 fn default_clock_alarm_interval_s() -> u64 {
@@ -528,6 +547,10 @@ impl Default for SyncStatus {
             last_ptp_rx_age_s: None,
             ptp_rx_pps: 0.0,
             rejoin: RejoinStatus::default(),
+            // camera-box issue 1372: no frequency step followed yet
+            freq_steps: 0,
+            last_freq_step_ppm: None,
+            last_freq_step_ts: None,
         }
     }
 }
