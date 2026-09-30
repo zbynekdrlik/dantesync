@@ -32,6 +32,11 @@ pub const DATE_STEP_PATH: &str = "/date/step";
 /// abandoned — the loop never acts on it — and the answer is `503`.
 pub const DATE_STEP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the HTTP side still waits once the loop has TAKEN a request (it is acting on it: one
+/// decision and a status publish, milliseconds). No answer by then, the request may have been
+/// acted on: the answer is `500`, never the `503` that means "nothing announced".
+pub const DATE_STEP_TAKEN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The header a step request must carry (any value), lower case.
 pub const DATE_STEP_HEADER: &str = "x-dantesync-step";
 
@@ -56,23 +61,27 @@ const CLAIM_ABANDONED: u8 = 2;
 
 /// One request from the HTTP route to the sync loop, which answers on `reply`. It is claimed
 /// exactly once: [`take`](Self::take) by the loop (it acts, then answers) or
-/// [`abandon`](Self::abandon) by the HTTP side (then nothing is ever announced for it) — so a 503
-/// always means "nothing announced", whatever the loop's timing (review rounds 1-2).
+/// [`StepClaim::abandon`] by the HTTP side (then nothing is ever announced for it) — so a 503
+/// always means "nothing announced", whatever the loop's timing (review rounds 1-3).
 pub struct DateStepRequest {
     pub reply: mpsc::Sender<DateStepOutcome>,
     claim: Arc<AtomicU8>,
 }
 
+/// The HTTP side's handle on a request's claim: it can only give the request up (review round 3:
+/// a shared raw atomic let any holder reset an abandoned claim).
+pub struct StepClaim(Arc<AtomicU8>);
+
 impl DateStepRequest {
     /// A pending request, and the HTTP side's handle on its claim.
-    pub fn new(reply: mpsc::Sender<DateStepOutcome>) -> (Self, Arc<AtomicU8>) {
+    pub fn new(reply: mpsc::Sender<DateStepOutcome>) -> (Self, StepClaim) {
         let claim = Arc::new(AtomicU8::new(CLAIM_PENDING));
         (
             DateStepRequest {
                 reply,
                 claim: claim.clone(),
             },
-            claim,
+            StepClaim(claim),
         )
     }
 
@@ -88,11 +97,13 @@ impl DateStepRequest {
             )
             .is_ok()
     }
+}
 
-    /// The HTTP side gives up on `claim`: true = abandoned, nothing will be announced (answer
+impl StepClaim {
+    /// The HTTP side gives the request up: true = abandoned, nothing will be announced (answer
     /// 503); false = the loop has already taken it, so its answer must be waited for.
-    pub fn abandon(claim: &AtomicU8) -> bool {
-        claim
+    pub fn abandon(&self) -> bool {
+        self.0
             .compare_exchange(
                 CLAIM_PENDING,
                 CLAIM_ABANDONED,
@@ -100,6 +111,38 @@ impl DateStepRequest {
                 Ordering::SeqCst,
             )
             .is_ok()
+    }
+}
+
+/// What the HTTP side got for a request it handed to the sync loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepAnswer {
+    /// The loop's answer.
+    Answered(DateStepOutcome),
+    /// Not taken within the reply timeout: abandoned, nothing is ever announced for it (`503`).
+    Abandoned,
+    /// Taken by the loop, which gave no answer (it dropped the reply, or overran the taken
+    /// timeout): it may have acted on it (`500`, never "nothing announced").
+    TakenUnanswered,
+}
+
+/// Wait for the loop's answer to a request sent with `claim`: up to `reply_timeout` for the loop
+/// to take and answer it; then abandon it, or — the loop took it first — wait up to
+/// `taken_timeout` more for what it did.
+pub fn await_answer(
+    answer: &mpsc::Receiver<DateStepOutcome>,
+    claim: &StepClaim,
+    reply_timeout: Duration,
+    taken_timeout: Duration,
+) -> StepAnswer {
+    let _ = taken_timeout;
+    match answer.recv_timeout(reply_timeout) {
+        Ok(outcome) => StepAnswer::Answered(outcome),
+        Err(_) if claim.abandon() => StepAnswer::Abandoned,
+        Err(_) => answer
+            .recv()
+            .map(StepAnswer::Answered)
+            .unwrap_or(StepAnswer::Abandoned),
     }
 }
 
@@ -305,17 +348,94 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (req, claim) = DateStepRequest::new(tx.clone());
         assert!(req.take(), "the loop takes a pending request");
-        assert!(
-            !DateStepRequest::abandon(&claim),
-            "taken: its answer must be awaited"
-        );
+        assert!(!claim.abandon(), "taken: its answer must be awaited");
         assert!(!req.take(), "claimed once");
         let (req, claim) = DateStepRequest::new(tx);
-        assert!(
-            DateStepRequest::abandon(&claim),
-            "the HTTP side gives up first"
-        );
+        assert!(claim.abandon(), "the HTTP side gives up first");
+        assert!(!claim.abandon(), "given up once");
         assert!(!req.take(), "abandoned: the loop never acts on it");
+    }
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    fn accepted() -> DateStepOutcome {
+        DateStepOutcome::Accepted {
+            amount_ns: 63_435_000,
+            land_ptp_ns: 42_000_000_000,
+            due_in_ms: 10_000,
+            seq: 2,
+        }
+    }
+
+    #[test]
+    fn an_untaken_request_is_abandoned_and_never_acted_on_126() {
+        let (tx, rx) = mpsc::channel();
+        let (req, claim) = DateStepRequest::new(tx);
+        assert_eq!(
+            await_answer(&rx, &claim, SHORT, Duration::from_secs(5)),
+            StepAnswer::Abandoned
+        );
+        assert!(!req.take(), "the loop never acts on it");
+    }
+
+    #[test]
+    fn a_late_answer_to_a_taken_request_is_awaited_never_a_503_126() {
+        // The loop takes the request inside the reply timeout and answers after it: the step
+        // WAS announced, so the answer must be its 202 (review round 3: nothing pinned this).
+        let (tx, rx) = mpsc::channel();
+        let (req, claim) = DateStepRequest::new(tx);
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let lp = std::thread::spawn(move || {
+            assert!(req.take());
+            taken_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            req.reply.send(accepted()).unwrap();
+        });
+        taken_rx.recv().unwrap();
+        assert_eq!(
+            await_answer(&rx, &claim, SHORT, Duration::from_secs(5)),
+            StepAnswer::Answered(accepted())
+        );
+        lp.join().unwrap();
+    }
+
+    #[test]
+    fn a_taken_request_the_loop_drops_unanswered_is_never_nothing_announced_126() {
+        let (tx, rx) = mpsc::channel();
+        let (req, claim) = DateStepRequest::new(tx);
+        assert!(req.take(), "the loop took it");
+        drop(req); // and unwound before answering
+        assert_eq!(
+            await_answer(&rx, &claim, SHORT, Duration::from_secs(5)),
+            StepAnswer::TakenUnanswered
+        );
+    }
+
+    #[test]
+    fn the_wait_for_a_taken_request_is_bounded_126() {
+        // The loop took it and hangs (it drops the reply only after 2 s): the connection is
+        // answered after the taken timeout, not held for as long as the loop hangs.
+        let (tx, rx) = mpsc::channel();
+        let (req, claim) = DateStepRequest::new(tx);
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let lp = std::thread::spawn(move || {
+            assert!(req.take());
+            taken_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(req);
+        });
+        taken_rx.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            await_answer(&rx, &claim, SHORT, Duration::from_millis(200)),
+            StepAnswer::TakenUnanswered
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(1_500),
+            "bounded: {:?}",
+            t0.elapsed()
+        );
+        lp.join().unwrap();
     }
 
     #[test]

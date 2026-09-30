@@ -10,7 +10,7 @@
 use crate::date_offset::{AuthorityState, DateOffsetState, DateSlew, STATE_VERSION};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct SlewFile {
@@ -124,6 +124,30 @@ pub(super) fn read(path: &Path) -> Result<Option<DateOffsetState>, String> {
 /// directory is synced after the rename, so a power cut cannot bring the previous record back
 /// (review round 2).
 pub(super) fn write_atomic(path: &Path, state: &DateOffsetState) -> std::io::Result<()> {
+    write_atomic_with(path, state, sync_dir)
+}
+
+/// The directory a record at `path` lives in (the directory to sync after the rename).
+fn dir_to_sync(path: &Path) -> Option<PathBuf> {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// Sync a directory (Unix; a no-op elsewhere).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+fn write_atomic_with(
+    path: &Path,
+    state: &DateOffsetState,
+    sync_dir: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -134,9 +158,8 @@ pub(super) fn write_atomic(path: &Path, state: &DateOffsetState) -> std::io::Res
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::File::open(dir)?.sync_all()?;
+    if let Some(dir) = dir_to_sync(path) {
+        sync_dir(&dir)?;
     }
     Ok(())
 }
@@ -275,5 +298,36 @@ mod tests {
         assert!(read(&path).is_err());
         // A directory that does not exist: an error, never a panic.
         assert!(write_atomic(&dir.path().join("no/such/dir/x.json"), &st2).is_err());
+    }
+
+    #[test]
+    fn a_directory_sync_that_fails_after_the_rename_still_saved_the_record_126() {
+        // The new record is in place once renamed: a directory that refuses fsync (EINVAL on
+        // some filesystems) must not read as "not saved" — that retried every 10 s for ever
+        // with a false "a restart would step the fleet" (review round 3).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("date-offset.json");
+        let st = sample(None, None);
+        let mut synced = None;
+        write_atomic_with(&path, &st, |d| {
+            synced = Some(d.to_path_buf());
+            Err(std::io::Error::from_raw_os_error(22))
+        })
+        .expect("saved: the rename is done");
+        assert_eq!(synced.as_deref(), Some(dir.path()), "its own directory");
+        assert_eq!(read(&path), Ok(Some(st)));
+    }
+
+    #[test]
+    fn the_directory_synced_is_the_record_s_own_even_for_a_bare_file_name_126() {
+        assert_eq!(
+            dir_to_sync(Path::new("/etc/dantesync/date-offset.json")),
+            Some(PathBuf::from("/etc/dantesync"))
+        );
+        assert_eq!(
+            dir_to_sync(Path::new("date-offset.json")),
+            Some(PathBuf::from(".")),
+            "the current directory, not skipped"
+        );
     }
 }

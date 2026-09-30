@@ -15,7 +15,8 @@
 //! still gets the status JSON, byte for byte as before.
 
 use crate::date_step_trigger::{
-    self, DateStepOutcome, DateStepRequest, Route, DATE_STEP_REPLY_TIMEOUT,
+    self, DateStepOutcome, DateStepRequest, Route, StepAnswer, DATE_STEP_REPLY_TIMEOUT,
+    DATE_STEP_TAKEN_TIMEOUT,
 };
 use crate::status::SyncStatus;
 use log::{error, info, warn};
@@ -202,7 +203,7 @@ fn handle_connection(
 /// name and the request carries the `X-DanteSync-Step` header (403); otherwise the request goes to
 /// the sync loop, whose answer is `202` (one coordinated step announced) or `409` (refused, with
 /// the reason), or `503` when the loop does not take it in time — then the request is abandoned
-/// and nothing is ever announced for it (`DateStepRequest::abandon`).
+/// and nothing is ever announced for it (`StepClaim::abandon`).
 fn handle_date_step(
     stream: &TcpStream,
     request: &[u8],
@@ -247,21 +248,21 @@ fn handle_date_step(
             date_step_trigger::refusal_body("the sync loop is not running"),
         );
     }
-    let answered = match answer.recv_timeout(DATE_STEP_REPLY_TIMEOUT) {
-        Ok(outcome) => Some(outcome),
-        // Not taken yet: abandon it (the loop will never act on it). Taken already: the loop is
-        // acting on it, so wait for what it did — a 503 must never hide an announced step.
-        Err(_) if DateStepRequest::abandon(&claim) => None,
-        Err(_) => answer.recv().ok(),
-    };
-    match answered {
-        Some(outcome) => {
+    // Not taken in time: abandoned (the loop will never act on it). Taken already: the loop is
+    // acting on it, so its answer is awaited — a 503 must never hide an announced step.
+    match date_step_trigger::await_answer(
+        &answer,
+        &claim,
+        DATE_STEP_REPLY_TIMEOUT,
+        DATE_STEP_TAKEN_TIMEOUT,
+    ) {
+        StepAnswer::Answered(outcome) => {
             if let DateStepOutcome::Refused { reason } = &outcome {
                 info!("[HTTP-Status] POST /date/step refused: {}", reason);
             }
             date_step_trigger::outcome_response(&outcome)
         }
-        None => (
+        StepAnswer::Abandoned | StepAnswer::TakenUnanswered => (
             503,
             date_step_trigger::refusal_body(
                 "the sync loop did not take the request in time: nothing was announced",
@@ -487,6 +488,22 @@ mod tests {
         port
     }
 
+    /// A test server whose "sync loop" takes every date-step request and drops it unanswered
+    /// (a loop that unwound while acting on it).
+    fn server_with_loop_that_drops_taken_requests() -> u16 {
+        let (tx, rx) = date_step_trigger::channel();
+        thread::spawn(move || {
+            for req in rx {
+                assert!(req.take(), "the loop takes a pending request");
+                drop(req);
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        spawn_accept_loop(listener, locked_status(), Some(tx));
+        port
+    }
+
     const POST_STEP: &[u8] = b"POST /date/step HTTP/1.1\r\nHost: 127.0.0.1:8898\r\nX-DanteSync-Step: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     #[test]
@@ -533,6 +550,24 @@ mod tests {
         spawn_accept_loop(listener, locked_status(), None);
         let (headers, _) = exchange(port, POST_STEP);
         assert!(headers.starts_with("HTTP/1.1 503"), "{headers}");
+    }
+
+    #[test]
+    fn a_taken_request_left_unanswered_is_500_unknown_never_the_503_of_nothing_announced_126() {
+        let port = server_with_loop_that_drops_taken_requests();
+        let (headers, body) = exchange(port, POST_STEP);
+        assert!(
+            headers.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{headers}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert!(v["accepted"].is_null(), "unknown, not refused: {body}");
+        assert!(
+            v["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("date_step_trigger_last")),
+            "{body}"
+        );
     }
 
     #[test]

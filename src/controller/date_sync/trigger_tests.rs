@@ -191,7 +191,7 @@ fn an_expired_step_request_is_refused_unacted_so_a_503_means_nothing_was_announc
     let (reply, answer) = std::sync::mpsc::channel();
     // The HTTP side gave up before the loop took it (the loop was blocked in an NTP burst, say).
     let (req, claim) = DateStepRequest::new(reply);
-    assert!(DateStepRequest::abandon(&claim));
+    assert!(claim.abandon());
     tx.send(req).expect("queued");
     c.serve_date_step_requests();
     match answer.try_recv() {
