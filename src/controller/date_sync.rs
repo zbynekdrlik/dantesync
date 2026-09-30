@@ -49,9 +49,10 @@ use daily::log_daily_authority;
 const AUTHORITY_REPLY_MAX_AGE: Duration = Duration::from_secs(5);
 
 /// A follower that has heard no APPLICABLE authority reply (fresh, same grandmaster, same time
-/// base) for this long stops following and returns to the local NTP date path — otherwise a
-/// silent, re-based or downgraded master would leave it neither following nor stepping, drifting
-/// at the grandmaster-vs-UTC rate with `/status` still saying "follower".
+/// base) for this long stops following — otherwise a silent, re-based or downgraded master would
+/// leave it neither following nor stepping, drifting at the grandmaster-vs-UTC rate with `/status`
+/// still saying "follower". dantesync#126: it first HOLDS the fleet D for
+/// `system.date_offset.authority_hold_s` (a master restart), then returns to the local NTP path.
 const AUTHORITY_LOSS: Duration = Duration::from_secs(30);
 
 /// After a failed date step, announces are not acted on for this long, so a clock that refuses
@@ -149,6 +150,8 @@ pub(super) struct DateSync {
     /// camera-box issue 1372 — the wall epoch (s) of the last grandmaster frequency step the phase
     /// lock followed (`/status` `last_freq_step_ts`).
     pub(super) last_freq_step_ts: Option<u64>,
+    /// dantesync#126 — the master's saved date offset, a follower's hold, the step on request.
+    pub(super) restart: restart::RestartState,
 }
 
 impl DateSync {
@@ -226,6 +229,7 @@ impl DateSync {
             correction,
             master_outage_realign: false,
             last_freq_step_ts: None,
+            restart: restart::RestartState::new(config),
         }
     }
 
@@ -538,7 +542,8 @@ where
         if delta.abs() > crate::date_offset::ABSORB_TOLERANCE_NS {
             warn!(
                 "[DATE] the master is {:+}us off the fleet date offset (its own PTP outage, a \
-                 re-anchor or a failed step) — stepping its OWN wall back to the fleet line",
+                 re-anchor, a restart or a failed step) — stepping its OWN wall back to the fleet \
+                 line",
                 delta / 1_000
             );
             self.apply_date_step(delta, StepKind::Join, seq);
@@ -570,6 +575,16 @@ where
     pub(super) fn ntp_under_date_authority(&mut self, offset_us: i64) -> bool {
         if !self.date_sync.enabled {
             return false;
+        }
+        // #126: a master restoring its saved date offset takes no NTP step before its first lock.
+        if self.boot_step_deferred() {
+            info!(
+                "[NTP] offset:{:+}us (the saved fleet date offset is restored at the first PTP \
+                 lock — no NTP step)",
+                offset_us
+            );
+            self.ntp_pending_step = None;
+            return true;
         }
         let Some(base) = self.date_sync.core.anchor_ns() else {
             return false;
@@ -679,10 +694,12 @@ where
             return false;
         }
         if self.date_sync.follower.adopted() {
-            info!(
-                "[NTP] offset:{:+}us (following the fleet date offset — no NTP step)",
-                offset_us
-            );
+            let how = if self.holding_date() {
+                "holding the fleet date offset, the master unheard"
+            } else {
+                "following the fleet date offset"
+            };
+            info!("[NTP] offset:{:+}us ({} — no NTP step)", offset_us, how);
             self.ntp_pending_step = None;
             return true;
         }
@@ -700,6 +717,11 @@ where
         let Some(anchor) = self.date_sync.d_in_effect(now_wall) else {
             return;
         };
+        // #126: a saved state is judged at the first anchor; a rejected one runs the boot step
+        // (from the loop) before the new session.
+        if self.restore_date_authority(anchor, now_wall) || self.date_sync.restart.boot_step_due {
+            return;
+        }
         let base = self.date_sync.core.anchor_ns().unwrap_or(anchor);
         let authority = DateAuthority::new(
             anchor,
@@ -720,23 +742,7 @@ where
             self.date_sync.authority = Some(authority);
             return;
         }
-        // The EFFECTIVE micro tuning: the interval is at least the in-flight time of one increment.
-        let micro = authority.micro().config();
-        info!(
-            "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date is \
-             held within {} ms of UTC by micro-corrections of at most {}us, one per {} s ({:.2} \
-             ms/min): forward a coordinated step, backward a coordinated slew at {} ppm (one per {} \
-             s), announced {} s ahead; only an error beyond {} ms is one coordinated step",
-            anchor,
-            micro.dead_band_ns / 1_000_000,
-            micro.step_ns / 1_000,
-            micro.interval_ns / 1_000_000_000,
-            micro.capacity_ns_per_min() as f64 / 1e6,
-            authority.slew_ppm(),
-            micro.backward_interval_ns / 1_000_000_000,
-            authority.lead_ns() * crate::date_offset::MICRO_LEAD_FACTOR / 1_000_000_000,
-            crate::date_offset::slew_cap_ns(self.date_sync.step_bound_ns) / 1_000_000
-        );
+        micro::log_micro_authority(anchor, &authority, self.date_sync.step_bound_ns);
         self.date_sync.authority = Some(authority);
     }
 
@@ -802,7 +808,12 @@ where
     /// #88 — every loop iteration: apply a coordinated step whose instant has come, and (a
     /// follower) act once on each new, APPLICABLE announce from the master.
     pub(super) fn service_date_offset(&mut self) {
-        if !self.date_sync.enabled || self.date_sync.core.anchor_ns().is_none() {
+        if !self.date_sync.enabled {
+            return;
+        }
+        // #126: a saved date offset that waits for PTP, and a deferred boot step (no anchor needed).
+        self.service_date_restart();
+        if self.date_sync.core.anchor_ns().is_none() {
             return;
         }
         if self.ptp_offline && self.date_sync.core.engaged() {
@@ -821,21 +832,11 @@ where
             self.tick_date_authority();
             self.realign_master_to_fleet();
             self.realign_offline_daily_master();
+            self.save_date_state_if_changed();
             return;
         }
-        let lost = match self.date_sync.last_applicable_reply {
-            None => true,
-            Some(t) => t.elapsed() > AUTHORITY_LOSS,
-        };
-        if lost && self.date_sync.follower.adopted() {
-            warn!(
-                "[DATE] no applicable date-offset authority reply for {}s — back to the local NTP \
-                 date path until the master is heard again",
-                AUTHORITY_LOSS.as_secs()
-            );
-            self.date_sync.follower.forget();
-            self.date_sync.last_announce = None;
-        }
+        // #126: a silent master is held through (`authority_hold_s`), then forgotten.
+        self.hold_or_forget_silent_authority();
         if self.in_step_backoff() {
             return;
         }
@@ -878,6 +879,7 @@ where
             return;
         }
         self.date_sync.last_applicable_reply = Some(Instant::now());
+        self.end_authority_hold();
         self.date_sync.last_announce = Some(ext.announce);
         let now_wall = wall_now_ns();
         let first = !self.date_sync.follower.adopted();
@@ -961,9 +963,13 @@ where
 mod daily;
 mod follow;
 mod freq_step;
+mod hold;
 mod micro;
 mod publish;
+mod restart;
+mod restart_file;
 mod slew;
+mod trigger;
 
 #[cfg(test)]
 mod daily_tests;
@@ -974,4 +980,8 @@ mod micro_tests;
 #[cfg(test)]
 mod rejoin_tests;
 #[cfg(test)]
+mod restart_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trigger_tests;

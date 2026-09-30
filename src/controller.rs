@@ -1181,7 +1181,16 @@ where
                 };
                 self.record_ntp_success(offset_us, &measurement);
 
-                if offset.as_millis() > 50 {
+                if offset.as_millis() > 50 && self.boot_step_deferred() {
+                    // dantesync#126: the NTP master restores its saved fleet date offset at the
+                    // first PTP lock instead — a restart must not move the fleet date.
+                    info!(
+                        "[DATE] boot step of {}{:?} SKIPPED: the saved fleet date offset is \
+                         restored at the first PTP lock (the UTC error is corrected at the next \
+                         nightly window)",
+                        sign_str, offset
+                    );
+                } else if offset.as_millis() > 50 {
                     info!("Stepping clock (NTP)...");
                     if let Err(e) = self.clock.step_clock(offset, sign) {
                         error!("Failed to step clock: {}", e);
@@ -2067,6 +2076,9 @@ where
         // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
         // step lands within one loop period of the announced instant on every box.
         self.service_date_offset();
+        // dantesync#126: answer every `POST /date/step` the HTTP route queued (every node answers;
+        // only the NTP master can announce the step).
+        self.serve_date_step_requests();
 
         let (buf, size, t2, source_ip) = match self.network.recv_packet()? {
             Some(res) => res,

@@ -75,7 +75,8 @@ use dantesync::net_linux;
 #[cfg(windows)]
 use dantesync::net_pcap;
 use dantesync::{
-    clock, config, controller, http_status, net, ntp, ntp_server, status, time_server, traits,
+    clock, config, controller, date_step_trigger, http_status, net, ntp, ntp_server, status,
+    time_server, traits,
 };
 
 use config::{HttpStatusConfig, NtpServerConfig, SystemConfig};
@@ -186,6 +187,13 @@ fn migrate_config_json(json: &mut serde_json::Value) -> bool {
 
     needs_migration
 }
+
+/// dantesync#126 — where the NTP master keeps its fleet date offset across a restart: beside
+/// `config.json`, in a file of its own (never inside the config). Only the master writes it.
+#[cfg(windows)]
+const DATE_STATE_PATH: &str = r"C:\ProgramData\DanteSync\date-offset.json";
+#[cfg(not(windows))]
+const DATE_STATE_PATH: &str = "/etc/dantesync/date-offset.json";
 
 fn load_config() -> Config {
     #[cfg(windows)]
@@ -580,12 +588,19 @@ fn run_sync_loop(
 
     // Start HTTP status endpoint (#47) — LAN automation reads the same status JSON
     // the named pipe serves, without a human or an SMB/pipe bridge in the loop.
+    // dantesync#126: its `POST /date/step` route (loopback only) reaches the sync loop over this
+    // channel; the controller answers it below.
+    let (date_step_tx, date_step_rx) = date_step_trigger::channel();
     if http_status_config.enabled {
         info!(
             "[HTTP-Status] Enabled — starting on port {}",
             http_status_config.port
         );
-        http_status::start_http_status_server(status_shared.clone(), http_status_config.port);
+        http_status::start_http_status_server(
+            status_shared.clone(),
+            http_status_config.port,
+            Some(date_step_tx),
+        );
     } else {
         info!("[HTTP-Status] Disabled by config");
     }
@@ -691,6 +706,14 @@ fn run_sync_loop(
 
     let mut controller =
         PtpController::new(sys_clock, network, ntp_source, status_shared, system_config);
+    controller.set_date_step_requests(date_step_rx);
+
+    // dantesync#126: the NTP master reads the fleet date offset it saved before this restart.
+    // A readable saved state skips the boot step below (the date is restored at the first PTP
+    // lock, so this restart does not move the fleet date); without one it runs as before.
+    if ntp_server_config.enabled && controller.phase_lock_enabled() {
+        controller.load_date_state(std::path::PathBuf::from(DATE_STATE_PATH));
+    }
 
     if !args.skip_ntp {
         info!("Using NTP Server: {}", ntp_server);
