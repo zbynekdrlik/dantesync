@@ -101,7 +101,9 @@ pub use micro::{
     MICRO_REVERSAL_BAND_NS, MICRO_TURNED_TREND_NS_PER_S, MICRO_WINDOW_NS, MIN_MICRO_INTERVAL_S,
     MIN_MICRO_STEP_US,
 };
-pub use persist::{AuthorityState, DateOffsetState, RestoreRejected, STATE_VERSION};
+pub use persist::{
+    AuthorityState, DateOffsetState, RestoreRejected, MAX_RESTORE_AGE_NS, STATE_VERSION,
+};
 pub use slew::{
     clamp_slew_ppm, correction_kind, slew_cap_ns, solve_displacement, CorrectionKind, DateSlew,
     HeldSlew, SlewSpec, DEFAULT_SLEW_PPM, MAX_SLEW_PPM, MIN_SLEW_PPM, SLEW_CAP_STEP_BOUNDS,

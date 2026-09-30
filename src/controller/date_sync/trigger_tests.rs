@@ -151,8 +151,17 @@ fn the_loop_answers_every_queued_request_on_its_channel_126() {
     c.set_date_step_requests(rx);
     let (reply1, answer1) = std::sync::mpsc::channel();
     let (reply2, answer2) = std::sync::mpsc::channel();
-    tx.send(DateStepRequest { reply: reply1 }).expect("queued");
-    tx.send(DateStepRequest { reply: reply2 }).expect("queued");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    tx.send(DateStepRequest {
+        reply: reply1,
+        deadline,
+    })
+    .expect("queued");
+    tx.send(DateStepRequest {
+        reply: reply2,
+        deadline,
+    })
+    .expect("queued");
     c.serve_date_step_requests();
     assert!(matches!(
         answer1.try_recv(),
@@ -165,11 +174,76 @@ fn the_loop_answers_every_queued_request_on_its_channel_126() {
     // A request whose asker gave up is still consumed, nothing breaks.
     let (reply3, answer3) = std::sync::mpsc::channel();
     drop(answer3);
-    tx.send(DateStepRequest { reply: reply3 }).expect("queued");
+    tx.send(DateStepRequest {
+        reply: reply3,
+        deadline,
+    })
+    .expect("queued");
     c.serve_date_step_requests();
     assert_eq!(
         c.date_sync.authority.as_ref().map(|a| a.seq()),
         Some(2),
         "still the one step"
     );
+}
+
+#[test]
+fn an_expired_step_request_is_refused_unacted_so_a_503_means_nothing_was_announced_126() {
+    let (mut c, _) = anchored_controller_with(
+        MockSystemClock::new(),
+        ntp_at(300_000),
+        true,
+        restart_config(),
+    );
+    readings_then_tick(&mut c);
+    let (tx, rx) = crate::date_step_trigger::channel();
+    c.set_date_step_requests(rx);
+    let (reply, answer) = std::sync::mpsc::channel();
+    // The loop took it after its deadline (it was blocked in an NTP burst, say).
+    tx.send(DateStepRequest {
+        reply,
+        deadline: Instant::now() - Duration::from_millis(1),
+    })
+    .expect("queued");
+    c.serve_date_step_requests();
+    match answer.try_recv() {
+        Ok(DateStepOutcome::Refused { reason }) => assert!(reason.contains("expired"), "{reason}"),
+        other => panic!("an expired request is refused: {other:?}"),
+    }
+    assert_eq!(
+        c.date_sync.authority.as_ref().map(|a| a.seq()),
+        Some(1),
+        "nothing announced"
+    );
+    assert!(status(&c).date_step_trigger_last.contains("expired"));
+}
+
+#[test]
+fn a_step_on_request_is_refused_before_the_authority_is_up_and_off_the_fleet_line_126() {
+    // The master before its first lock (restoring or starting its authority).
+    let mut clock = MockSystemClock::new();
+    clock.expect_adjust_frequency().returning(|_| Ok(()));
+    let mut m = PtpController::new(
+        clock,
+        crate::traits::MockPtpNetwork::new(),
+        ntp_at(0),
+        Arc::new(RwLock::new(SyncStatus::default())),
+        restart_config(),
+    );
+    m.configure_ntp_server_mode(100_000);
+    let reason = refused(m.date_step_on_request());
+    assert!(reason.contains("not up yet"), "{reason}");
+
+    // The master off the fleet line (its own wall 1 ms off, re-aligning): it re-joins first.
+    let (mut m, d) = anchored_controller_with(
+        MockSystemClock::new(),
+        ntp_at(300_000),
+        true,
+        restart_config(),
+    );
+    readings_then_tick(&mut m);
+    m.date_sync.core.set_anchor(d + 1_000_000);
+    let reason = refused(m.date_step_on_request());
+    assert!(reason.contains("off the fleet line"), "{reason}");
+    assert_eq!(m.date_sync.authority.as_ref().map(|a| a.seq()), Some(1));
 }

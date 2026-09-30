@@ -186,31 +186,45 @@ pub(super) fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u6
 }
 
 /// #126 — the restarted master's first anchor and its saved state (`restore_date_authority`):
-/// the same grandmaster, and the anchor within the daily emergency cap of the saved `D` → the
-/// restored authority (the same `D`, seq and change in flight, configured like a new one);
-/// anything else → `None`, a new session (`ensure_date_authority`, after the deferred boot step).
+/// the same grandmaster, a record under a day old, and the anchor within the daily emergency cap
+/// of the saved `D` → the restored authority (the same `D`, seq and change in flight, configured
+/// like a new one); anything else → `None`, a new session (`ensure_date_authority`, after the
+/// deferred boot step).
 pub(super) fn master_restores_authority(
     m: &Box_,
-    saved: (AuthorityState, u8),
+    saved: DateOffsetState,
     slew_ppm: u32,
     correction: CorrectionMode,
 ) -> Option<DateAuthority> {
     let anchor = m.core.anchor_ns()?;
-    let record = dantesync::date_offset::DateOffsetState {
-        authority: saved.0,
-        gm_uuid: [saved.1; 6],
-        written_wall_ns: 0,
-        written_ptp_ns: 0,
-    };
     let cap = DailyConfig::default().emergency_ns;
-    record
+    saved
         .validate_restore(Some([m.core_gm; 6]), anchor, m.wall_ns(), cap)
         .ok()?;
     let now_ptp = m.wall_ns() - anchor;
     Some(
-        DateAuthority::restore(&saved.0, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS)
-            .with_slew_ppm(slew_ppm)
-            .with_correction(correction)
-            .with_daily_last_step(saved.0.daily_last_step),
+        DateAuthority::restore(
+            &saved.authority,
+            now_ptp,
+            DEFAULT_STEP_BOUND_NS,
+            MIN_STEP_LEAD_NS,
+        )
+        .with_slew_ppm(slew_ppm)
+        .with_correction(correction)
+        .with_daily_last_step(saved.authority.daily_last_step),
     )
+}
+
+/// #126 — the restarted master aligns its own scheduler with the restored session when the
+/// session's change is still ahead (`restore_date_authority`), then takes its announce.
+pub(super) fn master_aligns_with_restored(m: &mut Box_, a: &DateAuthority) {
+    let anchor = m.core.anchor_ns().expect("anchored");
+    let now_ptp = m.wall_ns() - anchor;
+    let ahead = a.pending_step_ns(now_ptp).is_some()
+        || a.slew_in_progress(now_ptp)
+            .is_some_and(|sl| sl.start_ptp_ns > now_ptp);
+    if ahead {
+        m.follower.align_with_session(a.seq().wrapping_sub(1));
+    }
+    let _ = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
 }

@@ -59,6 +59,87 @@ pub(super) struct RestartLog {
 }
 
 impl Bench<'_> {
+    /// The master's authority at its first window, and at its first lock after a restart: the
+    /// restored one when the restart restores and the saved state validates (the controller's
+    /// `restore_date_authority`), else a new session (`ensure_date_authority`).
+    pub(super) fn master_builds_authority(&mut self) {
+        let m = &mut self.boxes[0];
+        let anchor = m.core.anchor_ns().expect("anchored");
+        let now_ptp = m.wall_ns() - anchor;
+        let restored = match (self.sc.master_restart, self.saved) {
+            (Some(r), Some(saved)) if r.restore => {
+                master_restores_authority(m, saved, self.sc.slew_ppm, self.sc.correction)
+            }
+            _ => None,
+        };
+        let a = match restored {
+            Some(a) => {
+                self.restart_log.restored = true;
+                master_aligns_with_restored(m, &a);
+                a
+            }
+            None => {
+                let a =
+                    DateAuthority::new(anchor, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS)
+                        .with_slew_ppm(self.sc.slew_ppm)
+                        .with_correction(self.sc.correction);
+                let act = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
+                assert_eq!(
+                    act,
+                    FollowAction::None,
+                    "the authority is aligned with itself"
+                );
+                a
+            }
+        };
+        if self.restart_log.seq_before.is_some() {
+            self.restart_log.seq_after.get_or_insert(a.seq());
+        }
+        self.authority = Some(a);
+    }
+
+    /// A coordinated step on request at window `w` (the master is on the fleet line: it
+    /// schedules the step on its own wall and publishes it at once).
+    pub(super) fn master_step_on_request(&mut self, w: u64) {
+        if !self.sc.step_requests_at.contains(&w) {
+            return;
+        }
+        let (m, a) = (&mut self.boxes[0], self.authority.as_mut().expect("up"));
+        let d = m.d_in_effect();
+        let now_ptp = m.wall_ns() - d;
+        let fleet = a.in_effect_ns(now_ptp);
+        assert_eq!(d, fleet, "the master is on the fleet line for the request");
+        let ann = a
+            .step_now(now_ptp)
+            .expect("the master accepts the step on request");
+        self.restart_log.request_seqs.push(ann.seq);
+        Self::master_takes(
+            m,
+            (ann, true, fleet),
+            w,
+            &mut self.announced,
+            &mut self.announced_slews,
+            &mut self.corrections,
+            &mut self.correction_walls,
+        );
+        self.snapshot = Some(master_publishes(m, a));
+    }
+
+    /// The controller saves the authority's state on every change (here: every window it runs).
+    pub(super) fn master_saves(&mut self) {
+        let (m, a) = (&self.boxes[0], self.authority.as_ref().expect("up"));
+        if m.core.rebase_pending() {
+            return;
+        }
+        let now_ptp = m.wall_ns() - m.d_in_effect();
+        self.saved = Some(DateOffsetState {
+            authority: a.persisted(now_ptp),
+            gm_uuid: [m.core_gm; 6],
+            written_wall_ns: m.wall_ns(),
+            written_ptp_ns: now_ptp,
+        });
+    }
+
     /// The restart's events, at the start of window `w`.
     pub(super) fn restart_events(&mut self, w: u64) {
         let Some(r) = self.sc.master_restart else {
@@ -343,6 +424,57 @@ fn the_1_14_restart_path_steps_every_follower_at_its_own_instant_126() {
         "the fleet split for seconds: {} ms",
         r.max_disagreement_ns / MS
     );
+}
+
+#[test]
+fn a_restart_inside_a_steps_lead_lands_the_step_with_the_fleet_126() {
+    // The master restarts 1 s after it announced a step (10 s lead) and is locked again 4 s
+    // later: its restored session still has the step ahead. Aligned with the session it
+    // schedules it on its own wall and lands it WITH the fleet — never as a late re-join.
+    let mut sc = restart_scenario("restart inside a step's lead", true, DEFAULT_HOLD_WINDOWS);
+    sc.run_windows = 2 * 3_600 * 2;
+    sc.step_requests_at = vec![FIRST_REQUEST_AT];
+    sc.master_restart = Some(MasterRestart {
+        at: FIRST_REQUEST_AT + 2,
+        gap: 2,
+        acq: 6,
+        restore: true,
+    });
+    let r = run(&sc);
+    let rl = &r.restart;
+    println!("[{}] {rl:?}; master steps {:?}", sc.label, r.steps[0]);
+    assert!(rl.restored);
+    assert_eq!(rl.request_seqs, vec![2]);
+    assert_eq!(rl.seq_after, Some(2), "the step's session is restored");
+    let request_ns = at_s(FIRST_REQUEST_AT) * 1e9;
+    let landings: Vec<(StepKind, i64, f64)> = r
+        .steps
+        .iter()
+        .map(|steps| {
+            let after: Vec<&Step> = steps.iter().filter(|s| s.3 > request_ns).collect();
+            assert_eq!(after.len(), 1, "one step after the request: {after:?}");
+            (after[0].2, after[0].1, after[0].3)
+        })
+        .collect();
+    // Every box lands it as a coordinated step at its instant; the followers by the same size,
+    // the master by that size plus its own re-join (the free-run of its 4 s down, folded into
+    // the step: it lands ON the fleet line — within the absorb tolerance).
+    assert!(
+        landings.iter().all(|l| l.0 == StepKind::Coordinated),
+        "{landings:?}"
+    );
+    assert!(
+        landings[1..].iter().all(|l| l.1 == landings[1].1),
+        "{landings:?}"
+    );
+    assert!(
+        (landings[0].1 - landings[1].1).abs() <= dantesync::date_offset::ABSORB_TOLERANCE_NS,
+        "{landings:?}"
+    );
+    let t: Vec<f64> = landings.iter().map(|l| l.2).collect();
+    let spread =
+        t.iter().cloned().fold(f64::MIN, f64::max) - t.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(spread < 100_000.0, "landed across {spread} ns");
 }
 
 /// The UTC-vs-fleet error accrued over `seconds` at `ppm`, ns.

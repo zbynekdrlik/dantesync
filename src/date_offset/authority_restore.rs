@@ -106,3 +106,14 @@ impl DateAuthority {
         Ok(self.announce())
     }
 }
+
+impl DateFollower {
+    /// dantesync#126 — the restarted master aligns its own scheduler with the session it restored
+    /// BEFORE it takes the session's announce, when that announce is still ahead (a saved step or
+    /// slew whose instant has not come): an unaligned follower ignores a change still ahead, so the
+    /// master would never schedule it — nor, staying unaligned, any later one — on its own wall.
+    /// `seq` is the seq in effect before that change. No-op once aligned (review round 1).
+    pub fn align_with_session(&mut self, seq: u32) {
+        let _ = seq; // RED stub (#126 review round 1)
+    }
+}

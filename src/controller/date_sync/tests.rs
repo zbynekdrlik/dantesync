@@ -497,10 +497,17 @@ fn a_follower_holds_the_fleet_date_through_a_silent_master_126() {
     }
     assert_eq!(c.date_sync.core.anchor_ns(), Some(d), "D did not move");
     c.update_shared_status();
+    {
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(st.date_authority, "holding");
+        assert_eq!(st.date_offset_seq, Some(3));
+    }
+    // Its own PTP offline: it takes its local NTP path, which no hold covers — not "holding".
+    c.ptp_offline = true;
+    c.update_shared_status();
     let st = c.get_status_shared();
-    let st = st.read().expect("status");
-    assert_eq!(st.date_authority, "holding");
-    assert_eq!(st.date_offset_seq, Some(3));
+    assert_ne!(st.read().expect("status").date_authority, "holding");
 }
 
 /// dantesync#126: the hold is bounded (`authority_hold_s`, 900 s by default). A master silent

@@ -59,8 +59,8 @@
 //! at its instant. `two_clock_bench/restart.rs` (see there).
 
 use dantesync::date_offset::{
-    same_time_base, slew_cap_ns, AuthorityState, CorrectionMode, DailyConfig, DateAnnounce,
-    DateAuthority, DateFollower, FollowAction, SlewSpec, StepKind, DEFAULT_SLEW_PPM,
+    same_time_base, slew_cap_ns, CorrectionMode, DailyConfig, DateAnnounce, DateAuthority,
+    DateFollower, DateOffsetState, FollowAction, SlewSpec, StepKind, DEFAULT_SLEW_PPM,
     DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
 };
 use dantesync::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
@@ -408,8 +408,8 @@ struct Bench<'s> {
     /// no authority, nothing published.
     master_down: bool,
     /// #126: the authority's saved state (written at the end of every window it runs, as the
-    /// controller writes it on every change) and the grandmaster of its anchor.
-    saved: Option<(AuthorityState, u8)>,
+    /// controller writes it on every change).
+    saved: Option<DateOffsetState>,
     restart_log: RestartLog,
 }
 
@@ -715,49 +715,13 @@ impl<'s> Bench<'s> {
         if self.master_down {
             return;
         }
+        if self.authority.is_none() {
+            // The first window (and #126: the first lock after a restart).
+            self.master_builds_authority();
+        }
         let grace = self.sc.grace;
         let offline = self.sc.master_offline_at(w);
         let m = &mut self.boxes[0];
-        let anchor = m.core.anchor_ns().unwrap();
-        let now_ptp = m.wall_ns() - anchor;
-        if self.authority.is_none() {
-            // #126: a restarted master restores its saved authority when it validates.
-            let restored = match (self.sc.master_restart, self.saved) {
-                (Some(r), Some(saved)) if r.restore => {
-                    master_restores_authority(m, saved, self.sc.slew_ppm, self.sc.correction)
-                }
-                _ => None,
-            };
-            let a = match restored {
-                Some(a) => {
-                    self.restart_log.restored = true;
-                    // Aligned with it like the controller (the action is left to the re-join).
-                    let _ = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
-                    a
-                }
-                None => {
-                    let a = DateAuthority::new(
-                        anchor,
-                        now_ptp,
-                        DEFAULT_STEP_BOUND_NS,
-                        MIN_STEP_LEAD_NS,
-                    )
-                    .with_slew_ppm(self.sc.slew_ppm)
-                    .with_correction(self.sc.correction);
-                    let act = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
-                    assert_eq!(
-                        act,
-                        FollowAction::None,
-                        "the authority is aligned with itself"
-                    );
-                    a
-                }
-            };
-            if self.restart_log.seq_before.is_some() {
-                self.restart_log.seq_after.get_or_insert(a.seq());
-            }
-            self.authority = Some(a);
-        }
         let a = self.authority.as_mut().unwrap();
         if let Some((old_ns, new_ns)) = window.rebase {
             // The master's re-anchor on a new time base rebases the fleet offset (no step).
@@ -829,39 +793,17 @@ impl<'s> Bench<'s> {
                 }
             }
         }
-        // #126: a coordinated step on request (the master is on the fleet line: it schedules it).
-        if self.sc.step_requests_at.contains(&w) {
-            let d = m.d_in_effect();
-            let now_ptp = m.wall_ns() - d;
-            let fleet = a.in_effect_ns(now_ptp);
-            assert_eq!(d, fleet, "the master is on the fleet line for the request");
-            let ann = a
-                .step_now(now_ptp)
-                .expect("the master accepts the step on request");
-            self.restart_log.request_seqs.push(ann.seq);
-            Self::master_takes(
-                m,
-                (ann, true, fleet),
-                w,
-                &mut self.announced,
-                &mut self.announced_slews,
-                &mut self.corrections,
-                &mut self.correction_walls,
-            );
-            self.snapshot = Some(master_publishes(m, a)); // published at once
-        }
         // The 10 s `tick_status`, on its own timer: not in phase with the NTP cadence (here 6.5 s
         // after it, i.e. later than the 5 s announce lead).
         if w % 20 == 13 {
             self.snapshot = Some(master_publishes(m, a));
         }
-        // #126: the controller saves the authority's state on every change (here: every window).
-        if !m.core.rebase_pending() {
-            self.saved = Some((a.persisted(m.wall_ns() - m.d_in_effect()), m.core_gm));
-        }
         if w > self.sc.settle_windows && !self.sc.settling_after_a_utc_jump(w) {
             self.max_utc = self.max_utc.max((self.utc.ns - m.wall_ns()).abs());
         }
+        // #126: a coordinated step on request, and the saved state.
+        self.master_step_on_request(w);
+        self.master_saves();
     }
 
     /// The master's glue for an announce its authority made: recorded, and scheduled by its own

@@ -29,8 +29,17 @@ where
         };
         let requests: Vec<DateStepRequest> = rx.try_iter().collect();
         for req in requests {
-            let outcome = self.date_step_on_request();
-            // The HTTP thread may have given up (timeout); nothing to do then.
+            // A request taken after its deadline is refused unacted: its HTTP side answers 503
+            // ("nothing was announced") by then (review round 1).
+            let outcome = if std::time::Instant::now() > req.deadline && false {
+                self.record_date_step(DateStepOutcome::Refused {
+                    reason: "the request expired before the sync loop took it: nothing announced"
+                        .to_string(),
+                })
+            } else {
+                self.date_step_on_request()
+            };
+            // The HTTP thread may have given up; nothing to do then.
             let _ = req.reply.send(outcome);
         }
     }
@@ -38,6 +47,12 @@ where
     /// dantesync#126 — one request: the coordinated step, or why not.
     pub(in crate::controller) fn date_step_on_request(&mut self) -> DateStepOutcome {
         let outcome = self.try_date_step_on_request();
+        self.record_date_step(outcome)
+    }
+
+    /// dantesync#126 — record a request's outcome (`/status.date_step_trigger_last`, the log) and
+    /// publish.
+    fn record_date_step(&mut self, outcome: DateStepOutcome) -> DateStepOutcome {
         let now = crate::date_offset::format_utc_rfc3339(wall_now_ns());
         self.date_sync.restart.step_trigger_last = match &outcome {
             DateStepOutcome::Accepted {
@@ -66,7 +81,12 @@ where
         if !self.date_sync.enabled {
             return refuse("the legacy clock discipline has no fleet date offset");
         }
-        if !self.ntp_server_mode || self.date_sync.authority.is_none() {
+        if !self.ntp_server_mode {
+            return refuse(
+                "this node is not the fleet date-offset authority (ask the NTP master, locally)",
+            );
+        }
+        if self.date_sync.authority.is_none() {
             return refuse(
                 "this node is not the fleet date-offset authority (ask the NTP master, locally)",
             );

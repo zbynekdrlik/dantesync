@@ -710,9 +710,12 @@ fn run_sync_loop(
 
     // dantesync#126: the NTP master reads the fleet date offset it saved before this restart.
     // A readable saved state skips the boot step below (the date is restored at the first PTP
-    // lock, so this restart does not move the fleet date); without one it runs as before.
+    // lock, so this restart does not move the fleet date); without one it runs as before. Any other
+    // node removes one left from an earlier stint as the master (another session by now).
     if ntp_server_config.enabled && controller.phase_lock_enabled() {
         controller.load_date_state(std::path::PathBuf::from(DATE_STATE_PATH));
+    } else {
+        controller.remove_stale_date_state(std::path::Path::new(DATE_STATE_PATH));
     }
 
     if !args.skip_ntp {
@@ -758,7 +761,9 @@ fn run_sync_loop(
                     "[NTP-Server] Failed to start: {} (continuing with PTP-only mode)",
                     e
                 );
-                // Continue without NTP server - PTP sync still works
+                // Continue without NTP server - PTP sync still works. dantesync#126: not the
+                // master, so a saved date offset is not restored and the skipped boot step runs.
+                controller.abandon_date_state();
             }
         }
     }

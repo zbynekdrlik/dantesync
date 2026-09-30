@@ -22,13 +22,15 @@
 //! because a restored authority routes every NTP reading through `on_utc_error` like any other.
 //!
 //! Saving ([`PtpController::save_date_state_if_changed`]) runs on the master's loop: the record
-//! (`DateAuthority::persisted` + the anchor's grandmaster) is written by temp + rename only when it
-//! changed; a write error is logged, retried after a backoff, and never fatal.
+//! (`DateAuthority::persisted` + the anchor's grandmaster) is written by temp + rename when it
+//! changed and at least every 10 minutes (a record over a day old is not restored); a write error
+//! is logged, retried after a backoff, and never fatal. A node that starts as a non-master removes
+//! a leftover record ([`PtpController::remove_stale_date_state`]).
 
 use super::restart_file;
 use super::*;
 use crate::date_offset::{AuthorityState, DateOffsetState, RestoreRejected};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A saved state still waiting for the first PTP lock after this long is given up: the boot step
 /// runs and the master takes its NTP path, as before 1.15 (a master whose PTP never comes must
@@ -38,6 +40,11 @@ pub(super) const RESTORE_WAIT_FOR_PTP: Duration = Duration::from_secs(300);
 
 /// After a failed save, the next attempt waits this long (the loop runs every 1 ms / 50 µs).
 const SAVE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The saved state is rewritten at least this often, unchanged or not, so its `written_wall_ns`
+/// says the master was running then (the restore refuses a record over a day old — review round
+/// 1) and a deleted file comes back.
+const SAVE_HEARTBEAT: Duration = Duration::from_secs(600);
 
 /// dantesync#126 — the restart state of one controller: the master's saved date offset, and a
 /// follower's hold through its master's silence (`hold.rs`) and the step on request
@@ -57,8 +64,10 @@ pub(in crate::controller) struct RestartState {
     pub(in crate::controller) boot_step_due: bool,
     /// How far off the saved `D` the first window may read the wall and still restore it (ns).
     pub(in crate::controller) cap_ns: i64,
-    /// The record last written (or read at start): written again only when it changes.
+    /// The record last written (or read at start): written again when it changes, or after
+    /// [`SAVE_HEARTBEAT`] since `last_saved_at`.
     pub(in crate::controller) last_saved: Option<(AuthorityState, [u8; 6])>,
+    pub(in crate::controller) last_saved_at: Option<Instant>,
     /// The last failed save (the retry is rate-bounded, the warning logged once per streak).
     pub(in crate::controller) save_failed_at: Option<Instant>,
     /// A follower's hold through a silent master (`system.date_offset.authority_hold_s`).
@@ -82,6 +91,7 @@ impl RestartState {
             boot_step_due: false,
             cap_ns: config.date_offset.restore_cap_ns(),
             last_saved: None,
+            last_saved_at: None,
             save_failed_at: None,
             hold: config.date_offset.authority_hold(),
             holding_since: None,
@@ -98,6 +108,10 @@ fn describe_rejection(r: RestoreRejected) -> String {
             "it belongs to grandmaster {}, this lock is on {}",
             format_mac(&saved),
             format_mac(&now)
+        ),
+        RestoreRejected::Stale { age_ns } => format!(
+            "it is {} h old (the fleet may have had another master since)",
+            age_ns / 3_600_000_000_000
         ),
         RestoreRejected::TimeBase { off_ns, cap_ns } => format!(
             "the first PTP window reads the wall {:+.3} ms off the saved D, beyond the {} ms cap \
@@ -159,11 +173,35 @@ where
         self.date_sync.restart.pending_restore.is_some()
     }
 
-    /// dantesync#126 — every loop iteration on the master, before anything needs an anchor: give
-    /// up a saved state that has waited too long for PTP, and run a deferred boot step.
+    /// dantesync#126 — is the boot step of `offset_us` skipped for the saved state? A wall more
+    /// than twice the restore cap off UTC cannot be on the fleet line (the authority keeps the line
+    /// within the cap of UTC), so that state could never be restored: it is dropped at once and the
+    /// boot step runs at start, instead of the master serving a wall seconds off UTC until its first
+    /// lock rejects it (review round 1).
+    pub(in crate::controller) fn skip_boot_step_for(&mut self, offset_us: i64) -> bool {
+        let _ = offset_us;
+        self.boot_step_deferred() // RED stub (#126 review round 1): no cap check
+    }
+
+    /// dantesync#126 — this node is not the fleet's master after all (`main`: its NTP server did
+    /// not start): the saved state it read is not restored, and the boot step it skipped runs now.
+    /// Without this it would never step to UTC (review round 1).
+    pub fn abandon_date_state(&mut self) {
+        // RED stub (#126 review round 1)
+    }
+
+    /// dantesync#126 — a node that starts as a NON-master removes a saved date offset left from an
+    /// earlier stint as the master: by the time it is the master again, the fleet's session is
+    /// another one (review round 1). A missing file is the normal case.
+    pub fn remove_stale_date_state(&mut self, path: &Path) {
+        let _ = path; // RED stub (#126 review round 1)
+    }
+
+    /// dantesync#126 — every loop iteration, before anything needs an anchor: give up a saved state
+    /// that has waited too long for PTP, and run a deferred boot step.
     pub(super) fn service_date_restart(&mut self) {
         if !self.ntp_server_mode {
-            return;
+            return; // RED stub (#126 review round 1): the give-up only in server mode
         }
         let rs = &mut self.date_sync.restart;
         if rs.pending_restore.is_some() && rs.loaded_at.elapsed() >= RESTORE_WAIT_FOR_PTP {
@@ -204,29 +242,19 @@ where
             -(measurement.offset.as_micros() as i64)
         };
         self.record_ntp_success(offset_us, &measurement);
-        if measurement.offset.as_millis() <= 50 {
-            info!(
-                "[DATE] deferred boot step: offset {:+}us is small, no step",
-                offset_us
-            );
-            return;
-        }
         warn!(
-            "[DATE] deferred boot step {:+}us (Stepping clock (NTP)): the saved fleet date offset \
-             was not restored",
+            "[DATE] the boot step runs now (NTP offset {:+}us): the saved fleet date offset was \
+             not restored",
             offset_us
         );
-        match self.clock.step_clock(measurement.offset, measurement.sign) {
-            Ok(()) => {
-                self.date_sync
-                    .core
-                    .note_step(offset_us.saturating_mul(1_000));
-                self.reset_ptp_measurement_after_step();
-                self.ntp_offset_samples.clear();
-                self.ntp_pending_step = None;
-                self.publish_post_step_residual(0);
-            }
-            Err(e) => error!("[DATE] deferred boot step failed: {}", e),
+        if self.step_boot_offset(measurement.offset, measurement.sign) {
+            // D moves with the wall, exactly: the phase lock sees no disturbance.
+            let sign = if measurement.sign > 0 { 1 } else { -1 };
+            let delta_ns = (measurement.offset.as_nanos() as i64).saturating_mul(sign);
+            self.date_sync.core.note_step(delta_ns);
+            self.reset_ptp_measurement_after_step();
+            self.ntp_offset_samples.clear();
+            self.ntp_pending_step = None;
         }
     }
 
@@ -268,6 +296,18 @@ where
         .with_correction(self.date_sync.correction)
         .with_daily_last_step(saved.authority.daily_last_step);
         let base = self.date_sync.core.anchor_ns().unwrap_or(anchor);
+        // A saved step or slew still ahead is scheduled on this master's own wall only once its
+        // scheduler is aligned with the session (review round 1): else it — and every later
+        // change — would reach this master as a late re-join.
+        let ahead = authority.pending_step_ns(now_ptp).is_some()
+            || authority
+                .slew_in_progress(now_ptp)
+                .is_some_and(|sl| sl.start_ptp_ns > now_ptp);
+        if ahead {
+            self.date_sync
+                .follower
+                .align_with_session(authority.seq().wrapping_sub(1));
+        }
         let act = self
             .date_sync
             .follower
@@ -315,7 +355,11 @@ where
         };
         let now_ptp = now_wall.wrapping_sub(own);
         let state = a.persisted(now_ptp);
-        if ds.restart.last_saved == Some((state, gm)) {
+        let recent = ds
+            .restart
+            .last_saved_at
+            .is_some_and(|t| t.elapsed() < SAVE_HEARTBEAT);
+        if ds.restart.last_saved == Some((state, gm)) && (recent || true) {
             return;
         }
         if ds
@@ -341,6 +385,7 @@ where
                     info!("[DATE] the fleet date offset is saved again");
                 }
                 self.date_sync.restart.last_saved = Some((state, gm));
+                self.date_sync.restart.last_saved_at = Some(Instant::now());
             }
             Err(e) => {
                 if self.date_sync.restart.save_failed_at.is_none() {

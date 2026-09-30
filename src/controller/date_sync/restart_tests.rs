@@ -370,3 +370,151 @@ fn the_master_saves_its_date_offset_when_it_changes_and_a_save_error_is_not_fata
     c.service_date_offset();
     assert_eq!(status(&c).date_offset_seq, Some(3), "the master runs on");
 }
+
+/// A master built like [`started`] but whose NTP server did not start (no server mode).
+fn started_without_server(mut clock: MockSystemClock, ntp: MockNtpSource, path: &Path) -> Ctl {
+    clock.expect_adjust_frequency().returning(|_| Ok(()));
+    let mut c = PtpController::new(
+        clock,
+        MockPtpNetwork::new(),
+        ntp,
+        Arc::new(RwLock::new(SyncStatus::default())),
+        restart_config(),
+    );
+    c.load_date_state(path.to_path_buf());
+    c.run_ntp_sync(false);
+    c
+}
+
+fn boot_step_clock(times: usize, us: u64, sign: i8) -> MockSystemClock {
+    let mut clock = MockSystemClock::new();
+    clock
+        .expect_step_clock()
+        .times(times)
+        .withf(move |dur, sg| *dur == Duration::from_micros(us) && *sg == sign)
+        .returning(|_, _| Ok(()));
+    clock
+}
+
+#[test]
+fn a_master_whose_ntp_server_does_not_start_takes_the_boot_step_it_skipped_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    restart_file::write_atomic(&path, &saved_state(PL_GM, d, 4)).expect("written");
+    // `main` abandons the saved state when the NTP server fails to bind.
+    let clock = boot_step_clock(1, BOOT_ERROR_US as u64, 1);
+    let mut c = started_without_server(clock, ntp_at(BOOT_ERROR_US), &path);
+    assert!(c.boot_step_deferred());
+    c.abandon_date_state();
+    assert!(!c.boot_step_deferred(), "not restored");
+    c.abandon_date_state(); // idempotent: no second step
+                            // And the give-up after the wait runs without server mode too.
+    let clock = boot_step_clock(1, BOOT_ERROR_US as u64, 1);
+    let mut c = started_without_server(clock, ntp_at(BOOT_ERROR_US), &path);
+    c.date_sync.restart.loaded_at =
+        Instant::now() - restart::RESTORE_WAIT_FOR_PTP - Duration::from_secs(1);
+    c.service_date_offset();
+    assert!(!c.boot_step_deferred());
+    ntp_cycles(&mut c); // no longer report-only: the ordinary path runs (nothing to step here)
+}
+
+#[test]
+fn a_boot_offset_beyond_twice_the_restore_cap_takes_the_boot_step_at_start_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    restart_file::write_atomic(&path, &saved_state(PL_GM, d, 4)).expect("written");
+    // A wall 11 s off UTC (a stale RTC) cannot be on a fleet line kept within 5 s of UTC.
+    let clock = boot_step_clock(1, 11_000_000, 1);
+    let c = started(clock, ntp_at(11_000_000), &path);
+    assert!(
+        !c.boot_step_deferred(),
+        "the saved state is dropped at start"
+    );
+    // Within twice the cap (6 s) it is still restored at the first lock.
+    let clock = boot_step_clock(0, 6_000_000, 1);
+    let c = started(clock, ntp_at(6_000_000), &path);
+    assert!(c.boot_step_deferred());
+}
+
+#[test]
+fn a_restore_inside_a_steps_lead_schedules_the_step_on_the_masters_own_wall_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    // Saved during a step's lead: seq 5 lands +250 ms 8 s from now.
+    let mut saved = saved_state(PL_GM, d, 5);
+    let now_ptp = wall_now_ns() - d;
+    saved.authority.pending = Some((d + 250 * MS, now_ptp + 8 * S));
+    restart_file::write_atomic(&path, &saved).expect("written");
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().times(0); // nothing now: at the instant, with the fleet
+    let mut m = started(clock, ntp_at(BOOT_ERROR_US), &path);
+    first_lock(&mut m, PL_GM, d);
+    m.service_date_offset();
+    let own = m
+        .date_sync
+        .follower
+        .pending()
+        .expect("the master scheduled the saved step on its own wall");
+    assert_eq!((own.seq, own.delta_ns), (5, 250 * MS));
+    let st = status(&m);
+    assert!(st.date_offset_restored);
+    assert_eq!(st.date_offset_seq, Some(5));
+    assert_eq!(st.date_step_pending_ns, Some(250 * MS));
+    assert_eq!(st.date_offset_ns, Some(d), "in effect only at the instant");
+}
+
+#[test]
+fn a_node_starting_as_a_follower_removes_a_leftover_saved_state_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    restart_file::write_atomic(&path, &saved_state(PL_GM, d, 4)).expect("written");
+    let (mut f, _) = anchored_controller_with(
+        MockSystemClock::new(),
+        MockNtpSource::new(),
+        false,
+        restart_config(),
+    );
+    f.remove_stale_date_state(&path);
+    assert!(
+        !path.exists(),
+        "another session's by the time it is the master again"
+    );
+    f.remove_stale_date_state(&path); // none: nothing to do
+}
+
+#[test]
+fn the_master_rewrites_its_saved_state_every_10_minutes_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let (mut c, _) = anchored_controller_with(
+        MockSystemClock::new(),
+        MockNtpSource::new(),
+        true,
+        restart_config(),
+    );
+    c.date_sync.restart.path = Some(path.clone());
+    c.service_date_offset();
+    let first = restart_file::read(&path)
+        .expect("readable")
+        .expect("written");
+    c.service_date_offset();
+    let again = restart_file::read(&path).expect("readable").expect("kept");
+    assert_eq!(
+        again.written_wall_ns, first.written_wall_ns,
+        "unchanged: not rewritten"
+    );
+    // Ten minutes later it is rewritten unchanged, with a fresh time (a record over a day old is
+    // not restored).
+    c.date_sync.restart.last_saved_at = Some(Instant::now() - Duration::from_secs(601));
+    std::thread::sleep(Duration::from_millis(2));
+    c.service_date_offset();
+    let later = restart_file::read(&path)
+        .expect("readable")
+        .expect("rewritten");
+    assert_eq!(later.authority, first.authority);
+    assert!(later.written_wall_ns > first.written_wall_ns);
+}

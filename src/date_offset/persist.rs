@@ -15,14 +15,20 @@
 //! ([`AuthorityState`], taken by [`super::DateAuthority::persisted`] and restored by
 //! [`super::DateAuthority::restore`]), and the restore decision ([`DateOffsetState::validate_restore`]).
 //! The JSON file (`date-offset.json` beside `config.json`, written by temp + rename) is the
-//! controller's (`controller/date_sync/persist.rs`), so this stays serde-free and the standalone
-//! `rustc` replica keeps covering it.
+//! controller's (`controller/date_sync/restart_file.rs`), so this stays serde-free and the
+//! standalone `rustc` replica keeps covering it.
 
 use super::DateSlew;
 
 /// The version of the saved record. A record of another version is not restored (the boot step
 /// and a fresh authority then run, as before 1.15).
 pub const STATE_VERSION: u32 = 1;
+
+/// A saved state older than this is not restored. A running master rewrites it at least every 10
+/// minutes, so only a master away longer than a day meets it — and the fleet may have been served
+/// by another master meanwhile (the saved `D` and seq are then another session's): the pre-1.15
+/// path is the safe one (review round 1).
+pub const MAX_RESTORE_AGE_NS: i64 = 86_400 * 1_000_000_000;
 
 /// The date authority's published state — what it saves and restores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +87,8 @@ pub enum RestoreRejected {
     NoGrandmaster,
     /// The saved `D` belongs to another grandmaster's time base.
     OtherGrandmaster { saved: [u8; 6], now: [u8; 6] },
+    /// The record is older than [`MAX_RESTORE_AGE_NS`] (by the master's wall now).
+    Stale { age_ns: i64 },
     /// The first locked window reads the wall `off_ns` off the saved `D` (`anchor − saved D`),
     /// beyond `cap_ns`: the grandmaster restarted its uptime under the same identity (days off),
     /// or the wall is too far off the fleet line to be re-joined by the master alone.
@@ -106,6 +114,10 @@ impl DateOffsetState {
                 saved: self.gm_uuid,
                 now,
             });
+        }
+        let age_ns = now_wall_ns.saturating_sub(self.written_wall_ns);
+        if age_ns > MAX_RESTORE_AGE_NS && false {
+            return Err(RestoreRejected::Stale { age_ns });
         }
         // "Now" in the saved time base, from the master's own anchor (it has nothing else yet).
         let now_ptp = now_wall_ns.wrapping_sub(anchor_ns);

@@ -49,6 +49,9 @@ fn wall_now_ns() -> i64 {
         .unwrap_or(0)
 }
 
+/// The boot NTP offset (ms) above which `run_ntp_sync` steps the wall to UTC.
+const BOOT_STEP_THRESHOLD_MS: u128 = 50;
+
 /// Format a 6-byte UUID/MAC as a readable string (e.g., "00:1D:C1:AB:CD:EF")
 fn format_mac(uuid: &[u8; 6]) -> String {
     format!(
@@ -1181,7 +1184,8 @@ where
                 };
                 self.record_ntp_success(offset_us, &measurement);
 
-                if offset.as_millis() > 50 && self.boot_step_deferred() {
+                if offset.as_millis() > BOOT_STEP_THRESHOLD_MS && self.skip_boot_step_for(offset_us)
+                {
                     // dantesync#126: the NTP master restores its saved fleet date offset at the
                     // first PTP lock instead — a restart must not move the fleet date.
                     info!(
@@ -1190,23 +1194,32 @@ where
                          error, coordinated, as if the master had not restarted)",
                         sign_str, offset
                     );
-                } else if offset.as_millis() > 50 {
-                    info!("Stepping clock (NTP)...");
-                    if let Err(e) = self.clock.step_clock(offset, sign) {
-                        error!("Failed to step clock: {}", e);
-                    } else {
-                        info!("Clock stepped successfully.");
-                        // The boot step is unbounded, so it cancels the WHOLE
-                        // measured offset — publish the residual, not the error
-                        // that no longer exists (#68).
-                        self.publish_post_step_residual(0);
-                    }
                 } else {
-                    info!("Offset small, skipping step.");
+                    self.step_boot_offset(offset, sign);
                 }
             }
             Err(e) => warn!("NTP Sync failed: {}", e),
         }
+    }
+
+    /// The boot step (`run_ntp_sync`, and dantesync#126's deferred one): step the wall by the WHOLE
+    /// measured offset when it is above [`BOOT_STEP_THRESHOLD_MS`] (unbounded: a cold start must
+    /// land on UTC). True when the wall was stepped.
+    pub(in crate::controller) fn step_boot_offset(&mut self, offset: Duration, sign: i8) -> bool {
+        if offset.as_millis() <= BOOT_STEP_THRESHOLD_MS {
+            info!("Offset small, skipping step.");
+            return false;
+        }
+        info!("Stepping clock (NTP)...");
+        if let Err(e) = self.clock.step_clock(offset, sign) {
+            error!("Failed to step clock: {}", e);
+            return false;
+        }
+        info!("Clock stepped successfully.");
+        // The boot step is unbounded, so it cancels the WHOLE measured offset — publish the
+        // residual, not the error that no longer exists (#68).
+        self.publish_post_step_residual(0);
+        true
     }
 
     /// Periodic NTP UTC alignment - steps clock to maintain UTC sync

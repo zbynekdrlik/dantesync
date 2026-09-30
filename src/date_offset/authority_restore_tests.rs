@@ -326,3 +326,41 @@ fn a_step_on_request_never_steps_the_fleet_back_126() {
     assert_eq!(l.a.seq(), 1, "nothing announced");
     assert_eq!(l.a.pending_step_ns(now), None);
 }
+
+#[test]
+fn a_restored_master_aligned_with_its_session_schedules_a_saved_step_still_ahead_126() {
+    // Saved inside a step's lead: seq 5 announces +250 ms at PTP0 + 8 s; seq 4 was in effect.
+    let saved = AuthorityState {
+        d_ns: 7 * S,
+        since_ptp_ns: PTP0 - 100 * S,
+        seq: 5,
+        pending: Some((7 * S + 250 * MS, PTP0 + 8 * S)),
+        slew: None,
+        micro: false,
+        daily_last_step: None,
+    };
+    let a = DateAuthority::restore(&saved, PTP0, 0, 0);
+    let wall = PTP0 + 7 * S;
+    // A fresh scheduler ignores a change still ahead: the master would never take it itself …
+    let mut unaligned = DateFollower::new();
+    assert_eq!(
+        unaligned.on_announce(a.announce(), 7 * S, wall),
+        FollowAction::None
+    );
+    assert_eq!(unaligned.pending(), None);
+    // … aligned with its session first, it schedules it for the instant, like every box.
+    let mut own = DateFollower::new();
+    own.align_with_session(a.seq().wrapping_sub(1));
+    assert_eq!(
+        own.on_announce(a.announce(), 7 * S, wall),
+        FollowAction::Scheduled {
+            delta_ns: 250 * MS,
+            effective_wall_ns: PTP0 + 8 * S + 7 * S
+        }
+    );
+    assert_eq!(own.due(PTP0 + 8 * S + 7 * S).map(|d| d.seq), Some(5));
+    assert_eq!(own.adopted_seq(), Some(5));
+    // Once aligned it is a no-op.
+    own.align_with_session(1);
+    assert_eq!(own.adopted_seq(), Some(5));
+}

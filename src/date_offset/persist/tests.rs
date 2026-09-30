@@ -24,8 +24,9 @@ fn state(pending: Option<(i64, i64)>) -> DateOffsetState {
             daily_last_step: Some((D + 4 * 86_400 * S, 1_520 * MS)),
         },
         gm_uuid: GM,
-        written_wall_ns: D + 4 * 86_400 * S,
-        written_ptp_ns: 4 * 86_400 * S,
+        // A minute before the probes' "now" (PTP time 5 days).
+        written_wall_ns: D + 5 * 86_400 * S - 60 * S,
+        written_ptp_ns: 5 * 86_400 * S - 60 * S,
     }
 }
 
@@ -110,4 +111,29 @@ fn a_time_base_off_beyond_the_cap_is_never_restored_126() {
         st.validate_restore(Some(GM), anchor, wall, CAP),
         Err(RestoreRejected::TimeBase { .. })
     ));
+}
+
+#[test]
+fn a_saved_state_older_than_a_day_is_not_restored_126() {
+    let st = state(None);
+    let ptp = 5 * 86_400 * S;
+    let (wall, anchor) = first_window(ptp, 0);
+    assert_eq!(st.validate_restore(Some(GM), anchor, wall, CAP), Ok(0));
+    // The same wall line a day and a second after the record was written.
+    let later = 86_400 * S + S;
+    let (wall, anchor) = first_window(ptp - 60 * S + later, 0);
+    assert_eq!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Err(RestoreRejected::Stale { age_ns: later })
+    );
+    // Exactly a day old still restores; a record "from the future" (the wall behind the one that
+    // wrote it, a reboot's RTC) is judged by the time base alone.
+    let (wall, anchor) = first_window(ptp - 60 * S + 86_400 * S, 0);
+    assert!(st.validate_restore(Some(GM), anchor, wall, CAP).is_ok());
+    let (wall, anchor) = first_window(ptp - 90 * S, -3 * S);
+    assert!(
+        wall < st.written_wall_ns,
+        "a wall behind the one that wrote the record"
+    );
+    assert_eq!(st.validate_restore(Some(GM), anchor, wall, CAP), Ok(-3 * S));
 }

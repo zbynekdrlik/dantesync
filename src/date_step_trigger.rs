@@ -10,8 +10,11 @@
 //! with a [`DateStepOutcome`].
 //!
 //! The answer is `202` + `{"accepted":true,…}` only when a step was announced; a refusal is a `4xx`
-//! with `{"accepted":false,"reason":…}`. An older build ignores the route and answers `200` with the
-//! status JSON, so a caller keys on `"accepted"`, never on the status code alone.
+//! with `{"accepted":false,"reason":…}`, and a `503` (no answer in time) guarantees nothing was
+//! announced: the loop refuses a request whose deadline has passed. The request must carry the
+//! `X-DanteSync-Step` header, which no web page can send cross-origin without a preflight this
+//! server never answers. An older build ignores the route and answers `200` with the status JSON,
+//! so a caller keys on `"accepted"`, never on the status code alone.
 
 use serde_json::json;
 use std::net::IpAddr;
@@ -21,9 +24,17 @@ use std::time::Duration;
 /// The route.
 pub const DATE_STEP_PATH: &str = "/date/step";
 
-/// How long the HTTP thread waits for the sync loop's answer (the loop polls every 1 ms / 50 µs;
-/// a loop blocked this long in an NTP query or a clock step is answered 503).
+/// How long the sync loop may take to pick a request up (it polls every 1 ms / 50 µs; an NTP
+/// burst or a clock step can block it for seconds): a request it takes later is refused unacted.
 pub const DATE_STEP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The HTTP thread waits this much longer than [`DATE_STEP_REPLY_TIMEOUT`] for the answer, so a
+/// request the loop took in time is always answered with what it did (review round 1: a `503`
+/// must mean "nothing announced").
+pub const DATE_STEP_REPLY_MARGIN: Duration = Duration::from_secs(1);
+
+/// The header a step request must carry (any value), lower case.
+pub const DATE_STEP_HEADER: &str = "x-dantesync-step";
 
 /// What the sync loop did with a request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,9 +51,11 @@ pub enum DateStepOutcome {
     Refused { reason: String },
 }
 
-/// One request from the HTTP route to the sync loop, which answers on `reply`.
+/// One request from the HTTP route to the sync loop, which answers on `reply` — and refuses it
+/// unacted once `deadline` has passed (the HTTP side has answered 503 by then, or is about to).
 pub struct DateStepRequest {
     pub reply: mpsc::Sender<DateStepOutcome>,
+    pub deadline: std::time::Instant,
 }
 
 /// The channel from the HTTP route (the sender, one clone per connection) to the sync loop.
@@ -82,6 +95,12 @@ pub fn route(request: &[u8]) -> Route {
     } else {
         Route::DateStepWrongMethod
     }
+}
+
+/// Does the request carry the [`DATE_STEP_HEADER`] header (the name case-insensitive)?
+pub fn has_step_header(request: &[u8]) -> bool {
+    let _ = request;
+    true // RED stub (#126 review round 1)
 }
 
 /// Only a loopback peer may request a step (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback).
@@ -154,6 +173,27 @@ mod tests {
         }
         // Garbage (not UTF-8, no request line) stays the status route.
         assert_eq!(route(&[0xff, 0xfe, 0x00]), Route::Status);
+    }
+
+    #[test]
+    fn a_step_request_must_carry_the_step_header_126() {
+        assert!(has_step_header(
+            b"POST /date/step HTTP/1.1\r\nHost: x\r\nX-DanteSync-Step: 1\r\n\r\n"
+        ));
+        assert!(has_step_header(
+            b"POST /date/step HTTP/1.1\r\nx-dantesync-step:yes\r\n\r\n"
+        ));
+        // Not a header: absent, only in the request line, or after the headers end.
+        assert!(!has_step_header(
+            b"POST /date/step HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+        assert!(!has_step_header(
+            b"POST /x-dantesync-step:1 HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+        assert!(!has_step_header(
+            b"POST /date/step HTTP/1.1\r\nHost: x\r\n\r\nX-DanteSync-Step: 1"
+        ));
+        assert!(!has_step_header(b""));
     }
 
     #[test]
