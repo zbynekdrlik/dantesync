@@ -130,6 +130,18 @@ where
     N: PtpNetwork,
     S: NtpSource,
 {
+    /// dantesync#126 — `main`'s one call, before `run_ntp_sync`: a node that will serve NTP under
+    /// the phase lock (the master) reads its saved fleet date offset ([`Self::load_date_state`]);
+    /// any other node removes one left from an earlier stint as the master (another session by
+    /// now, [`Self::remove_stale_date_state`]).
+    pub fn open_date_state(&mut self, path: &Path, ntp_server_enabled: bool) {
+        if ntp_server_enabled && self.date_sync.enabled {
+            self.load_date_state(path.to_path_buf());
+        } else {
+            self.remove_stale_date_state(path);
+        }
+    }
+
     /// dantesync#126 — the NTP master reads the fleet date offset it saved before this restart
     /// (`main`, before `run_ntp_sync`), and saves it at `path` from now on. A readable state
     /// skips the boot step and is restored at the first PTP lock; without one nothing changes.

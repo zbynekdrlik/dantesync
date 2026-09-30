@@ -467,6 +467,39 @@ fn a_restore_inside_a_steps_lead_schedules_the_step_on_the_masters_own_wall_126(
 }
 
 #[test]
+fn main_opens_the_saved_state_only_on_the_phase_locked_ntp_master_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    restart_file::write_atomic(&path, &saved_state(PL_GM, d, 4)).expect("written");
+    let built = || {
+        let mut clock = MockSystemClock::new();
+        clock.expect_adjust_frequency().returning(|_| Ok(()));
+        PtpController::new(
+            clock,
+            MockPtpNetwork::new(),
+            MockNtpSource::new(),
+            Arc::new(RwLock::new(SyncStatus::default())),
+            restart_config(),
+        )
+    };
+    let mut m: Ctl = built();
+    m.open_date_state(&path, true);
+    assert!(
+        m.boot_step_deferred(),
+        "the master reads it: its boot step waits"
+    );
+    assert!(path.exists(), "and keeps it");
+    let mut f: Ctl = built();
+    f.open_date_state(&path, false);
+    assert!(
+        !f.boot_step_deferred(),
+        "not the master: nothing to restore"
+    );
+    assert!(!path.exists(), "a node without the NTP server removes it");
+}
+
+#[test]
 fn a_node_starting_as_a_follower_removes_a_leftover_saved_state_126() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("date-offset.json");

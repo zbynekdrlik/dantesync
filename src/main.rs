@@ -708,15 +708,12 @@ fn run_sync_loop(
         PtpController::new(sys_clock, network, ntp_source, status_shared, system_config);
     controller.set_date_step_requests(date_step_rx);
 
-    // dantesync#126: the NTP master reads the fleet date offset it saved before this restart.
-    // A readable saved state skips the boot step below (the date is restored at the first PTP
-    // lock, so this restart does not move the fleet date); without one it runs as before. Any other
-    // node removes one left from an earlier stint as the master (another session by now).
-    if ntp_server_config.enabled && controller.phase_lock_enabled() {
-        controller.load_date_state(std::path::PathBuf::from(DATE_STATE_PATH));
-    } else {
-        controller.remove_stale_date_state(std::path::Path::new(DATE_STATE_PATH));
-    }
+    // dantesync#126: the NTP master's saved fleet date offset skips the boot step below (restored
+    // at the first PTP lock); any other node removes a leftover one.
+    controller.open_date_state(
+        std::path::Path::new(DATE_STATE_PATH),
+        ntp_server_config.enabled,
+    );
 
     if !args.skip_ntp {
         info!("Using NTP Server: {}", ntp_server);
