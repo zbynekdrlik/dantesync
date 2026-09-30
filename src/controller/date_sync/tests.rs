@@ -464,8 +464,50 @@ fn nothing_is_published_or_adopted_while_a_re_anchor_is_pending_88() {
     assert!(!f.date_sync.follower.adopted());
 }
 
+/// dantesync#126 (design issuecomment-5905806391, (c)): this replaces
+/// `a_follower_that_loses_the_authority_returns_to_the_local_ntp_path_88`. A silent master (a
+/// restart) no longer sends its followers back to their own NTP steps after 30 s — each of them
+/// stepped +247 ms at its own instant on 30.9.2026. A follower that has adopted `D` HOLDS it: `D`
+/// and seq kept, its NTP readings report-only, `/status` says "holding".
 #[test]
-fn a_follower_that_loses_the_authority_returns_to_the_local_ntp_path_88() {
+fn a_follower_holds_the_fleet_date_through_a_silent_master_126() {
+    let mut ntp = MockNtpSource::new();
+    ntp.expect_get_offset()
+        .returning(|| Ok(one_offset(5_000, 1)));
+    let mut clock = MockSystemClock::new();
+    // A real 5 ms NTP error (the restarted master's wall) is NOT stepped while holding.
+    clock.expect_step_clock().times(0);
+    let (mut c, d) = anchored_controller(clock, ntp, false);
+    let slot = with_authority(&mut c);
+    *slot.lock().unwrap() = Some(authority_reply(1, PL_GM, d, 1_000_000_000, 3));
+    c.service_date_offset();
+    assert!(c.date_sync.follower.adopted());
+    // The master goes silent for longer than the 30 s loss window.
+    c.date_sync.last_applicable_reply =
+        Some(Instant::now() - AUTHORITY_LOSS - Duration::from_secs(1));
+    c.service_date_offset();
+    assert!(
+        c.date_sync.follower.adopted(),
+        "the adopted D is held through the master's silence"
+    );
+    assert_eq!(c.date_sync.follower.adopted_seq(), Some(3), "the seq too");
+    for _ in 0..2 {
+        c.last_ntp_check = Instant::now() - Duration::from_secs(120);
+        c.check_ntp_utc_tracking();
+    }
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d), "D did not move");
+    c.update_shared_status();
+    let st = c.get_status_shared();
+    let st = st.read().expect("status");
+    assert_eq!(st.date_authority, "holding");
+    assert_eq!(st.date_offset_seq, Some(3));
+}
+
+/// dantesync#126: the hold is bounded (`authority_hold_s`, 900 s by default). A master silent
+/// longer than the loss window plus the hold is forgotten, and the follower takes its local NTP
+/// date path again (the 1.14 fallback, pinned by the test this one replaces).
+#[test]
+fn a_follower_falls_back_to_the_local_ntp_path_after_the_bounded_hold_126() {
     let mut ntp = MockNtpSource::new();
     ntp.expect_get_offset()
         .returning(|| Ok(one_offset(5_000, 1)));
@@ -477,13 +519,13 @@ fn a_follower_that_loses_the_authority_returns_to_the_local_ntp_path_88() {
     *slot.lock().unwrap() = Some(authority_reply(1, PL_GM, d, 1_000_000_000, 3));
     c.service_date_offset();
     assert!(c.date_sync.follower.adopted());
-    // The master goes silent for longer than the loss window.
+    // Silent past the loss window AND the default 900 s hold.
     c.date_sync.last_applicable_reply =
-        Some(Instant::now() - AUTHORITY_LOSS - Duration::from_secs(1));
+        Some(Instant::now() - AUTHORITY_LOSS - Duration::from_secs(900 + 1));
     c.service_date_offset();
     assert!(
         !c.date_sync.follower.adopted(),
-        "no longer following a silent master"
+        "no longer following a master silent past the hold"
     );
     for _ in 0..2 {
         c.last_ntp_check = Instant::now() - Duration::from_secs(120);
