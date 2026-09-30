@@ -261,6 +261,26 @@ where
         self.run_deferred_boot_step();
     }
 
+    /// The boot step (`run_ntp_sync`, and the deferred one below): step the wall by the WHOLE
+    /// measured offset when it is above `BOOT_STEP_THRESHOLD_MS` (unbounded: a cold start must
+    /// land on UTC). True when the wall was stepped.
+    pub(in crate::controller) fn step_boot_offset(&mut self, offset: Duration, sign: i8) -> bool {
+        if offset.as_millis() <= BOOT_STEP_THRESHOLD_MS {
+            info!("Offset small, skipping step.");
+            return false;
+        }
+        info!("Stepping clock (NTP)...");
+        if let Err(e) = self.clock.step_clock(offset, sign) {
+            error!("Failed to step clock: {}", e);
+            return false;
+        }
+        info!("Clock stepped successfully.");
+        // The boot step is unbounded, so it cancels the WHOLE measured offset — publish the
+        // residual, not the error that no longer exists (#68).
+        self.publish_post_step_residual(0);
+        true
+    }
+
     /// dantesync#126 — the boot step a rejected (or abandoned) saved state deferred: the start-up
     /// `run_ntp_sync` path, taken now from the loop. `D` moves with the wall (the phase lock sees
     /// no disturbance), and the new authority is built on the stepped anchor.

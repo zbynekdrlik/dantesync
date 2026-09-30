@@ -1202,26 +1202,6 @@ where
         }
     }
 
-    /// The boot step (`run_ntp_sync`, and dantesync#126's deferred one): step the wall by the WHOLE
-    /// measured offset when it is above [`BOOT_STEP_THRESHOLD_MS`] (unbounded: a cold start must
-    /// land on UTC). True when the wall was stepped.
-    pub(in crate::controller) fn step_boot_offset(&mut self, offset: Duration, sign: i8) -> bool {
-        if offset.as_millis() <= BOOT_STEP_THRESHOLD_MS {
-            info!("Offset small, skipping step.");
-            return false;
-        }
-        info!("Stepping clock (NTP)...");
-        if let Err(e) = self.clock.step_clock(offset, sign) {
-            error!("Failed to step clock: {}", e);
-            return false;
-        }
-        info!("Clock stepped successfully.");
-        // The boot step is unbounded, so it cancels the WHOLE measured offset — publish the
-        // residual, not the error that no longer exists (#68).
-        self.publish_post_step_residual(0);
-        true
-    }
-
     /// Periodic NTP UTC alignment - steps clock to maintain UTC sync
     ///
     /// This keeps all computers aligned to real UTC time by:
