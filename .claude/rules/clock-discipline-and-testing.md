@@ -1094,6 +1094,26 @@ next NTP samples. What was learned building the fix:
   (3 s, then 503); the loop answers every queued request each iteration, refused or not. Loopback
   only: the server binds 0.0.0.0. `202` only when announced; a pre-1.15 build answers 200 with
   the status JSON, so callers key on `"accepted"`.
+- **Review round 1 (fresh context, 0 🔴 7 🟡 9 🔵), each a test now:**
+  - *A restore inside a step's lead must align the master's own scheduler with the session first*
+    (`DateFollower::align_with_session`): a fresh follower ignores a change still ahead, so the
+    master never took the saved step — nor, staying unaligned, any later one — except as a late
+    re-join. The bench's lead case lands it on every box within 43 µs (the master's step carries
+    its own re-join, within the absorb tolerance).
+  - *A master whose NTP server does not start* (`main`) drops the saved state and takes the boot
+    step (`abandon_date_state`); the 300 s give-up runs without server mode too. Otherwise the
+    pending state kept it off every NTP step for ever.
+  - *A 503 must mean "nothing announced"*: the request carries a deadline; the loop refuses one it
+    takes too late (an NTP burst blocks it for seconds) and the HTTP side waits a second longer.
+    A POST needs `X-DanteSync-Step`, which no web page can send cross-origin.
+  - *A boot offset beyond twice the restore cap* cannot be on the fleet line (kept within the cap
+    of UTC): the boot step runs at start instead of serving a wall seconds off until the lock.
+  - *A stale record* (the node was not the master meanwhile): a record over a day old is refused,
+    the master rewrites it every 10 minutes, a non-master start removes it.
+  - Declined, with reasons: a writer thread for the save (a write follows the change it records,
+    never precedes a pending instant in the same iteration; the instants are ≥ 5 s away); the
+    300 s give-up stays (a master without PTP otherwise serves a free-running wall as NTP for
+    ever; its followers fall back after their hold either way).
 - **Bench (`tests/two_clock_bench/restart.rs`):** the hooks are inert unless a scenario sets
   `master_restart` / `follower_hold_windows` / `step_requests_at` (the bit-identity pair is
   unchanged). The 1.14 negative control must reproduce the incident; the 1.15 case bounds the

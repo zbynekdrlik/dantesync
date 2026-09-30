@@ -134,12 +134,14 @@ own user login password). Windows boxes are reached via MCP only in this procedu
        with `date_authority_hold_age_s` while the master is away, then `… heard again after
        holding …` and `"follower"`; NO `[DATE] stepped` and no `[StepClock]` anywhere.
      - **The coordinated step on request** (acceptance tests only): on the MASTER itself,
-       `curl -s -X POST http://127.0.0.1:8898/date/step` → `202` + `{"accepted":true,"amount_ns":…,
-       "land_ptp_ns":…,"due_in_ms":…,"seq":…}`; every box then logs ONE `[DATE] stepped +…us
-       (coordinated, seq N)` at the instant. Refused with a reason (`409`) while another change is
-       in flight, without a settled UTC estimate, or for a fleet ahead of UTC (never a backward
-       step); `403` from any non-loopback peer. A pre-1.15 build answers `200` + the status JSON:
-       key on `"accepted"`. `/status.date_step_trigger_last` records the last one.
+       `curl -s -X POST -H 'X-DanteSync-Step: 1' http://127.0.0.1:8898/date/step` → `202` +
+       `{"accepted":true,"amount_ns":…,"land_ptp_ns":…,"due_in_ms":…,"seq":…}`; every box then logs
+       ONE `[DATE] stepped +…us (coordinated, seq N)` at the instant. Refused with a reason (`409`)
+       while another change is in flight, without a settled UTC estimate, or for a fleet ahead of
+       UTC (never a backward step); `403` from a non-loopback peer or without the header; `503` =
+       the loop did not take it within 3 s, and NOTHING was announced. A pre-1.15 build answers
+       `200` + the status JSON: key on `"accepted"`. `/status.date_step_trigger_last` records the
+       last one.
      - **camera-box:** its watchdog / handover grading of `date_authority` must accept
        `"holding"` (a follower whose master is restarting), and `DANTESYNC_VERSION_PIN` advances.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
