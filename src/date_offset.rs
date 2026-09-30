@@ -76,6 +76,7 @@
 
 mod daily;
 mod micro;
+mod persist;
 mod slew;
 mod wire;
 pub use daily::{
@@ -92,6 +93,7 @@ pub use micro::{
     MICRO_REVERSAL_BAND_NS, MICRO_TURNED_TREND_NS_PER_S, MICRO_WINDOW_NS, MIN_MICRO_INTERVAL_S,
     MIN_MICRO_STEP_US,
 };
+pub use persist::{AuthorityState, DateOffsetState, RestoreRejected, STATE_VERSION};
 pub use slew::{
     clamp_slew_ppm, correction_kind, slew_cap_ns, solve_displacement, CorrectionKind, DateSlew,
     HeldSlew, SlewSpec, DEFAULT_SLEW_PPM, MAX_SLEW_PPM, MIN_SLEW_PPM, SLEW_CAP_STEP_BOUNDS,
@@ -958,8 +960,12 @@ impl DateFollower {
 }
 
 mod authority_daily;
+mod authority_restore;
+pub use authority_restore::StepRefused;
 
 #[cfg(test)]
 mod authority_daily_tests;
+#[cfg(test)]
+mod authority_restore_tests;
 #[cfg(test)]
 mod tests;

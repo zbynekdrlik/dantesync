@@ -1,0 +1,113 @@
+//! dantesync#126 — the saved date-offset record: `D` in effect at an instant, and whether a
+//! restarted master may restore it.
+
+use super::*;
+
+const S: i64 = 1_000_000_000;
+const MS: i64 = 1_000_000;
+const GM: [u8; 6] = [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c];
+const OTHER_GM: [u8; 6] = [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0d];
+/// The fleet line: wall = PTP + D.
+const D: i64 = 1_789_274_439_109_968_443;
+/// The emergency cap (5 s, the daily default).
+const CAP: i64 = 5_000 * MS;
+
+fn state(pending: Option<(i64, i64)>) -> DateOffsetState {
+    DateOffsetState {
+        authority: AuthorityState {
+            d_ns: D,
+            since_ptp_ns: 3 * 86_400 * S,
+            seq: 7,
+            pending,
+            slew: None,
+            micro: false,
+            daily_last_step: Some((D + 4 * 86_400 * S, 1_520 * MS)),
+        },
+        gm_uuid: GM,
+        written_wall_ns: D + 4 * 86_400 * S,
+        written_ptp_ns: 4 * 86_400 * S,
+    }
+}
+
+/// A wall and the anchor of the first locked window of a master whose wall is `off` off the line.
+fn first_window(ptp: i64, off: i64) -> (i64, i64) {
+    let wall = ptp + D + off;
+    (wall, wall - ptp)
+}
+
+#[test]
+fn a_pending_step_is_in_effect_from_its_instant_126() {
+    let st = state(Some((D + 250 * MS, 100 * S)));
+    assert_eq!(st.authority.d_in_effect_at(100 * S - 1), D);
+    assert_eq!(st.authority.d_in_effect_at(100 * S), D + 250 * MS);
+    assert_eq!(state(None).authority.d_in_effect_at(100 * S), D);
+}
+
+#[test]
+fn the_same_grandmaster_and_a_wall_on_the_line_restores_126() {
+    let st = state(None);
+    let ptp = 5 * 86_400 * S;
+    for off in [0, 37_000, -2 * MS, 1_200 * MS, -CAP, CAP] {
+        let (wall, anchor) = first_window(ptp, off);
+        assert_eq!(
+            st.validate_restore(Some(GM), anchor, wall, CAP),
+            Ok(off),
+            "a wall {off} ns off the line (a restart's free-run, a host reboot's RTC) is re-joined \
+             by the master alone"
+        );
+    }
+}
+
+#[test]
+fn the_offset_is_judged_against_the_d_in_effect_at_that_instant_126() {
+    // Saved inside a step's lead; the master is back after the instant, its wall where it was
+    // (it never took the step): it is the whole step off the fleet line, and re-joins it.
+    let st = state(Some((D + 250 * MS, 100 * S)));
+    let (wall, anchor) = first_window(200 * S, 0);
+    assert_eq!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Ok(-250 * MS)
+    );
+}
+
+#[test]
+fn another_grandmaster_or_none_is_never_restored_126() {
+    let st = state(None);
+    let (wall, anchor) = first_window(5 * 86_400 * S, 0);
+    assert_eq!(
+        st.validate_restore(Some(OTHER_GM), anchor, wall, CAP),
+        Err(RestoreRejected::OtherGrandmaster {
+            saved: GM,
+            now: OTHER_GM
+        })
+    );
+    assert_eq!(
+        st.validate_restore(None, anchor, wall, CAP),
+        Err(RestoreRejected::NoGrandmaster)
+    );
+}
+
+#[test]
+fn a_time_base_off_beyond_the_cap_is_never_restored_126() {
+    let st = state(None);
+    let ptp = 5 * 86_400 * S;
+    // One ns beyond the cap, either way.
+    for off in [CAP + 1, -CAP - 1] {
+        let (wall, anchor) = first_window(ptp, off);
+        assert_eq!(
+            st.validate_restore(Some(GM), anchor, wall, CAP),
+            Err(RestoreRejected::TimeBase {
+                off_ns: off,
+                cap_ns: CAP
+            })
+        );
+    }
+    // The grandmaster rebooted under the same identity: its uptime restarted at 42 s, so the
+    // first window reads the wall days off the saved D.
+    let wall = D + 5 * 86_400 * S;
+    let anchor = wall - 42 * S;
+    assert!(matches!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Err(RestoreRejected::TimeBase { .. })
+    ));
+}
