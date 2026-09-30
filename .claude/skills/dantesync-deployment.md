@@ -115,6 +115,33 @@ own user login password). Windows boxes are reached via MCP only in this procedu
      - **A `nightly date step MISSED` line** means another date change was in flight all window,
        or the daemon stalled. An emergency step that jumps over a window is not reported. Only an error beyond `daily_emergency_ms` (5 s) is stepped by
        day, and it logs `date correction beyond the emergency cap`.
+   - **From v1.15.0 (issue #126, a master restart keeps the fleet date): followers first, the NTP
+     master LAST, within ~40 minutes after the nightly step (02:00 UTC).** 1.14 saved nothing, so
+     the FIRST start of a 1.15 master has no saved state and takes the old path once: the boot step
+     to UTC (only if its error is > 50 ms) and a new session at seq 1. Right after the night's step
+     the error is < 50 ms (+1.06 ms/min on the rig), so there is no boot step and every follower
+     absorbs the new session (≤ 100 µs) instead of stepping; and upgraded followers HOLD the
+     fleet date through the master's restart instead of stepping on their own NTP 30 s in.
+     - **Roll check on the master:** its journal shows `[DATE] no saved fleet date offset at
+       /etc/dantesync/date-offset.json` on this first start, then the file exists (it is written
+       on every change of the authority). No follower journal shows `[DATE] stepped` around it.
+     - **The acceptance (a daytime restart, after that):** `systemctl restart dantesync` on the
+       master. Its journal: `[DATE] saved fleet date offset found … the boot step is skipped`,
+       `[DATE] boot step of … SKIPPED`, then at its first lock `[DATE] RESTORED the fleet date
+       offset …`; `/status` `date_offset_restored: true` with the SAME `date_offset_seq` and
+       `date_offset_ns`, `date_offset_error_ms` unchanged apart from drift. Every follower: `[DATE]
+       no applicable date-offset authority reply for 30s — HOLDING …`, `date_authority: "holding"`
+       with `date_authority_hold_age_s` while the master is away, then `… heard again after
+       holding …` and `"follower"`; NO `[DATE] stepped` and no `[StepClock]` anywhere.
+     - **The coordinated step on request** (acceptance tests only): on the MASTER itself,
+       `curl -s -X POST http://127.0.0.1:8898/date/step` → `202` + `{"accepted":true,"amount_ns":…,
+       "land_ptp_ns":…,"due_in_ms":…,"seq":…}`; every box then logs ONE `[DATE] stepped +…us
+       (coordinated, seq N)` at the instant. Refused with a reason (`409`) while another change is
+       in flight, without a settled UTC estimate, or for a fleet ahead of UTC (never a backward
+       step); `403` from any non-loopback peer. A pre-1.15 build answers `200` + the status JSON:
+       key on `"accepted"`. `/status.date_step_trigger_last` records the last one.
+     - **camera-box:** its watchdog / handover grading of `date_authority` must accept
+       `"holding"` (a follower whose master is restarting), and `DANTESYNC_VERSION_PIN` advances.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

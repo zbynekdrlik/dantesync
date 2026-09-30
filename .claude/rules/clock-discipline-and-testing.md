@@ -44,6 +44,19 @@ paths:
   - "src/controller/date_sync/freq_step.rs"
   - "src/controller/date_sync/freq_step_tests.rs"
   - "tests/two_clock_bench/freq_step.rs"
+  - "src/date_offset/persist.rs"
+  - "src/date_offset/persist/tests.rs"
+  - "src/date_offset/authority_restore.rs"
+  - "src/date_offset/authority_restore_tests.rs"
+  - "src/controller/date_sync/restart.rs"
+  - "src/controller/date_sync/restart_file.rs"
+  - "src/controller/date_sync/restart_tests.rs"
+  - "src/controller/date_sync/hold.rs"
+  - "src/controller/date_sync/trigger.rs"
+  - "src/controller/date_sync/trigger_tests.rs"
+  - "src/date_step_trigger.rs"
+  - "src/http_status.rs"
+  - "tests/two_clock_bench/restart.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -1048,3 +1061,72 @@ What was learned building it:
   UTC drift inside the micro capacity): the flip test asserts the phase / rate envelopes itself.
 - **Replica:** the pure module is a directory now; symlink `src/ptp_phase_lock/` beside
   `src/ptp_phase_lock.rs` in the scratch crate, or `mod freq_step;` does not resolve.
+
+## dantesync#126 (v1.15) — a master restart keeps the fleet date
+
+A `systemctl restart dantesync` on the master (strih-lx, 30.9.2026) stepped the whole rig at
+scattered instants: its boot step moved its own wall +247 ms to UTC, a fresh anchor started a new
+session at seq 1, and each follower dropped the silent authority after 30 s and stepped on its own
+next NTP samples. What was learned building the fix:
+
+- **Save the PUBLISHED state, not only D and seq.** `DateAuthority::persisted` carries the change
+  in flight (a pending step or a slew) and the last nightly step. A restart inside a step's lead
+  otherwise drops the step (the followers land it, the master does not) or repeats it, and a
+  restart inside the nightly window would decide the night twice (`DailyScheduler::restore_last_step`
+  marks it handled).
+- **The restore is judged at the first PTP window, AFTER the boot step would have run.** The
+  grandmaster and the time base need PTP. So a READABLE saved state defers the boot step, a
+  rejected one runs it from the loop (`service_date_restart`; `restore_date_authority` only sets
+  `boot_step_due`, never steps inside the servo's window processing), and a saved state with no
+  lock in 300 s is given up (a master without PTP must not free-run off UTC for ever).
+- **While a restore is pending the master takes NO NTP step** (`ntp_under_date_authority` is
+  report-only then). Its server-mode NTP path runs regardless of PTP lock and would step it toward
+  UTC during the acquisition, which the restore then has to Join back.
+- **Never seed the phase-lock core with the saved D.** A wall seconds off it would be slewed at the
+  ±2 ms error clamp for minutes, or trip the > 1 s re-base (`DISCONTINUITY_NS`) — which moves the
+  FLEET D by the base shift. The core anchors on its own first window, the authority is restored,
+  and `realign_master_to_fleet` moves ONLY the master's wall (≤ 100 µs absorbed, else one Join).
+  The master publishes the fleet D meanwhile (`date_step_pending_ns` = its own correction back).
+- **The follower hold is `forget()` postponed**, no new state in the pure follower (`hold.rs`,
+  `authority_silence`); `authority_hold_s = 0` is the 1.14 fallback. The time server's authority
+  flag is `date_authority == "master"`, so `"holding"` changes nothing on the wire.
+- **The step on request goes through a channel**: the :8898 thread sends it to the loop and waits
+  (3 s, then 503); the loop answers every queued request each iteration, refused or not. Loopback
+  only: the server binds 0.0.0.0. `202` only when announced; a pre-1.15 build answers 200 with
+  the status JSON, so callers key on `"accepted"`.
+- **Bench (`tests/two_clock_bench/restart.rs`):** the hooks are inert unless a scenario sets
+  `master_restart` / `follower_hold_windows` / `step_requests_at` (the bit-identity pair is
+  unchanged). The 1.14 negative control must reproduce the incident; the 1.15 case bounds the
+  restarted master's re-acquisition (its absorbed free-run, ~109 µs at worst) on its own, like the
+  double fault's settling. Give the session a seq above 1 before the restart (a step on request):
+  with seq 1 on both sides "the same session" and "a new session" read the same.
+
+## A fourth local net: the lib's OWN tests (the controller's too) under a rustc replica (#126)
+
+The mockall-based controller tests used to have no local path at all. They run under plain `rustc`
+(not a cargo shape) in about 30 s, ~350 MB:
+
+- **Real crates from `~/.cargo/registry/src`, one rustc call each** (~18 s, ~280 MB):
+  unicode-ident, proc-macro2 (`--cfg wrap_proc_macro --cfg 'feature="proc-macro"'`), quote, syn
+  (`clone-impls derive parsing printing proc-macro` as `--cfg 'feature="…"'`), serde_derive
+  (`--crate-type proc-macro`, `CARGO_PKG_VERSION_PATCH=228`), serde_core and serde (`--cfg
+  if_docsrs_then_no_serde_core`, `OUT_DIR` holding the build script's `private.rs` written by hand
+  — `pub mod __private228 { pub use crate::private::*; }`, serde's with `use serde_core::__private228
+  as serde_core_private;` —, `feature="std"`, serde `feature="derive"`), itoa, memchr, zmij,
+  serde_json (`--cfg 'fast_arithmetic="64"'`), byteorder, libc. Match the `Cargo.lock` versions.
+- **Stubs:** `log` (macros that `format!` their arguments, so format strings are still checked,
+  plus `log!`/`Level`), `anyhow`, `chrono`, `uuid`, `env_logger`, `tempfile`; and `mockall`: a
+  proc-macro `automock` that re-emits the trait plus an `include!` of a hand-written `Mock…`
+  (FIFO: the first matching, unsaturated expectation; `times` checked on drop) with the `expect_*`
+  / `times` / `with` / `withf` / `returning` / `in_sequence` surface the tests use.
+- **The crate:** a scratch `src/` of symlinks to the lib's modules, `ntp.rs` and `dscp.rs` reduced
+  to their data types (`rsntp`/`socket2` are not needed then). `rustc --test` it with `--extern`
+  for each; `--emit=metadata` without `--test` type-checks the lib, and `CARGO_PKG_RUST_VERSION=1.70.0
+  clippy-driver … -D warnings -A dead_code` reproduces the Lint job on it.
+- **Measured on dev1 (#126):** 569 of 571 lib tests pass; the two others are environmental
+  (`clock_alarm` formatting needs the real chrono; `gm_allowlist_hostname_resolution_…_113`
+  resolves `video-clock.lan` on the rig's LAN). A stubbed RED commit is proven the same way:
+  stub the new behaviour in the files, run, commit, restore.
+- It is still a replica: CI type-checks and runs the real crate (Windows included). Main and the
+  Windows-only code are outside it.
+
