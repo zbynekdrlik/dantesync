@@ -49,6 +49,9 @@ fn wall_now_ns() -> i64 {
         .unwrap_or(0)
 }
 
+/// The boot NTP offset (ms) above which `run_ntp_sync` steps the wall to UTC.
+const BOOT_STEP_THRESHOLD_MS: u128 = 50;
+
 /// Format a 6-byte UUID/MAC as a readable string (e.g., "00:1D:C1:AB:CD:EF")
 fn format_mac(uuid: &[u8; 6]) -> String {
     format!(
@@ -1181,19 +1184,18 @@ where
                 };
                 self.record_ntp_success(offset_us, &measurement);
 
-                if offset.as_millis() > 50 {
-                    info!("Stepping clock (NTP)...");
-                    if let Err(e) = self.clock.step_clock(offset, sign) {
-                        error!("Failed to step clock: {}", e);
-                    } else {
-                        info!("Clock stepped successfully.");
-                        // The boot step is unbounded, so it cancels the WHOLE
-                        // measured offset — publish the residual, not the error
-                        // that no longer exists (#68).
-                        self.publish_post_step_residual(0);
-                    }
+                if offset.as_millis() > BOOT_STEP_THRESHOLD_MS && self.skip_boot_step_for(offset_us)
+                {
+                    // dantesync#126: the NTP master restores its saved fleet date offset at the
+                    // first PTP lock instead — a restart must not move the fleet date.
+                    info!(
+                        "[DATE] boot step of {}{:?} SKIPPED: the saved fleet date offset is \
+                         restored at the first PTP lock (the date authority corrects the UTC \
+                         error, coordinated, as if the master had not restarted)",
+                        sign_str, offset
+                    );
                 } else {
-                    info!("Offset small, skipping step.");
+                    self.step_boot_offset(offset, sign);
                 }
             }
             Err(e) => warn!("NTP Sync failed: {}", e),
@@ -2067,6 +2069,9 @@ where
         // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
         // step lands within one loop period of the announced instant on every box.
         self.service_date_offset();
+        // dantesync#126: answer every `POST /date/step` the HTTP route queued (every node answers;
+        // only the NTP master can announce the step).
+        self.serve_date_step_requests();
 
         let (buf, size, t2, source_ip) = match self.network.recv_packet()? {
             Some(res) => res,

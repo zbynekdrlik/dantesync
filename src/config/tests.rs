@@ -734,3 +734,56 @@ fn daily_step_utc_and_the_emergency_cap_are_lenient_119() {
         assert!(warnings[0].contains("daily_step_utc"), "{warnings:?}");
     }
 }
+
+#[test]
+fn a_follower_holds_the_fleet_date_900_s_by_default_and_the_hold_is_lenient_126() {
+    use std::time::Duration;
+    // A 1.14 config has no hold key: the default (a master restart or reboot plus its PTP
+    // re-acquisition).
+    let c: SystemConfig =
+        serde_json::from_str(r#"{"date_offset":{"correction":"daily"}}"#).expect("parses");
+    assert_eq!(c.date_offset.authority_hold(), Duration::from_secs(900));
+    assert_eq!(
+        SystemConfig::default().date_offset.authority_hold(),
+        Duration::from_secs(super::DEFAULT_AUTHORITY_HOLD_S)
+    );
+    // 0 = no hold (the 1.14 fallback at 30 s); a day at most; a bad value means the default.
+    for (raw, want_s) in [
+        ("0", 0),
+        ("60", 60),
+        ("3600.4", 3_600),
+        ("999999", 86_400),
+        (r#""x""#, 900),
+        ("-5", 900),
+        ("null", 900),
+        ("[1]", 900),
+    ] {
+        let json = format!(r#"{{"date_offset":{{"authority_hold_s":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        assert_eq!(
+            c.date_offset.authority_hold(),
+            Duration::from_secs(want_s),
+            "authority_hold_s {raw}"
+        );
+    }
+}
+
+#[test]
+fn a_saved_date_offset_is_restored_within_the_daily_emergency_cap_126() {
+    let c: SystemConfig =
+        serde_json::from_str(r#"{"date_offset":{"correction":"micro"}}"#).expect("parses");
+    assert_eq!(
+        c.date_offset.restore_cap_ns(),
+        5_000_000_000,
+        "the daily emergency cap, whatever the correction mode"
+    );
+    for (raw, want_ms) in [("8000", 8_000), ("0", 5_000), ("10", 1_000)] {
+        let json = format!(r#"{{"date_offset":{{"daily_emergency_ms":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("parses");
+        assert_eq!(
+            c.date_offset.restore_cap_ns(),
+            want_ms * 1_000_000,
+            "daily_emergency_ms {raw}"
+        );
+    }
+}

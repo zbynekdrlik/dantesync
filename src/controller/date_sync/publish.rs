@@ -47,9 +47,19 @@ where
         status.date_authority = match anchor {
             None => String::new(),
             Some(_) if ds.authority.is_some() => "master".to_string(),
+            // #126: the master is silent and this follower keeps its D through the hold.
+            Some(_) if self.holding_date() => "holding".to_string(),
             Some(_) if ds.follower.adopted() => "follower".to_string(),
             Some(_) => "local".to_string(),
         };
+        // #126: the master restart kept the fleet date; a follower's hold; the step on request.
+        status.date_offset_restored = ds.authority.is_some() && ds.restart.restored;
+        status.date_authority_hold_age_s = if self.holding_date() {
+            ds.restart.holding_since.map(|t| t.elapsed().as_secs())
+        } else {
+            None
+        };
+        status.date_step_trigger_last = ds.restart.step_trigger_last.clone();
         let published = match ds.authority.as_ref() {
             Some(a) => Some(a.announce()),
             None => ds.last_announce,

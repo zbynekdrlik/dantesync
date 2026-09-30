@@ -659,3 +659,47 @@ fn test_to_json_bytes_matches_serde_json_to_vec() {
 
     assert_eq!(via_helper, via_direct);
 }
+
+/// dantesync#126: the restart / hold / step-on-request fields are additive. A literal 1.14.0 blob
+/// reads `false` / `null` / empty, and every value round-trips under its documented name.
+#[test]
+fn test_sync_status_restart_hold_and_trigger_fields_are_additive_126() {
+    let v1140 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+        "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+        "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+        "date_authority":"follower","date_offset_seq":1,"freq_steps":0,
+        "last_freq_step_ppm":null,"last_freq_step_ts":null}"#;
+    let restored: SyncStatus =
+        serde_json::from_str(v1140).expect("v1.14.0 JSON must still deserialize");
+    assert!(!restored.date_offset_restored);
+    assert_eq!(restored.date_authority_hold_age_s, None);
+    assert_eq!(restored.date_step_trigger_last, "");
+    assert_eq!(restored.date_authority, "follower");
+
+    let st = SyncStatus {
+        date_authority: "holding".to_string(),
+        date_offset_restored: true,
+        date_authority_hold_age_s: Some(42),
+        date_step_trigger_last: "2026-09-30T10:00:00Z accepted +247.297 ms, seq 5".to_string(),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&st).expect("serialize failed");
+    for field in [
+        r#""date_authority":"holding""#,
+        r#""date_offset_restored":true"#,
+        r#""date_authority_hold_age_s":42"#,
+        r#""date_step_trigger_last":"2026-09-30T10:00:00Z accepted +247.297 ms, seq 5""#,
+    ] {
+        assert!(json.contains(field), "{field} in {json}");
+    }
+    let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+    assert!(back.date_offset_restored);
+    assert_eq!(back.date_authority_hold_age_s, Some(42));
+    assert_eq!(back.date_step_trigger_last, st.date_step_trigger_last);
+    // Not holding: an explicit null, never a plausible-looking 0.
+    let fresh = serde_json::to_string(&SyncStatus::default()).expect("serialize failed");
+    assert!(
+        fresh.contains(r#""date_authority_hold_age_s":null"#),
+        "{fresh}"
+    );
+}

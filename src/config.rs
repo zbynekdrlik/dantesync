@@ -201,6 +201,36 @@ pub struct DateOffsetConfig {
         deserialize_with = "lenient_daily_emergency_ms"
     )]
     pub daily_emergency_ms: u64,
+    /// dantesync#126 — how long (s) a follower HOLDS the fleet date offset after the master went
+    /// silent (its 30 s authority-loss window), before it falls back to its local NTP date path.
+    /// Default 900: a master restart or reboot plus its PTP re-acquisition. While holding, the
+    /// follower keeps `D` and seq and its NTP readings are report-only; the master heard again
+    /// with the same `D` is re-joined with no step. `0` = no hold (the 1.14 behaviour: the
+    /// fallback at 30 s); anything above a day is clamped to a day ([`Self::authority_hold`]).
+    #[serde(
+        default = "default_date_authority_hold_s",
+        deserialize_with = "lenient_authority_hold_s"
+    )]
+    pub authority_hold_s: u64,
+}
+
+/// dantesync#126 — the default follower hold through a silent master (s).
+pub const DEFAULT_AUTHORITY_HOLD_S: u64 = 900;
+/// dantesync#126 — the longest follower hold (s): a day.
+pub const MAX_AUTHORITY_HOLD_S: u64 = 86_400;
+
+fn default_date_authority_hold_s() -> u64 {
+    DEFAULT_AUTHORITY_HOLD_S
+}
+
+fn lenient_authority_hold_s<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_authority_hold_s(),
+    ))
 }
 
 /// The `system.date_offset.correction` values (dantesync#119, 1.12).
@@ -353,6 +383,7 @@ impl Default for DateOffsetConfig {
             correction: default_date_correction(),
             daily_step_utc: default_date_daily_step_utc(),
             daily_emergency_ms: default_date_daily_emergency_ms(),
+            authority_hold_s: default_date_authority_hold_s(),
         }
     }
 }
@@ -386,6 +417,19 @@ impl DateOffsetConfig {
     /// clamped: step 50..=1000 µs, interval 10..=600 s).
     pub fn micro(&self) -> crate::date_offset::MicroConfig {
         crate::date_offset::MicroConfig::new(self.micro_step_us, self.micro_interval_s)
+    }
+
+    /// dantesync#126 — the effective follower hold through a silent master: `0` = none (the 1.14
+    /// fallback at the 30 s authority loss), else at most [`MAX_AUTHORITY_HOLD_S`].
+    pub fn authority_hold(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.authority_hold_s.min(MAX_AUTHORITY_HOLD_S))
+    }
+
+    /// dantesync#126 — how far off the saved `D` a restarted master's first PTP window may read
+    /// its wall and still restore it (ns): the daily emergency cap (`daily_emergency_ms`,
+    /// clamped as for the nightly step), whatever the correction mode.
+    pub fn restore_cap_ns(&self) -> i64 {
+        crate::date_offset::clamp_daily_emergency_ms(self.daily_emergency_ms) as i64 * 1_000_000
     }
 
     /// dantesync#119 (1.12) — the effective date-correction mode, and a warning for every value

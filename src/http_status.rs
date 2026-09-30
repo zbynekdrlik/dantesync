@@ -9,15 +9,28 @@
 //! functional gain. One blocking-accept thread + one short-lived thread per
 //! connection is plenty for a handful of requests/minute from CI — the same
 //! philosophy `ntp_server.rs` already uses for its UDP server.
+//!
+//! dantesync#126 — one ACTION route beside the status: `POST /date/step` from LOOPBACK only asks
+//! the NTP master for one coordinated date step (`crate::date_step_trigger`). Every other request
+//! still gets the status JSON, byte for byte as before.
 
+use crate::date_step_trigger::{
+    self, DateStepOutcome, DateStepRequest, Route, StepAnswer, DATE_STEP_REPLY_TIMEOUT,
+    DATE_STEP_TAKEN_TIMEOUT,
+};
 use crate::status::SyncStatus;
 use log::{error, info, warn};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
+
+/// dantesync#126 — where a `POST /date/step` goes: the sync loop's end of
+/// `crate::date_step_trigger::channel` (`None`: the route answers that no loop takes it).
+pub type DateStepSender = Option<mpsc::Sender<DateStepRequest>>;
 
 /// Hard cap on concurrent in-flight connections. This is a read-only monitoring
 /// endpoint on a trusted LAN, not a public service — the cap exists purely to bound
@@ -32,12 +45,16 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 ///
 /// A bind failure (port in use, no permission) is logged and the endpoint is simply
 /// disabled for this run — it must never take down the sync daemon itself.
-pub fn start_http_status_server(status: Arc<RwLock<SyncStatus>>, port: u16) {
+pub fn start_http_status_server(
+    status: Arc<RwLock<SyncStatus>>,
+    port: u16,
+    date_step: DateStepSender,
+) {
     let bind_addr = format!("0.0.0.0:{}", port);
     match TcpListener::bind(&bind_addr) {
         Ok(listener) => {
             info!("[HTTP-Status] Listening on {}", bind_addr);
-            spawn_accept_loop(listener, status);
+            spawn_accept_loop(listener, status, date_step);
         }
         Err(e) => {
             error!(
@@ -84,7 +101,11 @@ impl Drop for InFlightGuard {
 ///   and drop that one connection — the accept loop itself keeps running.
 /// - **Panic-safe slot release** (`InFlightGuard`): the in-flight slot releases via
 ///   `Drop`, so a future panic inside `handle_connection` can't leak it.
-fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
+fn spawn_accept_loop(
+    listener: TcpListener,
+    status: Arc<RwLock<SyncStatus>>,
+    date_step: DateStepSender,
+) {
     let in_flight = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -102,6 +123,7 @@ fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
                     }
 
                     let status = status.clone();
+                    let date_step = date_step.clone();
                     let counter = in_flight.clone();
                     let spawned = thread::Builder::new()
                         .name("http-status-conn".into())
@@ -109,7 +131,7 @@ fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
                             // Constructed BEFORE handle_connection so its Drop
                             // releases the slot even if handle_connection panics.
                             let _guard = InFlightGuard { counter };
-                            handle_connection(conn, &status);
+                            handle_connection(conn, &status, date_step.as_ref());
                         });
                     if let Err(e) = spawned {
                         // The thread never started, so no InFlightGuard was ever
@@ -130,16 +152,33 @@ fn spawn_accept_loop(listener: TcpListener, status: Arc<RwLock<SyncStatus>>) {
     });
 }
 
-/// Handle a single connection. There is exactly one route (`GET /status`), so we
-/// don't bother parsing the request line/headers beyond draining them — read
-/// (and discard) whatever the client sent, with a short read timeout so a client
-/// that never sends anything can't wedge this thread forever, then always respond
-/// with the current status JSON — the SAME bytes the named pipe sends
+/// Handle a single connection. Read whatever the client sent, with a short read timeout so
+/// a client that never sends anything can't wedge this thread forever. `POST /date/step`
+/// (dantesync#126) goes to [`handle_date_step`]; EVERY other request is answered with the
+/// current status JSON, as before — the SAME bytes the named pipe sends
 /// (`SyncStatus::to_json_bytes`), so the two transports can never drift apart.
-fn handle_connection(mut stream: TcpStream, status: &Arc<RwLock<SyncStatus>>) {
+fn handle_connection(
+    mut stream: TcpStream,
+    status: &Arc<RwLock<SyncStatus>>,
+    date_step: Option<&mpsc::Sender<DateStepRequest>>,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 1024];
-    let _ = stream.read(&mut buf);
+    let n = stream.read(&mut buf).unwrap_or(0);
+
+    match date_step_trigger::route(&buf[..n]) {
+        Route::Status => {}
+        Route::DateStepWrongMethod => {
+            let body = date_step_trigger::refusal_body("use POST /date/step");
+            write_response(&mut stream, 405, body.as_bytes());
+            return;
+        }
+        Route::DateStep => {
+            let (code, body) = handle_date_step(&stream, &buf[..n], date_step);
+            write_response(&mut stream, code, body.as_bytes());
+            return;
+        }
+    }
 
     let body = match status.read() {
         Ok(guard) => match guard.to_json_bytes() {
@@ -160,11 +199,98 @@ fn handle_connection(mut stream: TcpStream, status: &Arc<RwLock<SyncStatus>>) {
     write_response(&mut stream, 200, &body);
 }
 
+/// dantesync#126 — `POST /date/step`: refused unless the peer is loopback, the `Host` a loopback
+/// name and the request carries the `X-DanteSync-Step` header (403); otherwise the request goes to
+/// the sync loop, whose answer is `202` (one coordinated step announced) or `409` (refused, with
+/// the reason), or `503` when the loop does not take it in time — then the request is abandoned
+/// and nothing is ever announced for it (`StepClaim::abandon`) — or `500` when the loop took it
+/// and gave no answer (the outcome unknown).
+fn handle_date_step(
+    stream: &TcpStream,
+    request: &[u8],
+    date_step: Option<&mpsc::Sender<DateStepRequest>>,
+) -> (u16, String) {
+    let peer = stream.peer_addr().ok().map(|a| a.ip());
+    if !peer.is_some_and(date_step_trigger::peer_allowed) {
+        warn!(
+            "[HTTP-Status] POST /date/step from {:?} refused: loopback only",
+            peer
+        );
+        return (
+            403,
+            date_step_trigger::refusal_body("a date step is taken from loopback only"),
+        );
+    }
+    if !date_step_trigger::has_loopback_host(request) {
+        return (
+            403,
+            date_step_trigger::refusal_body("a date step needs a loopback Host"),
+        );
+    }
+    if !date_step_trigger::has_step_header(request) {
+        return (
+            403,
+            date_step_trigger::refusal_body(
+                "a date step needs the X-DanteSync-Step header (no web page can send it)",
+            ),
+        );
+    }
+    let Some(sender) = date_step else {
+        return (
+            503,
+            date_step_trigger::refusal_body("no sync loop takes date-step requests here"),
+        );
+    };
+    let (reply, answer) = mpsc::channel();
+    let (req, claim) = DateStepRequest::new(reply);
+    if sender.send(req).is_err() {
+        return (
+            503,
+            date_step_trigger::refusal_body("the sync loop is not running"),
+        );
+    }
+    // Not taken in time: abandoned (the loop will never act on it). Taken already: the loop is
+    // acting on it, so its answer is awaited — a 503 must never hide an announced step.
+    match date_step_trigger::await_answer(
+        &answer,
+        &claim,
+        DATE_STEP_REPLY_TIMEOUT,
+        DATE_STEP_TAKEN_TIMEOUT,
+    ) {
+        StepAnswer::Answered(outcome) => {
+            if let DateStepOutcome::Refused { reason } = &outcome {
+                info!("[HTTP-Status] POST /date/step refused: {}", reason);
+            }
+            date_step_trigger::outcome_response(&outcome)
+        }
+        StepAnswer::Abandoned => (
+            503,
+            date_step_trigger::refusal_body(
+                "the sync loop did not take the request in time: nothing was announced",
+            ),
+        ),
+        StepAnswer::TakenUnanswered => {
+            warn!("[HTTP-Status] POST /date/step: the sync loop took it and gave no answer");
+            (
+                500,
+                date_step_trigger::unknown_body(
+                    "the sync loop took the request and gave no answer: whether a step was \
+                     announced is unknown, read /status.date_step_trigger_last and the log",
+                ),
+            )
+        }
+    }
+}
+
 fn write_response(stream: &mut TcpStream, code: u16, body: &[u8]) {
-    let reason = if code == 200 {
-        "OK"
-    } else {
-        "Internal Server Error"
+    let reason = match code {
+        200 => "OK",
+        202 => "Accepted",
+        403 => "Forbidden",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
     };
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -232,7 +358,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local_addr").port();
-        spawn_accept_loop(listener, status);
+        spawn_accept_loop(listener, status, None);
 
         let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect to status endpoint");
         conn.set_read_timeout(Some(Duration::from_secs(5)))
@@ -282,7 +408,7 @@ mod tests {
         // does (it binds 0.0.0.0), but occupying the port on 0.0.0.0 across all
         // interfaces is the scenario we care about proving doesn't panic — reuse the
         // already-bound `blocker` port number against start_http_status_server.
-        start_http_status_server(status, port);
+        start_http_status_server(status, port, None);
         // No assertion beyond "did not panic" — a bind failure is logged and the
         // function returns normally.
         drop(blocker);
@@ -304,7 +430,7 @@ mod tests {
         let status = Arc::new(RwLock::new(SyncStatus::default()));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local_addr").port();
-        spawn_accept_loop(listener, status);
+        spawn_accept_loop(listener, status, None);
 
         // Hold MAX_CONCURRENT_CONNECTIONS connections open. Each server-side handler
         // thread blocks on its 2s read timeout (we never write anything), so the
@@ -336,5 +462,191 @@ mod tests {
         }
 
         drop(held);
+    }
+
+    /// dantesync#126 — send one raw request to a test server, return (headers, body).
+    fn exchange(port: u16, raw: &[u8]) -> (String, String) {
+        let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        conn.write_all(raw).expect("write request");
+        let mut response = Vec::new();
+        conn.read_to_end(&mut response).expect("read response");
+        let response = String::from_utf8(response).expect("utf8");
+        let (headers, body) = response.split_once("\r\n\r\n").expect("headers + body");
+        (headers.to_string(), body.to_string())
+    }
+
+    /// A test server whose "sync loop" takes every date-step request and answers it with
+    /// `outcome` (`None`: it never takes the request, like a loop blocked past the timeout).
+    fn server_with_loop(outcome: Option<DateStepOutcome>) -> u16 {
+        let (tx, rx) = date_step_trigger::channel();
+        thread::spawn(move || {
+            let mut kept = Vec::new();
+            for req in rx {
+                match outcome.clone() {
+                    Some(o) => {
+                        assert!(req.take(), "the loop takes a pending request");
+                        let _ = req.reply.send(o);
+                    }
+                    None => kept.push(req), // never taken, never answered
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        spawn_accept_loop(listener, locked_status(), Some(tx));
+        port
+    }
+
+    /// A test server whose "sync loop" takes every date-step request and drops it unanswered
+    /// (a loop that unwound while acting on it).
+    fn server_with_loop_that_drops_taken_requests() -> u16 {
+        let (tx, rx) = date_step_trigger::channel();
+        thread::spawn(move || {
+            for req in rx {
+                assert!(req.take(), "the loop takes a pending request");
+                drop(req);
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        spawn_accept_loop(listener, locked_status(), Some(tx));
+        port
+    }
+
+    const POST_STEP: &[u8] = b"POST /date/step HTTP/1.1\r\nHost: 127.0.0.1:8898\r\nX-DanteSync-Step: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn a_loopback_post_date_step_reaches_the_sync_loop_and_answers_202_126() {
+        let port = server_with_loop(Some(DateStepOutcome::Accepted {
+            amount_ns: 247_297_000,
+            land_ptp_ns: 42_000_000_000,
+            due_in_ms: 10_000,
+            seq: 6,
+        }));
+        let (headers, body) = exchange(port, POST_STEP);
+        assert!(headers.starts_with("HTTP/1.1 202 Accepted"), "{headers}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(v["accepted"], true, "{body}");
+        assert_eq!(v["amount_ns"], 247_297_000, "{body}");
+        assert_eq!(v["land_ptp_ns"], 42_000_000_000_i64, "{body}");
+        assert_eq!(v["seq"], 6, "{body}");
+    }
+
+    #[test]
+    fn a_refused_date_step_is_409_with_the_reason_and_never_accepted_126() {
+        let port = server_with_loop(Some(DateStepOutcome::Refused {
+            reason: "the fleet is not behind UTC".to_string(),
+        }));
+        let (headers, body) = exchange(port, POST_STEP);
+        assert!(headers.starts_with("HTTP/1.1 409 Conflict"), "{headers}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(v["accepted"], false, "{body}");
+        assert_eq!(v["reason"], "the fleet is not behind UTC", "{body}");
+    }
+
+    #[test]
+    fn a_sync_loop_that_does_not_answer_is_503_never_accepted_126() {
+        let port = server_with_loop(None);
+        let (headers, body) = exchange(port, POST_STEP);
+        assert!(
+            headers.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{headers}"
+        );
+        assert!(body.contains(r#""accepted":false"#), "{body}");
+        // No loop wired at all: 503 too.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        spawn_accept_loop(listener, locked_status(), None);
+        let (headers, _) = exchange(port, POST_STEP);
+        assert!(headers.starts_with("HTTP/1.1 503"), "{headers}");
+    }
+
+    #[test]
+    fn a_taken_request_left_unanswered_is_500_unknown_never_the_503_of_nothing_announced_126() {
+        let port = server_with_loop_that_drops_taken_requests();
+        let (headers, body) = exchange(port, POST_STEP);
+        assert!(
+            headers.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{headers}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert!(v["accepted"].is_null(), "unknown, not refused: {body}");
+        assert!(
+            v["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("date_step_trigger_last")),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn the_step_route_wants_post_and_every_other_request_still_gets_the_status_126() {
+        let status = locked_status();
+        let expected = status
+            .read()
+            .expect("read status")
+            .to_json_bytes()
+            .expect("serialize status");
+        // A loop that would accept: a GET must never reach it.
+        let port = server_with_loop(Some(DateStepOutcome::Accepted {
+            amount_ns: 1,
+            land_ptp_ns: 1,
+            due_in_ms: 1,
+            seq: 1,
+        }));
+        let (headers, body) = exchange(
+            port,
+            b"GET /date/step HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            headers.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{headers}"
+        );
+        assert!(body.contains(r#""accepted":false"#), "{body}");
+        for raw in [
+            &b"GET /status HTTP/1.1\r\nConnection: close\r\n\r\n"[..],
+            &b"POST /status HTTP/1.1\r\nConnection: close\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n"[..],
+        ] {
+            let (headers, body) = exchange(port, raw);
+            assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+            assert_eq!(body.as_bytes(), expected.as_slice(), "the status JSON");
+        }
+    }
+
+    #[test]
+    fn a_step_request_without_the_step_header_is_403_and_never_reaches_the_loop_126() {
+        // A loop that would accept: a request without the header must never reach it.
+        let port = server_with_loop(Some(DateStepOutcome::Accepted {
+            amount_ns: 1,
+            land_ptp_ns: 1,
+            due_in_ms: 1,
+            seq: 1,
+        }));
+        let (headers, body) = exchange(
+            port,
+            b"POST /date/step HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        assert!(body.contains(r#""accepted":false"#), "{body}");
+        assert!(body.contains("X-DanteSync-Step"), "{body}");
+    }
+
+    #[test]
+    fn a_step_request_naming_another_host_is_403_and_never_reaches_the_loop_126() {
+        let port = server_with_loop(Some(DateStepOutcome::Accepted {
+            amount_ns: 1,
+            land_ptp_ns: 1,
+            due_in_ms: 1,
+            seq: 1,
+        }));
+        let (headers, body) = exchange(
+            port,
+            b"POST /date/step HTTP/1.1\r\nHost: strih.lan:8898\r\nX-DanteSync-Step: 1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        assert!(body.contains("loopback Host"), "{body}");
     }
 }

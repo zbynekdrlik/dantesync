@@ -11,6 +11,28 @@ use crate::date_offset::DailyDecision;
 /// While the micro-corrections fall behind, the loud line is repeated this often.
 const FALLING_BEHIND_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// The NTP master's startup line when its authority makes micro-corrections (the daily one is
+/// `daily::log_daily_authority`).
+pub(super) fn log_micro_authority(anchor: i64, authority: &DateAuthority, step_bound_ns: i64) {
+    // The EFFECTIVE micro tuning: the interval is at least the in-flight time of one increment.
+    let micro = authority.micro().config();
+    info!(
+        "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date is \
+         held within {} ms of UTC by micro-corrections of at most {}us, one per {} s ({:.2} \
+         ms/min): forward a coordinated step, backward a coordinated slew at {} ppm (one per {} \
+         s), announced {} s ahead; only an error beyond {} ms is one coordinated step",
+        anchor,
+        micro.dead_band_ns / 1_000_000,
+        micro.step_ns / 1_000,
+        micro.interval_ns / 1_000_000_000,
+        micro.capacity_ns_per_min() as f64 / 1e6,
+        authority.slew_ppm(),
+        micro.backward_interval_ns / 1_000_000_000,
+        authority.lead_ns() * crate::date_offset::MICRO_LEAD_FACTOR / 1_000_000_000,
+        crate::date_offset::slew_cap_ns(step_bound_ns) / 1_000_000
+    );
+}
+
 impl<C, N, S> PtpController<C, N, S>
 where
     C: SystemClock,

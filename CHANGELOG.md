@@ -5,6 +5,63 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-09-30
+
+### Fixed
+
+- **A restart of the NTP master no longer steps the fleet date (issue #126).** On 30.9.2026 a
+  `systemctl restart dantesync` on strih-lx (the master) stepped its own wall +247 ms to UTC at
+  boot, started a new authority session, and every follower dropped the silent authority after
+  30 s and stepped on its OWN next NTP samples: resolume +247.730 ms at 06:02:42Z, cam7 at
+  06:02:46Z, dev1 +247.77 ms at 06:02:42Z — the whole rig at scattered instants, exactly the
+  disturbance the nightly window exists to avoid.
+  - **The master saves its date offset.** Whenever its authority's published state changes (D in
+    effect, seq, a step or slew in flight, the last nightly step, the grandmaster of the anchor)
+    it is written to `date-offset.json` beside `config.json` (`/etc/dantesync/`,
+    `C:\ProgramData\DanteSync\`) by temp + rename, and rewritten every 10 minutes otherwise (the
+    rewrite waits while a step or slew is in flight). A
+    write error is logged and retried, never fatal. Only the master writes it; a node that starts
+    as a non-master removes one left from an earlier stint as the master.
+  - **A restarted master restores it.** With a readable saved state the boot step is skipped and
+    the master takes no NTP step until its first PTP lock, where the state is judged: the same
+    grandmaster, and the first window within `daily_emergency_ms` (5 s) of the saved D. Accepted,
+    the authority continues with the same D and seq (a step whose instant passed while it was down
+    is in effect) and the master re-joins ONLY its own wall (a reboot's RTC, the free-run of the
+    gap); the accumulated UTC error is left to the next nightly window as if it had not restarted.
+    A restore inside a step's lead takes that step on the master's own wall at its instant, with
+    the fleet. Another grandmaster, a grandmaster that restarted its uptime, a wall seconds off, a
+    record over a day old, or no PTP lock within 300 s: the boot step runs then and a new session
+    starts (the pre-1.15 path), loudly; a boot offset beyond twice the cap (10 s), or an NTP server
+    that fails to start, takes the boot step at once. `/status.date_offset_restored`.
+  - **Followers hold the fleet date through the master's silence.** After the 30 s loss a follower
+    that has adopted D keeps D and seq for `system.date_offset.authority_hold_s` (900 s by
+    default; `0` = the 1.14 fallback): its NTP readings are report-only (the `[NTP] offset:` line
+    unchanged), a step already scheduled still lands at its instant, `/status.date_authority` is
+    `"holding"` with `date_authority_hold_age_s`, and the master heard again with the same D is
+    re-joined with no step. Past the hold the 1.14 fallback runs.
+  - **A coordinated step on request, for acceptance tests.** `POST /date/step` on the master's
+    :8898, from loopback only, announces the current UTC error as ONE coordinated step two leads
+    (10 s) ahead, exactly like the nightly window: `202` + `{"accepted":true,…}`. It must carry
+    the `X-DanteSync-Step` header and a loopback `Host` (no web page, rebound or cross-origin, can
+    send it). Refused with the reason (`409`) while another change is in flight, without a settled
+    UTC estimate, or for a fleet ahead of UTC; `403` off loopback, without the header or with
+    another Host; `503` when the loop does not take it within 3 s — the request is then abandoned
+    and nothing is ever announced for it; `500` with `"accepted": null` when the loop took it and
+    gave no answer within 30 s (unknown: read `/status.date_step_trigger_last`). Every other
+    request still gets the status JSON.
+    `/status.date_step_trigger_last`.
+  - Two-clock bench: a master restart 2 h in (down 2 s, locked 65 s later) with six boxes — the
+    1.14 path reproduces the incident (a +62.8 ms boot step, all five followers stepping on their
+    own NTP at scattered instants); the 1.15 path keeps seq 2, steps no follower, and two steps on
+    request land on all six boxes within 39 µs; a restart 1 s after a step's announce lands that
+    step on every box, the master included, within 43 µs.
+  - **Rollout:** the FIRST start of 1.15 on the master has nothing saved (1.14 saved nothing) and
+    still takes the old path once — roll the followers first and the master within ~40 minutes
+    after the nightly step (its error is then below the 50 ms boot-step threshold). **Rolling the
+    master back** to a pre-1.15 build: delete `date-offset.json` with it — a 1.15 installed again
+    within a day would otherwise restore the session from before the rollback, while the fleet
+    followed the older build's new one.
+
 ## [1.14.0] - 2026-09-29
 
 ### Fixed

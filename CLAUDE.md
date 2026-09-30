@@ -123,7 +123,10 @@ is running.
   the micro mode kept byte-identical, the master's own PTP outage in daily mode; v1.14: a
   grandmaster FREQUENCY step followed in seconds — the open-loop-phase detector, the linearity
   test and the shifted slope against level shifts, the integrator re-seed, the decaying phase pull
-  and its applied-rate transient) →
+  and its applied-rate transient; v1.15: a master restart keeps the fleet date — the saved
+  authority state, the restore judged at the first PTP window, the follower hold, the loopback
+  `POST /date/step`; and the lib's own tests, the controller's included, run locally under a
+  `rustc` replica with the real serde built by hand and a small mockall stand-in) →
   `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
   `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)

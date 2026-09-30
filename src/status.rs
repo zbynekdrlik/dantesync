@@ -258,6 +258,9 @@ pub struct SyncStatus {
     /// aligned with the master's announced `D` (steps only at the announced instants);
     /// `"local"` = PTP phase-locked but no authority heard yet (an older master, a grandmaster
     /// mismatch, the master unreachable) — the date then follows this node's own NTP step path;
+    /// `"holding"` (dantesync#126) = a follower whose master went silent: it keeps the adopted `D`
+    /// and seq, takes no NTP step, and re-joins the master with no step when it is heard again —
+    /// for up to `system.date_offset.authority_hold_s` (900 s), then `"local"`;
     /// `""` = the legacy discipline, or not PTP-phase-locked yet.
     #[serde(default)]
     pub date_authority: String,
@@ -382,6 +385,21 @@ pub struct SyncStatus {
     pub date_daily_last_step_ts: Option<u64>,
     #[serde(default)]
     pub date_daily_last_step_ms: Option<f64>,
+    /// dantesync#126 (the NTP master): true when its authority was RESTORED from the state it
+    /// saved before a restart (the same `D`, seq and change in flight) — the fleet date did not
+    /// change with the restart. `false` on a follower, on a master that started a new session
+    /// (no valid saved state: the boot step ran), and in a pre-1.15 blob.
+    #[serde(default)]
+    pub date_offset_restored: bool,
+    /// dantesync#126 (a follower): whole seconds this node has HELD the fleet date offset since
+    /// its master went silent (`date_authority` = `"holding"`); `null` otherwise.
+    #[serde(default)]
+    pub date_authority_hold_age_s: Option<u64>,
+    /// dantesync#126 (the NTP master): the last coordinated step on request (`POST /date/step`
+    /// on this server, loopback only) — when (UTC, fleet wall), and the step it announced or why
+    /// it was refused. Empty when none since the process started.
+    #[serde(default)]
+    pub date_step_trigger_last: String,
 
     // ========================================================================
     // PTP phase lock (dantesync#117) — additive.
@@ -538,6 +556,10 @@ impl Default for SyncStatus {
             date_daily_next_utc: None,
             date_daily_last_step_ts: None,
             date_daily_last_step_ms: None,
+            // #126: not restored, not holding, no step requested
+            date_offset_restored: false,
+            date_authority_hold_age_s: None,
+            date_step_trigger_last: String::new(),
             // #117: unknown until the controller publishes
             clock_discipline: String::new(),
             rate_source: String::new(),
