@@ -1090,10 +1090,13 @@ next NTP samples. What was learned building the fix:
 - **The follower hold is `forget()` postponed**, no new state in the pure follower (`hold.rs`,
   `authority_silence`); `authority_hold_s = 0` is the 1.14 fallback. The time server's authority
   flag is `date_authority == "master"`, so `"holding"` changes nothing on the wire.
-- **The step on request goes through a channel**: the :8898 thread sends it to the loop and waits
-  (3 s, then 503); the loop answers every queued request each iteration, refused or not. Loopback
-  only: the server binds 0.0.0.0. `202` only when announced; a pre-1.15 build answers 200 with
-  the status JSON, so callers key on `"accepted"`.
+- **The step on request goes through a channel**: the :8898 thread sends it to the loop, which
+  answers every queued request each iteration, refused or not. A request is CLAIMED once — the
+  loop `take()`s it before acting, the HTTP side `abandon()`s it after 3 s (a deadline alone was
+  not enough: a loop stall between its check and its answer gave a step AND a 503; review round
+  2) — so a 503 means nothing was announced. Loopback peer, loopback `Host` (DNS rebinding) and
+  the `X-DanteSync-Step` header (cross-origin pages): the server binds 0.0.0.0. `202` only when
+  announced; a pre-1.15 build answers 200 with the status JSON, so callers key on `"accepted"`.
 - **Review round 1 (fresh context, 0 🔴 7 🟡 9 🔵), each a test now:**
   - *A restore inside a step's lead must align the master's own scheduler with the session first*
     (`DateFollower::align_with_session`): a fresh follower ignores a change still ahead, so the
@@ -1103,17 +1106,26 @@ next NTP samples. What was learned building the fix:
   - *A master whose NTP server does not start* (`main`) drops the saved state and takes the boot
     step (`abandon_date_state`); the 300 s give-up runs without server mode too. Otherwise the
     pending state kept it off every NTP step for ever.
-  - *A 503 must mean "nothing announced"*: the request carries a deadline; the loop refuses one it
-    takes too late (an NTP burst blocks it for seconds) and the HTTP side waits a second longer.
-    A POST needs `X-DanteSync-Step`, which no web page can send cross-origin.
+  - *A 503 must mean "nothing announced"* (made airtight in round 2 by the claim above). A POST
+    needs `X-DanteSync-Step`, which no web page can send cross-origin.
   - *A boot offset beyond twice the restore cap* cannot be on the fleet line (kept within the cap
     of UTC): the boot step runs at start instead of serving a wall seconds off until the lock.
   - *A stale record* (the node was not the master meanwhile): a record over a day old is refused,
     the master rewrites it every 10 minutes, a non-master start removes it.
   - Declined, with reasons: a writer thread for the save (a write follows the change it records,
-    never precedes a pending instant in the same iteration; the instants are ≥ 5 s away); the
-    300 s give-up stays (a master without PTP otherwise serves a free-running wall as NTP for
-    ever; its followers fall back after their hold either way).
+    never precedes a pending instant in the same iteration; the instants are ≥ 5 s away, and the
+    10-minute heartbeat rewrite waits while a change is in flight — round 2); the 300 s give-up
+    stays (a master without PTP otherwise serves a free-running wall as NTP for ever; its
+    followers fall back after their hold either way).
+- **Review round 2 (fresh context, 0 🔴 2 🟡 5 🔵; the seven round-1 fixes confirmed):** the claim
+  and the loopback `Host` above; the heartbeat waits in flight; `remove_if_present` checks for the
+  file BEFORE unlinking (a camera box's read-only root answers EROFS even for a missing file — a
+  false warning on every start); the directory is synced after the rename. **A master ROLLED BACK
+  to a pre-1.15 build must lose its `date-offset.json`** (the deployment skill): 1.14 starts a new
+  session without touching the file, and a 1.15 installed again within a day would restore the
+  pre-rollback session — the age bound cannot tell "down" from "running another build". Kept
+  the 1-day bound: a shorter one (the hold + the heartbeat) would also refuse a master that was
+  only DOWN that long, whose followers kept its line (no NTP server to fall back on).
 - **Bench (`tests/two_clock_bench/restart.rs`):** the hooks are inert unless a scenario sets
   `master_restart` / `follower_hold_windows` / `step_requests_at` (the bit-identity pair is
   unchanged). The 1.14 negative control must reproduce the incident; the 1.15 case bounds the

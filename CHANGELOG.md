@@ -41,10 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **A coordinated step on request, for acceptance tests.** `POST /date/step` on the master's
     :8898, from loopback only, announces the current UTC error as ONE coordinated step two leads
     (10 s) ahead, exactly like the nightly window: `202` + `{"accepted":true,…}`. It must carry
-    the `X-DanteSync-Step` header (no web page can send it cross-origin). Refused with the reason
-    (`409`) while another change is in flight, without a settled UTC estimate, or for a fleet
-    ahead of UTC; `403` off loopback or without the header; `503` when the loop does not take it
-    within 3 s, and then nothing was announced. Every other request still gets the status JSON.
+    the `X-DanteSync-Step` header and a loopback `Host` (no web page, rebound or cross-origin, can
+    send it). Refused with the reason (`409`) while another change is in flight, without a settled
+    UTC estimate, or for a fleet ahead of UTC; `403` off loopback, without the header or with
+    another Host; `503` when the loop does not take it within 3 s — the request is then abandoned
+    and nothing is ever announced for it. Every other request still gets the status JSON.
     `/status.date_step_trigger_last`.
   - Two-clock bench: a master restart 2 h in (down 2 s, locked 65 s later) with six boxes — the
     1.14 path reproduces the incident (a +62.8 ms boot step, all five followers stepping on their
@@ -53,7 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     step on every box, the master included, within 43 µs.
   - **Rollout:** the FIRST start of 1.15 on the master has nothing saved (1.14 saved nothing) and
     still takes the old path once — roll the followers first and the master within ~40 minutes
-    after the nightly step (its error is then below the 50 ms boot-step threshold).
+    after the nightly step (its error is then below the 50 ms boot-step threshold). **Rolling the
+    master back** to a pre-1.15 build: delete `date-offset.json` with it — a 1.15 installed again
+    within a day would otherwise restore the session from before the rollback, while the fleet
+    followed the older build's new one.
 
 ## [1.14.0] - 2026-09-29
 

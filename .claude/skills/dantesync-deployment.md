@@ -138,12 +138,20 @@ own user login password). Windows boxes are reached via MCP only in this procedu
        `{"accepted":true,"amount_ns":…,"land_ptp_ns":…,"due_in_ms":…,"seq":…}`; every box then logs
        ONE `[DATE] stepped +…us (coordinated, seq N)` at the instant. Refused with a reason (`409`)
        while another change is in flight, without a settled UTC estimate, or for a fleet ahead of
-       UTC (never a backward step); `403` from a non-loopback peer or without the header; `503` =
-       the loop did not take it within 3 s, and NOTHING was announced. A pre-1.15 build answers
+       UTC (never a backward step); `403` from a non-loopback peer, without the header or with a
+       non-loopback `Host` (curl's own `127.0.0.1:8898` is fine); `503` = the loop did not take it
+       within 3 s, the request was abandoned and NOTHING was announced. A pre-1.15 build answers
        `200` + the status JSON: key on `"accepted"`. `/status.date_step_trigger_last` records the
        last one.
+     - **Rolling the MASTER back to a pre-1.15 build: delete `/etc/dantesync/date-offset.json`
+       (`C:\ProgramData\DanteSync\date-offset.json`) in the same step.** 1.14 does not know the
+       file and starts a new session; a 1.15 installed again within a day would restore the
+       session from BEFORE the rollback (same grandmaster, under a day old, within the 5 s cap)
+       and every follower would re-join it with a step at its own poll. A node that starts as a
+       non-master removes the file itself.
      - **camera-box:** its watchdog / handover grading of `date_authority` must accept
-       `"holding"` (a follower whose master is restarting), and `DANTESYNC_VERSION_PIN` advances.
+       `"holding"` (a follower whose master is restarting), and `DANTESYNC_VERSION_PIN` advances;
+       its fleet upgrader should delete the file on a master downgrade.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.
