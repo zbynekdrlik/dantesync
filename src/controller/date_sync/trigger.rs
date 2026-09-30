@@ -31,7 +31,7 @@ where
         for req in requests {
             // A request taken after its deadline is refused unacted: its HTTP side answers 503
             // ("nothing was announced") by then (review round 1).
-            let outcome = if std::time::Instant::now() > req.deadline && false {
+            let outcome = if std::time::Instant::now() > req.deadline {
                 self.record_date_step(DateStepOutcome::Refused {
                     reason: "the request expired before the sync loop took it: nothing announced"
                         .to_string(),
@@ -88,7 +88,8 @@ where
         }
         if self.date_sync.authority.is_none() {
             return refuse(
-                "this node is not the fleet date-offset authority (ask the NTP master, locally)",
+                "the date authority is not up yet: the master restores or starts it at its first \
+                 PTP lock",
             );
         }
         if self.ptp_offline

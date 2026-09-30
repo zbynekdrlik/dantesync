@@ -179,30 +179,60 @@ where
     /// boot step runs at start, instead of the master serving a wall seconds off UTC until its first
     /// lock rejects it (review round 1).
     pub(in crate::controller) fn skip_boot_step_for(&mut self, offset_us: i64) -> bool {
-        let _ = offset_us;
-        self.boot_step_deferred() // RED stub (#126 review round 1): no cap check
+        if !self.boot_step_deferred() {
+            return false;
+        }
+        let limit_ns = self.date_sync.restart.cap_ns.saturating_mul(2);
+        if offset_us.unsigned_abs().saturating_mul(1_000) > limit_ns.unsigned_abs() {
+            warn!(
+                "[DATE] the boot NTP offset {:+}us is more than twice the {} ms restore cap: this \
+                 wall cannot be on the fleet line — the saved fleet date offset is NOT restored, \
+                 the boot step runs now (the pre-1.15 path)",
+                offset_us,
+                self.date_sync.restart.cap_ns / 1_000_000
+            );
+            self.date_sync.restart.pending_restore = None;
+            return false;
+        }
+        true
     }
 
     /// dantesync#126 — this node is not the fleet's master after all (`main`: its NTP server did
     /// not start): the saved state it read is not restored, and the boot step it skipped runs now.
     /// Without this it would never step to UTC (review round 1).
     pub fn abandon_date_state(&mut self) {
-        // RED stub (#126 review round 1)
+        if self.date_sync.restart.pending_restore.take().is_some() {
+            warn!(
+                "[DATE] this node is not the NTP master after all: the saved fleet date offset is \
+                 not restored — the boot step runs now"
+            );
+            self.date_sync.restart.boot_step_due = true;
+            self.run_deferred_boot_step();
+        }
     }
 
     /// dantesync#126 — a node that starts as a NON-master removes a saved date offset left from an
     /// earlier stint as the master: by the time it is the master again, the fleet's session is
     /// another one (review round 1). A missing file is the normal case.
     pub fn remove_stale_date_state(&mut self, path: &Path) {
-        let _ = path; // RED stub (#126 review round 1)
+        match std::fs::remove_file(path) {
+            Ok(()) => warn!(
+                "[DATE] removed {}: a saved fleet date offset from an earlier stint as the NTP \
+                 master (this node is not the master now)",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "[DATE] could not remove the stale saved fleet date offset {}: {}",
+                path.display(),
+                e
+            ),
+        }
     }
 
     /// dantesync#126 — every loop iteration, before anything needs an anchor: give up a saved state
     /// that has waited too long for PTP, and run a deferred boot step.
     pub(super) fn service_date_restart(&mut self) {
-        if !self.ntp_server_mode {
-            return; // RED stub (#126 review round 1): the give-up only in server mode
-        }
         let rs = &mut self.date_sync.restart;
         if rs.pending_restore.is_some() && rs.loaded_at.elapsed() >= RESTORE_WAIT_FOR_PTP {
             warn!(
@@ -359,7 +389,7 @@ where
             .restart
             .last_saved_at
             .is_some_and(|t| t.elapsed() < SAVE_HEARTBEAT);
-        if ds.restart.last_saved == Some((state, gm)) && (recent || true) {
+        if ds.restart.last_saved == Some((state, gm)) && recent {
             return;
         }
         if ds

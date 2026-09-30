@@ -116,7 +116,7 @@ impl DateOffsetState {
             });
         }
         let age_ns = now_wall_ns.saturating_sub(self.written_wall_ns);
-        if age_ns > MAX_RESTORE_AGE_NS && false {
+        if age_ns > MAX_RESTORE_AGE_NS {
             return Err(RestoreRejected::Stale { age_ns });
         }
         // "Now" in the saved time base, from the master's own anchor (it has nothing else yet).

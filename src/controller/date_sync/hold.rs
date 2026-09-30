@@ -100,7 +100,9 @@ where
     /// dantesync#126 — a follower holding the fleet date offset (its master silent). Not while its
     /// own PTP is offline: it then takes its local NTP path, which a hold never covers.
     pub(in crate::controller) fn holding_date(&self) -> bool {
-        self.date_sync.restart.holding_since.is_some() && self.date_sync.follower.adopted()
+        self.date_sync.restart.holding_since.is_some()
+            && self.date_sync.follower.adopted()
+            && !self.ptp_offline
     }
 }
 

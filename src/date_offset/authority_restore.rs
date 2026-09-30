@@ -114,6 +114,8 @@ impl DateFollower {
     /// master would never schedule it — nor, staying unaligned, any later one — on its own wall.
     /// `seq` is the seq in effect before that change. No-op once aligned (review round 1).
     pub fn align_with_session(&mut self, seq: u32) {
-        let _ = seq; // RED stub (#126 review round 1)
+        if self.adopted_seq.is_none() {
+            self.adopted_seq = Some(seq);
+        }
     }
 }

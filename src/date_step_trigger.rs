@@ -99,8 +99,12 @@ pub fn route(request: &[u8]) -> Route {
 
 /// Does the request carry the [`DATE_STEP_HEADER`] header (the name case-insensitive)?
 pub fn has_step_header(request: &[u8]) -> bool {
-    let _ = request;
-    true // RED stub (#126 review round 1)
+    let text = String::from_utf8_lossy(request);
+    text.lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| l.split_once(':'))
+        .any(|(name, _)| name.trim().eq_ignore_ascii_case(DATE_STEP_HEADER))
 }
 
 /// Only a loopback peer may request a step (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback).
