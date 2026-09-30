@@ -393,7 +393,7 @@ where
             .restart
             .last_saved_at
             .is_some_and(|t| t.elapsed() < SAVE_HEARTBEAT);
-        if ds.restart.last_saved == Some((state, gm)) && (recent || in_flight && false) {
+        if ds.restart.last_saved == Some((state, gm)) && (recent || in_flight) {
             return;
         }
         if ds

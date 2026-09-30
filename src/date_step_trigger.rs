@@ -79,15 +79,27 @@ impl DateStepRequest {
     /// The loop claims the request: true = act on it (and answer); false = the HTTP side
     /// abandoned it (answered 503), so nothing may be announced.
     pub fn take(&self) -> bool {
-        let _ = &self.claim;
-        true // RED stub (#126 review round 2): no claim
+        self.claim
+            .compare_exchange(
+                CLAIM_PENDING,
+                CLAIM_TAKEN,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     /// The HTTP side gives up on `claim`: true = abandoned, nothing will be announced (answer
     /// 503); false = the loop has already taken it, so its answer must be waited for.
     pub fn abandon(claim: &AtomicU8) -> bool {
-        let _ = claim;
-        true // RED stub (#126 review round 2): no claim
+        claim
+            .compare_exchange(
+                CLAIM_PENDING,
+                CLAIM_ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }
 
@@ -152,8 +164,16 @@ pub fn has_step_header(request: &[u8]) -> bool {
 /// port)? A page served through a DNS-rebound name sends that name, so it is refused (review
 /// round 2). No `Host` at all is refused too.
 pub fn has_loopback_host(request: &[u8]) -> bool {
-    let _ = request;
-    true // RED stub (#126 review round 2): no Host check
+    let hs = headers(request);
+    let Some((_, host)) = hs.iter().find(|(n, _)| n == "host") else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    name.eq_ignore_ascii_case("localhost") || name == "::1" || name == "127.0.0.1"
 }
 
 /// Only a loopback peer may request a step (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback).
