@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The master saves its date offset.** Whenever its authority's published state changes (D in
     effect, seq, a step or slew in flight, the last nightly step, the grandmaster of the anchor)
     it is written to `date-offset.json` beside `config.json` (`/etc/dantesync/`,
-    `C:\ProgramData\DanteSync\`) by temp + rename, and rewritten at least every 10 minutes. A
+    `C:\ProgramData\DanteSync\`) by temp + rename, and rewritten every 10 minutes otherwise (the
+    rewrite waits while a step or slew is in flight). A
     write error is logged and retried, never fatal. Only the master writes it; a node that starts
     as a non-master removes one left from an earlier stint as the master.
   - **A restarted master restores it.** With a readable saved state the boot step is skipped and
@@ -45,7 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     send it). Refused with the reason (`409`) while another change is in flight, without a settled
     UTC estimate, or for a fleet ahead of UTC; `403` off loopback, without the header or with
     another Host; `503` when the loop does not take it within 3 s — the request is then abandoned
-    and nothing is ever announced for it. Every other request still gets the status JSON.
+    and nothing is ever announced for it; `500` with `"accepted": null` when the loop took it and
+    gave no answer within 30 s (unknown: read `/status.date_step_trigger_last`). Every other
+    request still gets the status JSON.
     `/status.date_step_trigger_last`.
   - Two-clock bench: a master restart 2 h in (down 2 s, locked 65 s later) with six boxes — the
     1.14 path reproduces the incident (a +62.8 ms boot step, all five followers stepping on their

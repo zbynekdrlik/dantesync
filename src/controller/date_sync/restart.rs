@@ -23,7 +23,8 @@
 //!
 //! Saving ([`PtpController::save_date_state_if_changed`]) runs on the master's loop: the record
 //! (`DateAuthority::persisted` + the anchor's grandmaster) is written by temp + rename when it
-//! changed and at least every 10 minutes (a record over a day old is not restored); a write error
+//! changed and every 10 minutes otherwise — that heartbeat waits while a step or slew is in flight
+//! (seconds) — (a record over a day old is not restored); a write error
 //! is logged, retried after a backoff, and never fatal. A node that starts as a non-master removes
 //! a leftover record ([`PtpController::remove_stale_date_state`]).
 
@@ -41,9 +42,10 @@ pub(super) const RESTORE_WAIT_FOR_PTP: Duration = Duration::from_secs(300);
 /// After a failed save, the next attempt waits this long (the loop runs every 1 ms / 50 µs).
 const SAVE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The saved state is rewritten at least this often, unchanged or not, so its `written_wall_ns`
-/// says the master was running then (the restore refuses a record over a day old — review round
-/// 1) and a deleted file comes back.
+/// The saved state is rewritten this often, unchanged or not, so its `written_wall_ns` says the
+/// master was running then (the restore refuses a record over a day old — review round 1) and a
+/// deleted file comes back. The rewrite waits while a step or slew is in flight on the master's
+/// own scheduler (seconds; review round 2).
 const SAVE_HEARTBEAT: Duration = Duration::from_secs(600);
 
 /// dantesync#126 — the restart state of one controller: the master's saved date offset, and a

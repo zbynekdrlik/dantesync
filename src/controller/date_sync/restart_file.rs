@@ -122,17 +122,23 @@ pub(super) fn read(path: &Path) -> Result<Option<DateOffsetState>, String> {
 /// Write the record by temp + rename in the same directory, the temp file synced first: a
 /// reader (the next start) sees the old record or the new one, never a torn one. On Unix the
 /// directory is synced after the rename, so a power cut cannot bring the previous record back
-/// (review round 2).
+/// (review round 2); a failure of that sync alone is a warning, not a failed save (round 3).
 pub(super) fn write_atomic(path: &Path, state: &DateOffsetState) -> std::io::Result<()> {
     write_atomic_with(path, state, sync_dir)
 }
 
-/// The directory a record at `path` lives in (the directory to sync after the rename).
+/// The directory a record at `path` lives in (the directory to sync after the rename; `.` for a
+/// bare file name).
 fn dir_to_sync(path: &Path) -> Option<PathBuf> {
-    path.parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .map(Path::to_path_buf)
+    match path.parent() {
+        Some(d) if d.as_os_str().is_empty() => Some(PathBuf::from(".")),
+        other => other.map(Path::to_path_buf),
+    }
 }
+
+/// A directory sync that failed after the rename is warned about once per process: the record is
+/// saved, only its durability across a power cut is not proven (review round 3).
+static DIR_SYNC_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Sync a directory (Unix; a no-op elsewhere).
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
@@ -158,8 +164,18 @@ fn write_atomic_with(
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // Renamed: the new record is in place. A directory that refuses the sync does not undo it.
     if let Some(dir) = dir_to_sync(path) {
-        sync_dir(&dir)?;
+        if let Err(e) = sync_dir(&dir) {
+            if !DIR_SYNC_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "[DATE] the fleet date offset is saved to {}, but its directory could not be \
+                     synced: {} (a power cut could bring the previous record back; warned once)",
+                    path.display(),
+                    e
+                );
+            }
+        }
     }
     Ok(())
 }

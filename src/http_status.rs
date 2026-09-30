@@ -203,7 +203,8 @@ fn handle_connection(
 /// name and the request carries the `X-DanteSync-Step` header (403); otherwise the request goes to
 /// the sync loop, whose answer is `202` (one coordinated step announced) or `409` (refused, with
 /// the reason), or `503` when the loop does not take it in time — then the request is abandoned
-/// and nothing is ever announced for it (`StepClaim::abandon`).
+/// and nothing is ever announced for it (`StepClaim::abandon`) — or `500` when the loop took it
+/// and gave no answer (the outcome unknown).
 fn handle_date_step(
     stream: &TcpStream,
     request: &[u8],
@@ -262,12 +263,22 @@ fn handle_date_step(
             }
             date_step_trigger::outcome_response(&outcome)
         }
-        StepAnswer::Abandoned | StepAnswer::TakenUnanswered => (
+        StepAnswer::Abandoned => (
             503,
             date_step_trigger::refusal_body(
                 "the sync loop did not take the request in time: nothing was announced",
             ),
         ),
+        StepAnswer::TakenUnanswered => {
+            warn!("[HTTP-Status] POST /date/step: the sync loop took it and gave no answer");
+            (
+                500,
+                date_step_trigger::unknown_body(
+                    "the sync loop took the request and gave no answer: whether a step was \
+                     announced is unknown, read /status.date_step_trigger_last and the log",
+                ),
+            )
+        }
     }
 }
 

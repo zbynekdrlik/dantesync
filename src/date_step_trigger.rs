@@ -10,9 +10,11 @@
 //! with a [`DateStepOutcome`].
 //!
 //! The answer is `202` + `{"accepted":true,…}` only when a step was announced; a refusal is a `4xx`
-//! with `{"accepted":false,"reason":…}`, and a `503` (no answer in time) guarantees nothing was
-//! announced: the request is CLAIMED once, either by the loop (which then acts and answers, however
-//! long it takes) or by the HTTP side giving up (the loop then never acts on it). The request must
+//! with `{"accepted":false,"reason":…}`, and a `503` (not taken in time) guarantees nothing was
+//! announced: the request is CLAIMED once, either by the loop (which then acts and answers) or by
+//! the HTTP side giving up (the loop then never acts on it). A request the loop took but left
+//! unanswered for [`DATE_STEP_TAKEN_TIMEOUT`] is a `500` with `{"accepted":null,…}`: unknown, read
+//! `/status.date_step_trigger_last`. The request must
 //! carry the `X-DanteSync-Step` header, which no web page can send cross-origin without a preflight
 //! this server never answers, and a loopback `Host` (a DNS-rebound page names its own host). An
 //! older build ignores the route and answers `200` with the status JSON, so a caller keys on
@@ -135,14 +137,15 @@ pub fn await_answer(
     reply_timeout: Duration,
     taken_timeout: Duration,
 ) -> StepAnswer {
-    let _ = taken_timeout;
     match answer.recv_timeout(reply_timeout) {
         Ok(outcome) => StepAnswer::Answered(outcome),
+        // Not taken yet (a timeout, or a loop that dropped it untaken): never acted on.
         Err(_) if claim.abandon() => StepAnswer::Abandoned,
-        Err(_) => answer
-            .recv()
-            .map(StepAnswer::Answered)
-            .unwrap_or(StepAnswer::Abandoned),
+        // Taken: bounded, and a silent loop is "unknown", never "nothing announced".
+        Err(_) => match answer.recv_timeout(taken_timeout) {
+            Ok(outcome) => StepAnswer::Answered(outcome),
+            Err(_) => StepAnswer::TakenUnanswered,
+        },
     }
 }
 
@@ -255,6 +258,12 @@ pub fn outcome_response(outcome: &DateStepOutcome) -> (u16, String) {
 /// `{"accepted":false,"reason":…}` — the body of every refusal (403, 405, 409, 503).
 pub fn refusal_body(reason: &str) -> String {
     json!({ "accepted": false, "reason": reason }).to_string()
+}
+
+/// The `500` body when the outcome is unknown (the loop took the request and gave no answer):
+/// `"accepted": null` — neither a step a caller may count on nor a refusal.
+pub fn unknown_body(reason: &str) -> String {
+    json!({ "accepted": null, "reason": reason }).to_string()
 }
 
 #[cfg(test)]
