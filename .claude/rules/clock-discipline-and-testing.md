@@ -1164,7 +1164,11 @@ The mockall-based controller tests used to have no local path at all. They run u
 - **The crate:** a scratch `src/` of symlinks to the lib's modules, `ntp.rs` and `dscp.rs` reduced
   to their data types (`rsntp`/`socket2` are not needed then). `rustc --test` it with `--extern`
   for each; `--emit=metadata` without `--test` type-checks the lib, and `CARGO_PKG_RUST_VERSION=1.70.0
-  clippy-driver … -D warnings -A dead_code` reproduces the Lint job on it.
+  clippy-driver … -D warnings -A dead_code` reproduces the Lint job on it. Run that clippy on the
+  LIB, never with `--test`: CI's Lint (`cargo clippy -- …`) does not lint test code, and the tests
+  already carry ~50 lints of their own (`field_reassign_with_default` in `config/tests.rs`,
+  `status/tests.rs` and `controller.rs`'s tests, `neg_multiply` in `clock/linux.rs`) — a `--test`
+  run reads as a regression that is not yours (#126 round 3).
 - **Measured on dev1 (#126):** 569 of 571 lib tests pass; the two others are environmental
   (`clock_alarm` formatting needs the real chrono; `gm_allowlist_hostname_resolution_…_113`
   resolves `video-clock.lan` on the rig's LAN). A stubbed RED commit is proven the same way:
