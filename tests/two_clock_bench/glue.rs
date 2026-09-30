@@ -195,7 +195,22 @@ pub(super) fn master_restores_authority(
     slew_ppm: u32,
     correction: CorrectionMode,
 ) -> Option<DateAuthority> {
-    // RED stub (#126): the pre-1.15 master never restores (a new session).
-    let _ = (m, saved, slew_ppm, correction);
-    None
+    let anchor = m.core.anchor_ns()?;
+    let record = dantesync::date_offset::DateOffsetState {
+        authority: saved.0,
+        gm_uuid: [saved.1; 6],
+        written_wall_ns: 0,
+        written_ptp_ns: 0,
+    };
+    let cap = DailyConfig::default().emergency_ns;
+    record
+        .validate_restore(Some([m.core_gm; 6]), anchor, m.wall_ns(), cap)
+        .ok()?;
+    let now_ptp = m.wall_ns() - anchor;
+    Some(
+        DateAuthority::restore(&saved.0, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS)
+            .with_slew_ppm(slew_ppm)
+            .with_correction(correction)
+            .with_daily_last_step(saved.0.daily_last_step),
+    )
 }

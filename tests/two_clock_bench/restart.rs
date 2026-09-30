@@ -82,8 +82,7 @@ impl Bench<'_> {
             let m = &mut self.boxes[0];
             m.word_ppm = -m.osc_ppm + 0.4;
             // 1.14: `run_ntp_sync` steps the wall to UTC (unbounded, before any anchor).
-            // RED stub (#126): the pre-1.15 start always takes the boot step.
-            if err.abs() > 50 * MS {
+            if !r.restore && err.abs() > 50 * MS {
                 m.stepped += err;
                 self.restart_log.boot_step_ns = Some(err);
             }
@@ -106,11 +105,9 @@ impl Bench<'_> {
     /// (two agreeing readings beyond the threshold step its wall, `D` moving with it) until it
     /// hears the authority again. No-op without the loss model.
     pub(super) fn follower_authority_loss(&mut self, w: u64) {
-        let Some(_hold) = self.sc.follower_hold_windows else {
+        let Some(hold) = self.sc.follower_hold_windows else {
             return;
         };
-        // RED stub (#126): the pre-1.15 follower has no hold (the fallback at the 30 s loss).
-        let hold = 0;
         let ntp_up = self.master_ntp_up(w);
         let master_wall = self.boxes[0].wall_ns();
         let grace = self.sc.grace;
