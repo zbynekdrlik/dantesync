@@ -1186,8 +1186,8 @@ where
                     // first PTP lock instead — a restart must not move the fleet date.
                     info!(
                         "[DATE] boot step of {}{:?} SKIPPED: the saved fleet date offset is \
-                         restored at the first PTP lock (the UTC error is corrected at the next \
-                         nightly window)",
+                         restored at the first PTP lock (the date authority corrects the UTC \
+                         error, coordinated, as if the master had not restarted)",
                         sign_str, offset
                     );
                 } else if offset.as_millis() > 50 {

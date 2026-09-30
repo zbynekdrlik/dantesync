@@ -67,14 +67,31 @@ pub enum Route {
 /// Route a raw request by its request line (`METHOD PATH HTTP/x`); a query string is ignored.
 /// Anything unreadable is the status route, as it always was.
 pub fn route(request: &[u8]) -> Route {
-    let _ = request;
-    Route::Status // RED stub (#126): no step route yet
+    let text = String::from_utf8_lossy(request);
+    let line = text.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+        return Route::Status;
+    };
+    let path = target.split('?').next().unwrap_or(target);
+    if path.trim_end_matches('/') != DATE_STEP_PATH {
+        return Route::Status;
+    }
+    if method.eq_ignore_ascii_case("POST") {
+        Route::DateStep
+    } else {
+        Route::DateStepWrongMethod
+    }
 }
 
 /// Only a loopback peer may request a step (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback).
 pub fn peer_allowed(ip: IpAddr) -> bool {
-    let _ = ip;
-    false // RED stub (#126)
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 /// The HTTP status code and the JSON body of an outcome: `202` when announced, `409` refused.

@@ -60,8 +60,71 @@ where
     }
 
     fn try_date_step_on_request(&mut self) -> DateStepOutcome {
-        DateStepOutcome::Refused {
-            reason: "not implemented yet (RED stub, #126)".to_string(),
+        let refuse = |reason: &str| DateStepOutcome::Refused {
+            reason: reason.to_string(),
+        };
+        if !self.date_sync.enabled {
+            return refuse("the legacy clock discipline has no fleet date offset");
+        }
+        if !self.ntp_server_mode || self.date_sync.authority.is_none() {
+            return refuse(
+                "this node is not the fleet date-offset authority (ask the NTP master, locally)",
+            );
+        }
+        if self.ptp_offline
+            || !self.date_sync.core.engaged()
+            || self.date_sync.core.rebase_pending()
+        {
+            return refuse("the master has no PTP phase lock right now");
+        }
+        let Some(base) = self.date_sync.core.anchor_ns() else {
+            return refuse("the master has no PTP phase lock right now");
+        };
+        let now_wall = wall_now_ns();
+        // The master's D IN EFFECT (its anchor plus a held slew's displacement).
+        let own = self.date_sync.follower.in_effect_ns(base, now_wall);
+        let now_ptp = now_wall.wrapping_sub(own);
+        let backoff = self.in_step_backoff();
+        let Some(a) = self.date_sync.authority.as_mut() else {
+            return refuse("this node is not the fleet date-offset authority");
+        };
+        let fleet = a.in_effect_ns(now_ptp);
+        if own != fleet || backoff {
+            return refuse("the master is off the fleet line (it re-aligns its own wall first)");
+        }
+        match a.step_now(now_ptp) {
+            Ok(ann) => {
+                let amount = ann.date_offset_ns.wrapping_sub(fleet);
+                let due_ms = ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000;
+                warn!(
+                    "[DATE] AUTHORITY: date step ON REQUEST {:+.3} ms (the whole UTC error, a \
+                     coordinated step) at PTP {} (in {} s), seq {}",
+                    amount as f64 / 1e6,
+                    ann.effective_ptp_ns,
+                    due_ms / 1_000,
+                    ann.seq
+                );
+                self.master_schedules_own(ann, base, now_wall);
+                DateStepOutcome::Accepted {
+                    amount_ns: amount,
+                    land_ptp_ns: ann.effective_ptp_ns,
+                    due_in_ms: due_ms,
+                    seq: ann.seq,
+                }
+            }
+            Err(StepRefused::ChangeInFlight) => {
+                refuse("a date change is already in flight (one at a time)")
+            }
+            Err(StepRefused::NoEstimate) => refuse(
+                "no settled UTC estimate yet (at least six fresh NTP readings in five minutes)",
+            ),
+            Err(StepRefused::NotBehind { error_ns }) => DateStepOutcome::Refused {
+                reason: format!(
+                    "the fleet is not behind UTC ({:+.3} ms): a backward correction is never \
+                     stepped on request (it is made at night)",
+                    error_ns as f64 / 1e6
+                ),
+            },
         }
     }
 }

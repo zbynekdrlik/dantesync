@@ -46,30 +46,60 @@ where
     /// dantesync#126 — every loop iteration on a follower: keep the adopted `D` through the
     /// master's silence for the hold, then fall back to the local NTP date path.
     pub(super) fn hold_or_forget_silent_authority(&mut self) {
-        // RED stub (#126): the 1.14 behaviour, the fallback at the 30 s loss.
-        let lost = match self.date_sync.last_applicable_reply {
-            None => true,
-            Some(t) => t.elapsed() > AUTHORITY_LOSS,
-        };
-        if lost && self.date_sync.follower.adopted() {
-            warn!(
-                "[DATE] no applicable date-offset authority reply for {}s — back to the local NTP \
-                 date path until the master is heard again",
-                AUTHORITY_LOSS.as_secs()
-            );
-            self.date_sync.follower.forget();
-            self.date_sync.last_announce = None;
+        if !self.date_sync.follower.adopted() {
+            self.date_sync.restart.holding_since = None;
+            return;
+        }
+        let silent_for = self.date_sync.last_applicable_reply.map(|t| t.elapsed());
+        let hold = self.date_sync.restart.hold;
+        match authority_silence(silent_for, AUTHORITY_LOSS, hold) {
+            Silence::Heard => {}
+            Silence::Hold => {
+                if self.date_sync.restart.holding_since.is_none() {
+                    warn!(
+                        "[DATE] no applicable date-offset authority reply for {}s — HOLDING the \
+                         fleet date offset (seq {}) for up to {}s: no NTP step while the master \
+                         restarts or re-acquires PTP",
+                        AUTHORITY_LOSS.as_secs(),
+                        self.date_sync
+                            .follower
+                            .adopted_seq()
+                            .map(|q| q.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        hold.as_secs()
+                    );
+                    self.date_sync.restart.holding_since = Some(Instant::now());
+                    self.update_shared_status();
+                }
+            }
+            Silence::Lost => {
+                warn!(
+                    "[DATE] no applicable date-offset authority reply for {}s — back to the local \
+                     NTP date path until the master is heard again",
+                    AUTHORITY_LOSS.saturating_add(hold).as_secs()
+                );
+                self.date_sync.follower.forget();
+                self.date_sync.last_announce = None;
+                self.date_sync.restart.holding_since = None;
+                self.update_shared_status();
+            }
         }
     }
 
     /// dantesync#126 — an applicable reply ends a hold (the caller then acts on the announce).
     pub(super) fn end_authority_hold(&mut self) {
-        // RED stub (#126)
+        if let Some(since) = self.date_sync.restart.holding_since.take() {
+            info!(
+                "[DATE] the date-offset authority is heard again after holding for {}s — following \
+                 it",
+                since.elapsed().as_secs()
+            );
+        }
     }
 
     /// dantesync#126 — a follower holding the fleet date offset (its master silent).
     pub(in crate::controller) fn holding_date(&self) -> bool {
-        false // RED stub (#126)
+        self.date_sync.restart.holding_since.is_some() && self.date_sync.follower.adopted()
     }
 }
 
