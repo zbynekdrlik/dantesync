@@ -23,10 +23,10 @@
 //!
 //! Saving ([`PtpController::save_date_state_if_changed`]) runs on the master's loop: the record
 //! (`DateAuthority::persisted` + the anchor's grandmaster) is written by temp + rename when it
-//! changed and every 10 minutes otherwise — that heartbeat waits while a step or slew is in flight
-//! (seconds) — (a record over a day old is not restored); a write error
-//! is logged, retried after a backoff, and never fatal. A node that starts as a non-master removes
-//! a leftover record ([`PtpController::remove_stale_date_state`]).
+//! changed, and every 10 minutes otherwise (a record over a day old is not restored; that heartbeat
+//! waits while a step or slew is in flight, seconds); a write error is logged, retried after a
+//! backoff, and never fatal. A node that starts as a non-master removes a leftover record
+//! ([`PtpController::remove_stale_date_state`]).
 
 use super::restart_file;
 use super::*;
