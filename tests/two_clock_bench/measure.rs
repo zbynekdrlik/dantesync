@@ -30,13 +30,21 @@ impl Bench<'_> {
         // and its D equal to the authority's): during its own PTP outage it runs the local NTP
         // date path by design (micro mode) or free-runs with the fleet D (daily mode, #119 1.12:
         // its free-run error is bounded by the daily scenarios on their own).
-        let a = self.authority.as_ref().unwrap();
-        let m = &self.boxes[0];
-        let m_d = m.d_in_effect();
-        let master_on_line =
-            !self.sc.master_offline_at(w) && a.in_effect_ns(m.wall_ns() - m_d) == m_d;
-        let slewing = a.slew_in_progress(m.wall_ns() - m_d).is_some()
-            || self.boxes.iter().any(|b| b.follower.held_slew().is_some());
+        // #126: while the master restarts (no authority, no PTP) only the followers are judged.
+        let (master_on_line, authority_slewing) = match self.authority.as_ref() {
+            Some(a) if !self.master_down => {
+                let m = &self.boxes[0];
+                let m_d = m.d_in_effect();
+                let now_ptp = m.wall_ns() - m_d;
+                (
+                    !self.sc.master_offline_at(w) && a.in_effect_ns(now_ptp) == m_d,
+                    a.slew_in_progress(now_ptp).is_some(),
+                )
+            }
+            _ => (false, false),
+        };
+        let slewing =
+            authority_slewing || self.boxes.iter().any(|b| b.follower.held_slew().is_some());
         if slewing && (w == GM_CHANGE_AT_WINDOW || w == GM_REBOOT_AT_WINDOW) {
             self.gm_events_in_slew += 1;
         }
@@ -78,6 +86,14 @@ impl Bench<'_> {
             && sc.master_ptp_offline.iter().any(|&(from, to)| {
                 (from..to).contains(&GM_CHANGE_AT_WINDOW) && (to..to + 600).contains(&w)
             });
+        // #126: a restarted master re-joins the fleet line with its own free-run of the gap: up to
+        // the absorb tolerance is absorbed and pulled in by the phase lock over ~2 minutes (the
+        // master's re-acquisition, bounded on its own like the double fault's settling).
+        let restart_settling = sc.master_restart.is_some_and(|r| {
+            let lock = r.at + r.gap + r.acq;
+            (lock..lock + 600).contains(&w)
+        });
+        let double_fault_settling = double_fault_settling || restart_settling;
         let hi = judged.iter().map(|b| b.wall_ns()).max().unwrap();
         let lo = judged.iter().map(|b| b.wall_ns()).min().unwrap();
         if straddling {

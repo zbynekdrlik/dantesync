@@ -51,11 +51,17 @@
 //! when the 02:00 UTC window opens, and an immediate step only beyond the 5 s emergency cap.
 //! `two_clock_bench/daily.rs` proves it over 48 h (see there); every scenario above runs in
 //! micro mode, which stays byte-identical.
+//!
+//! dantesync#126: a restart of the NTP master's PROCESS keeps the fleet date — the master restores
+//! its saved authority (the same `D` and seq) and its followers HOLD the fleet date through the
+//! gap, with the 1.14 path (a boot step to UTC, a new session, followers back on their own NTP
+//! steps after 30 s) as the negative control; and a coordinated step on request lands on every box
+//! at its instant. `two_clock_bench/restart.rs` (see there).
 
 use dantesync::date_offset::{
-    same_time_base, slew_cap_ns, CorrectionMode, DailyConfig, DateAnnounce, DateAuthority,
-    DateFollower, FollowAction, SlewSpec, StepKind, DEFAULT_SLEW_PPM, DEFAULT_STEP_BOUND_NS,
-    MIN_STEP_LEAD_NS,
+    same_time_base, slew_cap_ns, AuthorityState, CorrectionMode, DailyConfig, DateAnnounce,
+    DateAuthority, DateFollower, FollowAction, SlewSpec, StepKind, DEFAULT_SLEW_PPM,
+    DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS,
 };
 use dantesync::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 
@@ -147,6 +153,14 @@ struct Scenario {
     /// camera-box issue 1372: grandmaster A's rate STEPS to this (ppm) at this window, under the
     /// same identity (a Dante leader flip seen on the video VLAN: no re-anchor anywhere).
     gm_a_flip: Option<(u64, f64)>,
+    /// #126: the NTP master's PROCESS restarts (`restart.rs`); no scenario before 1.15 has one.
+    master_restart: Option<MasterRestart>,
+    /// #126: how long (windows) a follower HOLDS the fleet D after the 30 s authority loss before
+    /// it takes its local NTP date path; `None` = no loss model (no scenario before 1.15 silences
+    /// the master).
+    follower_hold_windows: Option<u64>,
+    /// #126: coordinated date steps on request at these windows (`DateAuthority::step_now`).
+    step_requests_at: Vec<u64>,
 }
 
 /// #119: after a UTC jump the fleet is off UTC by the jump until the corrections have paid it.
@@ -178,6 +192,9 @@ impl Scenario {
             utc_outages: Vec::new(),
             gm_b_ppm: GM_B_PPM,
             gm_a_flip: None,
+            master_restart: None,
+            follower_hold_windows: None,
+            step_requests_at: Vec::new(),
         }
     }
     fn daily(&self) -> bool {
@@ -223,6 +240,10 @@ use windows::*;
 mod box_ops;
 #[path = "two_clock_bench/measure.rs"]
 mod measure;
+// #126: the master's restart, the followers' authority loss / hold, the step on request.
+#[path = "two_clock_bench/restart.rs"]
+mod restart;
+use restart::*;
 
 struct Box_ {
     osc_ppm: f64,
@@ -275,6 +296,13 @@ struct Box_ {
     /// camera-box issue 1372: every grandmaster frequency step the phase lock followed:
     /// (window, the step in ppm).
     freq_steps: Vec<(u64, f64)>,
+    /// #126: the loss model — the window of the last applicable authority reply, whether this
+    /// follower has forgotten the authority, its local NTP path's pending reading, and the steps
+    /// that path took: (window, size).
+    last_heard_w: Option<u64>,
+    forgotten: bool,
+    local_candidate: Option<i64>,
+    local_steps: Vec<(u64, i64)>,
 }
 
 type Step = (u32, i64, StepKind, f64);
@@ -326,6 +354,9 @@ struct RunResult {
     correction_walls: Vec<i64>,
     /// camera-box issue 1372: per box, every frequency step followed (window, ppm).
     freq_steps: Vec<Vec<(u64, f64)>>,
+    /// #126: per box, the steps of the local NTP date path (window, size), and the restart.
+    local_steps: Vec<Vec<(u64, i64)>>,
+    restart: RestartLog,
 }
 
 /// Everything one bench run evolves: the true clocks, the boxes, the master's authority and its
@@ -373,6 +404,13 @@ struct Bench<'s> {
     /// (continuous wall, gm) at the start of the hour.
     hour_start: Vec<(i64, i64)>,
     rate_errors: Vec<f64>,
+    /// #126: the master's process is down or not yet PTP-locked after a restart: no PTP window,
+    /// no authority, nothing published.
+    master_down: bool,
+    /// #126: the authority's saved state (written at the end of every window it runs, as the
+    /// controller writes it on every change) and the grandmaster of its anchor.
+    saved: Option<(AuthorityState, u8)>,
+    restart_log: RestartLog,
 }
 
 /// One PTP window's result for the master's glue: its re-anchor on a new time base, if any, and
@@ -446,6 +484,10 @@ impl<'s> Bench<'s> {
                 last_landing: None,
                 rate_audit: RateAudit::default(),
                 freq_steps: Vec::new(),
+                last_heard_w: None,
+                forgotten: false,
+                local_candidate: None,
+                local_steps: Vec::new(),
             })
             .collect();
         let n = boxes.len();
@@ -494,6 +536,9 @@ impl<'s> Bench<'s> {
             wall_back: 0,
             hour_start: vec![(0, 0); n],
             rate_errors: Vec::new(),
+            master_down: false,
+            saved: None,
+            restart_log: RestartLog::default(),
         }
     }
 
@@ -593,6 +638,7 @@ impl<'s> Bench<'s> {
         let (gm_a, gm_b_pre, gm_b_post) = (&self.gm_a, &self.gm_b_pre, &self.gm_b_post);
         let t_end_ns = (w + 1) as f64 * TRUE_DT_NS;
         let judged = w > self.sc.settle_windows;
+        let master_down = self.master_down;
         for (i, b) in self.boxes.iter_mut().enumerate() {
             let (gm_id, gm) = gm_view(w, b.lag, gm_a, gm_b_pre, gm_b_post);
             let gm_ppm = if gm_id == 1 {
@@ -626,7 +672,8 @@ impl<'s> Bench<'s> {
                 b.core.request_rebase();
                 b.core_gm = gm_id;
             }
-            let master_offline = i == 0 && self.sc.master_offline_at(w);
+            // #126: a restarting master has no PTP window either (its process is down or acquiring).
+            let master_offline = i == 0 && (self.sc.master_offline_at(w) || master_down);
             if w < b.grace_until || master_offline {
                 if master_offline && b.core.engaged() {
                     // No PTP, no phase lock: the controller's `on_ptp_offline_edge` holds the
@@ -664,21 +711,51 @@ impl<'s> Bench<'s> {
 
     /// 4. The master: authority lifecycle + UTC every 10 s (the controller's date_sync glue).
     fn master_cycle(&mut self, w: u64, t0_ns: f64, window: MasterWindow) {
+        // #126: a restarting master runs no authority until its first PTP lock.
+        if self.master_down {
+            return;
+        }
         let grace = self.sc.grace;
         let offline = self.sc.master_offline_at(w);
         let m = &mut self.boxes[0];
         let anchor = m.core.anchor_ns().unwrap();
         let now_ptp = m.wall_ns() - anchor;
         if self.authority.is_none() {
-            let a = DateAuthority::new(anchor, now_ptp, DEFAULT_STEP_BOUND_NS, MIN_STEP_LEAD_NS)
-                .with_slew_ppm(self.sc.slew_ppm)
-                .with_correction(self.sc.correction);
-            let act = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
-            assert_eq!(
-                act,
-                FollowAction::None,
-                "the authority is aligned with itself"
-            );
+            // #126: a restarted master restores its saved authority when it validates.
+            let restored = match (self.sc.master_restart, self.saved) {
+                (Some(r), Some(saved)) if r.restore => {
+                    master_restores_authority(m, saved, self.sc.slew_ppm, self.sc.correction)
+                }
+                _ => None,
+            };
+            let a = match restored {
+                Some(a) => {
+                    self.restart_log.restored = true;
+                    // Aligned with it like the controller (the action is left to the re-join).
+                    let _ = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
+                    a
+                }
+                None => {
+                    let a = DateAuthority::new(
+                        anchor,
+                        now_ptp,
+                        DEFAULT_STEP_BOUND_NS,
+                        MIN_STEP_LEAD_NS,
+                    )
+                    .with_slew_ppm(self.sc.slew_ppm)
+                    .with_correction(self.sc.correction);
+                    let act = m.follower.on_announce(a.announce(), anchor, m.wall_ns());
+                    assert_eq!(
+                        act,
+                        FollowAction::None,
+                        "the authority is aligned with itself"
+                    );
+                    a
+                }
+            };
+            if self.restart_log.seq_before.is_some() {
+                self.restart_log.seq_after.get_or_insert(a.seq());
+            }
             self.authority = Some(a);
         }
         let a = self.authority.as_mut().unwrap();
@@ -752,10 +829,35 @@ impl<'s> Bench<'s> {
                 }
             }
         }
+        // #126: a coordinated step on request (the master is on the fleet line: it schedules it).
+        if self.sc.step_requests_at.contains(&w) {
+            let d = m.d_in_effect();
+            let now_ptp = m.wall_ns() - d;
+            let fleet = a.in_effect_ns(now_ptp);
+            assert_eq!(d, fleet, "the master is on the fleet line for the request");
+            let ann = a
+                .step_now(now_ptp)
+                .expect("the master accepts the step on request");
+            self.restart_log.request_seqs.push(ann.seq);
+            Self::master_takes(
+                m,
+                (ann, true, fleet),
+                w,
+                &mut self.announced,
+                &mut self.announced_slews,
+                &mut self.corrections,
+                &mut self.correction_walls,
+            );
+            self.snapshot = Some(master_publishes(m, a)); // published at once
+        }
         // The 10 s `tick_status`, on its own timer: not in phase with the NTP cadence (here 6.5 s
         // after it, i.e. later than the 5 s announce lead).
         if w % 20 == 13 {
             self.snapshot = Some(master_publishes(m, a));
+        }
+        // #126: the controller saves the authority's state on every change (here: every window).
+        if !m.core.rebase_pending() {
+            self.saved = Some((a.persisted(m.wall_ns() - m.d_in_effect()), m.core_gm));
         }
         if w > self.sc.settle_windows && !self.sc.settling_after_a_utc_jump(w) {
             self.max_utc = self.max_utc.max((self.utc.ns - m.wall_ns()).abs());
@@ -802,7 +904,10 @@ impl<'s> Bench<'s> {
             return;
         }
         let grace = self.sc.grace;
-        let published = self.snapshot.expect("published since the first window");
+        // #126: nothing is published while the master restarts (its followers hear silence).
+        let Some(published) = self.snapshot else {
+            return;
+        };
         let master_wall_now = self.boxes[0].wall_ns();
         let ann = DateAnnounce {
             date_offset_ns: published.date_offset_ns,
@@ -819,6 +924,7 @@ impl<'s> Bench<'s> {
                 self.refused += 1;
                 continue;
             }
+            b.last_heard_w = Some(w);
             let anchor = b.core.anchor_ns().expect("accepted ⇒ anchored");
             match b.follower.on_announce(ann, anchor, b.wall_ns()) {
                 FollowAction::None
@@ -904,6 +1010,8 @@ impl<'s> Bench<'s> {
                 .collect(),
             correction_walls: self.correction_walls,
             freq_steps: self.boxes.iter().map(|b| b.freq_steps.clone()).collect(),
+            local_steps: self.boxes.iter().map(|b| b.local_steps.clone()).collect(),
+            restart: self.restart_log.clone(),
         }
     }
 }
@@ -912,6 +1020,7 @@ fn run(sc: &Scenario) -> RunResult {
     let mut bench = Bench::new(sc);
     for w in 0..sc.run_windows {
         let t0_ns = w as f64 * TRUE_DT_NS;
+        bench.restart_events(w);
         let master_steps_at_start = bench.boxes[0].steps.len();
         bench.advance_clocks(w, t0_ns);
         bench.fold_completed_slews();
@@ -924,6 +1033,7 @@ fn run(sc: &Scenario) -> RunResult {
         let master_window = bench.ptp_windows(w);
         bench.master_cycle(w, t0_ns, master_window);
         bench.follower_polls(w, t0_ns);
+        bench.follower_authority_loss(w);
         bench.measure_disagreement(w, t0_ns);
         bench.audit_rates(w);
     }

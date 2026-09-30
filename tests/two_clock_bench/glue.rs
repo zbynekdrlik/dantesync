@@ -184,3 +184,18 @@ pub(super) fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u6
     m.core.set_anchor(fleet);
     m.realign_after_outage = false;
 }
+
+/// #126 — the restarted master's first anchor and its saved state (`restore_date_authority`):
+/// the same grandmaster, and the anchor within the daily emergency cap of the saved `D` → the
+/// restored authority (the same `D`, seq and change in flight, configured like a new one);
+/// anything else → `None`, a new session (`ensure_date_authority`, after the deferred boot step).
+pub(super) fn master_restores_authority(
+    m: &Box_,
+    saved: (AuthorityState, u8),
+    slew_ppm: u32,
+    correction: CorrectionMode,
+) -> Option<DateAuthority> {
+    // RED stub (#126): the pre-1.15 master never restores (a new session).
+    let _ = (m, saved, slew_ppm, correction);
+    None
+}
