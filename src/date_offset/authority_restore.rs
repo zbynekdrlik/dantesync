@@ -32,16 +32,15 @@ impl DateAuthority {
     /// dantesync#126 — the state to save, as it stands at `now_ptp_ns`: a change due by then has
     /// landed (so the record changes exactly when the published state does).
     pub fn persisted(&self, now_ptp_ns: i64) -> AuthorityState {
-        let _ = now_ptp_ns;
-        // RED stub (#126): nothing is saved yet.
+        let (d_ns, since_ptp_ns, pending, slew) = self.promoted(now_ptp_ns);
         AuthorityState {
-            d_ns: 0,
-            since_ptp_ns: 0,
-            seq: 0,
-            pending: None,
-            slew: None,
-            micro: false,
-            daily_last_step: None,
+            d_ns,
+            since_ptp_ns,
+            seq: self.seq,
+            pending,
+            slew,
+            micro: self.micro_kind,
+            daily_last_step: self.daily_last_step(),
         }
     }
 
@@ -57,15 +56,23 @@ impl DateAuthority {
         step_bound_ns: i64,
         lead_ns: i64,
     ) -> Self {
-        // RED stub (#126): a fresh authority, as before 1.15.
-        DateAuthority::new(state.d_ns, now_ptp_ns, step_bound_ns, lead_ns)
+        let mut a = DateAuthority::new(state.d_ns, now_ptp_ns, step_bound_ns, lead_ns);
+        a.current_since_ptp_ns = state.since_ptp_ns;
+        a.seq = state.seq;
+        a.pending = state.pending;
+        a.slew = state.slew;
+        a.micro_kind = state.micro;
+        a.promote(now_ptp_ns);
+        a
     }
 
     /// dantesync#126 — the last nightly step of the saved state (daily mode; nothing in micro
     /// mode). Call after [`with_correction`](Self::with_correction), which builds the scheduler.
-    pub fn with_daily_last_step(self, last: Option<(i64, i64)>) -> Self {
-        let _ = last;
-        self // RED stub (#126)
+    pub fn with_daily_last_step(mut self, last: Option<(i64, i64)>) -> Self {
+        if let (Some(daily), Some((wall, amount))) = (self.daily.as_mut(), last) {
+            daily.restore_last_step(wall, amount);
+        }
+        self
     }
 
     /// dantesync#126 — announce the current UTC error NOW as ONE coordinated step,
@@ -74,7 +81,28 @@ impl DateAuthority {
     /// nightly step), and the kept readings are compensated at once. Refused while another change
     /// is in flight, without a settled estimate, and for a fleet not behind UTC.
     pub fn step_now(&mut self, now_ptp_ns: i64) -> Result<DateAnnounce, StepRefused> {
-        let _ = now_ptp_ns;
-        Err(StepRefused::NoEstimate) // RED stub (#126)
+        self.promote(now_ptp_ns);
+        if self.pending.is_some() || self.slew.is_some() || self.over_bound.is_some() {
+            return Err(StepRefused::ChangeInFlight);
+        }
+        let land = now_ptp_ns.saturating_add(self.lead_ns.saturating_mul(MICRO_LEAD_FACTOR));
+        let estimate = if self.micro.settled(now_ptp_ns) {
+            self.micro.estimate(land)
+        } else {
+            None
+        };
+        let Some(est) = estimate else {
+            return Err(StepRefused::NoEstimate);
+        };
+        if est.error_ns <= 0 {
+            return Err(StepRefused::NotBehind {
+                error_ns: est.error_ns,
+            });
+        }
+        self.pending = Some((self.current_ns.saturating_add(est.error_ns), land));
+        self.micro.compensate(est.error_ns);
+        self.micro_kind = false;
+        self.seq = self.seq.wrapping_add(1);
+        Ok(self.announce())
     }
 }

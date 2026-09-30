@@ -49,8 +49,14 @@ pub struct AuthorityState {
 impl AuthorityState {
     /// `D` this state has in effect at `now_ptp_ns`: a pending step whose instant has come has
     /// landed, a slew is at its schedule.
-    pub fn d_in_effect_at(&self, _now_ptp_ns: i64) -> i64 {
-        self.d_ns // RED stub (#126): the change in flight is not applied yet
+    pub fn d_in_effect_at(&self, now_ptp_ns: i64) -> i64 {
+        if let Some(s) = self.slew {
+            return s.offset_at(now_ptp_ns);
+        }
+        match self.pending {
+            Some((d, eff)) if eff <= now_ptp_ns => d,
+            _ => self.d_ns,
+        }
     }
 }
 
@@ -94,8 +100,23 @@ impl DateOffsetState {
         now_wall_ns: i64,
         cap_ns: i64,
     ) -> Result<i64, RestoreRejected> {
-        let _ = (gm, anchor_ns, now_wall_ns, cap_ns);
-        Ok(0) // RED stub (#126): nothing is validated yet
+        let now = gm.ok_or(RestoreRejected::NoGrandmaster)?;
+        if now != self.gm_uuid {
+            return Err(RestoreRejected::OtherGrandmaster {
+                saved: self.gm_uuid,
+                now,
+            });
+        }
+        // "Now" in the saved time base, from the master's own anchor (it has nothing else yet).
+        let now_ptp = now_wall_ns.wrapping_sub(anchor_ns);
+        let off = anchor_ns.wrapping_sub(self.authority.d_in_effect_at(now_ptp));
+        if off.unsigned_abs() > cap_ns.unsigned_abs() {
+            return Err(RestoreRejected::TimeBase {
+                off_ns: off,
+                cap_ns,
+            });
+        }
+        Ok(off)
     }
 }
 

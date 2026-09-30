@@ -303,6 +303,17 @@ impl DailyScheduler {
         self.last_step
     }
 
+    /// dantesync#126 — a restarted master restores the last nightly step it had announced: it is
+    /// reported again, and the night it belongs to is handled (a restart inside that night's
+    /// window must not decide the night a second time).
+    pub fn restore_last_step(&mut self, landing_wall_ns: i64, amount_ns: i64) {
+        self.last_step = Some((landing_wall_ns, amount_ns));
+        let night = self.window_start(landing_wall_ns);
+        if !self.handled(night) {
+            self.done_window = Some(night);
+        }
+    }
+
     /// Is the window starting at `start` handled (it or a later one was stepped, not needed,
     /// skipped or missed)?
     fn handled(&self, start: i64) -> bool {

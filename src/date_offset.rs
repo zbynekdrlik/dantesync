@@ -73,6 +73,14 @@
 //! becomes the emergency cap (`daily_emergency_ms`, 5 s): only an error beyond it is stepped by
 //! day. [`CorrectionMode::Micro`] is the 1.11 behaviour, byte for byte (and what a bare
 //! [`DateAuthority::new`] runs). The step bound's 1.10 correction ("bound") no longer exists.
+//!
+//! # dantesync#126 — a master restart keeps the fleet date (1.15)
+//!
+//! The authority's published state is saved by the master whenever it changes
+//! ([`DateAuthority::persisted`], the record in `persist`) and restored by a restarted master
+//! ([`DateAuthority::restore`]): the same `D`, the same seq, the change in flight — so a restart no
+//! longer steps the fleet. [`DateAuthority::step_now`] announces a coordinated step of the current
+//! error on request (the acceptance tests' trigger), like the nightly window.
 
 mod daily;
 mod micro;
@@ -340,22 +348,40 @@ impl DateAuthority {
     /// Promote a pending step whose instant has passed. Called at the top of every entry point,
     /// so the authority's view of "in effect" never lags the clock.
     fn promote(&mut self, now_ptp_ns: i64) {
-        if let Some((offset, eff)) = self.pending {
+        let (current, since, pending, slew) = self.promoted(now_ptp_ns);
+        self.current_ns = current;
+        self.current_since_ptp_ns = since;
+        self.pending = pending;
+        self.slew = slew;
+    }
+
+    /// The in-effect state once every change due at `now_ptp_ns` has landed — (current `D`, its
+    /// instant, the pending step, the slew) — without changing anything: [`promote`](Self::promote)
+    /// applies it, and #126's [`persisted`](Self::persisted) saves it.
+    fn promoted(&self, now_ptp_ns: i64) -> (i64, i64, Option<(i64, i64)>, Option<DateSlew>) {
+        let (mut current, mut since, mut pending, mut slew) = (
+            self.current_ns,
+            self.current_since_ptp_ns,
+            self.pending,
+            self.slew,
+        );
+        if let Some((offset, eff)) = pending {
             if eff <= now_ptp_ns {
-                self.current_ns = offset;
-                self.current_since_ptp_ns = eff;
-                self.pending = None;
+                current = offset;
+                since = eff;
+                pending = None;
             }
         }
         // #119: a slew that has paid its amount leaves its end offset in effect. The seq is kept:
         // D did not change again, so a follower that slewed with it has nothing to do.
-        if let Some(s) = self.slew {
+        if let Some(s) = slew {
             if s.complete_at(now_ptp_ns) {
-                self.current_ns = s.to_ns;
-                self.current_since_ptp_ns = s.end_ptp_ns();
-                self.slew = None;
+                current = s.to_ns;
+                since = s.end_ptp_ns();
+                slew = None;
             }
         }
+        (current, since, pending, slew)
     }
 
     /// `D` in effect at `now_ptp_ns`.
