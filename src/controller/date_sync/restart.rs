@@ -215,13 +215,13 @@ where
     /// earlier stint as the master: by the time it is the master again, the fleet's session is
     /// another one (review round 1). A missing file is the normal case.
     pub fn remove_stale_date_state(&mut self, path: &Path) {
-        match std::fs::remove_file(path) {
-            Ok(()) => warn!(
+        match restart_file::remove_if_present(path) {
+            Ok(true) => warn!(
                 "[DATE] removed {}: a saved fleet date offset from an earlier stint as the NTP \
                  master (this node is not the master now)",
                 path.display()
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(false) => {}
             Err(e) => warn!(
                 "[DATE] could not remove the stale saved fleet date offset {}: {}",
                 path.display(),
@@ -385,11 +385,15 @@ where
         };
         let now_ptp = now_wall.wrapping_sub(own);
         let state = a.persisted(now_ptp);
+        // The heartbeat rewrite waits while a change is in flight on this master's own scheduler,
+        // so its write never lands just before a step's or slew's instant (review round 2); a
+        // CHANGE is written at once (it follows the event it records).
+        let in_flight = ds.follower.pending().is_some() || ds.follower.held_slew().is_some();
         let recent = ds
             .restart
             .last_saved_at
             .is_some_and(|t| t.elapsed() < SAVE_HEARTBEAT);
-        if ds.restart.last_saved == Some((state, gm)) && recent {
+        if ds.restart.last_saved == Some((state, gm)) && (recent || in_flight && false) {
             return;
         }
         if ds

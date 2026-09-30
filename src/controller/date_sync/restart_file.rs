@@ -120,7 +120,9 @@ pub(super) fn read(path: &Path) -> Result<Option<DateOffsetState>, String> {
 }
 
 /// Write the record by temp + rename in the same directory, the temp file synced first: a
-/// reader (the next start) sees the old record or the new one, never a torn one.
+/// reader (the next start) sees the old record or the new one, never a torn one. On Unix the
+/// directory is synced after the rename, so a power cut cannot bring the previous record back
+/// (review round 2).
 pub(super) fn write_atomic(path: &Path, state: &DateOffsetState) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -131,7 +133,23 @@ pub(super) fn write_atomic(path: &Path, state: &DateOffsetState) -> std::io::Res
         f.write_all(b"\n")?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Remove the record if there is one: `Ok(true)` removed, `Ok(false)` none. The check comes
+/// first because a camera box's root is READ-ONLY, where unlinking even a missing file fails with
+/// EROFS instead of NotFound (review round 2: a false warning on every start otherwise).
+pub(super) fn remove_if_present(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+        Ok(_) => std::fs::remove_file(path).map(|()| true),
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +243,16 @@ mod tests {
         .expect("JSON");
         both["micro"] = serde_json::json!(false);
         assert!(decode(&both.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_record_is_removed_only_when_present_126() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("date-offset.json");
+        assert!(!remove_if_present(&path).expect("none: not an error"));
+        write_atomic(&path, &sample(None, None)).expect("written");
+        assert!(remove_if_present(&path).expect("removed"));
+        assert!(!path.exists());
     }
 
     #[test]

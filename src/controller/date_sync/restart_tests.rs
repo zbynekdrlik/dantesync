@@ -518,3 +518,30 @@ fn the_master_rewrites_its_saved_state_every_10_minutes_126() {
     assert_eq!(later.authority, first.authority);
     assert!(later.written_wall_ns > first.written_wall_ns);
 }
+
+#[test]
+fn the_heartbeat_rewrite_waits_while_a_step_is_in_flight_126() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    // Restored inside a step's lead: the master's own scheduler holds the step.
+    let mut saved = saved_state(PL_GM, d, 5);
+    saved.authority.pending = Some((d + 250 * MS, wall_now_ns() - d + 8 * S));
+    restart_file::write_atomic(&path, &saved).expect("written");
+    let mut clock = MockSystemClock::new();
+    clock.expect_step_clock().times(0);
+    let mut m = started(clock, ntp_at(BOOT_ERROR_US), &path);
+    first_lock(&mut m, PL_GM, d);
+    m.service_date_offset();
+    let first = restart_file::read(&path).expect("readable").expect("kept");
+    assert!(m.date_sync.follower.pending().is_some(), "in flight");
+    // Ten minutes on, the heartbeat is due — but not while the step is in flight.
+    m.date_sync.restart.last_saved_at = Some(Instant::now() - Duration::from_secs(601));
+    std::thread::sleep(Duration::from_millis(2));
+    m.service_date_offset();
+    let again = restart_file::read(&path).expect("readable").expect("kept");
+    assert_eq!(
+        again.written_wall_ns, first.written_wall_ns,
+        "no rewrite in flight"
+    );
+}

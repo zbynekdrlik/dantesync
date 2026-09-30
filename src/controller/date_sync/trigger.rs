@@ -29,17 +29,16 @@ where
         };
         let requests: Vec<DateStepRequest> = rx.try_iter().collect();
         for req in requests {
-            // A request taken after its deadline is refused unacted: its HTTP side answers 503
-            // ("nothing was announced") by then (review round 1).
-            let outcome = if std::time::Instant::now() > req.deadline {
+            // Claimed once: a request its HTTP side abandoned (it answered 503, "nothing was
+            // announced") is never acted on (review rounds 1-2).
+            let outcome = if req.take() {
+                self.date_step_on_request()
+            } else {
                 self.record_date_step(DateStepOutcome::Refused {
                     reason: "the request expired before the sync loop took it: nothing announced"
                         .to_string(),
                 })
-            } else {
-                self.date_step_on_request()
             };
-            // The HTTP thread may have given up; nothing to do then.
             let _ = req.reply.send(outcome);
         }
     }

@@ -151,17 +151,10 @@ fn the_loop_answers_every_queued_request_on_its_channel_126() {
     c.set_date_step_requests(rx);
     let (reply1, answer1) = std::sync::mpsc::channel();
     let (reply2, answer2) = std::sync::mpsc::channel();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    tx.send(DateStepRequest {
-        reply: reply1,
-        deadline,
-    })
-    .expect("queued");
-    tx.send(DateStepRequest {
-        reply: reply2,
-        deadline,
-    })
-    .expect("queued");
+    let (req1, _claim1) = DateStepRequest::new(reply1);
+    let (req2, _claim2) = DateStepRequest::new(reply2);
+    tx.send(req1).expect("queued");
+    tx.send(req2).expect("queued");
     c.serve_date_step_requests();
     assert!(matches!(
         answer1.try_recv(),
@@ -174,11 +167,8 @@ fn the_loop_answers_every_queued_request_on_its_channel_126() {
     // A request whose asker gave up is still consumed, nothing breaks.
     let (reply3, answer3) = std::sync::mpsc::channel();
     drop(answer3);
-    tx.send(DateStepRequest {
-        reply: reply3,
-        deadline,
-    })
-    .expect("queued");
+    let (req3, _claim3) = DateStepRequest::new(reply3);
+    tx.send(req3).expect("queued");
     c.serve_date_step_requests();
     assert_eq!(
         c.date_sync.authority.as_ref().map(|a| a.seq()),
@@ -199,12 +189,10 @@ fn an_expired_step_request_is_refused_unacted_so_a_503_means_nothing_was_announc
     let (tx, rx) = crate::date_step_trigger::channel();
     c.set_date_step_requests(rx);
     let (reply, answer) = std::sync::mpsc::channel();
-    // The loop took it after its deadline (it was blocked in an NTP burst, say).
-    tx.send(DateStepRequest {
-        reply,
-        deadline: Instant::now() - Duration::from_millis(1),
-    })
-    .expect("queued");
+    // The HTTP side gave up before the loop took it (the loop was blocked in an NTP burst, say).
+    let (req, claim) = DateStepRequest::new(reply);
+    assert!(DateStepRequest::abandon(&claim));
+    tx.send(req).expect("queued");
     c.serve_date_step_requests();
     match answer.try_recv() {
         Ok(DateStepOutcome::Refused { reason }) => assert!(reason.contains("expired"), "{reason}"),

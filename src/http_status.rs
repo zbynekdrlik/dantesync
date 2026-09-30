@@ -15,7 +15,7 @@
 //! still gets the status JSON, byte for byte as before.
 
 use crate::date_step_trigger::{
-    self, DateStepOutcome, DateStepRequest, Route, DATE_STEP_REPLY_MARGIN, DATE_STEP_REPLY_TIMEOUT,
+    self, DateStepOutcome, DateStepRequest, Route, DATE_STEP_REPLY_TIMEOUT,
 };
 use crate::status::SyncStatus;
 use log::{error, info, warn};
@@ -198,10 +198,11 @@ fn handle_connection(
     write_response(&mut stream, 200, &body);
 }
 
-/// dantesync#126 — `POST /date/step`: refused unless the peer is loopback and the request carries
-/// the `X-DanteSync-Step` header (403); otherwise the request goes to the sync loop, whose answer
-/// is `202` (one coordinated step announced) or `409` (refused, with the reason), or `503` when no
-/// loop takes it in time (then nothing was announced: the loop refuses an expired request).
+/// dantesync#126 — `POST /date/step`: refused unless the peer is loopback, the `Host` a loopback
+/// name and the request carries the `X-DanteSync-Step` header (403); otherwise the request goes to
+/// the sync loop, whose answer is `202` (one coordinated step announced) or `409` (refused, with
+/// the reason), or `503` when the loop does not take it in time — then the request is abandoned
+/// and nothing is ever announced for it (`DateStepRequest::abandon`).
 fn handle_date_step(
     stream: &TcpStream,
     request: &[u8],
@@ -216,6 +217,12 @@ fn handle_date_step(
         return (
             403,
             date_step_trigger::refusal_body("a date step is taken from loopback only"),
+        );
+    }
+    if !date_step_trigger::has_loopback_host(request) {
+        return (
+            403,
+            date_step_trigger::refusal_body("a date step needs a loopback Host"),
         );
     }
     if !date_step_trigger::has_step_header(request) {
@@ -233,21 +240,28 @@ fn handle_date_step(
         );
     };
     let (reply, answer) = mpsc::channel();
-    let deadline = std::time::Instant::now() + DATE_STEP_REPLY_TIMEOUT;
-    if sender.send(DateStepRequest { reply, deadline }).is_err() {
+    let (req, claim) = DateStepRequest::new(reply);
+    if sender.send(req).is_err() {
         return (
             503,
             date_step_trigger::refusal_body("the sync loop is not running"),
         );
     }
-    match answer.recv_timeout(DATE_STEP_REPLY_TIMEOUT + DATE_STEP_REPLY_MARGIN) {
-        Ok(outcome) => {
+    let answered = match answer.recv_timeout(DATE_STEP_REPLY_TIMEOUT) {
+        Ok(outcome) => Some(outcome),
+        // Not taken yet: abandon it (the loop will never act on it). Taken already: the loop is
+        // acting on it, so wait for what it did — a 503 must never hide an announced step.
+        Err(_) if DateStepRequest::abandon(&claim) => None,
+        Err(_) => answer.recv().ok(),
+    };
+    match answered {
+        Some(outcome) => {
             if let DateStepOutcome::Refused { reason } = &outcome {
                 info!("[HTTP-Status] POST /date/step refused: {}", reason);
             }
             date_step_trigger::outcome_response(&outcome)
         }
-        Err(_) => (
+        None => (
             503,
             date_step_trigger::refusal_body(
                 "the sync loop did not take the request in time: nothing was announced",
@@ -451,14 +465,19 @@ mod tests {
         (headers.to_string(), body.to_string())
     }
 
-    /// A test server whose "sync loop" answers every date-step request with `outcome` (`None`:
-    /// it takes the request and drops the reply unanswered).
+    /// A test server whose "sync loop" takes every date-step request and answers it with
+    /// `outcome` (`None`: it never takes the request, like a loop blocked past the timeout).
     fn server_with_loop(outcome: Option<DateStepOutcome>) -> u16 {
         let (tx, rx) = date_step_trigger::channel();
         thread::spawn(move || {
+            let mut kept = Vec::new();
             for req in rx {
-                if let Some(o) = outcome.clone() {
-                    let _ = req.reply.send(o);
+                match outcome.clone() {
+                    Some(o) => {
+                        assert!(req.take(), "the loop takes a pending request");
+                        let _ = req.reply.send(o);
+                    }
+                    None => kept.push(req), // never taken, never answered
                 }
             }
         });
@@ -468,7 +487,7 @@ mod tests {
         port
     }
 
-    const POST_STEP: &[u8] = b"POST /date/step HTTP/1.1\r\nHost: localhost\r\nX-DanteSync-Step: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const POST_STEP: &[u8] = b"POST /date/step HTTP/1.1\r\nHost: 127.0.0.1:8898\r\nX-DanteSync-Step: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     #[test]
     fn a_loopback_post_date_step_reaches_the_sync_loop_and_answers_202_126() {
@@ -567,5 +586,21 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
         assert!(body.contains(r#""accepted":false"#), "{body}");
         assert!(body.contains("X-DanteSync-Step"), "{body}");
+    }
+
+    #[test]
+    fn a_step_request_naming_another_host_is_403_and_never_reaches_the_loop_126() {
+        let port = server_with_loop(Some(DateStepOutcome::Accepted {
+            amount_ns: 1,
+            land_ptp_ns: 1,
+            due_in_ms: 1,
+            seq: 1,
+        }));
+        let (headers, body) = exchange(
+            port,
+            b"POST /date/step HTTP/1.1\r\nHost: strih.lan:8898\r\nX-DanteSync-Step: 1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"), "{headers}");
+        assert!(body.contains("loopback Host"), "{body}");
     }
 }

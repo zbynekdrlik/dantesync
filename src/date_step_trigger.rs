@@ -11,27 +11,26 @@
 //!
 //! The answer is `202` + `{"accepted":true,…}` only when a step was announced; a refusal is a `4xx`
 //! with `{"accepted":false,"reason":…}`, and a `503` (no answer in time) guarantees nothing was
-//! announced: the loop refuses a request whose deadline has passed. The request must carry the
-//! `X-DanteSync-Step` header, which no web page can send cross-origin without a preflight this
-//! server never answers. An older build ignores the route and answers `200` with the status JSON,
-//! so a caller keys on `"accepted"`, never on the status code alone.
+//! announced: the request is CLAIMED once, either by the loop (which then acts and answers, however
+//! long it takes) or by the HTTP side giving up (the loop then never acts on it). The request must
+//! carry the `X-DanteSync-Step` header, which no web page can send cross-origin without a preflight
+//! this server never answers, and a loopback `Host` (a DNS-rebound page names its own host). An
+//! older build ignores the route and answers `200` with the status JSON, so a caller keys on
+//! `"accepted"`, never on the status code alone.
 
 use serde_json::json;
 use std::net::IpAddr;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// The route.
 pub const DATE_STEP_PATH: &str = "/date/step";
 
-/// How long the sync loop may take to pick a request up (it polls every 1 ms / 50 µs; an NTP
-/// burst or a clock step can block it for seconds): a request it takes later is refused unacted.
+/// How long the HTTP side waits for the sync loop to take a request (it polls every 1 ms / 50 µs;
+/// an NTP burst or a clock step can block it for seconds). Not taken by then, the request is
+/// abandoned — the loop never acts on it — and the answer is `503`.
 pub const DATE_STEP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// The HTTP thread waits this much longer than [`DATE_STEP_REPLY_TIMEOUT`] for the answer, so a
-/// request the loop took in time is always answered with what it did (review round 1: a `503`
-/// must mean "nothing announced").
-pub const DATE_STEP_REPLY_MARGIN: Duration = Duration::from_secs(1);
 
 /// The header a step request must carry (any value), lower case.
 pub const DATE_STEP_HEADER: &str = "x-dantesync-step";
@@ -51,11 +50,45 @@ pub enum DateStepOutcome {
     Refused { reason: String },
 }
 
-/// One request from the HTTP route to the sync loop, which answers on `reply` — and refuses it
-/// unacted once `deadline` has passed (the HTTP side has answered 503 by then, or is about to).
+const CLAIM_PENDING: u8 = 0;
+const CLAIM_TAKEN: u8 = 1;
+const CLAIM_ABANDONED: u8 = 2;
+
+/// One request from the HTTP route to the sync loop, which answers on `reply`. It is claimed
+/// exactly once: [`take`](Self::take) by the loop (it acts, then answers) or
+/// [`abandon`](Self::abandon) by the HTTP side (then nothing is ever announced for it) — so a 503
+/// always means "nothing announced", whatever the loop's timing (review rounds 1-2).
 pub struct DateStepRequest {
     pub reply: mpsc::Sender<DateStepOutcome>,
-    pub deadline: std::time::Instant,
+    claim: Arc<AtomicU8>,
+}
+
+impl DateStepRequest {
+    /// A pending request, and the HTTP side's handle on its claim.
+    pub fn new(reply: mpsc::Sender<DateStepOutcome>) -> (Self, Arc<AtomicU8>) {
+        let claim = Arc::new(AtomicU8::new(CLAIM_PENDING));
+        (
+            DateStepRequest {
+                reply,
+                claim: claim.clone(),
+            },
+            claim,
+        )
+    }
+
+    /// The loop claims the request: true = act on it (and answer); false = the HTTP side
+    /// abandoned it (answered 503), so nothing may be announced.
+    pub fn take(&self) -> bool {
+        let _ = &self.claim;
+        true // RED stub (#126 review round 2): no claim
+    }
+
+    /// The HTTP side gives up on `claim`: true = abandoned, nothing will be announced (answer
+    /// 503); false = the loop has already taken it, so its answer must be waited for.
+    pub fn abandon(claim: &AtomicU8) -> bool {
+        let _ = claim;
+        true // RED stub (#126 review round 2): no claim
+    }
 }
 
 /// The channel from the HTTP route (the sender, one clone per connection) to the sync loop.
@@ -97,14 +130,30 @@ pub fn route(request: &[u8]) -> Route {
     }
 }
 
-/// Does the request carry the [`DATE_STEP_HEADER`] header (the name case-insensitive)?
-pub fn has_step_header(request: &[u8]) -> bool {
+/// The request's header lines (between the request line and the blank line) as (name, value);
+/// a folded continuation line (leading whitespace) is not a header of its own.
+fn headers(request: &[u8]) -> Vec<(String, String)> {
     let text = String::from_utf8_lossy(request);
     text.lines()
         .skip(1)
         .take_while(|l| !l.is_empty())
+        .filter(|l| !l.starts_with([' ', '\t']))
         .filter_map(|l| l.split_once(':'))
-        .any(|(name, _)| name.trim().eq_ignore_ascii_case(DATE_STEP_HEADER))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect()
+}
+
+/// Does the request carry the [`DATE_STEP_HEADER`] header (the name case-insensitive)?
+pub fn has_step_header(request: &[u8]) -> bool {
+    headers(request).iter().any(|(n, _)| n == DATE_STEP_HEADER)
+}
+
+/// Is the request's `Host` a loopback name (`127.0.0.1`, `localhost`, `[::1]`, with or without a
+/// port)? A page served through a DNS-rebound name sends that name, so it is refused (review
+/// round 2). No `Host` at all is refused too.
+pub fn has_loopback_host(request: &[u8]) -> bool {
+    let _ = request;
+    true // RED stub (#126 review round 2): no Host check
 }
 
 /// Only a loopback peer may request a step (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback).
@@ -198,6 +247,55 @@ mod tests {
             b"POST /date/step HTTP/1.1\r\nHost: x\r\n\r\nX-DanteSync-Step: 1"
         ));
         assert!(!has_step_header(b""));
+    }
+
+    #[test]
+    fn a_step_request_must_name_a_loopback_host_126() {
+        for host in [
+            "127.0.0.1:8898",
+            "127.0.0.1",
+            "localhost:8898",
+            "LOCALHOST",
+            "[::1]:8898",
+        ] {
+            let raw = format!("POST /date/step HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert!(has_loopback_host(raw.as_bytes()), "{host}");
+        }
+        for host in [
+            "strih.lan:8898",
+            "10.77.9.202",
+            "evil.example:8898",
+            "127.0.0.1.nip.io",
+        ] {
+            let raw = format!("POST /date/step HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert!(!has_loopback_host(raw.as_bytes()), "{host}");
+        }
+        assert!(
+            !has_loopback_host(b"POST /date/step HTTP/1.0\r\n\r\n"),
+            "no Host"
+        );
+        // A folded continuation line is not a header of its own.
+        assert!(!has_step_header(
+            b"POST /date/step HTTP/1.1\r\nX-Other: a\r\n X-DanteSync-Step: 1\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn a_request_is_claimed_once_by_the_loop_or_by_the_http_side_giving_up_126() {
+        let (tx, _rx) = mpsc::channel();
+        let (req, claim) = DateStepRequest::new(tx.clone());
+        assert!(req.take(), "the loop takes a pending request");
+        assert!(
+            !DateStepRequest::abandon(&claim),
+            "taken: its answer must be awaited"
+        );
+        assert!(!req.take(), "claimed once");
+        let (req, claim) = DateStepRequest::new(tx);
+        assert!(
+            DateStepRequest::abandon(&claim),
+            "the HTTP side gives up first"
+        );
+        assert!(!req.take(), "abandoned: the loop never acts on it");
     }
 
     #[test]
