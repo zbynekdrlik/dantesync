@@ -140,7 +140,9 @@ own user login password). Windows boxes are reached via MCP only in this procedu
        while another change is in flight, without a settled UTC estimate, or for a fleet ahead of
        UTC (never a backward step); `403` from a non-loopback peer, without the header or with a
        non-loopback `Host` (curl's own `127.0.0.1:8898` is fine); `503` = the loop did not take it
-       within 3 s, the request was abandoned and NOTHING was announced. A pre-1.15 build answers
+       within 3 s, the request was abandoned and NOTHING was announced; `500` with
+       `"accepted": null` = the loop took it and gave no answer within 30 s — UNKNOWN, read
+       `/status.date_step_trigger_last` (and the log) before asking again. A pre-1.15 build answers
        `200` + the status JSON: key on `"accepted"`. `/status.date_step_trigger_last` records the
        last one.
      - **Rolling the MASTER back to a pre-1.15 build: delete `/etc/dantesync/date-offset.json`

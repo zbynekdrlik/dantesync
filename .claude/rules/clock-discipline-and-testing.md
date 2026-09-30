@@ -1126,6 +1126,16 @@ next NTP samples. What was learned building the fix:
   pre-rollback session — the age bound cannot tell "down" from "running another build". Kept
   the 1-day bound: a shorter one (the hold + the heartbeat) would also refuse a master that was
   only DOWN that long, whose followers kept its line (no NTP server to fall back on).
+- **Review round 3 (fresh context, 0 🔴 1 🟡 5 🔵; round 2 confirmed):** the wait is
+  `date_step_trigger::await_answer` (pure, threads + timeouts under test): a request the loop TOOK
+  is waited for at most `DATE_STEP_TAKEN_TIMEOUT` (30 s) and a silence is `TakenUnanswered` →
+  `500` + `"accepted": null` (unknown), never the `503` of "nothing announced" — a loop that
+  unwinds after `step_now` may have announced. The branch "taken, answered late" had no test; one
+  now pins it (mutated to `Err(_) => Abandoned` it fails). The claim is an opaque `StepClaim`
+  (only `abandon`). A directory sync failing AFTER the rename is one warning per process, not a
+  failed save (it retried every 10 s with a false "a restart would step the fleet"); a bare file
+  name syncs `.`. Declined: citing a camera-box ticket in the skill (a worker files none — the
+  supervisor gets it as a follow-up candidate).
 - **Bench (`tests/two_clock_bench/restart.rs`):** the hooks are inert unless a scenario sets
   `master_restart` / `follower_hold_windows` / `step_requests_at` (the bit-identity pair is
   unchanged). The 1.14 negative control must reproduce the incident; the 1.15 case bounds the
