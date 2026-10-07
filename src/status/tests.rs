@@ -556,6 +556,42 @@ fn test_sync_status_date_daily_fields_are_additive_119() {
     assert_eq!(back.date_daily_last_step_ms, Some(-1_295.25));
 }
 
+/// dantesync#119 (1.16): the nightly step's quantum is additive — a literal 1.15.0 blob reads
+/// `null`, a value round-trips under its documented name, and a node that reports none says so
+/// with an explicit `null`.
+#[test]
+fn test_sync_status_date_daily_step_quantum_is_additive_119() {
+    let v1150 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":null,"gm_source_ip":null,
+        "settled":true,"updated_ts":1790000000,"is_locked":true,"smoothed_rate_ppm":0.1,
+        "ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,"accumulated_phase_us":0.0,
+        "date_authority":"master","date_correction_mode":"daily",
+        "date_daily_next_utc":"2026-10-07T02:00:00Z","date_daily_last_step_ts":1791252010,
+        "date_daily_last_step_ms":1543.161209,"date_offset_restored":true,"freq_steps":0,
+        "last_freq_step_ppm":null,"last_freq_step_ts":null}"#;
+    let restored: SyncStatus =
+        serde_json::from_str(v1150).expect("v1.15.0 JSON must still deserialize");
+    assert_eq!(restored.date_daily_step_quantum_ms, None);
+    assert_eq!(restored.date_daily_last_step_ms, Some(1_543.161209));
+
+    let st = SyncStatus {
+        date_correction_mode: "daily".to_string(),
+        date_daily_step_quantum_ms: Some(200),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&st).expect("serialize failed");
+    assert!(
+        json.contains(r#""date_daily_step_quantum_ms":200"#),
+        "{json}"
+    );
+    let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+    assert_eq!(back.date_daily_step_quantum_ms, Some(200));
+    let fresh = serde_json::to_string(&SyncStatus::default()).expect("serialize failed");
+    assert!(
+        fresh.contains(r#""date_daily_step_quantum_ms":null"#),
+        "{fresh}"
+    );
+}
+
 /// dantesync#112: the PTP liveness fields are additive. A 1.12.0 blob reads `null` / 0 / the empty
 /// re-join object, and every value round-trips under its documented name.
 #[test]

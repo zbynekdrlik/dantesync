@@ -225,7 +225,8 @@ fn a_restored_daily_authority_keeps_its_last_nightly_step_and_the_night_it_handl
     );
 
     // Without the saved nightly step the restored authority judges the same night AGAIN (here a
-    // second step of the few ms drifted since the first): the saved step is what prevents it.
+    // `NoStep`: the ~-89 ms the 800 ms step overshot rounds to zero): the saved step is what
+    // prevents it.
     let bare = DateAuthority::restore(&saved, l.ptp, 0, 0).with_correction(daily());
     let mut b = Loop::new(bare, l.ptp, l.error, 17.6);
     b.run(40 * 60);
