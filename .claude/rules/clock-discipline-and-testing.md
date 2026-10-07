@@ -576,8 +576,8 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
   ~9 s. `CARGO_PKG_RUST_VERSION=1.70.0 clippy-driver` on the same `lib.rs` lints it like CI
   (without the env variable `clippy::manual_div_ceil` fires on `slew.rs`: `div_ceil` is newer
   than the MSRV). The bench runs on the `dantesync` rlib replica (the camera-box-lane gotchas
-  further down; 30/30 in ~20 s). The config, status and controller tests stay CI-only unless you build the #126
-  full-lib replica.
+  further down; 30/30 in ~20 s). The config, status and controller tests stay CI-only unless
+  you build the #126 full-lib replica.
 
 **What changes by mode:**
 - `on_utc_error`'s abnormal cap is `daily_emergency_ms` (5 s) in daily mode, 2 × the step bound
