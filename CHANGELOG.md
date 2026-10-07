@@ -5,6 +5,40 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-10-07
+
+### Fixed
+
+- **The nightly date step keeps every genlock grid in phase (issue #119, camera-box issue 1372).**
+  The 1.12 daily mode stepped the fleet date by the whole estimated UTC error: +1543.16 ms on
+  6.10.2026, which is 92.59 frames at 60 fps. Every per-second genlock grid on the rig (the camera
+  emit gates, the OBS receive FIFOs and render ticks) is anchored on the wall second, so a step
+  that is not a whole number of frames moved each grid's phase. camera-box measured 5 repeats and
+  4 skips on the stream program recording at 02:00:09.9–02:00:17.2Z.
+  - **The step is rounded to `system.date_offset.daily_step_quantum_ms`, 200 ms by default.**
+    200 ms is a whole number of frames at 25/30/50/60 fps and of samples at 48 kHz. The nearest
+    whole multiple is used, with ties rounded away from zero. A step that rounds to zero is not
+    made (`nightly date step not needed`). The remainder (at most half a quantum, ±100 ms) stays
+    in the fleet date and is measured again the next night. On the 6.10.2026 numbers, +1543.16 ms
+    becomes +1600 ms, and the next night pays the −56.84 ms back.
+  - **Config:** a missing key or `0` means 200. A value that does not divide 1000 ms evenly means
+    200, with a startup warning naming the key.
+  - **`/status.date_daily_step_quantum_ms`** is appended. It is set on the daily NTP master only;
+    it is `null` on a follower, in micro mode and in a pre-1.16 blob. `date_daily_last_step_ms`
+    is a whole multiple of it from the first 1.16 night on.
+  - **Log:** the nightly line now prints the step and the unrounded error, for example
+    `[DATE] AUTHORITY: nightly date step +1600.000 ms (the UTC error +1543.161 ms rounded to whole
+    200 ms, a coordinated step) …`. The master's startup line names the quantum.
+  - **Unchanged:**
+    - the emergency step beyond `daily_emergency_ms` (never rounded);
+    - the micro mode;
+    - the two-leads announce;
+    - the issue #126 restart hold and the step on request (`POST /date/step`, the current error,
+      unrounded).
+  - **Rollout:** only the master's behaviour changes; the followers apply whatever it announces.
+    A 1.15 master restores its saved date offset on the upgrade's restart, so the fleet date does
+    not move. The first rounded step is the next night after the master runs 1.16.
+
 ## [1.15.0] - 2026-09-30
 
 ### Fixed
