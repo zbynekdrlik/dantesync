@@ -68,11 +68,11 @@
 //! Each micro-step disturbs the Dante Virtual Soundcard on a Windows box; one rare step does not
 //! (owner decision, issue comment 5849932587). In [`CorrectionMode::Daily`] the authority keeps
 //! reading UTC and fitting the same robust estimate all day but announces nothing; when the nightly
-//! window opens ([`DailyScheduler`], 02:00 UTC by default) it announces ONE coordinated step of the
-//! whole estimated error, in either direction, [`MICRO_LEAD_FACTOR`] leads ahead. The abnormal cap
-//! becomes the emergency cap (`daily_emergency_ms`, 5 s): only an error beyond it is stepped by
-//! day. [`CorrectionMode::Micro`] is the 1.11 behaviour, byte for byte (and what a bare
-//! [`DateAuthority::new`] runs). The step bound's 1.10 correction ("bound") no longer exists.
+//! window opens ([`DailyScheduler`], 02:00 UTC by default) it announces ONE coordinated step, any
+//! sign, [`MICRO_LEAD_FACTOR`] leads ahead: the estimated error rounded to whole 200 ms (1.16). The
+//! abnormal cap becomes the emergency cap (`daily_emergency_ms`, 5 s): only an error beyond it is
+//! stepped by day, unrounded. [`CorrectionMode::Micro`] is the 1.11 behaviour, byte for byte (and
+//! what a bare [`DateAuthority::new`] runs). The step bound's 1.10 correction ("bound") is gone.
 //!
 //! # dantesync#126 — a master restart keeps the fleet date (1.15)
 //!
@@ -88,11 +88,11 @@ mod persist;
 mod slew;
 mod wire;
 pub use daily::{
-    clamp_daily_emergency_ms, format_utc_rfc3339, parse_daily_step_utc, CorrectionMode,
-    DailyConfig, DailyDecision, DailyScheduler, CORRECTION_DAILY, CORRECTION_MICRO,
+    clamp_daily_emergency_ms, daily_step_quantum_ms, format_utc_rfc3339, parse_daily_step_utc,
+    CorrectionMode, DailyConfig, DailyDecision, DailyScheduler, CORRECTION_DAILY, CORRECTION_MICRO,
     DAILY_MIN_STEP_NS, DAILY_WINDOW_NS, DAY_NS, DEFAULT_DAILY_EMERGENCY_MS,
-    DEFAULT_DAILY_STEP_TOD_S, DEFAULT_DAILY_STEP_UTC, MAX_DAILY_EMERGENCY_MS,
-    MIN_DAILY_EMERGENCY_MS,
+    DEFAULT_DAILY_STEP_QUANTUM_MS, DEFAULT_DAILY_STEP_TOD_S, DEFAULT_DAILY_STEP_UTC,
+    MAX_DAILY_EMERGENCY_MS, MIN_DAILY_EMERGENCY_MS,
 };
 pub use micro::{
     clamp_micro_interval_s, clamp_micro_step_us, MicroConfig, MicroEstimate, MicroScheduler,

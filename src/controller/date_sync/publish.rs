@@ -136,6 +136,14 @@ where
         status.date_daily_last_step_ts =
             last_daily.map(|(wall, _)| wall.div_euclid(1_000_000_000).max(0) as u64);
         status.date_daily_last_step_ms = last_daily.map(|(_, n)| n as f64 / 1e6);
+        // #119 (1.16): the quantum the nightly step is rounded to (the daily master only).
+        status.date_daily_step_quantum_ms = match (ds.authority.as_ref(), anchor) {
+            (Some(a), Some(_)) => match a.correction_mode() {
+                crate::date_offset::CorrectionMode::Daily(cfg) => Some(cfg.step_quantum_ms()),
+                crate::date_offset::CorrectionMode::Micro => None,
+            },
+            _ => None,
+        };
         status.date_correction_falling_behind = ds
             .authority
             .as_ref()

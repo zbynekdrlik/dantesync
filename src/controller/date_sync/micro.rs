@@ -73,6 +73,7 @@ where
         let fleet = a.in_effect_ns(now_ptp);
         let announced = a.on_tick(now_ptp);
         let daily_event = a.take_daily_event();
+        let mode = a.correction_mode();
         self.report_falling_behind(now_ptp);
         self.report_micro_paused(now_ptp);
         self.report_daily_event(daily_event);
@@ -84,10 +85,23 @@ where
         // it takes the fleet's steps on its own wall too.
         let on_line = own == fleet && (!self.ptp_offline || daily) && !self.in_step_backoff();
         if daily {
-            // #119 (1.12): the nightly step — one a night, loud.
+            // #119 (1.12): the nightly step — one a night, loud. 1.16: the step is the UTC error
+            // rounded to whole quanta; both are logged (the remainder waits for the next night).
+            // (The announce of a daily tick IS its nightly step, so the event is always there.)
+            let rounded = match (daily_event, mode) {
+                (
+                    Some(DailyDecision::Step { error_ns, .. }),
+                    crate::date_offset::CorrectionMode::Daily(cfg),
+                ) => format!(
+                    "the UTC error {:+.3} ms rounded to whole {} ms",
+                    error_ns as f64 / 1e6,
+                    cfg.step_quantum_ms()
+                ),
+                _ => "the UTC error rounded to the step quantum".to_string(),
+            };
             info!(
-                "[DATE] AUTHORITY: nightly date step {:+.3} ms (the whole UTC error, a coordinated \
-                 step) at PTP {} (in {} s), seq {}{}",
+                "[DATE] AUTHORITY: nightly date step {:+.3} ms ({rounded}, a coordinated step) at \
+                 PTP {} (in {} s), seq {}{}",
                 ann.date_offset_ns.wrapping_sub(fleet) as f64 / 1e6,
                 ann.effective_ptp_ns,
                 ann.effective_ptp_ns.wrapping_sub(now_ptp) / 1_000_000_000,
