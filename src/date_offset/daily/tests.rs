@@ -172,14 +172,21 @@ fn the_nightly_step_is_rounded_to_the_nearest_200_ms_ties_away_from_zero_119() {
             "error {error}"
         );
     }
-    // No overflow at the extremes: still a whole, signed multiple of the quantum.
-    for error in [i64::MAX, -i64::MAX] {
-        let mut d = DailyScheduler::new(DailyConfig::default());
-        let DailyDecision::Step { amount_ns, .. } = d.decide(at(2, 0, 0), est(error)) else {
-            panic!("a step for {error}");
-        };
-        assert_eq!(amount_ns % (200 * MS), 0, "{error}: {amount_ns}");
-        assert_eq!(amount_ns.signum(), error.signum(), "{error}: {amount_ns}");
+    // No overflow at the extremes: still a whole, signed multiple of the quantum. At 1000 ms the
+    // nearest multiple of ±i64::MAX lies beyond i64, so it is taken one quantum toward zero
+    // (review round 1: at 200 ms the nearest one fits, and the clamp went untested).
+    for quantum_ms in [200, 1_000] {
+        for error in [i64::MAX, -i64::MAX] {
+            let mut d =
+                DailyScheduler::new(DailyConfig::default().with_step_quantum_ms(quantum_ms));
+            let DailyDecision::Step { amount_ns, .. } = d.decide(at(2, 0, 0), est(error)) else {
+                panic!("a step for {error}");
+            };
+            let q = quantum_ms as i64 * MS;
+            assert_eq!(amount_ns % q, 0, "{quantum_ms} ms, {error}: {amount_ns}");
+            assert_eq!(amount_ns.signum(), error.signum(), "{error}: {amount_ns}");
+            assert!((amount_ns - error).abs() <= q, "{error}: {amount_ns}");
+        }
     }
 }
 

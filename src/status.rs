@@ -472,9 +472,10 @@ pub struct SyncStatus {
     // ========================================================================
     /// Daily mode on the NTP master only: the nightly date step is the UTC error rounded to a
     /// whole multiple of this (ms, ties away from zero; `system.date_offset.daily_step_quantum_ms`,
-    /// 200 by default), so `date_daily_last_step_ms` is a multiple of it and the fleet date sits
-    /// within half of it of UTC right after the step. `null` on a follower, in micro mode and in a
-    /// pre-1.16 blob.
+    /// 200 by default), so from the first 1.16 night on `date_daily_last_step_ms` is a multiple
+    /// of it (a 1.15 master upgraded to 1.16 restores its last, unrounded step and reports it
+    /// until then) and the fleet date sits within half of it of UTC right after the step. `null`
+    /// on a follower, in micro mode and in a pre-1.16 blob.
     #[serde(default)]
     pub date_daily_step_quantum_ms: Option<u64>,
 }

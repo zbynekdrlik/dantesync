@@ -19,8 +19,8 @@
 //!   is a whole number of frames at 25/30/50/60 fps and of samples at 48 kHz, so the step moves no
 //!   grid's phase. The unrounded 6.10.2026 step (+1543.16 ms = 92.59 frames at 60 fps) made every
 //!   camera repeat or skip a frame (camera-box issue 1372). The remainder (at most half a quantum)
-//!   stays in the fleet date: the estimate keeps it, and the next night measures it again. A step
-//!   that rounds to zero is no step.
+//!   stays in the fleet date, where the next night's readings measure it again. A step that
+//!   rounds to zero is no step.
 //! - The window is the moment it opens. It stays open for up to [`DAILY_WINDOW_NS`] (30 min) only
 //!   while no fresh UTC reading is available then. When UTC comes back inside the window the step
 //!   is made then; otherwise that night is skipped, loudly, and the next night makes it.

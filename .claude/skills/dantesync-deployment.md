@@ -167,7 +167,9 @@ own user login password). Windows boxes are reached via MCP only in this procedu
        +1600.000 ms (the UTC error +1543.161 ms rounded to whole 200 ms, a coordinated step) …`.
        `date_daily_last_step_ms` is a whole multiple of 200, and `date_offset_error_ms` right
        after the step is within ±100 ms (the remainder, measured again the next night). An error
-       under 100 ms logs `nightly date step not needed` instead.
+       with |error| < 100 ms (either sign; exactly ±100 ms steps ±200 ms) logs `nightly date step
+       not needed` instead. Until that first 1.16 night a 1.15 master upgraded to 1.16 still
+       reports its last unrounded step (`date_daily_last_step_ms`, restored from 1.15).
      - **camera-box:** its daily grading reads `date_daily_step_quantum_ms` additively, and
        `DANTESYNC_VERSION_PIN` advances (the camera-box supervisor's step, under the rig lease).
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and

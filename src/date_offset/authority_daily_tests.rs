@@ -1,6 +1,7 @@
 //! dantesync#119 (1.12) — the date authority in DAILY mode: readings all day, nothing announced;
-//! at the nightly window ONE coordinated step of the whole error, either direction; the
-//! emergency cap; the micro mode untouched. Closed-loop: the simulated fleet line drifts, is read
+//! at the nightly window ONE coordinated step of the error rounded to the 200 ms quantum (1.16),
+//! either direction, the remainder carried; the emergency cap, never rounded; the micro mode
+//! untouched. Closed-loop: the simulated fleet line drifts, is read
 //! every 10 s, and moves by exactly the step at its instant.
 
 use super::*;
@@ -147,6 +148,14 @@ fn a_daily_authority_announces_nothing_all_day_then_one_step_rounded_to_200_ms_1
     assert!(
         (-100 * MS..0).contains(&l.error),
         "the remainder stays: {}",
+        l.error
+    );
+    // … and the estimate knows it at once: the kept readings were compensated by the ROUNDED
+    // step, not by the error it was decided on (review round 1).
+    let est = l.a.micro().estimate(l.ptp).expect("an estimate").error_ns;
+    assert!(
+        (est - l.error).abs() < MS,
+        "the estimate {est} vs the remainder {}",
         l.error
     );
     // The rest of the night and the whole next day: nothing, the error regrows.

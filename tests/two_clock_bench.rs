@@ -47,8 +47,9 @@
 //! oscillate.
 //!
 //! dantesync#119 (1.12): the fleet date is corrected ONCE A NIGHT (`correction = "daily"`, the
-//! new default): nothing all day, one coordinated step of the whole error — either direction —
-//! when the 02:00 UTC window opens, and an immediate step only beyond the 5 s emergency cap.
+//! new default): nothing all day, one coordinated step of the error rounded to whole 200 ms
+//! (1.16) — either direction — when the 02:00 UTC window opens, and an immediate (unrounded)
+//! step only beyond the 5 s emergency cap.
 //! `two_clock_bench/daily.rs` proves it over 48 h (see there); every scenario above runs in
 //! micro mode, which stays byte-identical.
 //!

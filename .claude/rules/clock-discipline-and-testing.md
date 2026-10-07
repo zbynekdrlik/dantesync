@@ -554,8 +554,12 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
   error) to the nearest multiple of `DailyConfig::step_quantum_ns`, ties away from zero, in i128
   (one quantum toward zero at the ends of i64, so it is always a whole multiple). A round to 0 is
   `NoStep`. `Step { amount_ns, error_ns }` carries both, and the nightly log line prints both.
-- The remainder needs no state of its own: `daily_tick` compensates the kept readings by the
-  ROUNDED amount, so the estimate still holds the remainder and the next night measures it.
+- The remainder needs no state of its own. It is physically in the fleet date, and the next
+  night's estimate comes from that night's fresh readings (the trend window is 20 min), so it is
+  measured again. `daily_tick` compensates the kept readings by the ROUNDED amount, which keeps
+  the estimate right in the first ≤ 20 min after the step (a `step_now` then, for example). A
+  test pins that (`authority_daily_tests.rs`: the estimate equals the remainder right after the
+  landing); compensating by `error_ns` instead passed every other test and the bench.
 - `daily_step_quantum_ms`: 200 by default (whole frames at 25/30/50/60 fps and whole 48 kHz
   samples); 0 or garbage = 200 silently; a value that does not divide 1000 ms = 200 with a
   `correction_mode()` warning. Never round the emergency step, the micro mode or the step on
@@ -569,9 +573,11 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
   say `crate::`), so a scratch `lib.rs` with `pub mod date_offset;` beside symlinks to
   `src/date_offset.rs` and `src/date_offset/` builds with `rustc --edition 2021 --test lib.rs`
   in ~3 s (~190 MB) and runs all its tests (115 in 1.16, the authority closed loops included) in
-  ~9 s. `clippy-driver` on the same `lib.rs` lints it (allow `clippy::manual_div_ceil`: the
-  local toolchain flags `slew.rs`, CI's does not). The config, status, controller and bench
-  tests stay CI-only.
+  ~9 s. `CARGO_PKG_RUST_VERSION=1.70.0 clippy-driver` on the same `lib.rs` lints it like CI
+  (without the env variable `clippy::manual_div_ceil` fires on `slew.rs`: `div_ceil` is newer
+  than the MSRV). The bench runs on the `dantesync` rlib replica (the camera-box-lane gotchas
+  further down; 30/30 in ~20 s). The config, status and controller tests stay CI-only unless you build the #126
+  full-lib replica.
 
 **What changes by mode:**
 - `on_utc_error`'s abnormal cap is `daily_emergency_ms` (5 s) in daily mode, 2 × the step bound
@@ -633,7 +639,8 @@ re-join. So in daily mode:
   `date_daily_last_step_ts` (epoch s, fleet wall, where it lands) and `date_daily_last_step_ms`.
 - 1.16 appends `date_daily_step_quantum_ms` (integer ms, the daily master only, `null` on a
   follower, in micro mode and in a pre-1.16 blob). `date_daily_last_step_ms` is a whole multiple
-  of it.
+  of it from the first 1.16 night on: a 1.15 master upgraded to 1.16 restores its last unrounded
+  step and reports it until then, so a consumer must not grade the multiple before that night.
 
 **The 1.10 `"bound"` mode is gone** (since 1.11.0 the step bound only sets the micro cap). The
 value reads as daily with a warning.
