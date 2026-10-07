@@ -1,6 +1,7 @@
 //! dantesync#119 (1.12) — the date authority in DAILY mode: readings all day, nothing announced;
-//! at the nightly window ONE coordinated step of the whole error, either direction; the
-//! emergency cap; the micro mode untouched. Closed-loop: the simulated fleet line drifts, is read
+//! at the nightly window ONE coordinated step of the error rounded to the 200 ms quantum (1.16),
+//! either direction, the remainder carried; the emergency cap, never rounded; the micro mode
+//! untouched. Closed-loop: the simulated fleet line drifts, is read
 //! every 10 s, and moves by exactly the step at its instant.
 
 use super::*;
@@ -92,8 +93,20 @@ fn at(h: i64, m: i64) -> i64 {
     DAY0 + (h * 3_600 + m * 60) * S
 }
 
+/// The unrounded error the `i`-th nightly step was decided on.
+fn decided_error(events: &[DailyDecision], i: usize) -> i64 {
+    let steps: Vec<i64> = events
+        .iter()
+        .filter_map(|e| match e {
+            DailyDecision::Step { error_ns, .. } => Some(*error_ns),
+            _ => None,
+        })
+        .collect();
+    steps[i]
+}
+
 #[test]
-fn a_daily_authority_announces_nothing_all_day_then_one_step_of_the_whole_error_119() {
+fn a_daily_authority_announces_nothing_all_day_then_one_step_rounded_to_200_ms_119() {
     // 12:00 UTC, the fleet line 700 ms behind UTC, drifting +17.6 ppm (the rig).
     let a = daily_authority(at(12, 0), DailyConfig::default());
     let mut l = Loop::new(a, 700 * MS, 17.6);
@@ -104,6 +117,7 @@ fn a_daily_authority_announces_nothing_all_day_then_one_step_of_the_whole_error_
         !l.a.micro().falling_behind(),
         "no falling-behind alarm in daily mode"
     );
+    // ~1587.2 ms where it lands: stepped as 1600 ms (8 × 200 ms).
     let expected = 700 * MS + (17.6 * 1_000.0) as i64 * (14 * 3_600 + 10);
     l.run(2, |_| false);
     assert_eq!(l.steps.len(), 1, "one step at the window: {:?}", l.steps);
@@ -113,17 +127,39 @@ fn a_daily_authority_announces_nothing_all_day_then_one_step_of_the_whole_error_
         "announced when the window opens"
     );
     assert_eq!(eff - announced_at, LEAD2, "two leads ahead");
-    assert!(
-        (size - expected).abs() < MS,
-        "the whole error where it lands: {size} vs {expected}"
+    assert_eq!(
+        size,
+        1_600 * MS,
+        "the error where it lands ({expected}) rounded to the 200 ms quantum"
     );
     let ann = l.a.announce();
     assert!(!ann.micro, "a nightly step is not a micro-correction");
     assert_eq!(ann.slew, None);
-    assert_eq!(l.events, vec![DailyDecision::Step { amount_ns: size }]);
+    assert_eq!(l.events.len(), 1, "{:?}", l.events);
+    assert!(matches!(l.events[0], DailyDecision::Step { amount_ns, .. } if amount_ns == size));
+    assert!(
+        (decided_error(&l.events, 0) - expected).abs() < MS,
+        "decided on the unrounded error: {:?} vs {expected}",
+        l.events
+    );
     assert_eq!(l.a.daily_last_step().map(|s| s.1), Some(size));
-    // The rest of the night and the whole next day: nothing, the error lands near 0 and regrows.
-    l.run(23 * 3_600, |_| false);
+    // Landed: the remainder (~12.8 ms, the fleet now AHEAD of UTC) stays, within half a quantum.
+    l.run(20, |_| false);
+    assert!(
+        (-100 * MS..0).contains(&l.error),
+        "the remainder stays: {}",
+        l.error
+    );
+    // … and the estimate knows it at once: the kept readings were compensated by the ROUNDED
+    // step, not by the error it was decided on (review round 1).
+    let est = l.a.micro().estimate(l.ptp).expect("an estimate").error_ns;
+    assert!(
+        (est - l.error).abs() < MS,
+        "the estimate {est} vs the remainder {}",
+        l.error
+    );
+    // The rest of the night and the whole next day: nothing, the error regrows.
+    l.run(23 * 3_600 - 20, |_| false);
     assert_eq!(l.steps.len(), 1, "{:?}", l.steps);
     assert!(
         l.error.abs() > 1_300 * MS,
@@ -132,11 +168,18 @@ fn a_daily_authority_announces_nothing_all_day_then_one_step_of_the_whole_error_
     );
     l.run(3_600, |_| false);
     assert_eq!(l.steps.len(), 2, "the next night: {:?}", l.steps);
+    // The next night measures the remainder again: a day at +17.6 ppm (1520.64 ms) minus the
+    // ~12.8 ms the first step overshot is ~1507.9 ms, stepped as 1600 ms.
+    let second = expected - 1_600 * MS + (17.6 * 1_000.0) as i64 * 86_400;
+    assert_eq!(l.steps[1].1, 1_600 * MS, "{:?}", l.steps);
     assert!(
-        (l.steps[1].1 - 1_520 * MS).abs() < 10 * MS,
-        "a day at +17.6 ppm is ~1.52 s: {}",
-        l.steps[1].1
+        (decided_error(&l.events, 1) - second).abs() < MS,
+        "the remainder measured again: {:?} vs {second}",
+        l.events
     );
+    // Two nights' steps track two nights' drift to within half a quantum.
+    l.run(20, |_| false);
+    assert!(l.error.abs() <= 100 * MS, "residual {}", l.error);
 }
 
 #[test]
@@ -145,7 +188,8 @@ fn a_fleet_ahead_of_utc_is_stepped_back_at_night_never_slewed_by_day_119() {
     let mut l = Loop::new(a, -300 * MS, -15.0);
     l.run(15 * 3_600, |_| false);
     assert_eq!(l.steps.len(), 1, "{:?}", l.steps);
-    assert!(l.steps[0].1 < -1_000 * MS, "a backward STEP: {:?}", l.steps);
+    // ~-1056.2 ms where it lands: a backward STEP of 5 × 200 ms.
+    assert_eq!(l.steps[0].1, -1_000 * MS, "a backward STEP: {:?}", l.steps);
     assert_eq!(l.a.slew_in_progress(l.ptp), None);
 }
 
@@ -156,11 +200,18 @@ fn an_error_beyond_the_emergency_cap_is_stepped_at_once_119() {
     let mut l = Loop::new(a, 1_500 * MS, 0.0);
     l.run(600, |_| false);
     assert!(l.steps.is_empty(), "{:?}", l.steps);
-    // … 6 s does not: two agreeing readings, then one step, lead ahead.
-    l.error = 6_000 * MS;
+    // … 6.12 s does not: two agreeing readings, then one step of the whole reading — NOT rounded
+    // to the nightly quantum — lead ahead.
+    l.error = 6_123_456_789;
     l.run(20, |_| false);
     assert_eq!(l.steps.len(), 1, "{:?}", l.steps);
-    assert!((l.steps[0].1 - 6_000 * MS).abs() < MS, "{:?}", l.steps);
+    assert!((l.steps[0].1 - 6_123_456_789).abs() < MS, "{:?}", l.steps);
+    assert_ne!(
+        l.steps[0].1 % (200 * MS),
+        0,
+        "an emergency is never rounded: {:?}",
+        l.steps
+    );
     assert_eq!(
         l.steps[0].0 - l.steps[0].3,
         MIN_STEP_LEAD_NS,
@@ -238,12 +289,19 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_inside_it_else_the_next_n
     };
     l.run(39 * 3_600, down);
     assert_eq!(l.steps.len(), 1, "{:?}", l.steps);
-    // The error since 12:00 two days before, where the step lands (02:00:10).
+    // The error since 12:00 two days before, where the step lands (02:00:10): ~2407.9 ms,
+    // stepped as 2400 ms.
     let expected = (17.6 * 1_000.0) as i64 * (38 * 3_600 + 10);
-    assert!(
-        (l.steps[0].1 - expected).abs() < MS,
+    assert_eq!(
+        l.steps[0].1,
+        2_400 * MS,
         "the next night steps both days: {:?} vs {expected}",
         l.steps
+    );
+    assert!(
+        (decided_error(&l.events, 0) - expected).abs() < MS,
+        "{:?} vs {expected}",
+        l.events
     );
     let tod = (l.steps[0].2 - DAY0).rem_euclid(86_400 * S);
     assert_eq!(tod, 2 * 3_600 * S, "when the next window opens");

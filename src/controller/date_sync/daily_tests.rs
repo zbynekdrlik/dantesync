@@ -37,19 +37,20 @@ fn ntp_at(us: i64) -> MockNtpSource {
 
 #[test]
 fn the_nightly_step_is_pre_announced_and_shown_in_status_through_its_lead_then_cleared_119() {
-    for (us, sign) in [(300_000_i64, 1_i8), (-300_000, -1)] {
+    // ±330 ms off UTC: the step is the error rounded to the 200 ms quantum, ±400 ms.
+    for (us, sign) in [(330_000_i64, 1_i8), (-330_000, -1)] {
         let mut clock = MockSystemClock::new();
         clock
             .expect_step_clock()
             .times(1)
-            .withf(move |dur, sg| *dur == Duration::from_millis(300) && *sg == sign)
+            .withf(move |dur, sg| *dur == Duration::from_millis(400) && *sg == sign)
             .returning(|_, _| Ok(()));
         // The window opened a second ago: the step is decided at the first loop iteration with
         // an estimate (six readings).
         let start_s = now_s() - 1;
         let (mut c, d) = anchored_controller_with(clock, ntp_at(us), true, daily_config(start_s));
         readings_then_tick(&mut c);
-        let delta = us * 1_000;
+        let delta = i64::from(sign) * 400_000_000;
         let seq = c.date_sync.authority.as_ref().unwrap().seq();
         assert_eq!(seq, 2, "one announce");
         {
@@ -59,8 +60,9 @@ fn the_nightly_step_is_pre_announced_and_shown_in_status_through_its_lead_then_c
             assert_eq!(
                 st.date_step_pending_ns,
                 Some(delta),
-                "the whole error, signed"
+                "the error rounded to the quantum, signed"
             );
+            assert_eq!(st.date_daily_step_quantum_ms, Some(200));
             let due = st.date_step_due_in_ms.expect("due time during the lead");
             assert!((9_000..=10_000).contains(&due), "two 5 s leads: {due} ms");
             assert!(!st.date_offset_micro, "not a micro-correction");
@@ -128,6 +130,33 @@ fn a_daily_master_announces_nothing_by_day_and_raises_no_micro_alarm_119() {
         st.date_daily_next_utc,
         Some(crate::date_offset::format_utc_rfc3339(start_s * S))
     );
+    assert_eq!(
+        st.date_daily_step_quantum_ms,
+        Some(200),
+        "the default quantum"
+    );
+}
+
+#[test]
+fn the_configured_step_quantum_reaches_the_authority_and_status_119() {
+    // A configured quantum (here 40 ms: whole frames at 25 fps) is what the daily master rounds
+    // to and reports; a value that does not divide a second means 200 ms.
+    for (raw, want) in [(40_u64, 40_u64), (1_000, 1_000), (300, 200), (0, 200)] {
+        let mut config = daily_config(now_s() + 6 * 3_600);
+        config.date_offset.daily_step_quantum_ms = raw;
+        let (c, _d) =
+            anchored_controller_with(MockSystemClock::new(), MockNtpSource::new(), true, config);
+        let crate::date_offset::CorrectionMode::Daily(cfg) =
+            c.date_sync.authority.as_ref().unwrap().correction_mode()
+        else {
+            panic!("daily mode");
+        };
+        assert_eq!(cfg.step_quantum_ms(), want, "{raw}");
+        c.update_shared_status();
+        let st = c.get_status_shared();
+        let st = st.read().expect("status");
+        assert_eq!(st.date_daily_step_quantum_ms, Some(want), "{raw}");
+    }
 }
 
 #[test]
@@ -188,14 +217,15 @@ fn a_daily_master_without_ptp_takes_its_own_nightly_step_with_the_fleet_119() {
     // Review round 1: its D is the fleet D (it takes no local NTP steps), so it schedules the
     // nightly step on its own wall like every follower — a long outage never leaves it a day's
     // drift off the fleet.
+    // 330 ms off UTC: the fleet step is 400 ms (rounded to the 200 ms quantum).
     let mut clock = MockSystemClock::new();
     clock
         .expect_step_clock()
         .times(1)
-        .withf(|dur, sg| *dur == Duration::from_millis(300) && *sg == 1)
+        .withf(|dur, sg| *dur == Duration::from_millis(400) && *sg == 1)
         .returning(|_, _| Ok(()));
     let start_s = now_s() - 1;
-    let (mut c, d) = anchored_controller_with(clock, ntp_at(300_000), true, daily_config(start_s));
+    let (mut c, d) = anchored_controller_with(clock, ntp_at(330_000), true, daily_config(start_s));
     c.ptp_offline = true;
     c.service_date_offset();
     readings_then_tick(&mut c);
@@ -209,9 +239,9 @@ fn a_daily_master_without_ptp_takes_its_own_nightly_step_with_the_fleet_119() {
         .follower
         .due(wall_now_ns() + 11 * S)
         .expect("the off-line master scheduled the fleet step for its own wall");
-    assert_eq!(due.delta_ns, 300_000_000);
+    assert_eq!(due.delta_ns, 400_000_000);
     c.apply_date_step(due.delta_ns, StepKind::Coordinated, due.seq);
-    assert_eq!(c.date_sync.core.anchor_ns(), Some(d + 300_000_000));
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(d + 400_000_000));
 }
 
 #[test]
@@ -287,5 +317,12 @@ fn the_configured_mode_reaches_the_authority_and_micro_stays_micro_119() {
         c.date_sync.authority.as_ref().unwrap().correction_mode(),
         crate::date_offset::CorrectionMode::Micro,
         "the pre-1.12 tests run the micro mode"
+    );
+    c.update_shared_status();
+    let st = c.get_status_shared();
+    let st = st.read().expect("status");
+    assert_eq!(
+        st.date_daily_step_quantum_ms, None,
+        "no nightly step in micro mode"
     );
 }

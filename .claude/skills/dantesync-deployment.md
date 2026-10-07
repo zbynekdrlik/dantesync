@@ -154,6 +154,24 @@ own user login password). Windows boxes are reached via MCP only in this procedu
      - **camera-box:** its watchdog / handover grading of `date_authority` must accept
        `"holding"` (a follower whose master is restarting), and `DANTESYNC_VERSION_PIN` advances;
        its fleet upgrader should delete the file on a master downgrade.
+   - **From v1.16.0 (issue #119, the nightly step rounded to a grid-preserving quantum).** Only
+     the master's behaviour changes: the nightly step is the UTC error rounded to a whole
+     `system.date_offset.daily_step_quantum_ms` (200 by default; leave the key out). Followers
+     apply what it announces, as before. A 1.15+ master restores its saved date offset on the
+     upgrade's restart, so the fleet date does not move.
+     - **Roll check on the master:** `/status` shows `date_daily_step_quantum_ms: 200` (`null` on
+       every follower and in micro mode). The startup line reads `… one coordinated step of the
+       UTC error rounded to whole 200 ms …`. With no startup warning naming
+       `daily_step_quantum_ms` (a value that does not divide 1000 ms falls back to 200, loudly).
+     - **After the first 1.16 night:** the journal line is `[DATE] AUTHORITY: nightly date step
+       +1600.000 ms (the UTC error +1543.161 ms rounded to whole 200 ms, a coordinated step) …`.
+       `date_daily_last_step_ms` is a whole multiple of 200, and `date_offset_error_ms` right
+       after the step is within ±100 ms (the remainder, measured again the next night). An error
+       with |error| < 100 ms (either sign; exactly ±100 ms steps ±200 ms) logs `nightly date step
+       not needed` instead. Until that first 1.16 night a 1.15 master upgraded to 1.16 still
+       reports its last unrounded step (`date_daily_last_step_ms`, restored from 1.15).
+     - **camera-box:** its daily grading reads `date_daily_step_quantum_ms` additively, and
+       `DANTESYNC_VERSION_PIN` advances (the camera-box supervisor's step, under the rig lease).
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

@@ -3,8 +3,9 @@
 //!
 //! Proven over 48 simulated hours (the grandmaster change and reboot still happen):
 //! - at +17.6 ppm (the rig): exactly two steps, both announced when the 02:00 UTC window opens,
-//!   none outside it; each the whole error (the second a full day's, ~1.52 s); every box within
-//!   50 µs of relative phase; no wall ever running back;
+//!   none outside it; each the error rounded to a whole 200 ms (1.16: whole frames and samples on
+//!   every per-second grid), the remainder carried into the next night; every box within 50 µs of
+//!   relative phase; no wall ever running back;
 //! - at −15 ppm: the fleet runs ahead, and it is stepped BACK at night, never slewed by day;
 //! - a 6 s UTC jump (beyond the 5 s emergency cap) is stepped at once;
 //! - a UTC outage over the window: the step is made when UTC returns inside the 30 min window,
@@ -20,6 +21,26 @@ const FIRST_WINDOW_W: u64 = 42_400 * 2;
 const SECOND_WINDOW_W: u64 = 128_800 * 2;
 /// The step lands two 5 s leads after the window opens.
 const LANDING_S: f64 = 10.0;
+/// dantesync#119 (1.16): every nightly step is a whole multiple of the default quantum, so the
+/// fleet line lands within half of it of UTC (the remainder waits for the next night).
+const QUANTUM: i64 = 200 * MS;
+/// The master's estimate of the error is this close to the true error (the bench's NTP noise
+/// through the robust line).
+const ESTIMATE_TOL: i64 = 5 * MS;
+
+/// `step` is a whole number of quanta, the nearest to the true error `error` (to within the
+/// estimate's tolerance).
+fn assert_rounded_step(label: &str, what: &str, step: i64, error: i64) {
+    assert_eq!(
+        step % QUANTUM,
+        0,
+        "[{label}] {what} {step} is not a whole number of 200 ms"
+    );
+    assert!(
+        (step - error).abs() <= QUANTUM / 2 + ESTIMATE_TOL,
+        "[{label}] {what} {step} is not the error {error} rounded to 200 ms"
+    );
+}
 
 fn daily_scenario(label: &'static str, utc_vs_gm_ppm: f64) -> Scenario {
     let mut sc = Scenario::plain(label, utc_vs_gm_ppm, true);
@@ -96,33 +117,27 @@ fn a_day_at_the_rigs_drift_is_one_step_a_night_in_the_window_and_none_by_day_119
             windows[0].abs_diff(FIRST_WINDOW_W) <= 4 && windows[1].abs_diff(SECOND_WINDOW_W) <= 4,
             "[{label}] the two nights: {windows:?}"
         );
-        // Each step is the whole error where it lands: the first the drift since the start, the
-        // second a full day's.
+        // Each step is the error where it lands rounded to 200 ms: the first the drift since the
+        // start, the second a full day's PLUS the remainder the first left (carried, never lost).
         let ppm = sc.utc_vs_gm_ppm;
         let first = accrued(ppm, FIRST_WINDOW_W as f64 / 2.0 + LANDING_S);
         let second = accrued(ppm, 86_400.0);
+        let (c0, c1) = (r.corrections[0].1, r.corrections[1].1);
+        let before_second = first - c0 + second;
         println!(
-            "[{label}] steps {} ms and {} ms (the whole error: {} ms and {} ms)",
-            r.corrections[0].1 as f64 / 1e6,
-            r.corrections[1].1 as f64 / 1e6,
+            "[{label}] steps {} ms and {} ms (the true error where they land: {} ms and {} ms)",
+            c0 as f64 / 1e6,
+            c1 as f64 / 1e6,
             first as f64 / 1e6,
-            second as f64 / 1e6
+            before_second as f64 / 1e6
         );
-        assert!(
-            (r.corrections[0].1 - first).abs() < 5 * MS,
-            "[{label}] first step {} vs {first}",
-            r.corrections[0].1
-        );
-        assert!(
-            (r.corrections[1].1 - second).abs() < 5 * MS,
-            "[{label}] second step {} vs {second}",
-            r.corrections[1].1
-        );
+        assert_rounded_step(label, "first step", c0, first);
+        assert_rounded_step(label, "second step", c1, before_second);
         if ppm > 0.0 {
             assert!(second > 1_500 * MS, "a day at +17.6 ppm is ~1.52 s");
             assert_eq!(r.wall_went_back, 0, "[{label}] forward steps only");
         } else {
-            assert!(r.corrections.iter().all(|c| c.1 < -600 * MS));
+            assert!(r.corrections.iter().all(|c| c.1 <= -600 * MS));
             // Only at the two backward steps does any wall read less than a window before.
             assert!(
                 r.wall_went_back <= 2 * 6,
@@ -136,9 +151,10 @@ fn a_day_at_the_rigs_drift_is_one_step_a_night_in_the_window_and_none_by_day_119
             "[{label}] relative phase {} µs",
             r.max_relative_phase_ns / US
         );
-        // The fleet date ran free by day: its error reached a day's drift, never the emergency cap.
+        // The fleet date ran free by day: its error reached a day's drift (with the first night's
+        // remainder), never the emergency cap.
         assert!(
-            r.max_fleet_utc_error_ns >= second.abs() - 10 * MS
+            r.max_fleet_utc_error_ns >= before_second.abs() - 10 * MS
                 && r.max_fleet_utc_error_ns < 2 * second.abs(),
             "[{label}] the fleet line was {} ms off UTC at most",
             r.max_fleet_utc_error_ns / MS
@@ -170,11 +186,17 @@ fn a_6_s_utc_jump_is_stepped_at_once_as_an_emergency_119() {
         (size - expected).abs() < 5 * MS,
         "the whole error at once: {size} vs {expected}"
     );
+    assert_ne!(size % QUANTUM, 0, "an emergency is never rounded: {size}");
     assert_in_window("emergency, then the night", &tods[1..], 7_200.0);
     assert!(
         r.corrections[1].1.abs() < 700 * MS,
         "the night steps only what drifted since the emergency: {}",
         r.corrections[1].1
+    );
+    assert_eq!(
+        r.corrections[1].1 % QUANTUM,
+        0,
+        "the night's step is rounded"
     );
     assert!(r.max_relative_phase_ns <= 50 * US);
     assert_eq!(r.wall_went_back, 0);
@@ -207,15 +229,16 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_else_the_next_night_119()
         "the first night steps once UTC is back and read six times: {tods:?}"
     );
     assert_in_window(sc.label, &tods[1..], 7_200.0);
-    // The estimate after the gap still knows the whole error.
+    // The estimate after the gap still knows the whole error (stepped rounded to 200 ms).
     let first = accrued(
         17.6,
         FIRST_WINDOW_W as f64 / 2.0 + (tods[0] - 7_200.0) + LANDING_S,
     );
-    assert!(
-        (r.corrections[0].1 - first).abs() < 5 * MS,
-        "{} vs {first}",
-        r.corrections[0].1
+    assert_rounded_step(
+        sc.label,
+        "the step after the gap",
+        r.corrections[0].1,
+        first,
     );
 
     let (sc, r) = (&scenarios[1], &results[1]);
@@ -234,11 +257,7 @@ fn a_utc_outage_over_the_window_steps_when_utc_returns_else_the_next_night_119()
     assert!(r.corrections[0].0.abs_diff(SECOND_WINDOW_W) <= 4);
     assert_in_window(sc.label, &tods, 7_200.0);
     let both = accrued(17.6, SECOND_WINDOW_W as f64 / 2.0 + LANDING_S);
-    assert!(
-        (r.corrections[0].1 - both).abs() < 5 * MS,
-        "both days' error: {} vs {both}",
-        r.corrections[0].1
-    );
+    assert_rounded_step(sc.label, "both days' step", r.corrections[0].1, both);
     assert!(r.max_relative_phase_ns <= 50 * US);
     assert_eq!(r.wall_went_back, 0);
 }

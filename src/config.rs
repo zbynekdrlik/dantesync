@@ -173,8 +173,8 @@ pub struct DateOffsetConfig {
     /// dantesync#119 (1.12) — how the NTP master corrects the fleet date:
     ///
     /// - `"daily"` (DEFAULT, owner decision): nothing all day, then ONE coordinated step of the
-    ///   whole error, either direction, when the nightly window opens at `daily_step_utc`; an
-    ///   error beyond `daily_emergency_ms` is stepped at once.
+    ///   error rounded to whole `daily_step_quantum_ms`, either direction, when the nightly window
+    ///   opens at `daily_step_utc`; an error beyond `daily_emergency_ms` is stepped at once.
     /// - `"micro"`: the 1.11 micro-corrections (`micro_step_us` per `micro_interval_s`), unchanged.
     ///
     /// `"bound"` (the 1.10 step at the step bound) no longer exists since 1.11.0; it and any other
@@ -201,6 +201,17 @@ pub struct DateOffsetConfig {
         deserialize_with = "lenient_daily_emergency_ms"
     )]
     pub daily_emergency_ms: u64,
+    /// dantesync#119 (1.16) — the nightly step is the error rounded to a whole number of this
+    /// (ms), ties away from zero; the remainder stays and is measured again the next night.
+    /// Default 200: a whole number of frames at 25/30/50/60 fps and of samples at 48 kHz on every
+    /// per-second genlock grid, so the step changes no grid's phase. `0` (or a non-number) means
+    /// the default; a value that does not divide 1000 ms evenly means the default, with a loud
+    /// warning ([`Self::correction_mode`]). The emergency step is never rounded.
+    #[serde(
+        default = "default_date_daily_step_quantum_ms",
+        deserialize_with = "lenient_daily_step_quantum_ms"
+    )]
+    pub daily_step_quantum_ms: u64,
     /// dantesync#126 — how long (s) a follower HOLDS the fleet date offset after the master went
     /// silent (its 30 s authority-loss window), before it falls back to its local NTP date path.
     /// Default 900: a master restart or reboot plus its PTP re-acquisition. While holding, the
@@ -258,6 +269,20 @@ where
     Ok(lenient_u64_or(
         serde_json::Value::deserialize(deserializer)?,
         default_date_daily_emergency_ms(),
+    ))
+}
+
+fn default_date_daily_step_quantum_ms() -> u64 {
+    crate::date_offset::DEFAULT_DAILY_STEP_QUANTUM_MS
+}
+
+fn lenient_daily_step_quantum_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_u64_or(
+        serde_json::Value::deserialize(deserializer)?,
+        default_date_daily_step_quantum_ms(),
     ))
 }
 
@@ -383,6 +408,7 @@ impl Default for DateOffsetConfig {
             correction: default_date_correction(),
             daily_step_utc: default_date_daily_step_utc(),
             daily_emergency_ms: default_date_daily_emergency_ms(),
+            daily_step_quantum_ms: default_date_daily_step_quantum_ms(),
             authority_hold_s: default_date_authority_hold_s(),
         }
     }
@@ -435,11 +461,12 @@ impl DateOffsetConfig {
     /// dantesync#119 (1.12) — the effective date-correction mode, and a warning for every value
     /// that fell back to its default (the controller logs them loudly at startup): `"daily"` (the
     /// default, and what an unknown value or the removed `"bound"` means) or `"micro"`,
-    /// case-insensitive; `daily_step_utc` parsed leniently, else 02:00.
+    /// case-insensitive; `daily_step_utc` parsed leniently, else 02:00; `daily_step_quantum_ms`
+    /// a divisor of 1000 ms, else 200.
     pub fn correction_mode(&self) -> (crate::date_offset::CorrectionMode, Vec<String>) {
         use crate::date_offset::{
-            parse_daily_step_utc, CorrectionMode, DailyConfig, DEFAULT_DAILY_STEP_TOD_S,
-            DEFAULT_DAILY_STEP_UTC,
+            daily_step_quantum_ms, parse_daily_step_utc, CorrectionMode, DailyConfig,
+            DEFAULT_DAILY_STEP_QUANTUM_MS, DEFAULT_DAILY_STEP_TOD_S, DEFAULT_DAILY_STEP_UTC,
         };
         let mut warnings = Vec::new();
         let v = self.correction.trim();
@@ -469,8 +496,18 @@ impl DateOffsetConfig {
             ));
             DEFAULT_DAILY_STEP_TOD_S
         });
+        let quantum_ms = daily_step_quantum_ms(self.daily_step_quantum_ms).unwrap_or_else(|| {
+            warnings.push(format!(
+                "system.date_offset.daily_step_quantum_ms {} does not divide 1000 ms evenly (the \
+                 nightly step must stay whole on every per-second grid) — using {} ms",
+                self.daily_step_quantum_ms, DEFAULT_DAILY_STEP_QUANTUM_MS
+            ));
+            DEFAULT_DAILY_STEP_QUANTUM_MS
+        });
         (
-            CorrectionMode::Daily(DailyConfig::new(tod_s, self.daily_emergency_ms)),
+            CorrectionMode::Daily(
+                DailyConfig::new(tod_s, self.daily_emergency_ms).with_step_quantum_ms(quantum_ms),
+            ),
             warnings,
         )
     }

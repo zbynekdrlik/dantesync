@@ -11,8 +11,16 @@
 //!   the boxes still agree to the µs.
 //! - In a window that opens at `daily_step_utc` (02:00 by default: 04:00 CEST / 03:00 CET, with
 //!   no time-zone library and the 1 h DST shift accepted), the authority announces ONE coordinated
-//!   step of the whole estimated error, in EITHER direction, two leads ahead. The #119
-//!   backward-slew rule protected live audio during the day; at night a backward step is allowed.
+//!   step, in EITHER direction, two leads ahead. The #119 backward-slew rule protected live audio
+//!   during the day; at night a backward step is allowed.
+//! - That step is the estimated error ROUNDED to a whole number of `daily_step_quantum_ms` (1.16,
+//!   200 ms by default), ties away from zero. Every per-second genlock grid on the rig (the camera
+//!   emit gates, the OBS receive FIFOs and render ticks) is anchored on the wall second, and 200 ms
+//!   is a whole number of frames at 25/30/50/60 fps and of samples at 48 kHz, so the step moves no
+//!   grid's phase. The unrounded 6.10.2026 step (+1543.16 ms = 92.59 frames at 60 fps) made every
+//!   camera repeat or skip a frame (camera-box issue 1372). The remainder (at most half a quantum)
+//!   stays in the fleet date, where the next night's readings measure it again. A step that
+//!   rounds to zero is no step.
 //! - The window is the moment it opens. It stays open for up to [`DAILY_WINDOW_NS`] (30 min) only
 //!   while no fresh UTC reading is available then. When UTC comes back inside the window the step
 //!   is made then; otherwise that night is skipped, loudly, and the next night makes it.
@@ -56,6 +64,37 @@ pub const MAX_DAILY_EMERGENCY_MS: u64 = 3_600_000;
 /// it is not worth a clock event. This happens, for example, after a restart right after the
 /// night's step.
 pub const DAILY_MIN_STEP_NS: i64 = MICRO_DEAD_BAND_NS;
+
+/// dantesync#119 (1.16) — the default nightly step quantum (ms): a whole number of frames at
+/// 25/30/50/60 fps and of samples at 48 kHz, on a per-second grid.
+pub const DEFAULT_DAILY_STEP_QUANTUM_MS: u64 = 200;
+
+/// The nightly step quantum actually used for a configured value (ms): `0` means the default; a
+/// value that divides 1000 ms evenly is taken (so the quantum stays whole on every per-second
+/// grid); anything else is `None` (the caller then uses [`DEFAULT_DAILY_STEP_QUANTUM_MS`] and
+/// warns).
+pub fn daily_step_quantum_ms(ms: u64) -> Option<u64> {
+    match ms {
+        0 => Some(DEFAULT_DAILY_STEP_QUANTUM_MS),
+        ms if 1_000 % ms == 0 => Some(ms),
+        _ => None,
+    }
+}
+
+/// `error_ns` rounded to the nearest whole multiple of `quantum_ns` (> 0), ties away from zero.
+/// At the very ends of `i64` the multiple is taken one quantum toward zero, so the result is
+/// always a whole multiple.
+fn round_to_quantum(error_ns: i64, quantum_ns: i64) -> i64 {
+    let q = i128::from(quantum_ns.max(1));
+    let e = i128::from(error_ns);
+    let mut rounded = e.signum() * ((e.abs() + q / 2) / q) * q;
+    if rounded > i128::from(i64::MAX) {
+        rounded -= q;
+    } else if rounded < i128::from(i64::MIN) {
+        rounded += q;
+    }
+    rounded as i64
+}
 
 /// The emergency cap actually used for a configured value (ms): `0` means the default, anything
 /// else is clamped to [`MIN_DAILY_EMERGENCY_MS`]..=[`MAX_DAILY_EMERGENCY_MS`].
@@ -119,16 +158,33 @@ pub struct DailyConfig {
     pub step_tod_ns: i64,
     /// An error beyond this is stepped at once (ns).
     pub emergency_ns: i64,
+    /// dantesync#119 (1.16): the nightly step is a whole multiple of this (ns).
+    pub step_quantum_ns: i64,
 }
 
 impl DailyConfig {
     /// From configured values: the window's start in seconds into the UTC day (taken mod one
-    /// day), the emergency cap in ms (clamped by [`clamp_daily_emergency_ms`]).
+    /// day), the emergency cap in ms (clamped by [`clamp_daily_emergency_ms`]). The step quantum
+    /// is the default ([`DEFAULT_DAILY_STEP_QUANTUM_MS`]); see [`Self::with_step_quantum_ms`].
     pub fn new(step_tod_s: i64, emergency_ms: u64) -> Self {
         DailyConfig {
             step_tod_ns: step_tod_s.rem_euclid(86_400) * NS_PER_S,
             emergency_ns: clamp_daily_emergency_ms(emergency_ms) as i64 * 1_000_000,
+            step_quantum_ns: DEFAULT_DAILY_STEP_QUANTUM_MS as i64 * 1_000_000,
         }
+    }
+
+    /// dantesync#119 (1.16) — the step quantum from a configured value (ms), by
+    /// [`daily_step_quantum_ms`]: a value it refuses means the default.
+    pub fn with_step_quantum_ms(mut self, ms: u64) -> Self {
+        let ms = daily_step_quantum_ms(ms).unwrap_or(DEFAULT_DAILY_STEP_QUANTUM_MS);
+        self.step_quantum_ns = ms as i64 * 1_000_000;
+        self
+    }
+
+    /// The step quantum (ms).
+    pub fn step_quantum_ms(&self) -> u64 {
+        (self.step_quantum_ns / 1_000_000) as u64
     }
 }
 
@@ -166,9 +222,11 @@ impl CorrectionMode {
 pub enum DailyDecision {
     /// Nothing to do now.
     Idle,
-    /// Inside the window with a fresh estimate: step the whole estimated error.
-    Step { amount_ns: i64 },
-    /// Inside the window, but the error is within the minimum: nothing to step tonight.
+    /// Inside the window with a fresh estimate: step `amount_ns`, the estimated error `error_ns`
+    /// rounded to the step quantum (dantesync#119, 1.16). The remainder stays in the fleet date.
+    Step { amount_ns: i64, error_ns: i64 },
+    /// Inside the window, but the error is within the minimum, or rounds to no quantum at all:
+    /// nothing to step tonight.
     NoStep { error_ns: i64 },
     /// Inside the window with no fresh UTC reading: waiting up to its end (fleet wall, ns).
     /// Reported once per window.
@@ -271,8 +329,17 @@ impl DailyScheduler {
                 error_ns: est.error_ns,
             };
         }
+        // dantesync#119 (1.16): a whole number of quanta, so no per-second grid changes phase.
+        // The remainder stays in the fleet date and is measured again the next night.
+        let amount_ns = round_to_quantum(est.error_ns, self.cfg.step_quantum_ns);
+        if amount_ns == 0 {
+            return DailyDecision::NoStep {
+                error_ns: est.error_ns,
+            };
+        }
         DailyDecision::Step {
-            amount_ns: est.error_ns,
+            amount_ns,
+            error_ns: est.error_ns,
         }
     }
 

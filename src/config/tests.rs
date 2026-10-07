@@ -736,6 +736,67 @@ fn daily_step_utc_and_the_emergency_cap_are_lenient_119() {
 }
 
 #[test]
+fn the_nightly_step_quantum_is_200_ms_by_default_and_lenient_119() {
+    use crate::date_offset::{CorrectionMode, DailyConfig};
+    // A 1.15 config has no quantum key: 200 ms, no warning.
+    let c: SystemConfig =
+        serde_json::from_str(r#"{"date_offset":{"correction":"daily"}}"#).expect("parses");
+    assert_eq!(c.date_offset.daily_step_quantum_ms, 200);
+    let (mode, warnings) = c.date_offset.correction_mode();
+    assert_eq!(mode, CorrectionMode::Daily(DailyConfig::default()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let CorrectionMode::Daily(cfg) = mode else {
+        unreachable!()
+    };
+    assert_eq!(cfg.step_quantum_ns, 200_000_000);
+    assert_eq!(
+        SystemConfig::default().date_offset.daily_step_quantum_ms,
+        200
+    );
+    // A divisor of 1000 ms is taken; 0 or garbage means 200 silently (like the emergency cap);
+    // a number that does not divide a second means 200 with a warning naming the key.
+    for (raw, want_ms, warns) in [
+        ("1", 1, false),
+        ("40", 40, false),
+        ("125", 125, false),
+        ("200", 200, false),
+        ("250.0", 250, false),
+        ("1000", 1_000, false),
+        ("0", 200, false),
+        (r#""x""#, 200, false),
+        ("-5", 200, false),
+        ("null", 200, false),
+        ("[1]", 200, false),
+        ("3", 200, true),
+        ("300", 200, true),
+        ("33.3", 200, true),
+        ("2000", 200, true),
+    ] {
+        let json = format!(r#"{{"date_offset":{{"daily_step_quantum_ms":{raw}}}}}"#);
+        let c: SystemConfig = serde_json::from_str(&json).expect("must still parse");
+        let (mode, warnings) = c.date_offset.correction_mode();
+        assert_eq!(
+            mode,
+            CorrectionMode::Daily(DailyConfig::default().with_step_quantum_ms(want_ms)),
+            "daily_step_quantum_ms {raw}"
+        );
+        let CorrectionMode::Daily(cfg) = mode else {
+            unreachable!()
+        };
+        assert_eq!(
+            cfg.step_quantum_ms(),
+            want_ms,
+            "daily_step_quantum_ms {raw}"
+        );
+        assert_eq!(warnings.len(), usize::from(warns), "{raw}: {warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("daily_step_quantum_ms")),
+            "{raw}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
 fn a_follower_holds_the_fleet_date_900_s_by_default_and_the_hold_is_lenient_126() {
     use std::time::Duration;
     // A 1.14 config has no hold key: the default (a master restart or reboot plus its PTP

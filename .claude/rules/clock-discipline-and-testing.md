@@ -521,9 +521,10 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
 - The authority keeps recording UTC readings into the SAME `MicroScheduler` estimate (Theil–Sen
   line), but `DateAuthority::on_tick` hands the decision to `DailyScheduler`
   (`src/date_offset/daily.rs`).
-- Nothing happens by day. When the window opens at `daily_step_utc` (02:00 UTC), the whole
-  estimated error at the landing instant is announced as ONE coordinated step, either direction,
-  never a slew, `MICRO_LEAD_FACTOR` leads ahead.
+- Nothing happens by day. When the window opens at `daily_step_utc` (02:00 UTC), the estimated
+  error at the landing instant, rounded to whole `daily_step_quantum_ms` (1.16, below), is
+  announced as ONE coordinated step, either direction, never a slew, `MICRO_LEAD_FACTOR` leads
+  ahead.
 - The window is read on the FLEET wall (`ptp + D`). A grandmaster rebase moves PTP time, never
   that wall, so the scheduler keeps no PTP state and needs no rebase.
 - A decision needs a SETTLED estimate (`MicroScheduler::settled`): at least `MICRO_MIN_READINGS`
@@ -544,6 +545,39 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
   step back to 22:00 then hid the next 02:00, SILENTLY (the `<=` handled check extends that to
   several nights). A forward emergency jump over a window is not reported MISSED either.
 - No step for |error| ≤ 2 ms + 3 σ, for example after a restart right after the night's step.
+
+**The step is a whole number of a grid-preserving quantum (1.16, design 6028569753):**
+- Why: every per-second genlock grid on the rig (camera emit gates, OBS receive FIFOs and render
+  ticks) is anchored on the wall second. The unrounded 6.10.2026 step (+1543.16 ms = 92.59 frames
+  at 60 fps) moved every grid's phase: camera-box measured 5 repeats + 4 skips at 02:00:10Z.
+- `DailyScheduler::decide` rounds AFTER the dead band (the band is judged on the unrounded
+  error) to the nearest multiple of `DailyConfig::step_quantum_ns`, ties away from zero, in i128
+  (one quantum toward zero at the ends of i64, so it is always a whole multiple). A round to 0 is
+  `NoStep`. `Step { amount_ns, error_ns }` carries both, and the nightly log line prints both.
+- The remainder needs no state of its own. It is physically in the fleet date, and the next
+  night's estimate comes from that night's fresh readings (the trend window is 20 min), so it is
+  measured again. `daily_tick` compensates the kept readings by the ROUNDED amount, which keeps
+  the estimate right in the first ≤ 20 min after the step (a `step_now` then, for example). A
+  test pins that (`authority_daily_tests.rs`: the estimate equals the remainder right after the
+  landing); compensating by `error_ns` instead passed every other test and the bench.
+- `daily_step_quantum_ms`: 200 by default (whole frames at 25/30/50/60 fps and whole 48 kHz
+  samples); 0 or garbage = 200 silently; a value that does not divide 1000 ms = 200 with a
+  `correction_mode()` warning. Never round the emergency step, the micro mode or the step on
+  request: none of them goes through `decide`.
+- Tests that read the WINDOW logic run on a 1 ms quantum (`ms_quantum()` in
+  `src/date_offset/daily/tests.rs`), so their numbers stay the decision. The rounding has its
+  own tests, and an assertion on a nightly step size elsewhere (authority, controller, bench)
+  must expect the rounded value. Avoid an error of exactly an odd multiple of half a quantum in a
+  controller test (±300 ms is a tie): the estimate's last ns decides the side.
+- **Tier-0 RED/GREEN of the whole `date_offset` module:** it has no dependencies (only comments
+  say `crate::`), so a scratch `lib.rs` with `pub mod date_offset;` beside symlinks to
+  `src/date_offset.rs` and `src/date_offset/` builds with `rustc --edition 2021 --test lib.rs`
+  in ~3 s (~190 MB) and runs all its tests (115 in 1.16, the authority closed loops included) in
+  ~9 s. `CARGO_PKG_RUST_VERSION=1.70.0 clippy-driver` on the same `lib.rs` lints it like CI
+  (without the env variable `clippy::manual_div_ceil` fires on `slew.rs`: `div_ceil` is newer
+  than the MSRV). The bench runs on the `dantesync` rlib replica (the camera-box-lane gotchas
+  further down; 30/30 in ~20 s). The config, status and controller tests stay CI-only unless
+  you build the #126 full-lib replica.
 
 **What changes by mode:**
 - `on_utc_error`'s abnormal cap is `daily_emergency_ms` (5 s) in daily mode, 2 × the step bound
@@ -587,8 +621,13 @@ re-join. So in daily mode:
 - `check()` skips the micro-era direction, size and UTC-bound assertions in daily mode, where the
   date runs free by day and a backward step is allowed. The daily file asserts the window, the
   count and the size instead.
-- Measured at +17.6 ppm: 746.47 ms and 1520.59 ms (the true error: 746.42 / 1520.64). Announced
-  at 02:00:00.000 and 02:00:00.246 fleet time. Relative phase max 19 µs, hourly rate ≤ 0.0023 ppm.
+- Before 1.16, measured at +17.6 ppm: 746.47 ms and 1520.59 ms (the true error: 746.42 /
+  1520.64). Announced at 02:00:00.000 and 02:00:00.246 fleet time. Relative phase max 19 µs,
+  hourly rate ≤ 0.0023 ppm.
+- Since 1.16 every nightly step is a whole multiple of 200 ms within half a quantum (+ the 5 ms
+  estimate tolerance) of the true error where it lands, and the second night's true error
+  includes the first night's remainder (`assert_rounded_step`). At +17.6 ppm that is 800 ms
+  (746.42) then 1400 ms (1467.06); at −15 ppm −600 ms (−636.15) then −1400 ms (−1332.15).
 - A master outage over the window must END before the grandmaster change (~02:23 bench time).
   Otherwise it is the documented double fault (the master publishes an old-base D until it
   returns: thousands of refused replies, 929 µs of settling). Round 1 hit that by accident.
@@ -598,6 +637,10 @@ re-join. So in daily mode:
   once it lands, the same fields as every other step.
 - Also published: `date_correction_mode`, `date_daily_next_utc` (RFC 3339, fleet wall),
   `date_daily_last_step_ts` (epoch s, fleet wall, where it lands) and `date_daily_last_step_ms`.
+- 1.16 appends `date_daily_step_quantum_ms` (integer ms, the daily master only, `null` on a
+  follower, in micro mode and in a pre-1.16 blob). `date_daily_last_step_ms` is a whole multiple
+  of it from the first 1.16 night on: a 1.15 master upgraded to 1.16 restores its last unrounded
+  step and reports it until then, so a consumer must not grade the multiple before that night.
 
 **The 1.10 `"bound"` mode is gone** (since 1.11.0 the step bound only sets the micro cap). The
 value reads as daily with a warning.

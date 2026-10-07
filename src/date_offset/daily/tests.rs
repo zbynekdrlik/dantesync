@@ -18,6 +18,20 @@ fn at(h: i64, m: i64, s: i64) -> i64 {
     DAY0 + (h * 3_600 + m * 60 + s) * S
 }
 
+/// The nightly decision to step `amount_ns`, decided on an estimated error of `error_ns`.
+fn step(amount_ns: i64, error_ns: i64) -> DailyDecision {
+    DailyDecision::Step {
+        amount_ns,
+        error_ns,
+    }
+}
+
+/// A 1 ms quantum: a whole-ms error is stepped as it is, so the window tests read the decision
+/// directly (the default 200 ms rounding has its own tests).
+fn ms_quantum() -> DailyConfig {
+    DailyConfig::default().with_step_quantum_ms(1)
+}
+
 #[test]
 fn daily_step_utc_parses_leniently_119() {
     assert_eq!(parse_daily_step_utc("02:00"), Some(7_200));
@@ -87,7 +101,7 @@ fn nothing_is_decided_during_the_day_119() {
 }
 
 #[test]
-fn the_whole_error_is_stepped_once_when_the_window_opens_119() {
+fn one_rounded_step_is_made_when_the_window_opens_119() {
     let mut d = DailyScheduler::new(DailyConfig::default());
     assert_eq!(
         d.decide(at(1, 59, 59), est(1_500 * MS)),
@@ -95,9 +109,7 @@ fn the_whole_error_is_stepped_once_when_the_window_opens_119() {
     );
     assert_eq!(
         d.decide(at(2, 0, 0), est(1_520 * MS)),
-        DailyDecision::Step {
-            amount_ns: 1_520 * MS
-        }
+        step(1_600 * MS, 1_520 * MS)
     );
     // Once per UTC day: the rest of the window, and the rest of the day, is idle.
     for t in [at(2, 0, 1), at(2, 29, 59), at(2, 31, 0), at(23, 0, 0)] {
@@ -105,16 +117,16 @@ fn the_whole_error_is_stepped_once_when_the_window_opens_119() {
     }
     // The next night steps again, backward too.
     assert_eq!(
-        d.decide(at(2, 0, 0) + 86_400 * S, est(-1_300 * MS)),
-        DailyDecision::Step {
-            amount_ns: -1_300 * MS
-        }
+        d.decide(at(2, 0, 0) + 86_400 * S, est(-1_250 * MS)),
+        step(-1_200 * MS, -1_250 * MS)
     );
 }
 
 #[test]
 fn a_small_error_is_left_alone_119() {
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    // The dead band is judged on the UNROUNDED error (a 1 ms quantum here, so a step past it is
+    // visible).
+    let mut d = DailyScheduler::new(ms_quantum());
     // 2 ms + 3 σ (σ = 50 µs) = 2.15 ms.
     assert_eq!(
         d.decide(at(2, 0, 0), est(2_100_000)),
@@ -123,18 +135,142 @@ fn a_small_error_is_left_alone_119() {
         }
     );
     assert_eq!(d.decide(at(2, 1, 0), est(9 * MS)), DailyDecision::Idle);
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(
         d.decide(at(2, 0, 0), est(-2_200_000)),
-        DailyDecision::Step {
-            amount_ns: -2_200_000
-        }
+        step(-2 * MS, -2_200_000)
     );
 }
 
 #[test]
+fn the_nightly_step_is_rounded_to_the_nearest_200_ms_ties_away_from_zero_119() {
+    // dantesync#119 follow-up (design 6028569753): the step is a whole number of 200 ms — whole
+    // frames at 25/30/50/60 fps and whole 48 kHz samples on every per-second grid. The first two
+    // are the live 6.10.2026 step (+1543.16 ms = 92.59 frames at 60 fps) and the 7.10.2026 error.
+    for (error, amount) in [
+        (1_543_161_209, 1_600 * MS),
+        (1_489_638_000, 1_400 * MS),
+        (1_400 * MS, 1_400 * MS),
+        (299_999_999, 200 * MS),
+        (100_000_001, 200 * MS),
+        // Exactly half a quantum: away from zero.
+        (100 * MS, 200 * MS),
+        (300 * MS, 400 * MS),
+        (1_500 * MS, 1_600 * MS),
+        // Negative (the fleet ahead of UTC): the same rule, mirrored.
+        (-1_543_161_209, -1_600 * MS),
+        (-1_489_638_000, -1_400 * MS),
+        (-299_999_999, -200 * MS),
+        (-100 * MS, -200 * MS),
+        (-300 * MS, -400 * MS),
+        (-1_500 * MS, -1_600 * MS),
+    ] {
+        let mut d = DailyScheduler::new(DailyConfig::default());
+        assert_eq!(
+            d.decide(at(2, 0, 0), est(error)),
+            step(amount, error),
+            "error {error}"
+        );
+    }
+    // No overflow at the extremes: still a whole, signed multiple of the quantum. At 1000 ms the
+    // nearest multiple of ±i64::MAX lies beyond i64, so it is taken one quantum toward zero
+    // (review round 1: at 200 ms the nearest one fits, and the clamp went untested).
+    for quantum_ms in [200, 1_000] {
+        for error in [i64::MAX, -i64::MAX] {
+            let mut d =
+                DailyScheduler::new(DailyConfig::default().with_step_quantum_ms(quantum_ms));
+            let DailyDecision::Step { amount_ns, .. } = d.decide(at(2, 0, 0), est(error)) else {
+                panic!("a step for {error}");
+            };
+            let q = quantum_ms as i64 * MS;
+            assert_eq!(amount_ns % q, 0, "{quantum_ms} ms, {error}: {amount_ns}");
+            assert_eq!(amount_ns.signum(), error.signum(), "{error}: {amount_ns}");
+            assert!((amount_ns - error).abs() <= q, "{error}: {amount_ns}");
+        }
+    }
+}
+
+#[test]
+fn a_step_that_rounds_to_zero_is_no_step_and_the_next_night_measures_it_again_119() {
+    // Past the dead band but under half a quantum: nothing is stepped tonight, the night is
+    // handled, and the remainder is measured again the next night with a day's drift on top.
+    for (error, next_night) in [
+        (99_999_999, 1_600 * MS),
+        (-99_999_999, 1_400 * MS),
+        (50 * MS, 1_600 * MS),
+        (2_200_000, 1_600 * MS),
+        (-2_200_000, 1_600 * MS),
+    ] {
+        let mut d = DailyScheduler::new(DailyConfig::default());
+        assert_eq!(
+            d.decide(at(2, 0, 0), est(error)),
+            DailyDecision::NoStep { error_ns: error },
+            "error {error}"
+        );
+        assert_eq!(d.decide(at(2, 10, 0), est(error)), DailyDecision::Idle);
+        let tomorrow = error + 1_520 * MS;
+        assert_eq!(
+            d.decide(at(2, 0, 0) + 86_400 * S, est(tomorrow)),
+            step(next_night, tomorrow),
+            "error {error}"
+        );
+    }
+}
+
+#[test]
+fn a_configured_quantum_rounds_to_its_own_multiple_119() {
+    for (quantum_ms, error, amount) in [
+        (1_000, 1_543_161_209, 2_000 * MS),
+        (1_000, 1_489_638_000, 1_000 * MS),
+        (1_000, -1_500 * MS, -2_000 * MS),
+        (40, 1_543_161_209, 1_560 * MS),
+        (40, -1_543_161_209, -1_560 * MS),
+        (1, 1_543_161_209, 1_543 * MS),
+    ] {
+        let mut d = DailyScheduler::new(DailyConfig::default().with_step_quantum_ms(quantum_ms));
+        assert_eq!(
+            d.decide(at(2, 0, 0), est(error)),
+            step(amount, error),
+            "quantum {quantum_ms} ms, error {error}"
+        );
+    }
+}
+
+#[test]
+fn the_step_quantum_is_200_ms_by_default_and_must_divide_a_second_119() {
+    assert_eq!(DEFAULT_DAILY_STEP_QUANTUM_MS, 200);
+    assert_eq!(DailyConfig::default().step_quantum_ns, 200 * MS);
+    assert_eq!(DailyConfig::new(7_200, 0).step_quantum_ns, 200 * MS);
+    // 0 = the default; a divisor of 1000 ms is taken; anything else is refused (the caller warns
+    // and uses the default).
+    for (raw, want) in [
+        (0, Some(200)),
+        (1, Some(1)),
+        (40, Some(40)),
+        (125, Some(125)),
+        (200, Some(200)),
+        (500, Some(500)),
+        (1_000, Some(1_000)),
+        (3, None),
+        (300, None),
+        (999, None),
+        (2_000, None),
+        (u64::MAX, None),
+    ] {
+        assert_eq!(daily_step_quantum_ms(raw), want, "{raw}");
+        assert_eq!(
+            DailyConfig::default()
+                .with_step_quantum_ms(raw)
+                .step_quantum_ms(),
+            want.unwrap_or(200),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
 fn without_utc_the_window_waits_up_to_30_minutes_then_skips_the_night_119() {
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
     assert_eq!(
         d.decide(at(2, 0, 0), None),
@@ -147,12 +283,10 @@ fn without_utc_the_window_waits_up_to_30_minutes_then_skips_the_night_119() {
     // UTC back inside the window: the step is made then.
     assert_eq!(
         d.decide(at(2, 29, 59), est(1_400 * MS)),
-        DailyDecision::Step {
-            amount_ns: 1_400 * MS
-        }
+        step(1_400 * MS, 1_400 * MS)
     );
 
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
     assert!(matches!(
         d.decide(at(2, 0, 0), None),
@@ -168,9 +302,7 @@ fn without_utc_the_window_waits_up_to_30_minutes_then_skips_the_night_119() {
     assert_eq!(d.decide(at(3, 0, 0), est(1_400 * MS)), DailyDecision::Idle);
     assert_eq!(
         d.decide(at(2, 0, 0) + 86_400 * S, est(2_900 * MS)),
-        DailyDecision::Step {
-            amount_ns: 2_900 * MS
-        },
+        step(2_900 * MS, 2_900 * MS),
         "the next night steps two days' error"
     );
 }
@@ -181,7 +313,7 @@ fn a_window_that_closed_while_the_scheduler_was_not_asked_is_reported_once_119()
     // between (another date change in flight all along, a stalled process) is missed: reported
     // once, loudly (review round 1) — only a window already past at the FIRST ask (a boot) is
     // silent.
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(1, 0, 0), est(MS * 900)), DailyDecision::Idle);
     assert_eq!(
         d.decide(at(3, 0, 0), est(MS * 900)),
@@ -192,9 +324,7 @@ fn a_window_that_closed_while_the_scheduler_was_not_asked_is_reported_once_119()
     assert_eq!(d.decide(at(3, 0, 1), est(MS * 900)), DailyDecision::Idle);
     assert_eq!(
         d.decide(at(2, 0, 0) + 86_400 * S, est(MS * 900)),
-        DailyDecision::Step {
-            amount_ns: 900 * MS
-        }
+        step(900 * MS, 900 * MS)
     );
 }
 
@@ -203,7 +333,7 @@ fn an_emergency_step_back_across_a_night_never_hides_the_next_window_119() {
     // Review round 2: a master booted 6 h ahead (fleet wall 04:00) marks the 02:00 window it
     // first sees as handled; the emergency step back to 22:00 must not make the next 02:00 look
     // handled too — nor report the night it jumped over as missed.
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(4, 0, 0), None), DailyDecision::Idle);
     d.on_emergency_step(at(4, 0, 5) - 6 * 3_600 * S);
     for t in [at(22, 0, 5) - 86_400 * S, at(23, 0, 0) - 86_400 * S] {
@@ -215,27 +345,24 @@ fn an_emergency_step_back_across_a_night_never_hides_the_next_window_119() {
     );
     assert_eq!(
         d.decide(at(2, 0, 0), est(MS * 70)),
-        DailyDecision::Step { amount_ns: 70 * MS },
+        step(70 * MS, 70 * MS),
         "the next night steps"
     );
     // A FORWARD emergency jump over a window is not a missed night either (it just corrected
     // the whole error): silent, and the next window still steps.
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
     d.on_emergency_step(at(1, 0, 5) + 3 * 3_600 * S);
     assert_eq!(d.decide(at(4, 0, 5), est(MS * 5)), DailyDecision::Idle);
     assert_eq!(
         d.decide(at(2, 0, 0) + 86_400 * S, est(MS * 90)),
-        DailyDecision::Step { amount_ns: 90 * MS }
+        step(90 * MS, 90 * MS)
     );
     // An emergency step that lands INSIDE an open window leaves that window to decide.
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
     d.on_emergency_step(at(2, 5, 0));
-    assert_eq!(
-        d.decide(at(2, 5, 0), est(MS * 30)),
-        DailyDecision::Step { amount_ns: 30 * MS }
-    );
+    assert_eq!(d.decide(at(2, 5, 0), est(MS * 30)), step(30 * MS, 30 * MS));
 }
 
 #[test]
@@ -244,12 +371,9 @@ fn a_backward_step_across_the_window_start_never_decides_the_night_again_119() {
     // backward step larger than the landing's distance from the start, possible once
     // daily_emergency_ms is configured past 10 s). The night is handled: no second decision, no
     // false skip, and the next window is tomorrow's.
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert_eq!(d.decide(at(1, 0, 0), None), DailyDecision::Idle);
-    assert_eq!(
-        d.decide(at(2, 0, 0), est(-20 * S)),
-        DailyDecision::Step { amount_ns: -20 * S }
-    );
+    assert_eq!(d.decide(at(2, 0, 0), est(-20 * S)), step(-20 * S, -20 * S));
     // Landed at 02:00:10: the wall reads 01:59:50.
     for t in [
         at(1, 59, 50),
@@ -267,23 +391,18 @@ fn a_backward_step_across_the_window_start_never_decides_the_night_again_119() {
     }
     assert_eq!(
         d.decide(at(2, 0, 0) + 86_400 * S, est(MS * 900)),
-        DailyDecision::Step {
-            amount_ns: 900 * MS
-        }
+        step(900 * MS, 900 * MS)
     );
 }
 
 #[test]
 fn a_boot_inside_the_window_steps_when_the_estimate_exists_119() {
-    let mut d = DailyScheduler::new(DailyConfig::default());
+    let mut d = DailyScheduler::new(ms_quantum());
     assert!(matches!(
         d.decide(at(2, 15, 0), None),
         DailyDecision::Waiting { .. }
     ));
-    assert_eq!(
-        d.decide(at(2, 16, 0), est(40 * MS)),
-        DailyDecision::Step { amount_ns: 40 * MS }
-    );
+    assert_eq!(d.decide(at(2, 16, 0), est(40 * MS)), step(40 * MS, 40 * MS));
 }
 
 #[test]
@@ -311,24 +430,19 @@ fn the_next_window_is_the_open_one_until_it_is_handled_119() {
 
 #[test]
 fn a_window_at_midnight_and_a_custom_time_work_119() {
-    let mut d = DailyScheduler::new(DailyConfig::new(0, 0));
+    let mut d = DailyScheduler::new(DailyConfig::new(0, 0).with_step_quantum_ms(1));
     assert_eq!(d.decide(at(23, 59, 0), est(900 * MS)), DailyDecision::Idle);
     assert_eq!(
         d.decide(DAY0 + 86_400 * S, est(900 * MS)),
-        DailyDecision::Step {
-            amount_ns: 900 * MS
-        }
+        step(900 * MS, 900 * MS)
     );
-    let mut d = DailyScheduler::new(DailyConfig::new(
-        parse_daily_step_utc("13:45:30").unwrap(),
-        0,
-    ));
+    let mut d = DailyScheduler::new(
+        DailyConfig::new(parse_daily_step_utc("13:45:30").unwrap(), 0).with_step_quantum_ms(1),
+    );
     assert_eq!(d.decide(at(13, 45, 29), est(900 * MS)), DailyDecision::Idle);
     assert_eq!(
         d.decide(at(13, 45, 30), est(900 * MS)),
-        DailyDecision::Step {
-            amount_ns: 900 * MS
-        }
+        step(900 * MS, 900 * MS)
     );
 }
 

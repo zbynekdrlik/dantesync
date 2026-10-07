@@ -61,9 +61,10 @@ impl DateAuthority {
     /// dantesync#119 (1.12) — the nightly step: the [`DailyScheduler`] decides on the FLEET wall
     /// (`PTP now + D`; nothing is in flight here, so `D` is `current_ns`) from the micro
     /// estimate at the landing instant — `None` without a UTC reading in the last
-    /// [`MICRO_READING_MAX_AGE_NS`]. A step is ONE coordinated step of the whole error, either
-    /// direction (never a slew), announced at `land`; the kept readings are compensated at once
-    /// (they describe the error once it has landed), as for a micro-correction.
+    /// [`MICRO_READING_MAX_AGE_NS`]. A step is ONE coordinated step of the error rounded to the
+    /// step quantum (1.16), either direction (never a slew), announced at `land`; the kept
+    /// readings are compensated by that step at once (they describe the error once it has landed,
+    /// the remainder included), as for a micro-correction.
     pub(super) fn daily_tick(&mut self, now_ptp_ns: i64, land: i64) -> Option<DateAnnounce> {
         let wall = now_ptp_ns.wrapping_add(self.current_ns);
         let estimate = if self.micro.settled(now_ptp_ns) {
@@ -75,7 +76,7 @@ impl DateAuthority {
         if decision != DailyDecision::Idle {
             self.daily_event = Some(decision);
         }
-        let DailyDecision::Step { amount_ns } = decision else {
+        let DailyDecision::Step { amount_ns, .. } = decision else {
             return None;
         };
         self.pending = Some((self.current_ns.saturating_add(amount_ns), land));

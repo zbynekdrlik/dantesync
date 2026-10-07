@@ -15,10 +15,12 @@ pub(super) fn log_daily_authority(
     info!(
         "[DATE] this NTP master is the fleet DATE-OFFSET AUTHORITY: D={}ns — the fleet date \
              runs at the Dante tick all day and is corrected ONCE A NIGHT: one coordinated \
-             step of the whole UTC error, either direction, when the window opens at \
-             {:02}:{:02}:{:02} UTC (up to {} min while UTC is unavailable), announced {} s \
-             ahead; only an error beyond {} ms is stepped at once (correction = \"daily\")",
+             step of the UTC error rounded to whole {} ms, either direction, when the window \
+             opens at {:02}:{:02}:{:02} UTC (up to {} min while UTC is unavailable), announced \
+             {} s ahead; only an error beyond {} ms is stepped at once, unrounded (correction = \
+             \"daily\")",
         anchor,
+        cfg.step_quantum_ms(),
         tod_s / 3_600,
         tod_s % 3_600 / 60,
         tod_s % 60,

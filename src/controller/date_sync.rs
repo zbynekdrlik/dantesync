@@ -27,8 +27,9 @@
 //! dantesync#119 (1.12) — by default the fleet date is corrected ONCE A NIGHT
 //! (`system.date_offset.correction = "daily"`, `crate::date_offset::DailyScheduler`): the master's
 //! loop drives the same authority tick, which announces nothing by day and ONE coordinated step
-//! of the whole error when the nightly window opens (logged loudly, published through the usual
-//! `date_step_pending_ns` / `date_step_due_in_ms` during its lead, and in `date_daily_*`). Every box
+//! of the error rounded to whole `daily_step_quantum_ms` (1.16) when the nightly window opens
+//! (logged loudly, published through the usual `date_step_pending_ns` / `date_step_due_in_ms`
+//! during its lead, and in `date_daily_*`). Every box
 //! applies it through the ordinary step path. In daily mode the master also keeps off its local
 //! NTP step path during its own PTP outage: the fleet line is deliberately off UTC, so it
 //! free-runs on the learned frequency and re-joins the fleet line with one step of the measured
