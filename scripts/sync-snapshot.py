@@ -62,6 +62,12 @@ MODES = {0: "INIT", 1: "ACQ", 2: "PROD", 3: "LOCK", 4: "NANO", 5: "NTP-only"}
 # =============================================================================
 
 DRIFT_NANO_US = 0.5     # NANO mode entry: < 0.5 us/s
+
+# dantesync#129: since 1.17 `gm_uuid` (base reply bytes 42-47) is the REAL grandmaster, not the
+# constant 00:00:00:00:01:00 every node misread before. Two ports of one clock (the video and the
+# audio VLAN) carry two UUIDs, and a mixed 1.16/1.17 fleet reports both forms, so a GM difference
+# is reported, never a verdict term.
+GM_REPORT_ONLY = "report-only: two ports of one clock carry two UUIDs, issue 129"
 DRIFT_LOCK_US = 5.0     # LOCK threshold: < 5 us/s
 DRIFT_PROD_US = 20.0    # PROD/ACQ boundary: < 20 us/s
 
@@ -331,7 +337,7 @@ def print_brief(results: List[TimeResponse], reference: str, sample_rate: int):
         drift = abs(r.drift_rate_ppm)
         samp_sec = drift_to_samples_per_sec(r.drift_rate_ppm, sample_rate)
         quality = audio_quality_rating(r, sample_rate)
-        gm_note = "" if r.gm_uuid == ref_gm else " GM-DIFF!"
+        gm_note = "" if r.gm_uuid == ref_gm else " GM-DIFF (report-only)"
 
         if r.host == reference:
             status = "REFERENCE"
@@ -355,18 +361,19 @@ def print_brief(results: List[TimeResponse], reference: str, sample_rate: int):
     all_same_gm = len(set(r.gm_uuid for r in online)) == 1
     max_samp_sec = drift_to_samples_per_sec(max_drift, sample_rate)
 
-    if all_locked and all_same_gm and max_drift < DRIFT_NANO_US:
+    if not all_same_gm:
+        print(f"NOTE: the hosts name {len(set(r.gm_uuid for r in online))} grandmaster UUIDs "
+              f"({GM_REPORT_ONLY})")
+    if all_locked and max_drift < DRIFT_NANO_US:
         print(f"VERDICT: SAMPLE-LOCKED (max drift {max_drift:.2f} us/s = {max_samp_sec:.3f} samples/sec)")
         return 0
-    elif all_locked and all_same_gm and max_drift < DRIFT_LOCK_US:
+    elif all_locked and max_drift < DRIFT_LOCK_US:
         print(f"VERDICT: FREQUENCY-LOCKED (max drift {max_drift:.2f} us/s = {max_samp_sec:.3f} samples/sec)")
         return 0
     else:
         issues = []
         if not all_locked:
             issues.append("not all locked")
-        if not all_same_gm:
-            issues.append("different grandmasters")
         if max_drift >= DRIFT_LOCK_US:
             issues.append(f"drift {max_drift:.1f} us/s = {max_samp_sec:.1f} samp/sec")
         print(f"VERDICT: {'DEGRADED' if all_locked else 'NOT SYNCED'} ({', '.join(issues)})")
@@ -578,7 +585,7 @@ def print_comprehensive(results: List[TimeResponse], reference: str, sample_rate
     print()
     print(f"  Servo Health:")
     print(f"    All locked:        {'YES' if all_locked else 'NO  <-- some hosts not locked!'}")
-    print(f"    Same grandmaster:  {'YES' if all_same_gm else 'NO  <-- network segmentation!'}")
+    print(f"    Same grandmaster:  {'YES' if all_same_gm else 'NO  (' + GM_REPORT_ONLY + ')'}")
 
     # Per-host quality breakdown
     qualities = {}
@@ -594,17 +601,17 @@ def print_comprehensive(results: List[TimeResponse], reference: str, sample_rate
     print()
 
     # Verdict
-    if all_locked and all_same_gm and max_drift < DRIFT_NANO_US:
+    if all_locked and max_drift < DRIFT_NANO_US:
         print(f"  VERDICT: SAMPLE-LOCKED")
         print(f"  All {len(online)} hosts in NANO/LOCK with drift < {DRIFT_NANO_US} us/s.")
         print(f"  Sub-sample precision at {sample_rate/1000:.0f}kHz — suitable for Dante audio.")
         result = 0
-    elif all_locked and all_same_gm and max_drift < DRIFT_LOCK_US:
+    elif all_locked and max_drift < DRIFT_LOCK_US:
         print(f"  VERDICT: FREQUENCY-LOCKED")
         print(f"  All hosts locked, max drift {max_drift:.2f} us/s = {max_samp_sec:.3f} samples/sec.")
         print(f"  Operationally fine — less than half a sample per second of drift.")
         result = 0
-    elif all_locked and all_same_gm:
+    elif all_locked:
         print(f"  VERDICT: DEGRADED")
         print(f"  All hosts locked but max drift {max_drift:.1f} us/s = {max_samp_sec:.1f} samples/sec.")
         marginal = qualities.get("MARGINAL", []) + qualities.get("DRIFTING", [])
@@ -617,9 +624,6 @@ def print_comprehensive(results: List[TimeResponse], reference: str, sample_rate
         if not all_locked:
             unlocked = [r.host for r in online if not r.is_locked]
             issues.append(f"Unlocked: {', '.join(unlocked)}")
-        if not all_same_gm:
-            gms = set(r.gm_uuid for r in online)
-            issues.append(f"Multiple grandmasters: {len(gms)}")
         for issue in issues:
             print(f"    - {issue}")
         result = 1
@@ -662,11 +666,11 @@ def print_json(results: List[TimeResponse], reference: str, sample_rate: int):
     all_locked = all(r.is_locked for r in online) if online else False
     all_same_gm = (len(set(r.gm_uuid for r in online)) == 1) if online else False
 
-    if all_locked and all_same_gm and max_drift < DRIFT_NANO_US:
+    if all_locked and max_drift < DRIFT_NANO_US:
         verdict = "SAMPLE-LOCKED"
-    elif all_locked and all_same_gm and max_drift < DRIFT_LOCK_US:
+    elif all_locked and max_drift < DRIFT_LOCK_US:
         verdict = "FREQUENCY-LOCKED"
-    elif all_locked and all_same_gm:
+    elif all_locked:
         verdict = "DEGRADED"
     else:
         verdict = "NOT SYNCED"
