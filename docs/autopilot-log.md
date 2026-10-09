@@ -829,3 +829,20 @@ canary evidence before continuing.
 - RED -> GREEN: `fef7247` (tests only; does not compile against 1.15's API; with the rounding disabled 8 lib tests + 3 bench scenarios fail) -> `c1061ab` (lib replica 115/115, bench 30/30: +17.6 ppm steps 800/1400 ms for 746.416/1467.056, -15 ppm -600/-1400 for -636.15/-1332.15, the 6.19 s emergency unrounded). CI run 37556879782 green on `8b69f24`.
 - Review round 1 (fresh context; 0 🔴 2 🟡 5 🔵): both 🟡 were surviving mutants (compensate by `error_ns`; the i64 clamp untested at 200 ms), pinned in `7b8e1fc` (each mutant now fails one test); the 🔵 doc fixes (the remainder's real cause, stale "whole error" docs, a 1.15 master reports its unrounded last step until the first 1.16 night, the MSRV clippy env, |error| < 100 ms).
 - Rollout is the camera-box supervisor's step (rig lease, pin + grading update); nothing deployed from this lane.
+
+## Issue 129 slice 0: the 40-byte PTPv1 header and the real grandmaster identity (v1.17.0, PR 130, branch `issue-129-slice0`)
+
+- **Design:** the main session's Approach 1 (issuecomment-6089379787). Fix the layout at the source: SIZE 40, the full GM block, Follow_Up skip 2. The sender fields are report-only. Validation 6089472977 (dev1 `/status` `gm_uuid [0,0,0,0,1,0]`, a read-only tcpdump of 10.77.9.230 on enp2s0). Anchors + consumer findings 6089477430.
+- **Real bytes:** `tests/fixtures/ptpv1/` holds one Sync (124 B) and its Follow_Up (52 B), 2026-10-09T21:17:17Z. GM `00:1d:c1:08:02:14`, stratum 0x79, identifier DFLT, variance −4000, preferred 1, subdomain `_DFLT`, syncInterval −2.
+- **RED → GREEN:**
+  - parser `63cc247` → `a71518b`: the old-API subset fails 4/5 on the old ptp.rs; 15/15 after;
+  - test builders `b3ddf36` (buf[49..55] → 54..60, own commit), simulation `68063cb`;
+  - consumers `be26ec0` → `5f8f8a7`: follower report-only, the legacy constant on the 31900 wire, the persist RED at tests.rs:150;
+  - sender status `10bd5ea` → `533ed35` (child module `controller/ptp_sender.rs`).
+- **Review round 1** (fresh context; 0 🔴 3 🟡 4 🔵), all fixed in-branch:
+  - the restart restore's GM check would have become live (`2cefb71` → `b8f9b70`, report-only, `OtherGrandmaster` removed);
+  - sync-snapshot.py's GM-DIFF verdict term made informational (`ee98176`);
+  - ptplog's byte-0 version check matched no real packet (`ee98176` → `5e6f00f`, the library parser);
+  - nits in `ce822f9`.
+- **Local nets:** `cargo fmt --check`; a rustc replica of `ptp` + `date_offset` (131 tests) + ptplog (2); MSRV-1.70 clippy-driver clean. CI on `5edf5e1` was all green (run 37994181178).
+- **Not done here:** release tag + canary per OS class (the supervisor's step); recording every node's GM identity on both VLANs on issue 129; enforcing the version/subdomain/self filter and putting the real UUID back on the 31900 wire (later slices of issue 129).
