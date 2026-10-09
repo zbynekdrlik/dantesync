@@ -106,11 +106,6 @@ impl RestartState {
 fn describe_rejection(r: RestoreRejected) -> String {
     match r {
         RestoreRejected::NoGrandmaster => "no grandmaster identity at the first lock".to_string(),
-        RestoreRejected::OtherGrandmaster { saved, now } => format!(
-            "it belongs to grandmaster {}, this lock is on {}",
-            format_mac(&saved),
-            format_mac(&now)
-        ),
         RestoreRejected::Stale { age_ns } => format!(
             "it is {} h old (the fleet may have had another master since)",
             age_ns / 3_600_000_000_000
@@ -329,6 +324,16 @@ where
         let Some(saved) = self.date_sync.restart.pending_restore.take() else {
             return false;
         };
+        if let Some(now) = self.date_sync.anchor_gm {
+            if saved.names_another_grandmaster(now) {
+                info!(
+                    "[DATE] the saved fleet date offset names grandmaster {}, this lock is on {} \
+                     — reported only (issue 129): the PTP time base decides the restore",
+                    format_mac(&saved.gm_uuid),
+                    format_mac(&now)
+                );
+            }
+        }
         let checked = saved.validate_restore(
             self.date_sync.anchor_gm,
             anchor,

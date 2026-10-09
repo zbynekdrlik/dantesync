@@ -83,10 +83,9 @@ pub struct DateOffsetState {
 /// step to UTC, a fresh anchor and a new authority session at seq 1 — logged loudly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestoreRejected {
-    /// No grandmaster identity is known at the first lock.
+    /// No grandmaster identity is known at the first lock. (dantesync#129: ANOTHER identity is no
+    /// rejection — see [`DateOffsetState::names_another_grandmaster`]; the time base decides.)
     NoGrandmaster,
-    /// The saved `D` belongs to another grandmaster's time base.
-    OtherGrandmaster { saved: [u8; 6], now: [u8; 6] },
     /// The record is older than [`MAX_RESTORE_AGE_NS`] (by the master's wall now).
     Stale { age_ns: i64 },
     /// The first locked window reads the wall `off_ns` off the saved `D` (`anchor − saved D`),
@@ -97,11 +96,16 @@ pub enum RestoreRejected {
 
 impl DateOffsetState {
     /// May the saved state be restored by a master whose phase lock anchored `anchor_ns` (the
-    /// median `t2 − t1` of its first locked window) under the grandmaster `gm`? Yes when it is the
-    /// same grandmaster (or the record is a pre-1.17 one, saved with the misread constant) and the
-    /// anchor is within `cap_ns` (the daily emergency cap) of the saved `D` in effect at that
-    /// instant. Returns how far the master's wall is off the restored line
-    /// (`anchor − saved D`): the master re-aligns its OWN wall by that much, never the fleet.
+    /// median `t2 − t1` of its first locked window) under the grandmaster `gm`? Yes when a
+    /// grandmaster is known, the record is fresh, and the anchor is within `cap_ns` (the daily
+    /// emergency cap) of the saved `D` in effect at that instant: the same PTP time base.
+    /// Returns how far the master's wall is off the restored line (`anchor − saved D`): the
+    /// master re-aligns its OWN wall by that much, never the fleet.
+    ///
+    /// dantesync#129 (slice 0): the grandmaster's UUID is reported, never enforced. Before 1.17
+    /// every record held the misread constant, so the comparison never refused; a real UUID can
+    /// now differ under one time base (another port of the same clock), and a grandmaster with
+    /// another uptime is days off, which the time-base check refuses.
     pub fn validate_restore(
         &self,
         gm: Option<[u8; 6]>,
@@ -109,15 +113,7 @@ impl DateOffsetState {
         now_wall_ns: i64,
         cap_ns: i64,
     ) -> Result<i64, RestoreRejected> {
-        let now = gm.ok_or(RestoreRejected::NoGrandmaster)?;
-        // dantesync#129: a record a pre-1.17 master saved carries the constant it misread off
-        // every Sync; it names no grandmaster, so the time-base check below decides.
-        if self.gm_uuid != crate::ptp::LEGACY_MISREAD_GM_UUID && now != self.gm_uuid {
-            return Err(RestoreRejected::OtherGrandmaster {
-                saved: self.gm_uuid,
-                now,
-            });
-        }
+        gm.ok_or(RestoreRejected::NoGrandmaster)?;
         let age_ns = now_wall_ns.saturating_sub(self.written_wall_ns);
         if age_ns > MAX_RESTORE_AGE_NS {
             return Err(RestoreRejected::Stale { age_ns });
@@ -132,6 +128,12 @@ impl DateOffsetState {
             });
         }
         Ok(off)
+    }
+
+    /// dantesync#129 — does the record name a grandmaster other than `now`? Report-only (the
+    /// restore logs it). A pre-1.17 record holds `ptp::LEGACY_MISREAD_GM_UUID`, which names none.
+    pub fn names_another_grandmaster(&self, now: [u8; 6]) -> bool {
+        self.gm_uuid != crate::ptp::LEGACY_MISREAD_GM_UUID && self.gm_uuid != now
     }
 }
 
