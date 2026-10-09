@@ -977,6 +977,8 @@ mod daily_tests;
 #[cfg(test)]
 mod freq_step_tests;
 #[cfg(test)]
+mod gm_identity_tests;
+#[cfg(test)]
 mod micro_tests;
 #[cfg(test)]
 mod rejoin_tests;

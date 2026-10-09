@@ -137,3 +137,33 @@ fn a_saved_state_older_than_a_day_is_not_restored_126() {
     );
     assert_eq!(st.validate_restore(Some(GM), anchor, wall, CAP), Ok(-3 * S));
 }
+
+/// dantesync#129: a 1.16 master saved the constant it misread as the grandmaster's UUID. On the
+/// upgrade's restart the live UUID is real, and refusing the restore would boot-step the master to
+/// UTC: the fleet date would move. A saved constant names no grandmaster, so the time base decides.
+#[test]
+fn a_saved_pre_1_17_misread_constant_restores_under_the_real_grandmaster_129() {
+    let mut st = state(None);
+    st.gm_uuid = crate::ptp::LEGACY_MISREAD_GM_UUID;
+    let ptp = 5 * 86_400 * S;
+    let (wall, anchor) = first_window(ptp, 37_000);
+    assert_eq!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Ok(37_000),
+        "the same time base restores"
+    );
+    let (wall, anchor) = first_window(ptp, 10 * S);
+    assert_eq!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Err(RestoreRejected::TimeBase {
+            off_ns: 10 * S,
+            cap_ns: CAP
+        }),
+        "the time-base check still decides"
+    );
+    assert_eq!(
+        st.validate_restore(None, anchor, wall, CAP),
+        Err(RestoreRejected::NoGrandmaster),
+        "still no restore with no identity at the lock"
+    );
+}
