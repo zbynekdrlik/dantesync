@@ -844,5 +844,9 @@ canary evidence before continuing.
   - sync-snapshot.py's GM-DIFF verdict term made informational (`ee98176`);
   - ptplog's byte-0 version check matched no real packet (`ee98176` → `5e6f00f`, the library parser);
   - nits in `ce822f9`.
-- **Local nets:** `cargo fmt --check`; a rustc replica of `ptp` + `date_offset` (131 tests) + ptplog (2); MSRV-1.70 clippy-driver clean. CI on `5edf5e1` was all green (run 37994181178).
+- **Review round 2** (fresh context; 0 🔴 1 🟡 5 🔵), all fixed in-branch:
+  - the controller rejection path at the first lock re-pinned with a time-base case (`2ad506a`);
+  - the two-clock bench's follower check mirrors the report-only UUID, and its 30 scenarios pass unchanged;
+  - doc nits in `e5f3b7d`.
+- **Local nets:** `cargo fmt --check`; a rustc replica of `ptp` + `date_offset` (131 tests) + ptplog (2) + the two-clock bench (30); MSRV-1.70 clippy-driver clean. CI: run 37994181178 on `5edf5e1` and run 37995332280 on `49b12a5`, both all green.
 - **Not done here:** release tag + canary per OS class (the supervisor's step); recording every node's GM identity on both VLANs on issue 129; enforcing the version/subdomain/self filter and putting the real UUID back on the 31900 wire (later slices of issue 129).
