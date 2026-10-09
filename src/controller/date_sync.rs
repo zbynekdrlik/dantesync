@@ -49,8 +49,8 @@ use daily::log_daily_authority;
 /// per second; a stale reply means the master went quiet).
 const AUTHORITY_REPLY_MAX_AGE: Duration = Duration::from_secs(5);
 
-/// A follower that has heard no APPLICABLE authority reply (fresh, same grandmaster, same time
-/// base) for this long stops following — otherwise a silent, re-based or downgraded master would
+/// A follower that has heard no APPLICABLE authority reply (fresh, in the same PTP time base)
+/// for this long stops following — otherwise a silent, re-based or downgraded master would
 /// leave it neither following nor stepping, drifting at the grandmaster-vs-UTC rate with `/status`
 /// still saying "follower". dantesync#126: it first HOLDS the fleet D for
 /// `system.date_offset.authority_hold_s` (a master restart), then returns to the local NTP path.

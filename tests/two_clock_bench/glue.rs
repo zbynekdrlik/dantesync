@@ -184,9 +184,9 @@ pub(super) fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u6
 
 /// #126 — the restarted master's first anchor and its saved state (`restore_date_authority`):
 /// a grandmaster known (its UUID is report-only since 1.17), a record under a day old, and the
-/// anchor within the daily emergency cap of the saved `D` → the restored authority (the same `D`, seq and change in flight, configured
-/// like a new one); anything else → `None`, a new session (`ensure_date_authority`, after the
-/// deferred boot step).
+/// anchor within the daily emergency cap of the saved `D` → the restored authority (the same `D`,
+/// seq and change in flight, configured like a new one); anything else → `None`, a new session
+/// (`ensure_date_authority`, after the deferred boot step).
 pub(super) fn master_restores_authority(
     m: &Box_,
     saved: DateOffsetState,

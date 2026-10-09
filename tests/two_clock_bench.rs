@@ -840,8 +840,8 @@ impl<'s> Bench<'s> {
     }
 
     /// 5. Followers poll the master's 31900 every second (10 % of polls lost). The reply carries
-    ///    the master's wall, its published D and the D's grandmaster (the extension); a follower
-    ///    adopts it only in its own time base — the controller's exact checks.
+    ///    the master's wall and its published D; a follower adopts it only in its own time base —
+    ///    the controller's exact checks (the grandmaster UUID is report-only since 1.17).
     fn follower_polls(&mut self, w: u64, t0_ns: f64) {
         if w % POLL_INTERVAL_WINDOWS != 0 {
             return;

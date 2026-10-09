@@ -294,6 +294,11 @@ fn a_saved_state_in_another_time_base_runs_the_boot_step_at_the_first_lock_129()
         Some(1),
         "a new session (the pre-1.15 path)"
     );
+    assert_eq!(
+        st.date_offset_ns,
+        Some(anchor + BOOT_ERROR_US * 1_000),
+        "the new session publishes the stepped anchor"
+    );
     assert!(!st.date_offset_restored);
 }
 
