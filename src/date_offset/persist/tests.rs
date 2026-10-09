@@ -71,20 +71,29 @@ fn the_offset_is_judged_against_the_d_in_effect_at_that_instant_126() {
     );
 }
 
+/// dantesync#129 (slice 0): the grandmaster UUID is report-only. Another UUID under the same
+/// time base (another port of one clock) restores; a grandmaster with another uptime is refused by
+/// the time base (`a_time_base_off_beyond_the_cap_is_never_restored_126`); no identity at all is
+/// still never restored.
 #[test]
-fn another_grandmaster_or_none_is_never_restored_126() {
+fn another_grandmaster_uuid_is_reported_and_none_is_never_restored_129() {
     let st = state(None);
     let (wall, anchor) = first_window(5 * 86_400 * S, 0);
     assert_eq!(
         st.validate_restore(Some(OTHER_GM), anchor, wall, CAP),
-        Err(RestoreRejected::OtherGrandmaster {
-            saved: GM,
-            now: OTHER_GM
-        })
+        Ok(0)
     );
+    assert!(st.names_another_grandmaster(OTHER_GM));
+    assert!(!st.names_another_grandmaster(GM));
     assert_eq!(
         st.validate_restore(None, anchor, wall, CAP),
         Err(RestoreRejected::NoGrandmaster)
+    );
+    let mut legacy = state(None);
+    legacy.gm_uuid = crate::ptp::LEGACY_MISREAD_GM_UUID;
+    assert!(
+        !legacy.names_another_grandmaster(GM),
+        "a pre-1.17 record names no grandmaster"
     );
 }
 
