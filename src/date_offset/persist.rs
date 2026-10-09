@@ -98,8 +98,9 @@ pub enum RestoreRejected {
 impl DateOffsetState {
     /// May the saved state be restored by a master whose phase lock anchored `anchor_ns` (the
     /// median `t2 − t1` of its first locked window) under the grandmaster `gm`? Yes when it is the
-    /// same grandmaster and the anchor is within `cap_ns` (the daily emergency cap) of the saved
-    /// `D` in effect at that instant. Returns how far the master's wall is off the restored line
+    /// same grandmaster (or the record is a pre-1.17 one, saved with the misread constant) and the
+    /// anchor is within `cap_ns` (the daily emergency cap) of the saved `D` in effect at that
+    /// instant. Returns how far the master's wall is off the restored line
     /// (`anchor − saved D`): the master re-aligns its OWN wall by that much, never the fleet.
     pub fn validate_restore(
         &self,
@@ -109,7 +110,9 @@ impl DateOffsetState {
         cap_ns: i64,
     ) -> Result<i64, RestoreRejected> {
         let now = gm.ok_or(RestoreRejected::NoGrandmaster)?;
-        if now != self.gm_uuid {
+        // dantesync#129: a record a pre-1.17 master saved carries the constant it misread off
+        // every Sync; it names no grandmaster, so the time-base check below decides.
+        if self.gm_uuid != crate::ptp::LEGACY_MISREAD_GM_UUID && now != self.gm_uuid {
             return Err(RestoreRejected::OtherGrandmaster {
                 saved: self.gm_uuid,
                 now,

@@ -855,9 +855,12 @@ where
             return;
         };
         // D belongs to the master's PTP time base. Adopt it only when this box is in that same
-        // base: PTP online, no re-anchor pending, the same grandmaster as OUR anchor, and — the
-        // decisive check, which also catches a grandmaster that rebooted under the same UUID —
-        // both nodes reading the same PTP "now" (`same_time_base`).
+        // base: PTP online, no re-anchor pending, and — the decisive check, which also catches a
+        // grandmaster that rebooted under the same UUID — both nodes reading the same PTP "now"
+        // (`same_time_base`). dantesync#129: the grandmaster UUID is reported, never enforced.
+        // Before 1.17 every node read the same constant, so the comparison never refused; now the
+        // master's and a follower's grandmaster can be two ports (two UUIDs) of one clock on two
+        // VLANs, and a 1.17 master announces the constant for the 1.16 followers.
         if self.ptp_offline || self.date_sync.core.rebase_pending() {
             return;
         }
@@ -869,15 +872,20 @@ where
             .date_sync
             .follower
             .in_effect_ns(anchor, reply.received_wall_ns);
-        if Some(ext.gm_uuid) != self.date_sync.anchor_gm
-            || !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, d_at_reply)
-        {
+        if !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, d_at_reply) {
             debug!(
                 "[DATE] authority announce seq {} is in another PTP time base (its GM {:?}, ours \
                  {:?}) — not applicable here",
                 ext.announce.seq, ext.gm_uuid, self.date_sync.anchor_gm
             );
             return;
+        }
+        if Some(ext.gm_uuid) != self.date_sync.anchor_gm {
+            debug!(
+                "[DATE] authority announce seq {} names GM {:?}, ours is {:?} — the same PTP time \
+                 base, so applicable (the GM UUID is report-only, issue 129)",
+                ext.announce.seq, ext.gm_uuid, self.date_sync.anchor_gm
+            );
         }
         self.date_sync.last_applicable_reply = Some(Instant::now());
         self.end_authority_hold();

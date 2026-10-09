@@ -289,7 +289,13 @@ fn date_extension_from_status(status: &SyncStatus, now_wall_ns: i64) -> Option<D
     Some(DateExtension {
         version: crate::date_offset::EXT_VERSION,
         authority: status.date_authority == "master",
-        gm_uuid: status.date_offset_gm_uuid?,
+        // dantesync#129 (slice 0): no D without the anchor's grandmaster, but the wire carries the
+        // constant pre-1.17 nodes misread: a 1.16 follower adopts an announce only when its UUID
+        // equals its own (misread) anchor's, and a 1.17 follower no longer compares it. Any
+        // upgrade order keeps the fleet on one date. `/status.date_offset_gm_uuid` stays real.
+        gm_uuid: status
+            .date_offset_gm_uuid
+            .map(|_| crate::ptp::LEGACY_MISREAD_GM_UUID)?,
         // This node's PTP "now" from its D IN EFFECT (never the published, possibly pending D).
         now_ptp_ns: now_wall_ns.wrapping_sub(in_effect),
         announce: DateAnnounce {
