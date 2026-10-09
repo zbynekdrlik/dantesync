@@ -880,7 +880,11 @@ where
             );
             return;
         }
-        if Some(ext.gm_uuid) != self.date_sync.anchor_gm {
+        // A 1.17+ master announces the constant (the wire value for 1.16 followers): only a
+        // real, different UUID is worth a line.
+        if ext.gm_uuid != crate::ptp::LEGACY_MISREAD_GM_UUID
+            && Some(ext.gm_uuid) != self.date_sync.anchor_gm
+        {
             debug!(
                 "[DATE] authority announce seq {} names GM {:?}, ours is {:?} — the same PTP time \
                  base, so applicable (the GM UUID is report-only, issue 129)",

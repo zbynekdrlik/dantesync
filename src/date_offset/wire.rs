@@ -31,7 +31,8 @@ pub const EXT_VERSION: u8 = 3;
 /// dantesync#129 (1.17, slice 0): a 1.17 node sends `ptp::LEGACY_MISREAD_GM_UUID` here (the
 /// constant every pre-1.17 node read as its grandmaster), so a 1.16 follower, which compares it
 /// with its own misread anchor, keeps adopting. A 1.17 follower reports the field and lets the
-/// time-base check decide; the real identity returns here once no pre-1.17 node is left.
+/// time-base check decide; the real identity returns here in a later slice of issue 129, once no
+/// pre-1.17 node is left.
 ///
 /// A future version APPENDS fields; a v1 reader decodes the first 40 bytes of any version ≥ 1.
 ///

@@ -41,8 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The 31900 extension keeps announcing the pre-1.17 constant. A 1.16 follower compares it
     with its own (misread) anchor, so the fleet stays on one date in any upgrade order.
     `/status.date_offset_gm_uuid` is real.
-- **A 1.16 master upgraded to 1.17 restores its saved date offset.** Its `date-offset.json`
-  holds the constant; a saved constant names no grandmaster, so the time-base check decides.
+- **The master's restart restore does not start refusing either.** The saved grandmaster UUID is
+  reported (one info line when it differs, never for the pre-1.17 constant) and the PTP time base
+  decides, as before: a 1.16 master upgraded to 1.17 restores its `date-offset.json` (it holds
+  the constant), and so does a 1.17 master back under another port of the same clock. A
+  grandmaster with another uptime is days off and still refused by the time-base check.
 - **Rollback below 1.17 on the NTP master:** delete `date-offset.json` with the rollback. A 1.17
   master saves the REAL grandmaster, and a 1.16 master would refuse it as another grandmaster
   (a boot step to UTC: the fleet date moves once).

@@ -43,17 +43,19 @@ The real packets are committed in `tests/fixtures/ptpv1/`, with their provenance
 
 The constant was published, saved and announced, so a 1.17 node meets it:
 
-1. **The master's restart restore** (`DateOffsetState::validate_restore`). A 1.16
-   `date-offset.json` holds the constant. Refusing it as `OtherGrandmaster` would boot-step the
-   master to UTC on the upgrade's restart and move the fleet date. A saved constant names no
-   grandmaster, so the time-base check decides.
+1. **The master's restart restore** (`DateOffsetState::validate_restore`). The saved UUID is
+   report-only (`names_another_grandmaster` drives one info line; the pre-1.17 constant names
+   none), and the time-base check decides. A 1.16 `date-offset.json` holds the constant: refusing
+   it would boot-step the master to UTC on the upgrade's restart and move the fleet date. Review
+   round 1 also caught that a 1.17 record of another port of the same clock would have been
+   refused, a check that never refused before 1.17. `RestoreRejected::OtherGrandmaster` is gone.
 2. **The follower's announce applicability** (`service_date_offset`). The GM UUID is report-only
    (debug log); `same_time_base` decides. Two ports of one clock (two VLANs) carry two UUIDs,
    and a 1.16 master announces the constant.
 3. **The 31900 extension** (`date_extension_from_status`). A 1.17 node announces the constant, not
    its real anchor GM: a 1.16 follower adopts only an announce whose UUID equals its own misread
-   anchor. So the upgrade order does not matter. Put the real UUID back on the wire only once no
-   pre-1.17 node is left; 1.17+ followers never refuse on it.
+   anchor. So the upgrade order does not matter. The real UUID goes back on the wire in a later
+   slice of issue 129, once no pre-1.17 node is left; 1.17+ followers never refuse on it.
 
 Rollback of the MASTER below 1.17: delete `date-offset.json` (a 1.16 master refuses the real UUID).
 

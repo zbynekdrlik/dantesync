@@ -60,7 +60,7 @@ fn ms(millis: u64) -> Duration {
 /// A 60-byte PTPv1 datagram with the given control byte (0 Sync, 1 Delay_Req, 2 Follow_Up).
 fn ptp_packet(control: u8) -> Vec<u8> {
     let mut buf = vec![0u8; 60];
-    buf[0] = 0x10; // PTPv1
+    buf[1] = 1; // versionPTP = 1 (a u16 at 0..2, #129)
     buf[32] = control;
     buf
 }

@@ -21,7 +21,9 @@ pub struct SyncStatus {
     /// Current frequency adjustment being applied (PPM)
     pub drift_ppm: f64,
 
-    /// Grandmaster clock UUID (from PTP Sync messages)
+    /// Grandmaster clock UUID (from PTP Sync messages). dantesync#129: the real
+    /// `grandmasterClockUuid` since 1.17; earlier versions report `[0,0,0,0,1,0]` on every node
+    /// (a misread of the Sync body).
     pub gm_uuid: Option<[u8; 6]>,
 
     /// IP address of the device sending PTP Sync messages
