@@ -7,12 +7,13 @@
 //!   UTC) and keeps the master off its NTP step path until the first lock: its NTP readings are
 //!   report-only meanwhile.
 //! - **At the first lock** ([`PtpController::restore_date_authority`], from
-//!   `ensure_date_authority`) the state is judged: the same grandmaster, and the first window's
-//!   `t2 − t1` within the daily emergency cap of the saved `D`. Accepted: the authority continues
+//!   `ensure_date_authority`) the state is judged: a grandmaster known (its UUID is report-only
+//!   since 1.17, dantesync#129), and the first window's `t2 − t1` within the daily emergency cap
+//!   of the saved `D`. Accepted: the authority continues
 //!   with the same `D`, seq and change in flight, and `realign_master_to_fleet` moves ONLY this
 //!   master's wall onto it (a host reboot's RTC wall, the free-run of the restart gap).
-//! - **Rejected** (another grandmaster, a grandmaster that restarted its uptime, a wall seconds
-//!   off), or **no PTP lock within [`RESTORE_WAIT_FOR_PTP`]**: the boot step runs then, from the
+//! - **Rejected** (no grandmaster identity, a stale record, a grandmaster whose uptime is off the
+//!   saved line, a wall seconds off), or **no PTP lock within [`RESTORE_WAIT_FOR_PTP`]**: the boot step runs then, from the
 //!   loop ([`PtpController::run_deferred_boot_step`]), and a new session starts at seq 1 — the
 //!   path every master took before 1.15, logged loudly.
 //! - **No file / an unreadable one**: the boot step runs at start, exactly as before.

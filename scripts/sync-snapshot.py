@@ -62,14 +62,14 @@ MODES = {0: "INIT", 1: "ACQ", 2: "PROD", 3: "LOCK", 4: "NANO", 5: "NTP-only"}
 # =============================================================================
 
 DRIFT_NANO_US = 0.5     # NANO mode entry: < 0.5 us/s
+DRIFT_LOCK_US = 5.0     # LOCK threshold: < 5 us/s
+DRIFT_PROD_US = 20.0    # PROD/ACQ boundary: < 20 us/s
 
 # dantesync#129: since 1.17 `gm_uuid` (base reply bytes 42-47) is the REAL grandmaster, not the
 # constant 00:00:00:00:01:00 every node misread before. Two ports of one clock (the video and the
 # audio VLAN) carry two UUIDs, and a mixed 1.16/1.17 fleet reports both forms, so a GM difference
 # is reported, never a verdict term.
 GM_REPORT_ONLY = "report-only: two ports of one clock carry two UUIDs, issue 129"
-DRIFT_LOCK_US = 5.0     # LOCK threshold: < 5 us/s
-DRIFT_PROD_US = 20.0    # PROD/ACQ boundary: < 20 us/s
 
 
 # =============================================================================
@@ -459,6 +459,7 @@ def print_comprehensive(results: List[TimeResponse], reference: str, sample_rate
     print("  Drift Rate:  smoothed rate of clock error (us/s). Near 0 = clocks tick at same rate.")
     print("  Freq Adj:    correction applied to system clock (PPM). +ve = clock was slow.")
     print("  PTP Offset:  phase vs Dante grandmaster (device-uptime, NOT UTC — large values normal).")
+    print(f"  GM DIFF*:    this host names another grandmaster UUID than the reference ({GM_REPORT_ONLY}).")
     print("-" * W)
     hdr = (f"{'Host':<15}{'Drift (us/s)':<14}{'Freq Adj PPM':<14}"
            f"{'PTP Offset':<18}{'Raw (ns)':<16}{'Mode':<7}{'GM UUID':<22}{'GM':<5}")
@@ -471,7 +472,7 @@ def print_comprehensive(results: List[TimeResponse], reference: str, sample_rate
             continue
 
         offset_human = format_ns_offset(r.ptp_offset_ns)
-        gm_match = "OK" if r.gm_uuid == ref_gm else "DIFF"
+        gm_match = "OK" if r.gm_uuid == ref_gm else "DIFF*"
 
         print(f"{r.host:<15}{r.drift_rate_ppm:>+12.2f}  {r.freq_adj_ppm:>+12.2f}  "
               f"{offset_human:<18}{r.ptp_offset_ns:<16}{r.mode:<7}{r.gm_uuid:<22}{gm_match:<5}")

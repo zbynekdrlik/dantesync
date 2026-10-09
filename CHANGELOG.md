@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported (one info line when it differs, never for the pre-1.17 constant) and the PTP time base
   decides, as before: a 1.16 master upgraded to 1.17 restores its `date-offset.json` (it holds
   the constant), and so does a 1.17 master back under another port of the same clock. A
-  grandmaster with another uptime is days off and still refused by the time-base check.
+  grandmaster whose uptime differs from the saved line by more than the cap (5 s) is still
+  refused by the time-base check.
 - **Rollback below 1.17 on the NTP master:** delete `date-offset.json` with the rollback. A 1.17
   master saves the REAL grandmaster, and a 1.16 master would refuse it as another grandmaster
   (a boot step to UTC: the fleet date moves once).

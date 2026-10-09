@@ -857,10 +857,9 @@ where
         // D belongs to the master's PTP time base. Adopt it only when this box is in that same
         // base: PTP online, no re-anchor pending, and — the decisive check, which also catches a
         // grandmaster that rebooted under the same UUID — both nodes reading the same PTP "now"
-        // (`same_time_base`). dantesync#129: the grandmaster UUID is reported, never enforced.
-        // Before 1.17 every node read the same constant, so the comparison never refused; now the
-        // master's and a follower's grandmaster can be two ports (two UUIDs) of one clock on two
-        // VLANs, and a 1.17 master announces the constant for the 1.16 followers.
+        // (`same_time_base`). dantesync#129: the grandmaster UUID is reported, never enforced
+        // (pre-1.17 every node read one constant; two ports of one clock carry two UUIDs). A 1.17
+        // master announces that constant for 1.16 followers: only a real, different UUID is logged.
         if self.ptp_offline || self.date_sync.core.rebase_pending() {
             return;
         }
@@ -880,8 +879,6 @@ where
             );
             return;
         }
-        // A 1.17+ master announces the constant (the wire value for 1.16 followers): only a
-        // real, different UUID is worth a line.
         if ext.gm_uuid != crate::ptp::LEGACY_MISREAD_GM_UUID
             && Some(ext.gm_uuid) != self.date_sync.anchor_gm
         {

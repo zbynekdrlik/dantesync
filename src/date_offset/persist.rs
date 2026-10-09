@@ -71,7 +71,8 @@ impl AuthorityState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DateOffsetState {
     pub authority: AuthorityState,
-    /// The grandmaster of the anchor `D` belongs to (a restore under another one is refused).
+    /// The grandmaster of the anchor `D` belongs to (since 1.17 reported at a restore under another
+    /// one, never a refusal: the time base decides, dantesync#129).
     pub gm_uuid: [u8; 6],
     /// The master's wall when the record was written (ns since the epoch).
     pub written_wall_ns: i64,
@@ -89,8 +90,9 @@ pub enum RestoreRejected {
     /// The record is older than [`MAX_RESTORE_AGE_NS`] (by the master's wall now).
     Stale { age_ns: i64 },
     /// The first locked window reads the wall `off_ns` off the saved `D` (`anchor − saved D`),
-    /// beyond `cap_ns`: the grandmaster restarted its uptime under the same identity (days off),
-    /// or the wall is too far off the fleet line to be re-joined by the master alone.
+    /// beyond `cap_ns`: the grandmaster restarted its uptime (under the same identity or another),
+    /// another grandmaster's uptime differs by more than the cap, or the wall is too far off the
+    /// fleet line to be re-joined by the master alone.
     TimeBase { off_ns: i64, cap_ns: i64 },
 }
 
@@ -104,8 +106,10 @@ impl DateOffsetState {
     ///
     /// dantesync#129 (slice 0): the grandmaster's UUID is reported, never enforced. Before 1.17
     /// every record held the misread constant, so the comparison never refused; a real UUID can
-    /// now differ under one time base (another port of the same clock), and a grandmaster with
-    /// another uptime is days off, which the time-base check refuses.
+    /// now differ under one time base (another port of the same clock). A grandmaster whose uptime
+    /// differs by more than the cap is refused by the time-base check; one within the cap restores
+    /// (as in 1.16) and moves the fleet by less than the cap, where a refusal's boot step moves it
+    /// anyway.
     pub fn validate_restore(
         &self,
         gm: Option<[u8; 6]>,
