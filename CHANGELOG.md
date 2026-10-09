@@ -5,6 +5,48 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-10-09
+
+### Fixed
+
+- **The grandmaster's identity is read where a PTPv1 Sync carries it (issue #129, slice 0).**
+  The PTPv1 header (IEEE 1588-2002) is 40 bytes; it was parsed as 36, so the Sync body was read
+  4 bytes early and every node reported the grandmaster UUID `00:00:00:00:01:00` (a reserved
+  byte and `grandmasterCommunicationTechnology`). Proven on real Dante bytes captured on dev1
+  (`tests/fixtures/ptpv1/`): the grandmaster `10.77.9.230` is `00:1d:c1:08:02:14`.
+  - **`/status.gm_uuid` is the real grandmaster.** The "GRANDMASTER UUID CHANGED" detector now
+    tells grandmasters apart: a real change re-anchors `D` (no wall step), the first identity
+    after a start is no change.
+  - **The best-master fields are parsed:** stratum, identifier, variance, preferred (the
+    grandmaster's log line names them). Nothing selects on them yet (slice 1, the failover).
+  - **The Follow_Up decode is byte-identical:** the body now starts at 40 and skips 2, the same
+    absolute byte 42 as the old 36 + 6, pinned on the real packet.
+  - **versionPTP / versionNetwork are read as u16** (the old parse read 0).
+
+### Added
+
+- **`/status.ptp_version`, `ptp_subdomain`, `ptp_source_uuid`** (additive): the header of the
+  last followed Sync. Dante reads `1`, `"_DFLT"` and the grandmaster's port. Logged on a change:
+  `PTP sender: PTPv1 (network v1), subdomain "_DFLT", source 00:1D:C1:08:02:14 port 2 (reported
+  only, issue 129)`. **Report-only:** a foreign version or subdomain is followed exactly as
+  before. The filter is enforced in a later release, once the live identities on the video and
+  audio VLANs are recorded on issue #129.
+
+### Unchanged for the fleet (report-only by design)
+
+- **The date authority does not start refusing anyone.**
+  - A follower adopts the master's date offset on the PTP time-base check alone. The master's
+    and an audio-VLAN follower's grandmaster can be two ports (two UUIDs) of one clock. A
+    different UUID is logged at debug level, never a refusal.
+  - The 31900 extension keeps announcing the pre-1.17 constant. A 1.16 follower compares it
+    with its own (misread) anchor, so the fleet stays on one date in any upgrade order.
+    `/status.date_offset_gm_uuid` is real.
+- **A 1.16 master upgraded to 1.17 restores its saved date offset.** Its `date-offset.json`
+  holds the constant; a saved constant names no grandmaster, so the time-base check decides.
+- **Rollback below 1.17 on the NTP master:** delete `date-offset.json` with the rollback. A 1.17
+  master saves the REAL grandmaster, and a 1.16 master would refuse it as another grandmaster
+  (a boot step to UTC: the fleet date moves once).
+
 ## [1.16.0] - 2026-10-07
 
 ### Fixed

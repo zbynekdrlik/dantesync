@@ -73,6 +73,13 @@ The trigger: Poprad's resolume-pp reads `mode NTP-only`, `gm_source_ip none`, so
 - Accept only the Dante subdomain the live GMs use: read off the wire first, recorded in the spec before enforcing.
 - Drop packets whose source UUID is the node's own.
 
+**Read off the wire (9.10.2026, dev1 enp2s0, video VLAN, `tests/fixtures/ptpv1/`):**
+- versionPTP 1, versionNetwork 1, subdomain `_DFLT`;
+- grandmaster `10.77.9.230`: UUID `00:1d:c1:08:02:14` (= the Sync's sourceUuid, port 2), stratum
+  0x79 (121), identifier `DFLT`, variance −4000, preferred 1, boundary clock 1, syncInterval −2.
+- The audio VLAN is not read yet: the 1.17 `/status` fields (`gm_uuid`, `ptp_subdomain`,
+  `ptp_source_uuid`) record it after the rollout.
+
 **Report-only rollout**
 - The date authority's GM check starts to discriminate once `gm_uuid` is real. Before it does, deploy in report mode and log the GM UUID every node sees.
 - Then check that the video-VLAN and audio-VLAN nodes see one AIC128-D clock identity, or record how they differ. Only then enforce.
