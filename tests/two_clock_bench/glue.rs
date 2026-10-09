@@ -15,7 +15,6 @@ pub(super) struct Published {
     pub(super) slew: Option<SlewSpec>,
     /// #119 follow-up: the published change is a micro-correction.
     pub(super) micro: bool,
-    pub(super) gm: u8,
     /// The master's D IN EFFECT at the publish (anchor + its slew's displacement): the time
     /// server derives the replier's PTP now from it.
     pub(super) master_anchor_ns: i64,
@@ -29,7 +28,6 @@ pub(super) fn master_publishes(m: &Box_, a: &DateAuthority) -> Published {
         seq: ann.seq,
         slew: ann.slew,
         micro: ann.micro,
-        gm: m.core_gm,
         master_anchor_ns: m.d_in_effect(),
     }
 }
@@ -60,15 +58,14 @@ pub(super) fn master_runs_local_ntp_path(daily: bool) -> bool {
 }
 
 /// A follower's applicability checks (`service_date_offset`); the time server computes the
-/// replier's PTP now from the SNAPSHOT's D in effect and the live wall.
+/// replier's PTP now from the SNAPSHOT's D in effect and the live wall. dantesync#129: the
+/// grandmaster UUID is report-only (1.17), so the time base alone decides, as in the controller.
 pub(super) fn follower_accepts(b: &Box_, p: &Published, master_wall_now: i64) -> bool {
     if b.core.anchor_ns().is_none() {
         return false;
     }
     let now_ptp = master_wall_now - p.master_anchor_ns;
-    !b.core.rebase_pending()
-        && b.core_gm == p.gm
-        && same_time_base(now_ptp, b.wall_ns(), b.d_in_effect())
+    !b.core.rebase_pending() && same_time_base(now_ptp, b.wall_ns(), b.d_in_effect())
 }
 
 /// The master's local NTP step while it has no PTP (`note_local_date_step`): its own wall and D
@@ -186,8 +183,8 @@ pub(super) fn master_reconcile(m: &mut Box_, a: &DateAuthority, t_ns: f64, w: u6
 }
 
 /// #126 — the restarted master's first anchor and its saved state (`restore_date_authority`):
-/// the same grandmaster, a record under a day old, and the anchor within the daily emergency cap
-/// of the saved `D` → the restored authority (the same `D`, seq and change in flight, configured
+/// a grandmaster known (its UUID is report-only since 1.17), a record under a day old, and the
+/// anchor within the daily emergency cap of the saved `D` → the restored authority (the same `D`, seq and change in flight, configured
 /// like a new one); anything else → `None`, a new session (`ensure_date_authority`, after the
 /// deferred boot step).
 pub(super) fn master_restores_authority(

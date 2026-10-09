@@ -63,8 +63,8 @@ impl Clock {
 /// another device: another UUID, uptime and oscillator) at `GM_CHANGE_AT_WINDOW`, and that new
 /// grandmaster REBOOTS under the same UUID (its uptime restarts) at `GM_REBOOT_AT_WINDOW`. Each box
 /// notices each event a few windows apart. At the change the MASTER is last, so followers
-/// re-anchor while it still publishes a `D` in the old base (refused by the anchor grandmaster in
-/// the extension). At the reboot the master is FIRST, so it publishes a `D` in the new base while
+/// re-anchor while it still publishes a `D` in the old base (refused by the time-base check; the
+/// grandmaster UUID is report-only since 1.17, dantesync#129). At the reboot the master is FIRST, so it publishes a `D` in the new base while
 /// some followers are still in the old one under the SAME UUID: only the time-base check
 /// (`same_time_base`) stops those from taking a multi-day "late" step.
 pub(super) fn gm_view<'a>(

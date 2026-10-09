@@ -254,6 +254,49 @@ fn a_saved_state_under_another_grandmaster_uuid_on_the_same_time_base_restores_1
     assert_eq!(st.date_offset_seq, Some(4), "the same session");
 }
 
+/// The rejection path at the first lock (#126; since #129 a time-base refusal, the UUID being
+/// report-only): the deferred boot step runs from the loop, D moves with the wall, and a new
+/// session starts at seq 1. A saved state of another grandmaster whose uptime is beyond the cap.
+#[test]
+fn a_saved_state_in_another_time_base_runs_the_boot_step_at_the_first_lock_129() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    restart_file::write_atomic(&path, &saved_state(OTHER_GM, d, 4)).expect("written");
+    let mut clock = MockSystemClock::new();
+    // Only the deferred boot step, taken from the loop after the rejection.
+    clock
+        .expect_step_clock()
+        .times(1)
+        .withf(|dur, sign| *dur == Duration::from_micros(BOOT_ERROR_US as u64) && *sign == 1)
+        .returning(|_, _| Ok(()));
+    let mut c = started(clock, ntp_at(BOOT_ERROR_US), &path);
+    assert!(c.boot_step_deferred());
+    // The new grandmaster's uptime is 10 s off the saved D: beyond the 5 s cap.
+    let anchor = d + 10 * S;
+    first_lock(&mut c, PL_GM, anchor);
+    assert!(
+        c.date_sync.authority.is_none(),
+        "no session before the boot step"
+    );
+    assert!(c.date_sync.restart.boot_step_due);
+    c.service_date_offset();
+    assert!(!c.date_sync.restart.boot_step_due, "it ran");
+    assert_eq!(
+        c.date_sync.core.anchor_ns(),
+        Some(anchor + BOOT_ERROR_US * 1_000),
+        "D moved with the wall"
+    );
+    let st = status(&c);
+    assert_eq!(st.date_authority, "master");
+    assert_eq!(
+        st.date_offset_seq,
+        Some(1),
+        "a new session (the pre-1.15 path)"
+    );
+    assert!(!st.date_offset_restored);
+}
+
 #[test]
 fn a_master_waiting_for_its_first_lock_takes_no_ntp_step_and_gives_up_after_the_wait_126() {
     let dir = tempfile::tempdir().expect("tempdir");

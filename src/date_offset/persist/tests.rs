@@ -120,6 +120,11 @@ fn a_time_base_off_beyond_the_cap_is_never_restored_126() {
         st.validate_restore(Some(GM), anchor, wall, CAP),
         Err(RestoreRejected::TimeBase { .. })
     ));
+    // #129: another grandmaster (its UUID is report-only) with another uptime: the same refusal.
+    assert!(matches!(
+        st.validate_restore(Some(OTHER_GM), anchor, wall, CAP),
+        Err(RestoreRejected::TimeBase { .. })
+    ));
 }
 
 #[test]
