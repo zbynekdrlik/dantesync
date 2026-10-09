@@ -478,6 +478,20 @@ pub struct SyncStatus {
     /// on a follower, in micro mode and in a pre-1.16 blob.
     #[serde(default)]
     pub date_daily_step_quantum_ms: Option<u64>,
+
+    // ========================================================================
+    // The PTP sender's identity (dantesync#129, 1.17) — additive, report-only.
+    // ========================================================================
+    /// From the header of the last Sync this node followed: `versionPTP` (Dante: 1), the subdomain
+    /// (Dante: `"_DFLT"`, up to the first NUL) and the sender's `sourceUuid` (a grandmaster's own
+    /// port, or a boundary clock relaying it; `gm_uuid` is the grandmaster). Reported only: no
+    /// packet is filtered on them yet. `null` until a Sync arrives, and in a pre-1.17 blob.
+    #[serde(default)]
+    pub ptp_version: Option<u16>,
+    #[serde(default)]
+    pub ptp_subdomain: Option<String>,
+    #[serde(default)]
+    pub ptp_source_uuid: Option<[u8; 6]>,
 }
 
 fn default_clock_alarm_interval_s() -> u64 {
@@ -587,6 +601,10 @@ impl Default for SyncStatus {
             last_freq_step_ts: None,
             // #119 (1.16): no nightly step quantum until the daily master publishes
             date_daily_step_quantum_ms: None,
+            // #129 (1.17): no Sync heard yet
+            ptp_version: None,
+            ptp_subdomain: None,
+            ptp_source_uuid: None,
         }
     }
 }

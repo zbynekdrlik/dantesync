@@ -36,6 +36,12 @@ mod date_sync;
 /// `ptp_liveness` field.
 mod ptp_liveness;
 
+/// dantesync#129 — the PTP sender's and the grandmaster's identity as a Sync carries them: logged
+/// and published on `/status`, report-only. A child module like `date_sync`; its state is the one
+/// `current_ptp_sender` field.
+mod ptp_sender;
+use ptp_sender::{describe_grandmaster, PtpSender};
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -624,6 +630,9 @@ where
     current_sync_source: Option<[u8; 6]>,
     /// IP address of the device sending PTP Sync messages (for display in tray app)
     current_sync_source_ip: Option<std::net::Ipv4Addr>,
+    /// dantesync#129 — the last Sync's header identity (version, subdomain, source UUID):
+    /// logged on a change and published on `/status`, report-only.
+    current_ptp_sender: Option<PtpSender>,
 
     /// camera-box issue 1073 — trusted grandmaster-source allowlist, parsed once
     /// from `config.gm_allowlist`. When restricting (non-empty), a PTP packet
@@ -954,6 +963,7 @@ where
             current_gm_uuid: None,
             current_sync_source: None,
             current_sync_source_ip: None,
+            current_ptp_sender: None,
             gm_allowlist,
             gm_resolver,
             last_gm_resolve: now,
@@ -2186,6 +2196,7 @@ where
     // ========================================================================
 
     fn handle_sync_message(&mut self, header: &PtpV1Header, buf: &[u8], t2: SystemTime) {
+        self.note_ptp_sender(header);
         // Check if Sync source changed (different device sending PTP)
         let source_uuid = header.source_uuid;
         match self.current_sync_source {
@@ -2246,16 +2257,21 @@ where
             match self.current_gm_uuid {
                 Some(current) if current != new_uuid => {
                     warn!(
-                        ">>> GRANDMASTER UUID CHANGED: {} -> {} <<<",
+                        ">>> GRANDMASTER UUID CHANGED: {} -> {} <<< ({})",
                         format_mac(&current),
-                        format_mac(&new_uuid)
+                        format_mac(&new_uuid),
+                        describe_grandmaster(&body)
                     );
                     self.current_gm_uuid = Some(new_uuid);
                     // Note: sync source change already did soft reset if needed
                     self.on_grandmaster_uuid_change(); // #117: re-anchor D
                 }
                 None => {
-                    info!("Grandmaster UUID: {}", format_mac(&new_uuid));
+                    info!(
+                        "Grandmaster UUID: {} ({})",
+                        format_mac(&new_uuid),
+                        describe_grandmaster(&body)
+                    );
                     self.current_gm_uuid = Some(new_uuid);
                 }
                 _ => {}
@@ -2913,6 +2929,13 @@ where
             status.drift_ppm = self.last_adj_ppm;
             status.gm_uuid = self.current_gm_uuid;
             status.gm_source_ip = self.current_sync_source_ip;
+            // #129: the PTP sender's identity, report-only.
+            status.ptp_version = self.current_ptp_sender.as_ref().map(|p| p.version);
+            status.ptp_subdomain = self
+                .current_ptp_sender
+                .as_ref()
+                .map(|p| p.subdomain.clone());
+            status.ptp_source_uuid = self.current_ptp_sender.as_ref().map(|p| p.source_uuid);
             // #113: publish the live hostname resolution so external gates can
             // compare gm_source_ip against the resolved set (and see loud failures).
             status.gm_allowlist_resolved = self.gm_allowlist.resolved_ips().to_vec();
