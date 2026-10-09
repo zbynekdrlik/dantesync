@@ -22,13 +22,15 @@ Check the current clock synchronization status across all DanteSync targets usin
 3. The offset analysis shows:
    - System time difference (should be < 1ms)
    - Monotonic counter difference (true tick alignment)
-   - Grandmaster UUID (should match across hosts)
+   - Grandmaster UUID (real since 1.17; before it every node showed 00:00:00:00:01:00)
 
 4. Flag any issues:
    - Host showing OFFLINE - check firewall/service
    - Mode not LOCK or NANO - still acquiring
    - Offset > 1ms - sync problem
-   - Different GM UUIDs - network segmentation
+   - Different GM UUIDs - report-only (issue 129): the video and the audio VLAN can hear two
+     ports of one clock, and a mixed 1.16/1.17 fleet shows both forms. Record it on issue 129;
+     it is a problem only together with a lock or drift issue
 
 ## Network Targets
 

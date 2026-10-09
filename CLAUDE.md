@@ -147,6 +147,12 @@ is running.
   10→30→60→120→300 s schedule, the finding that `D` is anchored once per process, the
   per-socket-loopback-address test trick) →
   `.claude/rules/ptp-liveness-rejoin.md` (auto-loads on its `paths:`)
+- PTPv1 wire format + the grandmaster identity (#129 — the 40-byte header proven on real Dante
+  bytes in `tests/fixtures/ptpv1/`, the Follow_Up offset that was right only by accident, the
+  pre-1.17 misread constant `00:00:00:00:01:00` and its three consumers (the restart restore, the
+  report-only follower check, the constant kept on the 31900 wire), report-only sender fields,
+  a read-only tcpdump capture on dev1, the 10-second rustc replica for `ptp` + `date_offset`) →
+  `.claude/rules/ptpv1-wire-format.md` (auto-loads on its `paths:`)
 - DSCP marking of timesync sockets (#52 — which sockets are markable per platform: Linux ntp_server
   reply YES, Linux rsntp client NO handle, Windows filters IP_TOS; the `dscp<<2` TOS-byte math;
   fail-open; socket2 0.5.10 set_tos) → `.claude/rules/dscp-marking.md` (auto-loads on its `paths:`)

@@ -1,8 +1,29 @@
 //! Simple PTP packet logger - shows raw T1, T2, and offset without filtering
 
+use dantesync::ptp::{PtpV1Control, PtpV1FollowUpBody, PtpV1Header};
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The sequence id of a PTPv1 Sync (versionPTP 1), with the library's parser (dantesync#129: the
+/// header is 40 bytes and versionPTP a u16).
+fn sync_sequence(packet: &[u8]) -> Option<u16> {
+    let h = PtpV1Header::parse(packet).ok()?;
+    (h.version_ptp == 1 && h.message_type == PtpV1Control::Sync).then_some(h.sequence_id)
+}
+
+/// A PTPv1 Follow_Up's associated sequence id and precise origin time (ns).
+fn follow_up_origin(packet: &[u8]) -> Option<(u16, i64)> {
+    let h = PtpV1Header::parse(packet).ok()?;
+    if h.version_ptp != 1 || h.message_type != PtpV1Control::FollowUp {
+        return None;
+    }
+    let body = PtpV1FollowUpBody::parse(packet.get(PtpV1Header::SIZE..)?).ok()?;
+    Some((
+        body.associated_sequence_id,
+        body.precise_origin_timestamp.to_nanos(),
+    ))
+}
 
 fn main() {
     println!("=== PTP Raw Offset Logger ===\n");
@@ -39,57 +60,37 @@ fn main() {
             let t2 = SystemTime::now();
             let t2_ns = t2.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
 
-            if size >= 36 && (buf[0] & 0x0F) == 1 {
-                // PTPv1
-                let msg_type = buf[32] & 0x0F;
-                if msg_type == 0 {
-                    // Sync
-                    let seq_id = u16::from_be_bytes([buf[30], buf[31]]);
-                    pending.insert(seq_id, (t2_ns, t2_ns));
-                }
+            if let Some(seq_id) = sync_sequence(&buf[..size]) {
+                pending.insert(seq_id, (t2_ns, t2_ns));
             }
         }
 
         // Check general socket (FollowUp messages)
         if let Ok((size, _)) = sock_general.recv_from(&mut buf) {
-            if size >= 52 && (buf[0] & 0x0F) == 1 {
-                // PTPv1
-                let msg_type = buf[32] & 0x0F;
-                if msg_type == 2 {
-                    // FollowUp
-                    let assoc_seq = u16::from_be_bytes([buf[42], buf[43]]);
+            if let Some((assoc_seq, t1_ns)) = follow_up_origin(&buf[..size]) {
+                if let Some((t2_ns, _)) = pending.remove(&assoc_seq) {
+                    // Calculate phase offset (within 1 second)
+                    let t1_mod = t1_ns % 1_000_000_000;
+                    let t2_mod = t2_ns % 1_000_000_000;
 
-                    if let Some((t2_ns, _)) = pending.remove(&assoc_seq) {
-                        // Parse T1 from FollowUp (offset 44-51 in body, which starts at 36)
-                        let t1_secs =
-                            u32::from_be_bytes([buf[44], buf[45], buf[46], buf[47]]) as i64;
-                        let t1_nanos =
-                            u32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]) as i64;
-                        let t1_ns = t1_secs * 1_000_000_000 + t1_nanos;
-
-                        // Calculate phase offset (within 1 second)
-                        let t1_mod = t1_ns % 1_000_000_000;
-                        let t2_mod = t2_ns % 1_000_000_000;
-
-                        let mut raw_offset = t2_mod - t1_mod;
-                        // Normalize to ±0.5s
-                        if raw_offset > 500_000_000 {
-                            raw_offset -= 1_000_000_000;
-                        }
-                        if raw_offset < -500_000_000 {
-                            raw_offset += 1_000_000_000;
-                        }
-
-                        let offset_us = raw_offset as f64 / 1000.0;
-                        offsets.push(offset_us);
-
-                        println!(
-                            "{:>6} {:>20} {:>20} {:>+12.1} {:>+12.1}",
-                            assoc_seq, t1_mod, t2_mod, offset_us, offset_us
-                        );
-
-                        count += 1;
+                    let mut raw_offset = t2_mod - t1_mod;
+                    // Normalize to ±0.5s
+                    if raw_offset > 500_000_000 {
+                        raw_offset -= 1_000_000_000;
                     }
+                    if raw_offset < -500_000_000 {
+                        raw_offset += 1_000_000_000;
+                    }
+
+                    let offset_us = raw_offset as f64 / 1000.0;
+                    offsets.push(offset_us);
+
+                    println!(
+                        "{:>6} {:>20} {:>20} {:>+12.1} {:>+12.1}",
+                        assoc_seq, t1_mod, t2_mod, offset_us, offset_us
+                    );
+
+                    count += 1;
                 }
             }
         }
@@ -120,4 +121,36 @@ fn main() {
     }
 
     println!("\n=== Done ===");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// dantesync#129 — real Dante packets (`tests/fixtures/ptpv1/README.md`).
+    const DANTE_SYNC: &[u8] = include_bytes!("../../tests/fixtures/ptpv1/dante-sync.bin");
+    const DANTE_FOLLOW_UP: &[u8] = include_bytes!("../../tests/fixtures/ptpv1/dante-follow-up.bin");
+
+    #[test]
+    fn a_real_dante_sync_is_logged_129() {
+        // versionPTP is a u16 (byte 0 is 0x00 on the wire): the old `buf[0] & 0x0F == 1` check
+        // matched no real packet.
+        assert_eq!(sync_sequence(DANTE_SYNC), Some(0xb27a));
+        assert_eq!(
+            sync_sequence(DANTE_FOLLOW_UP),
+            None,
+            "a Follow_Up is no Sync"
+        );
+        assert_eq!(sync_sequence(&DANTE_SYNC[..39]), None, "a runt");
+    }
+
+    #[test]
+    fn a_real_dante_follow_up_gives_its_origin_time_129() {
+        assert_eq!(
+            follow_up_origin(DANTE_FOLLOW_UP),
+            Some((0xb27a, 541_867 * 1_000_000_000 + 434_557_859))
+        );
+        assert_eq!(follow_up_origin(DANTE_SYNC), None, "a Sync is no Follow_Up");
+        assert_eq!(follow_up_origin(&DANTE_FOLLOW_UP[..51]), None, "a runt");
+    }
 }

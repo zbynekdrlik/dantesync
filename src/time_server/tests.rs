@@ -422,6 +422,21 @@ fn a_micro_correction_is_published_with_its_micro_flag_119() {
     assert!(!e.announce.micro);
 }
 
+/// dantesync#129 (slice 0): a 1.16 follower adopts an announce only when its GM UUID equals its own
+/// anchor's, which it misread as `LEGACY_MISREAD_GM_UUID`. A 1.17 master therefore keeps
+/// announcing that constant, so the fleet adopts it in any upgrade order; a 1.17 follower no
+/// longer compares the UUID (the time base decides). `/status.date_offset_gm_uuid` stays real.
+#[test]
+fn the_extension_announces_the_pre_1_17_constant_whatever_the_anchor_grandmaster_129() {
+    let status = master_status();
+    assert_eq!(
+        status.date_offset_gm_uuid,
+        Some([0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c])
+    );
+    let e = date_extension_from_status(&status, 1_790_000_100_000_000_000).unwrap();
+    assert_eq!(e.gm_uuid, crate::ptp::LEGACY_MISREAD_GM_UUID);
+}
+
 #[test]
 fn no_extension_is_published_without_the_anchor_grandmaster_88() {
     // The controller clears the anchor GM while a re-anchor is pending: no D may be
@@ -469,8 +484,8 @@ fn parse_reply_reads_gm_lock_and_extension_and_rejects_strangers_88() {
     );
     assert_eq!(
         parsed.ext.unwrap().gm_uuid,
-        [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c],
-        "the anchor's grandmaster rides in the extension"
+        crate::ptp::LEGACY_MISREAD_GM_UUID,
+        "#129 slice 0: the extension carries the pre-1.17 constant, not the anchor's grandmaster"
     );
 
     assert_eq!(

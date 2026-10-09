@@ -7,14 +7,15 @@
 //!   UTC) and keeps the master off its NTP step path until the first lock: its NTP readings are
 //!   report-only meanwhile.
 //! - **At the first lock** ([`PtpController::restore_date_authority`], from
-//!   `ensure_date_authority`) the state is judged: the same grandmaster, and the first window's
-//!   `t2 − t1` within the daily emergency cap of the saved `D`. Accepted: the authority continues
-//!   with the same `D`, seq and change in flight, and `realign_master_to_fleet` moves ONLY this
-//!   master's wall onto it (a host reboot's RTC wall, the free-run of the restart gap).
-//! - **Rejected** (another grandmaster, a grandmaster that restarted its uptime, a wall seconds
-//!   off), or **no PTP lock within [`RESTORE_WAIT_FOR_PTP`]**: the boot step runs then, from the
-//!   loop ([`PtpController::run_deferred_boot_step`]), and a new session starts at seq 1 — the
-//!   path every master took before 1.15, logged loudly.
+//!   `ensure_date_authority`) the state is judged: a grandmaster known (its UUID is report-only
+//!   since 1.17, dantesync#129), and the first window's `t2 − t1` within the daily emergency cap
+//!   of the saved `D`. Accepted: the authority continues with the same `D`, seq and change in
+//!   flight, and `realign_master_to_fleet` moves ONLY this master's wall onto it (a host reboot's
+//!   RTC wall, the free-run of the restart gap).
+//! - **Rejected** (no grandmaster identity, a stale record, a grandmaster whose uptime is off the
+//!   saved line, a wall seconds off), or **no PTP lock within [`RESTORE_WAIT_FOR_PTP`]**: the
+//!   boot step runs then, from the loop ([`PtpController::run_deferred_boot_step`]), and a new
+//!   session starts at seq 1 — the path every master took before 1.15, logged loudly.
 //! - **No file / an unreadable one**: the boot step runs at start, exactly as before.
 //!
 //! The accumulated UTC error is left to the authority's coordinated correction — the next nightly
@@ -106,18 +107,14 @@ impl RestartState {
 fn describe_rejection(r: RestoreRejected) -> String {
     match r {
         RestoreRejected::NoGrandmaster => "no grandmaster identity at the first lock".to_string(),
-        RestoreRejected::OtherGrandmaster { saved, now } => format!(
-            "it belongs to grandmaster {}, this lock is on {}",
-            format_mac(&saved),
-            format_mac(&now)
-        ),
         RestoreRejected::Stale { age_ns } => format!(
             "it is {} h old (the fleet may have had another master since)",
             age_ns / 3_600_000_000_000
         ),
         RestoreRejected::TimeBase { off_ns, cap_ns } => format!(
             "the first PTP window reads the wall {:+.3} ms off the saved D, beyond the {} ms cap \
-             (a grandmaster that restarted its uptime, or a wall far off the fleet line)",
+             (a grandmaster that restarted its uptime, another grandmaster with another uptime, or \
+             a wall far off the fleet line)",
             off_ns as f64 / 1e6,
             cap_ns / 1_000_000
         ),
@@ -329,6 +326,16 @@ where
         let Some(saved) = self.date_sync.restart.pending_restore.take() else {
             return false;
         };
+        if let Some(now) = self.date_sync.anchor_gm {
+            if saved.names_another_grandmaster(now) {
+                info!(
+                    "[DATE] the saved fleet date offset names grandmaster {}, this lock is on {} \
+                     — reported only (issue 129): the PTP time base decides the restore",
+                    format_mac(&saved.gm_uuid),
+                    format_mac(&now)
+                );
+            }
+        }
         let checked = saved.validate_restore(
             self.date_sync.anchor_gm,
             anchor,

@@ -230,8 +230,35 @@ fn the_boot_step_is_skipped_only_while_a_readable_saved_state_waits_126() {
     }
 }
 
+/// dantesync#129 (slice 0): the saved grandmaster UUID is report-only. A master that comes back
+/// under another UUID (another port of one clock) on the same time base restores the fleet date;
+/// a grandmaster with another uptime is refused by the time base (the persist tests).
 #[test]
-fn a_saved_state_under_another_grandmaster_runs_the_boot_step_at_the_first_lock_126() {
+fn a_saved_state_under_another_grandmaster_uuid_on_the_same_time_base_restores_129() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("date-offset.json");
+    let d = wall_now_ns() - PL_PTP_NOW_NS;
+    restart_file::write_atomic(&path, &saved_state(OTHER_GM, d, 4)).expect("written");
+    let mut clock = MockSystemClock::new();
+    // No boot step and no restore step: the fleet date continues.
+    clock.expect_step_clock().times(0);
+    let mut c = started(clock, ntp_at(BOOT_ERROR_US), &path);
+    assert!(c.boot_step_deferred());
+    first_lock(&mut c, PL_GM, d);
+    c.service_date_offset();
+    assert!(!c.date_sync.restart.boot_step_due);
+    let st = status(&c);
+    assert_eq!(st.date_authority, "master");
+    assert!(st.date_offset_restored, "restored, not re-derived");
+    assert_eq!(st.date_offset_ns, Some(d), "the same fleet D");
+    assert_eq!(st.date_offset_seq, Some(4), "the same session");
+}
+
+/// The rejection path at the first lock (#126; since #129 a time-base refusal, the UUID being
+/// report-only): the deferred boot step runs from the loop, D moves with the wall, and a new
+/// session starts at seq 1. A saved state of another grandmaster whose uptime is beyond the cap.
+#[test]
+fn a_saved_state_in_another_time_base_runs_the_boot_step_at_the_first_lock_129() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("date-offset.json");
     let d = wall_now_ns() - PL_PTP_NOW_NS;
@@ -245,7 +272,9 @@ fn a_saved_state_under_another_grandmaster_runs_the_boot_step_at_the_first_lock_
         .returning(|_, _| Ok(()));
     let mut c = started(clock, ntp_at(BOOT_ERROR_US), &path);
     assert!(c.boot_step_deferred());
-    first_lock(&mut c, PL_GM, d);
+    // The new grandmaster's uptime is 10 s off the saved D: beyond the 5 s cap.
+    let anchor = d + 10 * S;
+    first_lock(&mut c, PL_GM, anchor);
     assert!(
         c.date_sync.authority.is_none(),
         "no session before the boot step"
@@ -255,7 +284,7 @@ fn a_saved_state_under_another_grandmaster_runs_the_boot_step_at_the_first_lock_
     assert!(!c.date_sync.restart.boot_step_due, "it ran");
     assert_eq!(
         c.date_sync.core.anchor_ns(),
-        Some(d + BOOT_ERROR_US * 1_000),
+        Some(anchor + BOOT_ERROR_US * 1_000),
         "D moved with the wall"
     );
     let st = status(&c);
@@ -264,6 +293,11 @@ fn a_saved_state_under_another_grandmaster_runs_the_boot_step_at_the_first_lock_
         st.date_offset_seq,
         Some(1),
         "a new session (the pre-1.15 path)"
+    );
+    assert_eq!(
+        st.date_offset_ns,
+        Some(anchor + BOOT_ERROR_US * 1_000),
+        "the new session publishes the stepped anchor"
     );
     assert!(!st.date_offset_restored);
 }

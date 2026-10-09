@@ -49,8 +49,8 @@ use daily::log_daily_authority;
 /// per second; a stale reply means the master went quiet).
 const AUTHORITY_REPLY_MAX_AGE: Duration = Duration::from_secs(5);
 
-/// A follower that has heard no APPLICABLE authority reply (fresh, same grandmaster, same time
-/// base) for this long stops following — otherwise a silent, re-based or downgraded master would
+/// A follower that has heard no APPLICABLE authority reply (fresh, in the same PTP time base)
+/// for this long stops following — otherwise a silent, re-based or downgraded master would
 /// leave it neither following nor stepping, drifting at the grandmaster-vs-UTC rate with `/status`
 /// still saying "follower". dantesync#126: it first HOLDS the fleet D for
 /// `system.date_offset.authority_hold_s` (a master restart), then returns to the local NTP path.
@@ -855,9 +855,11 @@ where
             return;
         };
         // D belongs to the master's PTP time base. Adopt it only when this box is in that same
-        // base: PTP online, no re-anchor pending, the same grandmaster as OUR anchor, and — the
-        // decisive check, which also catches a grandmaster that rebooted under the same UUID —
-        // both nodes reading the same PTP "now" (`same_time_base`).
+        // base: PTP online, no re-anchor pending, and — the decisive check, which also catches a
+        // grandmaster that rebooted under the same UUID — both nodes reading the same PTP "now"
+        // (`same_time_base`). dantesync#129: the grandmaster UUID is reported, never enforced
+        // (pre-1.17 every node read one constant; two ports of one clock carry two UUIDs). A 1.17
+        // master announces that constant for 1.16 followers: only a real, different UUID is logged.
         if self.ptp_offline || self.date_sync.core.rebase_pending() {
             return;
         }
@@ -869,15 +871,22 @@ where
             .date_sync
             .follower
             .in_effect_ns(anchor, reply.received_wall_ns);
-        if Some(ext.gm_uuid) != self.date_sync.anchor_gm
-            || !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, d_at_reply)
-        {
+        if !same_time_base(ext.now_ptp_ns, reply.received_wall_ns, d_at_reply) {
             debug!(
                 "[DATE] authority announce seq {} is in another PTP time base (its GM {:?}, ours \
                  {:?}) — not applicable here",
                 ext.announce.seq, ext.gm_uuid, self.date_sync.anchor_gm
             );
             return;
+        }
+        if ext.gm_uuid != crate::ptp::LEGACY_MISREAD_GM_UUID
+            && Some(ext.gm_uuid) != self.date_sync.anchor_gm
+        {
+            debug!(
+                "[DATE] authority announce seq {} names GM {:?}, ours is {:?} — the same PTP time \
+                 base, so applicable (the GM UUID is report-only, issue 129)",
+                ext.announce.seq, ext.gm_uuid, self.date_sync.anchor_gm
+            );
         }
         self.date_sync.last_applicable_reply = Some(Instant::now());
         self.end_authority_hold();
@@ -976,6 +985,8 @@ mod trigger;
 mod daily_tests;
 #[cfg(test)]
 mod freq_step_tests;
+#[cfg(test)]
+mod gm_identity_tests;
 #[cfg(test)]
 mod micro_tests;
 #[cfg(test)]

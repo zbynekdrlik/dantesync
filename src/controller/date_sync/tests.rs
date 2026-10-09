@@ -123,7 +123,7 @@ pub(super) fn authority_reply(
 /// A reply whose published D may carry a pending step; `in_effect_ns` is the master's D in
 /// effect (what its PTP "now" is taken from). Both walls read "now", so a D in effect in this
 /// box's base passes the time-base check and one days away fails.
-fn authority_reply_in_effect(
+pub(super) fn authority_reply_in_effect(
     serial: u64,
     gm: [u8; 6],
     date_offset_ns: i64,
@@ -319,11 +319,22 @@ fn a_follower_applies_an_announced_step_only_at_its_instant_88() {
 
 #[test]
 fn a_follower_ignores_an_offset_from_another_grandmasters_time_base_88() {
-    // No step_clock expectation: any step panics the mock.
+    // No step_clock expectation: any step panics the mock. #129: another grandmaster's time base is
+    // told by the PTP "now" both nodes read (`same_time_base`) — here 3 days apart. The UUID alone
+    // no longer refuses (two ports of one clock carry two UUIDs; slice 0 is report-only), see
+    // `gm_identity_tests`.
     let (mut c, d) = anchored_controller(MockSystemClock::new(), MockNtpSource::new(), false);
     let slot = with_authority(&mut c);
     let other_gm = [0x00, 0x1d, 0xc1, 0x99, 0x99, 0x99];
-    *slot.lock().unwrap() = Some(authority_reply(1, other_gm, d + 3_000_000, 1, 1));
+    let three_days: i64 = 3 * 86_400 * 1_000_000_000;
+    *slot.lock().unwrap() = Some(authority_reply_in_effect(
+        1,
+        other_gm,
+        d + 3_000_000,
+        1,
+        1,
+        d - three_days,
+    ));
     c.service_date_offset();
     assert_eq!(c.date_sync.core.anchor_ns(), Some(d));
     c.update_shared_status();

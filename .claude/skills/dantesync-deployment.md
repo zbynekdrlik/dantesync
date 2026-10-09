@@ -172,6 +172,21 @@ own user login password). Windows boxes are reached via MCP only in this procedu
        reports its last unrounded step (`date_daily_last_step_ms`, restored from 1.15).
      - **camera-box:** its daily grading reads `date_daily_step_quantum_ms` additively, and
        `DANTESYNC_VERSION_PIN` advances (the camera-box supervisor's step, under the rig lease).
+   - **From v1.17.0 (issue #129 slice 0, the real grandmaster identity; report-only).** Any
+     upgrade order: the master keeps announcing the old constant on 31900 and a 1.17 follower no
+     longer compares the GM UUID, so no node's date-offset adoption changes. A 1.16 master's
+     `date-offset.json` restores on the upgrade's restart.
+     - **Roll check on every node:** `/status.gm_uuid` is a real Audinate UUID (`[0,29,193,…]`,
+       never `[0,0,0,0,1,0]`). `ptp_version: 1`, `ptp_subdomain: "_DFLT"`, `ptp_source_uuid`
+       set. The journal has one `PTP sender: PTPv1 …` line and the `Grandmaster UUID: … (stratum
+       …, identifier "…", variance …, preferred …)` line.
+     - **Record on issue #129:** each node's `gm_uuid`, `gm_source_ip`, `ptp_subdomain` and
+       `ptp_source_uuid`, video VLAN AND audio VLAN (mbc, fohabl). That table decides the
+       enforced filter and whether the two VLANs share one clock identity.
+     - **Rollback of the MASTER below 1.17:** delete `date-offset.json` with it (a 1.17 master
+       saves the real grandmaster, which a 1.16 master refuses: a boot step to UTC).
+     - **camera-box:** `DANTESYNC_VERSION_PIN` advances. A consumer that grades `gm_uuid` sees it
+       change from the constant to the real UUID once per node.
 5. **Final live proof**: `curl http://10.77.9.202:8898/status` and
    `curl http://10.77.9.204:8898/status` from dev1 (the exact acceptance camera-box's
    own tickets check for) — both must return 200 with `is_locked: true`.

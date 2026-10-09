@@ -71,20 +71,29 @@ fn the_offset_is_judged_against_the_d_in_effect_at_that_instant_126() {
     );
 }
 
+/// dantesync#129 (slice 0): the grandmaster UUID is report-only. Another UUID under the same
+/// time base (another port of one clock) restores; a grandmaster with another uptime is refused by
+/// the time base (`a_time_base_off_beyond_the_cap_is_never_restored_126`); no identity at all is
+/// still never restored.
 #[test]
-fn another_grandmaster_or_none_is_never_restored_126() {
+fn another_grandmaster_uuid_is_reported_and_none_is_never_restored_129() {
     let st = state(None);
     let (wall, anchor) = first_window(5 * 86_400 * S, 0);
     assert_eq!(
         st.validate_restore(Some(OTHER_GM), anchor, wall, CAP),
-        Err(RestoreRejected::OtherGrandmaster {
-            saved: GM,
-            now: OTHER_GM
-        })
+        Ok(0)
     );
+    assert!(st.names_another_grandmaster(OTHER_GM));
+    assert!(!st.names_another_grandmaster(GM));
     assert_eq!(
         st.validate_restore(None, anchor, wall, CAP),
         Err(RestoreRejected::NoGrandmaster)
+    );
+    let mut legacy = state(None);
+    legacy.gm_uuid = crate::ptp::LEGACY_MISREAD_GM_UUID;
+    assert!(
+        !legacy.names_another_grandmaster(GM),
+        "a pre-1.17 record names no grandmaster"
     );
 }
 
@@ -109,6 +118,11 @@ fn a_time_base_off_beyond_the_cap_is_never_restored_126() {
     let anchor = wall - 42 * S;
     assert!(matches!(
         st.validate_restore(Some(GM), anchor, wall, CAP),
+        Err(RestoreRejected::TimeBase { .. })
+    ));
+    // #129: another grandmaster (its UUID is report-only) with another uptime: the same refusal.
+    assert!(matches!(
+        st.validate_restore(Some(OTHER_GM), anchor, wall, CAP),
         Err(RestoreRejected::TimeBase { .. })
     ));
 }
@@ -136,4 +150,34 @@ fn a_saved_state_older_than_a_day_is_not_restored_126() {
         "a wall behind the one that wrote the record"
     );
     assert_eq!(st.validate_restore(Some(GM), anchor, wall, CAP), Ok(-3 * S));
+}
+
+/// dantesync#129: a 1.16 master saved the constant it misread as the grandmaster's UUID. On the
+/// upgrade's restart the live UUID is real, and refusing the restore would boot-step the master to
+/// UTC: the fleet date would move. A saved constant names no grandmaster, so the time base decides.
+#[test]
+fn a_saved_pre_1_17_misread_constant_restores_under_the_real_grandmaster_129() {
+    let mut st = state(None);
+    st.gm_uuid = crate::ptp::LEGACY_MISREAD_GM_UUID;
+    let ptp = 5 * 86_400 * S;
+    let (wall, anchor) = first_window(ptp, 37_000);
+    assert_eq!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Ok(37_000),
+        "the same time base restores"
+    );
+    let (wall, anchor) = first_window(ptp, 10 * S);
+    assert_eq!(
+        st.validate_restore(Some(GM), anchor, wall, CAP),
+        Err(RestoreRejected::TimeBase {
+            off_ns: 10 * S,
+            cap_ns: CAP
+        }),
+        "the time-base check still decides"
+    );
+    assert_eq!(
+        st.validate_restore(None, anchor, wall, CAP),
+        Err(RestoreRejected::NoGrandmaster),
+        "still no restore with no identity at the lock"
+    );
 }

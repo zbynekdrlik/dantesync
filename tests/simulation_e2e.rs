@@ -123,8 +123,9 @@ impl PtpNetwork for StatefulNetwork {
             self.pending_followup = None;
             let t2_sys = SystemTime::UNIX_EPOCH;
 
-            let mut buf = vec![0u8; 60];
-            buf[0] = 0x10;
+            // A real PTPv1 Follow_Up is 52 bytes (#129).
+            let mut buf = vec![0u8; 52];
+            buf[1] = 1; // versionPTP
             buf[32] = 0x02; // FollowUp
             buf[30] = (seq >> 8) as u8;
             buf[31] = (seq & 0xFF) as u8;
@@ -137,7 +138,7 @@ impl PtpNetwork for StatefulNetwork {
             BigEndian::write_u32(&mut buf[44..48], s);
             BigEndian::write_u32(&mut buf[48..52], n);
 
-            return Ok(Some((buf, 60, t2_sys, None)));
+            return Ok(Some((buf, 52, t2_sys, None)));
         }
 
         // Advance time (packet interval 125ms)
@@ -158,16 +159,17 @@ impl PtpNetwork for StatefulNetwork {
         let t2_ns_val = (t1_ns as f64 + offset + noise) as u64;
         let t2_sys = SystemTime::UNIX_EPOCH + Duration::from_nanos(t2_ns_val);
 
-        let mut buf = vec![0u8; 60];
-        buf[0] = 0x10;
+        // A real PTPv1 Sync is 124 bytes: a 40-byte header, grandmasterClockUuid at 54..60 (#129).
+        let mut buf = vec![0u8; 124];
+        buf[1] = 1; // versionPTP
         buf[32] = 0x00; // Sync
         buf[30] = (self.seq >> 8) as u8;
         buf[31] = (self.seq & 0xFF) as u8;
-        buf[49] = 1;
+        buf[54..60].copy_from_slice(&[0x00, 0x1d, 0xc1, 0x00, 0x00, 0x01]);
 
         self.pending_followup = Some((self.seq, t1_ns));
 
-        Ok(Some((buf, 60, t2_sys, None)))
+        Ok(Some((buf, 124, t2_sys, None)))
     }
 
     fn reset(&mut self) -> Result<()> {

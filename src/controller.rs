@@ -36,6 +36,12 @@ mod date_sync;
 /// `ptp_liveness` field.
 mod ptp_liveness;
 
+/// dantesync#129 — the PTP sender's and the grandmaster's identity as a Sync carries them: logged
+/// and published on `/status`, report-only. A child module like `date_sync`; its state is the one
+/// `current_ptp_sender` field.
+mod ptp_sender;
+use ptp_sender::{describe_grandmaster, PtpSender};
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -624,6 +630,9 @@ where
     current_sync_source: Option<[u8; 6]>,
     /// IP address of the device sending PTP Sync messages (for display in tray app)
     current_sync_source_ip: Option<std::net::Ipv4Addr>,
+    /// dantesync#129 — the last Sync's header identity (version, subdomain, source UUID):
+    /// logged on a change and published on `/status`, report-only.
+    current_ptp_sender: Option<PtpSender>,
 
     /// camera-box issue 1073 — trusted grandmaster-source allowlist, parsed once
     /// from `config.gm_allowlist`. When restricting (non-empty), a PTP packet
@@ -954,6 +963,7 @@ where
             current_gm_uuid: None,
             current_sync_source: None,
             current_sync_source_ip: None,
+            current_ptp_sender: None,
             gm_allowlist,
             gm_resolver,
             last_gm_resolve: now,
@@ -2186,6 +2196,7 @@ where
     // ========================================================================
 
     fn handle_sync_message(&mut self, header: &PtpV1Header, buf: &[u8], t2: SystemTime) {
+        self.note_ptp_sender(header);
         // Check if Sync source changed (different device sending PTP)
         let source_uuid = header.source_uuid;
         match self.current_sync_source {
@@ -2246,16 +2257,21 @@ where
             match self.current_gm_uuid {
                 Some(current) if current != new_uuid => {
                     warn!(
-                        ">>> GRANDMASTER UUID CHANGED: {} -> {} <<<",
+                        ">>> GRANDMASTER UUID CHANGED: {} -> {} <<< ({})",
                         format_mac(&current),
-                        format_mac(&new_uuid)
+                        format_mac(&new_uuid),
+                        describe_grandmaster(&body)
                     );
                     self.current_gm_uuid = Some(new_uuid);
                     // Note: sync source change already did soft reset if needed
                     self.on_grandmaster_uuid_change(); // #117: re-anchor D
                 }
                 None => {
-                    info!("Grandmaster UUID: {}", format_mac(&new_uuid));
+                    info!(
+                        "Grandmaster UUID: {} ({})",
+                        format_mac(&new_uuid),
+                        describe_grandmaster(&body)
+                    );
                     self.current_gm_uuid = Some(new_uuid);
                 }
                 _ => {}
@@ -2913,6 +2929,13 @@ where
             status.drift_ppm = self.last_adj_ppm;
             status.gm_uuid = self.current_gm_uuid;
             status.gm_source_ip = self.current_sync_source_ip;
+            // #129: the PTP sender's identity, report-only.
+            status.ptp_version = self.current_ptp_sender.as_ref().map(|p| p.version);
+            status.ptp_subdomain = self
+                .current_ptp_sender
+                .as_ref()
+                .map(|p| p.subdomain.clone());
+            status.ptp_source_uuid = self.current_ptp_sender.as_ref().map(|p| p.source_uuid);
             // #113: publish the live hostname resolution so external gates can
             // compare gm_source_ip against the resolved set (and see loud failures).
             status.gm_allowlist_resolved = self.gm_allowlist.resolved_ips().to_vec();
@@ -3323,20 +3346,22 @@ mod tests {
 
         let gm_uuid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
 
+        // #129: the IEEE 1588-2002 layout — a 40-byte header, the Sync's grandmasterClockUuid at
+        // absolute 54..60, the Follow_Up's associatedSequenceId at 42 and its timestamp at 44..52.
         let make_sync = move |seq: u16| -> Vec<u8> {
-            let mut buf = vec![0u8; 60];
-            buf[0] = 0x10;
+            let mut buf = vec![0u8; SYNC_LEN];
+            buf[1] = 1; // versionPTP
             buf[32] = 0x00;
             buf[22..28].copy_from_slice(&gm_uuid);
             let mut w = &mut buf[30..32];
             w.write_u16::<BigEndian>(seq).unwrap();
-            buf[49..55].copy_from_slice(&gm_uuid);
+            buf[54..60].copy_from_slice(&gm_uuid);
             buf
         };
 
         let make_followup = move |seq: u16, t1_ns: u64| -> Vec<u8> {
-            let mut buf = vec![0u8; 60];
-            buf[0] = 0x10;
+            let mut buf = vec![0u8; FOLLOW_UP_LEN];
+            buf[1] = 1; // versionPTP
             buf[32] = 0x02;
             buf[22..28].copy_from_slice(&gm_uuid);
             let mut w = &mut buf[30..32];
@@ -3361,12 +3386,12 @@ mod tests {
             mock_net
                 .expect_recv_packet()
                 .times(1)
-                .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, None))));
+                .returning(move || Ok(Some((sync_pkt.clone(), SYNC_LEN, t2, None))));
 
             mock_net
                 .expect_recv_packet()
                 .times(1)
-                .returning(move || Ok(Some((follow_pkt.clone(), 60, t2, None))));
+                .returning(move || Ok(Some((follow_pkt.clone(), FOLLOW_UP_LEN, t2, None))));
         }
 
         mock_net.expect_recv_packet().returning(|| Ok(None));
@@ -3394,17 +3419,21 @@ mod tests {
     // GM-SOURCE ALLOWLIST TESTS (camera-box issue 1073)
     // ========================================================================
 
-    /// Build a minimal PTPv1 Sync packet with the given source/grandmaster UUID,
+    /// A real PTPv1 Sync is 124 bytes, a Follow_Up 52 (#129, `tests/fixtures/ptpv1`).
+    const SYNC_LEN: usize = 124;
+    const FOLLOW_UP_LEN: usize = 52;
+
+    /// Build a PTPv1 Sync packet with the given source/grandmaster UUID,
     /// mirroring `test_ptp_locking_flow`'s own `make_sync` byte layout.
     fn make_sync_pkt(uuid: [u8; 6], seq: u16) -> Vec<u8> {
         use byteorder::{BigEndian, WriteBytesExt};
-        let mut buf = vec![0u8; 60];
-        buf[0] = 0x10; // PTPv1 header
+        let mut buf = vec![0u8; SYNC_LEN];
+        buf[1] = 1; // versionPTP = 1
         buf[32] = 0x00; // control = Sync
         buf[22..28].copy_from_slice(&uuid); // source UUID
         let mut w = &mut buf[30..32];
         w.write_u16::<BigEndian>(seq).unwrap();
-        buf[49..55].copy_from_slice(&uuid); // grandmaster clock UUID
+        buf[54..60].copy_from_slice(&uuid); // grandmasterClockUuid (#129: body 14..20)
         buf
     }
 
@@ -3592,7 +3621,7 @@ mod tests {
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, Some(foreign_ip)))));
+            .returning(move || Ok(Some((sync_pkt.clone(), SYNC_LEN, t2, Some(foreign_ip)))));
         mock_net.expect_recv_packet().returning(|| Ok(None));
 
         let mock_clock = MockSystemClock::new();
@@ -3645,7 +3674,7 @@ mod tests {
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, Some(rig_ip)))));
+            .returning(move || Ok(Some((sync_pkt.clone(), SYNC_LEN, t2, Some(rig_ip)))));
         mock_net.expect_recv_packet().returning(|| Ok(None));
 
         let status = Arc::new(RwLock::new(SyncStatus::default()));
@@ -3694,7 +3723,7 @@ mod tests {
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, Some(any_ip)))));
+            .returning(move || Ok(Some((sync_pkt.clone(), SYNC_LEN, t2, Some(any_ip)))));
         mock_net.expect_recv_packet().returning(|| Ok(None));
 
         let status = Arc::new(RwLock::new(SyncStatus::default()));
@@ -3735,7 +3764,7 @@ mod tests {
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((sync_pkt.clone(), 60, t2, None))));
+            .returning(move || Ok(Some((sync_pkt.clone(), SYNC_LEN, t2, None))));
         mock_net.expect_recv_packet().returning(|| Ok(None));
 
         let status = Arc::new(RwLock::new(SyncStatus::default()));
@@ -3789,15 +3818,15 @@ mod tests {
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((f0.clone(), 60, t2, Some(foreign_ip)))));
+            .returning(move || Ok(Some((f0.clone(), SYNC_LEN, t2, Some(foreign_ip)))));
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((f1.clone(), 60, t2, Some(foreign_ip)))));
+            .returning(move || Ok(Some((f1.clone(), SYNC_LEN, t2, Some(foreign_ip)))));
         mock_net
             .expect_recv_packet()
             .times(1)
-            .returning(move || Ok(Some((rig.clone(), 60, t2, Some(rig_ip)))));
+            .returning(move || Ok(Some((rig.clone(), SYNC_LEN, t2, Some(rig_ip)))));
         mock_net.expect_recv_packet().returning(|| Ok(None));
 
         let status = Arc::new(RwLock::new(SyncStatus::default()));

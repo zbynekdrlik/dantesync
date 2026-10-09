@@ -592,6 +592,53 @@ fn test_sync_status_date_daily_step_quantum_is_additive_119() {
     );
 }
 
+/// dantesync#129 (1.17): the PTP sender's identity is additive and report-only — a literal 1.16.0
+/// blob reads `null`, the values round-trip under their documented names, and a node that has
+/// heard no Sync says so with an explicit `null`.
+#[test]
+fn test_sync_status_ptp_sender_identity_is_additive_129() {
+    let v1160 = r#"{"offset_ns":0,"drift_ppm":0.0,"gm_uuid":[0,0,0,0,1,0],
+        "gm_source_ip":"10.77.9.230","settled":true,"updated_ts":1791580000,"is_locked":true,
+        "smoothed_rate_ppm":0.1,"ntp_offset_us":0,"mode":"LOCK","ntp_failed":false,
+        "accumulated_phase_us":0.0,"date_authority":"follower","date_daily_step_quantum_ms":null,
+        "freq_steps":0,"last_freq_step_ppm":null,"last_freq_step_ts":null}"#;
+    let restored: SyncStatus =
+        serde_json::from_str(v1160).expect("v1.16.0 JSON must still deserialize");
+    assert_eq!(restored.ptp_version, None);
+    assert_eq!(restored.ptp_subdomain, None);
+    assert_eq!(restored.ptp_source_uuid, None);
+    assert_eq!(restored.gm_uuid, Some([0, 0, 0, 0, 1, 0]));
+
+    let st = SyncStatus {
+        gm_uuid: Some([0x00, 0x1d, 0xc1, 0x08, 0x02, 0x14]),
+        ptp_version: Some(1),
+        ptp_subdomain: Some("_DFLT".to_string()),
+        ptp_source_uuid: Some([0x00, 0x1d, 0xc1, 0x08, 0x02, 0x14]),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&st).expect("serialize failed");
+    for field in [
+        r#""gm_uuid":[0,29,193,8,2,20]"#,
+        r#""ptp_version":1"#,
+        r#""ptp_subdomain":"_DFLT""#,
+        r#""ptp_source_uuid":[0,29,193,8,2,20]"#,
+    ] {
+        assert!(json.contains(field), "{field} in {json}");
+    }
+    let back: SyncStatus = serde_json::from_str(&json).expect("deserialize failed");
+    assert_eq!(back.ptp_version, Some(1));
+    assert_eq!(back.ptp_subdomain.as_deref(), Some("_DFLT"));
+    assert_eq!(back.ptp_source_uuid, st.ptp_source_uuid);
+    let fresh = serde_json::to_string(&SyncStatus::default()).expect("serialize failed");
+    for field in [
+        r#""ptp_version":null"#,
+        r#""ptp_subdomain":null"#,
+        r#""ptp_source_uuid":null"#,
+    ] {
+        assert!(fresh.contains(field), "{field} in {fresh}");
+    }
+}
+
 /// dantesync#112: the PTP liveness fields are additive. A 1.12.0 blob reads `null` / 0 / the empty
 /// re-join object, and every value round-trips under its documented name.
 #[test]
