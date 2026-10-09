@@ -28,18 +28,47 @@ impl From<u8> for PtpV1Control {
     }
 }
 
+/// dantesync#129 — what every node before 1.17 read as the grandmaster UUID off a real Dante Sync:
+/// a 36-byte header plus a 13-byte skip landed on absolute bytes 49..55, the reserved byte and
+/// `grandmasterCommunicationTechnology` (1) inside zeros. It was reported on `/status.gm_uuid`,
+/// saved by the NTP master with its date offset (`date-offset.json`) and announced on 31900, so it
+/// is a value a newer node still meets: it names no grandmaster.
+pub const LEGACY_MISREAD_GM_UUID: [u8; 6] = [0, 0, 0, 0, 1, 0];
+
+/// The PTPv1 message header (IEEE 1588-2002), 40 bytes:
+///
+/// | Offset | Field |
+/// |---|---|
+/// | 0 | versionPTP (u16) |
+/// | 2 | versionNetwork (u16) |
+/// | 4..20 | subdomain |
+/// | 20 | messageType |
+/// | 21 | sourceCommunicationTechnology |
+/// | 22..28 | sourceUuid |
+/// | 28 | sourcePortId (u16) |
+/// | 30 | sequenceId (u16) |
+/// | 32 | control |
+/// | 33 | reserved |
+/// | 34 | flags (u16) |
+/// | 36..40 | reserved |
+///
+/// dantesync#129: the size was 36 before 1.17, so the Sync body was read 4 bytes early.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PtpV1Header {
-    pub version_ptp: u8,
-    pub message_length: u16,
+    pub version_ptp: u16,
+    pub version_network: u16,
+    /// The subdomain name, NUL-padded (Dante: `_DFLT`).
+    pub subdomain: [u8; 16],
+    /// Taken from `control` (the message's kind), not from the header's `messageType` byte.
     pub message_type: PtpV1Control,
     pub source_uuid: [u8; 6],
+    pub source_port_id: u16,
     pub sequence_id: u16,
     pub control: u8,
 }
 
 impl PtpV1Header {
-    pub const SIZE: usize = 36;
+    pub const SIZE: usize = 40;
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < Self::SIZE {
@@ -47,14 +76,13 @@ impl PtpV1Header {
         }
         let mut rdr = Cursor::new(data);
 
-        let v_r1 = rdr.read_u8()?;
-        let version_ptp = (v_r1 >> 4) & 0x0F;
+        let version_ptp = rdr.read_u16::<BigEndian>()?;
+        let version_network = rdr.read_u16::<BigEndian>()?;
 
-        let _v_n_r2 = rdr.read_u8()?; // versionNetwork
-        let message_length = rdr.read_u16::<BigEndian>()?;
-
-        // Skip subdomain (16 bytes)
-        rdr.set_position(rdr.position() + 16);
+        let mut subdomain = [0u8; 16];
+        for byte in &mut subdomain {
+            *byte = rdr.read_u8()?;
+        }
 
         let _msg_type_val = rdr.read_u8()?;
         let _src_comm_tech = rdr.read_u8()?;
@@ -64,21 +92,34 @@ impl PtpV1Header {
             *byte = rdr.read_u8()?;
         }
 
-        let _source_port_id = rdr.read_u16::<BigEndian>()?;
+        let source_port_id = rdr.read_u16::<BigEndian>()?;
         let sequence_id = rdr.read_u16::<BigEndian>()?;
         let control = rdr.read_u8()?;
+        // reserved (1), flags (2), reserved (4): nothing read.
 
         let message_type = PtpV1Control::from(control);
 
         Ok(PtpV1Header {
             version_ptp,
-            message_length,
+            version_network,
+            subdomain,
             message_type,
             source_uuid,
+            source_port_id,
             sequence_id,
             control,
         })
     }
+
+    /// The subdomain as text: up to the first NUL, lossy UTF-8 (a log / `/status` value).
+    pub fn subdomain_name(&self) -> String {
+        nul_terminated(&self.subdomain)
+    }
+}
+
+fn nul_terminated(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// dantesync#112 — a PTP TIME message: a datagram with a whole PTPv1 header whose control is Sync
@@ -111,19 +152,42 @@ impl PtpTimestamp {
     }
 }
 
-#[derive(Debug)]
+/// The grandmaster block of a PTPv1 Sync body (IEEE 1588-2002), offsets from the header's end:
+///
+/// | Offset | Field |
+/// |---|---|
+/// | 0..8 | originTimestamp |
+/// | 8 | epochNumber (u16) |
+/// | 10 | currentUTCOffset (i16) |
+/// | 12 | reserved |
+/// | 13 | grandmasterCommunicationTechnology |
+/// | 14..20 | grandmasterClockUuid |
+/// | 20 | grandmasterPortId (u16) |
+/// | 22 | grandmasterSequenceId (u16) |
+/// | 24..27 | reserved |
+/// | 27 | grandmasterClockStratum |
+/// | 28..32 | grandmasterClockIdentifier |
+/// | 32..34 | reserved |
+/// | 34 | grandmasterClockVariance (i16) |
+/// | 36 | reserved |
+/// | 37 | grandmasterPreferred |
+///
+/// The rest of the 84-byte body (the local and parent clock) is not read. dantesync#129: the
+/// best-master fields are parsed for the grandmaster failover; nothing selects on them yet.
+#[derive(Debug, PartialEq, Eq)]
 pub struct PtpV1SyncMessageBody {
-    // originTimestamp (8)
-    // epochNumber (2)
-    // currentUtcOffset (2)
-    // grandmasterCommTech (1)
     pub grandmaster_clock_uuid: [u8; 6],
-    // ... others ignored
+    pub grandmaster_port_id: u16,
+    pub grandmaster_sequence_id: u16,
+    pub grandmaster_clock_stratum: u8,
+    pub grandmaster_clock_identifier: [u8; 4],
+    pub grandmaster_clock_variance: i16,
+    pub grandmaster_preferred: bool,
 }
 
 impl PtpV1SyncMessageBody {
-    // We only need up to GM UUID (offset 13 + 6 = 19 bytes)
-    pub const MIN_SIZE: usize = 19;
+    /// Up to and including grandmasterPreferred.
+    pub const MIN_SIZE: usize = 38;
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < Self::MIN_SIZE {
@@ -131,17 +195,44 @@ impl PtpV1SyncMessageBody {
         }
         let mut rdr = Cursor::new(data);
 
-        // Skip originTimestamp (8), epoch (2), utcOffset (2), commTech (1) = 13 bytes
-        rdr.set_position(13);
+        // originTimestamp (8), epochNumber (2), currentUTCOffset (2), reserved (1),
+        // grandmasterCommunicationTechnology (1).
+        rdr.set_position(14);
 
-        let mut gm_uuid = [0u8; 6];
-        for byte in &mut gm_uuid {
+        let mut grandmaster_clock_uuid = [0u8; 6];
+        for byte in &mut grandmaster_clock_uuid {
+            *byte = rdr.read_u8()?;
+        }
+        let grandmaster_port_id = rdr.read_u16::<BigEndian>()?;
+        let grandmaster_sequence_id = rdr.read_u16::<BigEndian>()?;
+
+        rdr.set_position(27);
+        let grandmaster_clock_stratum = rdr.read_u8()?;
+        let mut grandmaster_clock_identifier = [0u8; 4];
+        for byte in &mut grandmaster_clock_identifier {
             *byte = rdr.read_u8()?;
         }
 
+        rdr.set_position(34);
+        let grandmaster_clock_variance = rdr.read_i16::<BigEndian>()?;
+
+        rdr.set_position(37);
+        let grandmaster_preferred = rdr.read_u8()? != 0;
+
         Ok(PtpV1SyncMessageBody {
-            grandmaster_clock_uuid: gm_uuid,
+            grandmaster_clock_uuid,
+            grandmaster_port_id,
+            grandmaster_sequence_id,
+            grandmaster_clock_stratum,
+            grandmaster_clock_identifier,
+            grandmaster_clock_variance,
+            grandmaster_preferred,
         })
+    }
+
+    /// The clock identifier as text (Dante: `DFLT`), as [`PtpV1Header::subdomain_name`].
+    pub fn grandmaster_identifier_name(&self) -> String {
+        nul_terminated(&self.grandmaster_clock_identifier)
     }
 }
 
@@ -152,7 +243,8 @@ pub struct PtpV1FollowUpBody {
 }
 
 impl PtpV1FollowUpBody {
-    pub const SIZE: usize = 16;
+    /// reserved (2), associatedSequenceId (2), preciseOriginTimestamp (8).
+    pub const SIZE: usize = 12;
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < Self::SIZE {
@@ -160,8 +252,9 @@ impl PtpV1FollowUpBody {
         }
         let mut rdr = Cursor::new(data);
 
-        // Skip padding (6 bytes)
-        rdr.set_position(rdr.position() + 6);
+        // reserved (2). dantesync#129: before 1.17 the body started 4 bytes early (a 36-byte
+        // header) and skipped 6, which reached the same absolute byte 42: the decode is unchanged.
+        rdr.set_position(2);
 
         let associated_sequence_id = rdr.read_u16::<BigEndian>()?;
         let seconds = rdr.read_u32::<BigEndian>()?;
