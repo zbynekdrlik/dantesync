@@ -107,3 +107,37 @@ fn another_time_base_is_never_adopted_whatever_the_grandmaster_uuid_129() {
         assert_eq!(c.date_sync.core.anchor_ns(), Some(d));
     }
 }
+
+#[test]
+fn the_real_sync_publishes_the_ptp_sender_and_its_grandmaster_on_status_129() {
+    // Report-only: version, subdomain and source UUID are published (never a filter in slice 0),
+    // and `gm_uuid` is the real grandmaster, not the misread constant.
+    let (mut c, _) = anchored_controller(MockSystemClock::new(), MockNtpSource::new(), false);
+    c.current_gm_uuid = None;
+    feed_sync(&mut c, DANTE_SYNC);
+    c.update_shared_status();
+    let st = c.get_status_shared();
+    let st = st.read().expect("status");
+    assert_eq!(st.gm_uuid, Some(DANTE_GM));
+    assert_eq!(st.ptp_version, Some(1));
+    assert_eq!(st.ptp_subdomain.as_deref(), Some("_DFLT"));
+    assert_eq!(st.ptp_source_uuid, Some(DANTE_GM));
+}
+
+#[test]
+fn a_foreign_version_or_subdomain_is_reported_never_dropped_129() {
+    // A PTPv2-numbered or foreign-subdomain Sync is still processed exactly as before (the filter
+    // is enforced only after the live identities of both VLANs are recorded on issue 129).
+    let (mut c, _) = anchored_controller(MockSystemClock::new(), MockNtpSource::new(), false);
+    c.current_gm_uuid = None;
+    let mut foreign = DANTE_SYNC.to_vec();
+    foreign[1] = 2; // versionPTP = 2
+    foreign[4..9].copy_from_slice(b"_ALT1");
+    feed_sync(&mut c, &foreign);
+    assert_eq!(c.current_gm_uuid, Some(DANTE_GM), "still followed");
+    c.update_shared_status();
+    let st = c.get_status_shared();
+    let st = st.read().expect("status");
+    assert_eq!(st.ptp_version, Some(2));
+    assert_eq!(st.ptp_subdomain.as_deref(), Some("_ALT1"));
+}
