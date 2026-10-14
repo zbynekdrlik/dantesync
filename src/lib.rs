@@ -19,6 +19,7 @@ pub mod spike_filter;
 pub mod status;
 pub mod time_server;
 pub mod traits;
+pub mod tray_view;
 
 #[cfg(unix)]
 pub mod net_linux;
