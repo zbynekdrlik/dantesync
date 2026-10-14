@@ -22,7 +22,7 @@ mod linux_app {
     use dantesync::tray_view::{self, IconSpec, TrayState, TrayStatus};
     use gtk::glib;
     use std::fs::{File, OpenOptions};
-    use std::net::SocketAddr;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -35,15 +35,20 @@ mod linux_app {
     const UI_TICK: Duration = Duration::from_millis(250);
 
     /// Take the per-user single-instance lock: an exclusive non-blocking `flock` on
-    /// the lock file, held for the process lifetime by the returned `File`. `None` (the
-    /// reason printed) when another tray already holds it or the file cannot be opened.
+    /// the lock file (never through a symlink), held for the process lifetime by the
+    /// returned `File`. `None` when another tray already holds it (a normal exit 0); a
+    /// lock file that cannot be opened ends the process with exit 1.
     fn single_instance_lock() -> Option<File> {
         let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-        let path = tray_view::lock_file_path(xdg.as_deref());
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let path = tray_view::lock_file_path(xdg.as_deref(), uid);
         let file = match OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
         {
             Ok(f) => f,
@@ -53,7 +58,7 @@ mod linux_app {
                     path.display(),
                     e
                 );
-                return None;
+                std::process::exit(1);
             }
         };
         // SAFETY: flock on a file descriptor this process owns and keeps open.
@@ -110,6 +115,8 @@ mod linux_app {
                 );
                 self.state = Some(state);
             }
+            // tray-icon 0.14's appindicator backend has no tooltip (a no-op today); kept so
+            // a backend that gains one shows the Windows tooltip text.
             let _ = self.tray.set_tooltip(Some(texts.tooltip));
             self.status_i.set_text(texts.status_line);
             self.mode_i.set_text(texts.mode_line);
@@ -158,9 +165,13 @@ mod linux_app {
             }
         };
 
-        let endpoint: SocketAddr = tray_view::STATUS_ENDPOINT
-            .parse()
-            .expect("STATUS_ENDPOINT is a socket address");
+        // The daemon's own config names a non-default `http_status.port`.
+        let config = std::fs::read_to_string(tray_view::LINUX_CONFIG_PATH).ok();
+        let endpoint = tray_view::status_endpoint_from_config(config.as_deref());
+        eprintln!(
+            "dantesync-tray: v{} polling http://{}/status",
+            version, endpoint
+        );
         let (tx, rx) = mpsc::channel::<Option<TrayStatus>>();
         std::thread::spawn(move || loop {
             let reading = tray_view::fetch_status(endpoint, POLL_INTERVAL);

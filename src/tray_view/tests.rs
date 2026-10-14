@@ -525,17 +525,180 @@ fn fetch_refuses_an_oversized_answer() {
 }
 
 #[test]
+fn fetch_gives_up_on_a_trickling_server_at_one_deadline() {
+    // A sender that keeps each read alive (a byte every 100 ms) must not hold the poller
+    // past the one deadline, whatever the per-read timeout would allow.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = conn.read(&mut buf);
+        for b in REAL_RESPONSE.iter().take(40) {
+            if conn.write_all(&[*b]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let start = Instant::now();
+    assert!(fetch_status(addr, Duration::from_millis(500)).is_none());
+    assert!(start.elapsed() < Duration::from_millis(1500));
+    server.join().unwrap();
+}
+
+#[test]
+fn the_endpoint_port_comes_from_the_daemon_config() {
+    let local = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    assert_eq!(status_endpoint_from_config(None), local(8898));
+    assert_eq!(
+        status_endpoint_from_config(Some(r#"{"http_status":{"enabled":true,"port":9100}}"#)),
+        local(9100)
+    );
+    // A config without the key, a bad value or broken JSON: the default.
+    assert_eq!(
+        status_endpoint_from_config(Some(r#"{"servo":{}}"#)),
+        local(8898)
+    );
+    assert_eq!(
+        status_endpoint_from_config(Some(r#"{"http_status":{"port":70000}}"#)),
+        local(8898)
+    );
+    assert_eq!(
+        status_endpoint_from_config(Some(r#"{"http_status":{"port":0}}"#)),
+        local(8898)
+    );
+    assert_eq!(
+        status_endpoint_from_config(Some(r#"{"http_status":{"port":"x"}}"#)),
+        local(8898)
+    );
+    assert_eq!(status_endpoint_from_config(Some("{not json")), local(8898));
+    assert_eq!(DEFAULT_STATUS_PORT, 8898);
+}
+
+#[test]
 fn lock_file_prefers_the_runtime_dir() {
     assert_eq!(
-        lock_file_path(Some("/run/user/1000")),
+        lock_file_path(Some("/run/user/1000"), 1000),
         PathBuf::from("/run/user/1000/dantesync-tray.lock")
     );
+    // No runtime dir: a per-user file in /tmp, never one shared by every user.
     assert_eq!(
-        lock_file_path(Some("")),
-        PathBuf::from("/tmp/dantesync-tray.lock")
+        lock_file_path(Some(""), 1000),
+        PathBuf::from("/tmp/dantesync-tray-1000.lock")
     );
     assert_eq!(
-        lock_file_path(None),
-        PathBuf::from("/tmp/dantesync-tray.lock")
+        lock_file_path(None, 1001),
+        PathBuf::from("/tmp/dantesync-tray-1001.lock")
     );
+}
+
+#[test]
+fn the_alarm_floor_is_the_daemon_floor() {
+    assert_eq!(
+        CLOCK_ALARM_TRAY_FLOOR_S,
+        crate::clock_alarm::CLOCK_ALARM_INTERVAL_FLOOR_S
+    );
+}
+
+/// The Windows tray's renderer before issue 132 (`generate_icon_full` in
+/// `src/bin/tray.rs`, v1.17.0), verbatim except that it returns the buffer instead of
+/// an `Icon`. The shared renderer must reproduce it byte for byte.
+fn renderer_before_132(
+    r: u8,
+    g: u8,
+    b: u8,
+    pulse_intensity: f32,
+    show_update_badge: bool,
+) -> Vec<u8> {
+    let width = 32;
+    let height = 32;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+
+    let cx = 16.0;
+    let cy = 16.0;
+    let inner_radius = 11.0;
+    let outer_radius = 15.0;
+    let ring_width = outer_radius - inner_radius;
+
+    let badge_cx = 25.0;
+    let badge_cy = 7.0;
+    let badge_radius = 5.0;
+
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 - cx + 0.5;
+            let dy = y as f32 - cy + 0.5;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            let badge_dx = x as f32 - badge_cx + 0.5;
+            let badge_dy = y as f32 - badge_cy + 0.5;
+            let badge_dist = (badge_dx * badge_dx + badge_dy * badge_dy).sqrt();
+
+            if show_update_badge && badge_dist <= badge_radius {
+                let mut alpha = 255u8;
+                if badge_dist > badge_radius - 1.0 {
+                    alpha = ((badge_radius - badge_dist) * 255.0).max(0.0) as u8;
+                }
+                rgba.push(255);
+                rgba.push(152);
+                rgba.push(0);
+                rgba.push(alpha);
+            } else if dist <= inner_radius {
+                let mut alpha = 255u8;
+                if dist > inner_radius - 1.0 {
+                    alpha = ((inner_radius - dist) * 255.0).max(0.0) as u8;
+                }
+                rgba.push(r);
+                rgba.push(g);
+                rgba.push(b);
+                rgba.push(alpha);
+            } else if dist <= outer_radius && pulse_intensity > 0.01 {
+                let ring_pos = (dist - inner_radius) / ring_width;
+                let ring_alpha = ((1.0 - ring_pos) * pulse_intensity * 180.0) as u8;
+                let ring_r = (r as f32 * 1.3).min(255.0) as u8;
+                let ring_g = (g as f32 * 1.3).min(255.0) as u8;
+                let ring_b = (b as f32 * 1.3).min(255.0) as u8;
+                rgba.push(ring_r);
+                rgba.push(ring_g);
+                rgba.push(ring_b);
+                rgba.push(ring_alpha);
+            } else {
+                rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
+            }
+        }
+    }
+    rgba
+}
+
+#[test]
+fn the_renderer_is_byte_identical_to_the_windows_one_before_132() {
+    let colours = [
+        RGB_OFFLINE,
+        RGB_NTP_ONLY,
+        RGB_NANO,
+        RGB_LOCKED,
+        RGB_ACQUIRING,
+        RGB_UPDATE_BADGE,
+    ];
+    for rgb in colours {
+        for pulse in [0.0f32, 0.01, 0.011, 0.3, 0.5, 0.77, 1.0] {
+            for badge in [false, true] {
+                let spec = IconSpec {
+                    rgb,
+                    pulse,
+                    update_badge: badge,
+                };
+                assert_eq!(
+                    render_icon_rgba(&spec),
+                    renderer_before_132(rgb[0], rgb[1], rgb[2], pulse, badge),
+                    "{:?}",
+                    spec
+                );
+            }
+        }
+    }
 }

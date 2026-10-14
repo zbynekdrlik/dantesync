@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux too (new release asset `dantesync-tray-linux-amd64`). It polls the daemon's
   `http://127.0.0.1:8898/status` once a second and shows the same icon as Windows: green LOCK,
   cyan NANO, yellow acquiring, orange NTP-only, red when the service does not answer (never a
-  stale state). Menu: status / mode / PTP master (read-only) + Quit; one instance per user
-  (`$XDG_RUNTIME_DIR/dantesync-tray.lock`); one stderr line per state change. No notifications:
+  stale state; the port follows `http_status.port` in `/etc/dantesync/config.json`). Menu:
+  status / mode / PTP master (read-only) + Quit; one instance per user
+  (`$XDG_RUNTIME_DIR/dantesync-tray.lock`, else `/tmp/dantesync-tray-<uid>.lock`); one stderr
+  line per state change. No notifications:
   the daemon already `notify-send`s the NO DANTE CLOCK alarm (issue #114). Run it in an X session
   with a system tray; runtime packages `libgtk-3-0`, `libayatana-appindicator3-1`, `libxdo3`.
 - **`src/tray_view.rs`:** the icon colour / pulse / pixels, the menu and tooltip texts and the

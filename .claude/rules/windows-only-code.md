@@ -18,7 +18,8 @@ paths:
 - `ci.yml`'s `test` job runs `cargo test --lib`/`--test '*'` **on `ubuntu-latest` only** — this job
   still never touches `#[cfg(windows)]` code at all.
 - `ci.yml`'s `build` job compile-checks this code for real on `windows-latest` via
-  `cargo build --release --bin dantesync --bin dantesync-tray` (with the Npcap SDK installed) — a
+  `cargo build --release --features tray --bin dantesync --bin dantesync-tray` (with the Npcap SDK
+  installed; the tray bin has `required-features = ["tray"]` since dantesync#132) — a
   genuine type/borrow/API error in `#[cfg(windows)]` **production** code fails a PR here.
 - **#56 (superseded by #58 below):** added `cargo test --no-run --verbose` to compile+link every
   Windows test binary without executing it, closing the specific compile/link-break class that
@@ -80,9 +81,9 @@ against the GNU target does **not** need the Npcap SDK / `LIB` env var (that's o
 catch real type/borrow/API errors in `#[cfg(windows)]` code that a Linux-only check silently skips:
 
 ```bash
-cargo check --target x86_64-pc-windows-gnu --bin dantesync --bin dantesync-tray
+cargo check --target x86_64-pc-windows-gnu --features tray --bin dantesync --bin dantesync-tray
 cargo check --target x86_64-pc-windows-gnu --tests --lib   # ALSO check mod tests, not just bins
-cargo clippy --target x86_64-pc-windows-gnu --bin dantesync --bin dantesync-tray -- -A dead_code
+cargo clippy --target x86_64-pc-windows-gnu --features tray --bin dantesync --bin dantesync-tray -- -A dead_code
 ```
 
 **The `--tests --lib` line matters on its own** — the original recipe here only checked `--bin`

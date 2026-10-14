@@ -113,7 +113,7 @@ jobs:
       # here; the daemon above is built without the `tray` feature and never links gtk.
       - name: Install Linux tray dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Build Tray (Linux)
         if: runner.os == 'Linux'

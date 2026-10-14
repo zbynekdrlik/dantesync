@@ -16,9 +16,11 @@
 //! - [`ClockAlarmCadence`]: when the Windows tray raises the dantesync#114 NO DANTE CLOCK
 //!   balloon (the Linux daemon already `notify-send`s it itself);
 //! - [`fetch_status`]: one HTTP/1.0 GET of the status endpoint with plain `std::net`
-//!   (the Linux shell's transport); any failure reads as offline.
+//!   (the Linux shell's transport), bounded by one deadline; any failure reads as offline;
+//! - [`status_endpoint_from_config`]: the endpoint port read from the daemon's own
+//!   `config.json` (`http_status.port`, default 8898).
 
-use crate::clock_alarm::{compose_message, ClockAlarmStatus};
+use crate::clock_alarm::{compose_message, ClockAlarmStatus, CLOCK_ALARM_INTERVAL_FLOOR_S};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -41,9 +43,11 @@ pub const RGB_ACQUIRING: [u8; 3] = [255, 193, 7];
 /// The update badge dot (orange).
 pub const RGB_UPDATE_BADGE: [u8; 3] = [255, 152, 0];
 
-/// The status endpoint the Linux tray polls: the daemon's own HTTP server on loopback
-/// (`http_status.rs`, default port 8898).
-pub const STATUS_ENDPOINT: &str = "127.0.0.1:8898";
+/// The daemon's default HTTP status port (`config::HttpStatusConfig`, `http_status.rs`).
+pub const DEFAULT_STATUS_PORT: u16 = 8898;
+
+/// The daemon's config file on Linux, read for a non-default `http_status.port`.
+pub const LINUX_CONFIG_PATH: &str = "/etc/dantesync/config.json";
 
 /// The one request the Linux tray sends. HTTP/1.0: the server answers and closes.
 pub const STATUS_REQUEST: &[u8] = b"GET /status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
@@ -54,9 +58,8 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// The balloon text shown once when the NO DANTE CLOCK alarm clears.
 pub const CLOCK_RESTORED_MESSAGE: &str = "Dante clock restored — PTP re-locked";
 
-/// The fastest the clock-alarm balloon repeats, whatever the daemon publishes
-/// (the same floor as `clock_alarm::CLOCK_ALARM_INTERVAL_FLOOR_S`).
-pub const CLOCK_ALARM_TRAY_FLOOR_S: u64 = 10;
+/// The fastest the clock-alarm balloon repeats, whatever the daemon publishes.
+pub const CLOCK_ALARM_TRAY_FLOOR_S: u64 = CLOCK_ALARM_INTERVAL_FLOOR_S;
 
 fn default_clock_alarm_interval_s() -> u64 {
     60
@@ -382,17 +385,23 @@ pub fn parse_status_response(raw: &[u8]) -> Option<TrayStatus> {
     serde_json::from_slice(&raw[header_end + 4..]).ok()
 }
 
-/// One GET of the status endpoint at `addr`, each step (connect, write, read) bounded by
-/// `timeout`. Any failure is `None`: the caller shows offline, never a stale state.
+/// One GET of the status endpoint at `addr`: the connect is bounded by `timeout`, and the
+/// write plus the whole read by one more `timeout` (a slow sender cannot stretch it). Any
+/// failure is `None`: the caller shows offline, never a stale state.
 pub fn fetch_status(addr: SocketAddr, timeout: Duration) -> Option<TrayStatus> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
+    let deadline = Instant::now() + timeout;
     stream.set_write_timeout(Some(timeout)).ok()?;
     stream.write_all(STATUS_REQUEST).ok()?;
 
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(left)).ok()?;
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -409,12 +418,25 @@ pub fn fetch_status(addr: SocketAddr, timeout: Duration) -> Option<TrayStatus> {
     parse_status_response(&raw)
 }
 
+/// The status endpoint on loopback for a daemon config: `http_status.port` from the
+/// daemon's `config.json` text, or [`DEFAULT_STATUS_PORT`] when the config is absent,
+/// unreadable or has no valid port.
+pub fn status_endpoint_from_config(config_json: Option<&str>) -> SocketAddr {
+    let port = config_json
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|v| v.get("http_status")?.get("port")?.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(DEFAULT_STATUS_PORT);
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
 /// Where the Linux tray keeps its single-instance lock: `$XDG_RUNTIME_DIR` (per user)
-/// when set and non-empty, else `/tmp`.
-pub fn lock_file_path(xdg_runtime_dir: Option<&str>) -> PathBuf {
+/// when set and non-empty, else a per-uid file in `/tmp`.
+pub fn lock_file_path(xdg_runtime_dir: Option<&str>, uid: u32) -> PathBuf {
     match xdg_runtime_dir {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("dantesync-tray.lock"),
-        _ => PathBuf::from("/tmp/dantesync-tray.lock"),
+        _ => PathBuf::from(format!("/tmp/dantesync-tray-{}.lock", uid)),
     }
 }
 
