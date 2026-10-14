@@ -576,6 +576,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger",
+ "gtk",
  "if-addrs",
  "libc",
  "log",
