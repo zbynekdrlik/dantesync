@@ -16,7 +16,7 @@ serde_json = "1.0"
 
 [package]
 name = "dantesync"
-version = "1.17.0"
+version = "1.18.0"
 edition = "2021"
 description = "High-precision PTP synchronization for Dante Audio networks"
 license = "MIT"
@@ -50,11 +50,25 @@ windows = { version = "0.52", features = [
 ] }
 windows-service = "0.7"
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros", "rt-multi-thread"] }
-tray-icon = "0.14"
 winit = "0.29"
 winrt-notification = "0.5"  # Windows toast notifications
 pcap = "2.2"  # Npcap for Windows packet capture with precise timestamps
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }  # HTTP client for version check (native-tls = Windows schannel, drops the rustls-webpki stack — #340 security audit RUSTSEC-2026-0098/0099/0104)
+
+# dantesync#132: the tray icon, on Windows (winit + named pipe) and on Linux (gtk main
+# loop + the :8898 HTTP status). Optional, enabled only by the `tray` feature that the
+# `dantesync-tray` bin requires, so the daemon (headless camera boxes) never links gtk
+# and no other build needs the gtk / libxdo dev packages.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.14", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }  # the same gtk 0.18 tray-icon 0.14 (muda) runs on
+
+[features]
+# Build the tray: `cargo build --release --features tray --bin dantesync-tray`.
+# Linux needs libgtk-3-dev + libxdo-dev to build it (libayatana-appindicator3 is loaded at run time).
+tray = ["dep:tray-icon", "dep:gtk"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -71,6 +85,7 @@ path = "src/main.rs"
 [[bin]]
 name = "dantesync-tray"
 path = "src/bin/tray.rs"
+required-features = ["tray"]
 
 [[bin]]
 name = "clocktest"

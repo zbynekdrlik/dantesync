@@ -5,6 +5,29 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] - 2026-10-14
+
+### Added
+
+- **A Linux tray icon with the Windows clock states (issue #132).** `dantesync-tray` now runs on
+  Linux too (new release asset `dantesync-tray-linux-amd64`). It polls the daemon's
+  `http://127.0.0.1:8898/status` once a second and shows the same icon as Windows: green LOCK,
+  cyan NANO, yellow acquiring, orange NTP-only, red when the service does not answer (never a
+  stale state; the port follows `http_status.port` in `/etc/dantesync/config.json`). Menu:
+  status / mode / PTP master (read-only) + Quit; one instance per user
+  (`$XDG_RUNTIME_DIR/dantesync-tray.lock`, else `/tmp/dantesync-tray-<uid>.lock`); one stderr
+  line per state change. No notifications:
+  the daemon already `notify-send`s the NO DANTE CLOCK alarm (issue #114). Run it in an X session
+  with a system tray; runtime packages `libgtk-3-0`, `libayatana-appindicator3-1`, `libxdo3`.
+- **`src/tray_view.rs`:** the icon colour / pulse / pixels, the menu and tooltip texts and the
+  clock-alarm cadence, shared by the Windows and the Linux tray and unit-tested (the Windows
+  tray's look and toasts are unchanged).
+
+### Changed
+
+- **The tray builds with the `tray` cargo feature** (`--features tray --bin dantesync-tray`). The
+  daemon and every other build leave it out and never link gtk (headless camera boxes).
+
 ## [1.17.0] - 2026-10-09
 
 ### Fixed
