@@ -17,6 +17,16 @@ A high-precision PTP (Precision Time Protocol) synchronization tool optimized fo
 - **Service Control:** Restart/Stop service directly from tray menu
 - **Live Status:** Tooltip shows drift rate, frequency adjustment, NTP offset
 
+### Linux Tray Icon
+- **Same states as Windows:** green = LOCK, cyan = NANO, yellow = acquiring, orange = NTP-only
+  (PTP lost), red = the service does not answer (never a stale green)
+- **Menu:** status, mode and PTP master lines (read-only) plus Quit
+- **Source:** polls `http://127.0.0.1:8898/status` once a second; one instance per user
+- **Run:** `dantesync-tray` (release asset `dantesync-tray-linux-amd64`) inside an X session whose
+  panel has a system tray (e.g. tint2). Runtime packages: `libgtk-3-0`,
+  `libayatana-appindicator3-1`, `libxdo3`. The NO DANTE CLOCK alarm is notified by the daemon
+  itself (`notify-send`), so the Linux tray shows no notifications.
+
 ## Installation
 
 ### Linux
@@ -52,6 +62,10 @@ dantesync [OPTIONS]
 ```bash
 cargo build --release
 ```
+
+The tray needs the `tray` feature: `cargo build --release --features tray --bin dantesync-tray`
+(on Linux with `libgtk-3-dev libayatana-appindicator3-dev libxdo-dev` installed). The daemon is
+built without it and never links gtk.
 
 **Windows Build Requirements:**
 - Rust Toolchain (`x86_64-pc-windows-msvc`)
