@@ -56,47 +56,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **No direct pushes to master:** All changes to `master` must go through a PR merge from `dev`. Branch protection enforces this for all users including admins.
 - **Never create additional branches.** If a branch other than `master` or `dev` exists, it is a mistake and should be deleted.
 
-## Local Build Policy
+## Build & CI
 
-**Tier 0 (default) — CI builds the release binaries; local checkouts run cheap checks only.**
+`ci.yml` runs on every PR: Lint (`cargo clippy -- -D warnings -A dead_code`, NOT `--all-targets`),
+`cargo test --lib` + `--test '*'`, and a real Linux+Windows compile. `.github/workflows/release.yml`
+builds and publishes `dantesync-linux-amd64`, `dantesync-windows-amd64.exe` and
+`dantesync-tray-windows-amd64.exe` on every tag push, all-or-nothing via `needs: build` (a failure
+on either platform skips `publish` — no release with a missing asset).
 
-`.github/workflows/release.yml` builds and publishes `dantesync-linux-amd64` and
-`dantesync-windows-amd64.exe` (plus `dantesync-tray-windows-amd64.exe`) on every tag push, gated
-all-or-nothing via `needs: build` (a failure on either platform skips `publish` entirely — no
-release with a missing asset). `ci.yml`'s own `test`/`build` jobs already run the full test suite
-and a real Linux+Windows compile on every PR. There is no reason to run a local release build or a
-full local test suite — CI is what actually produces and verifies the shipped binaries.
-
-**UPDATE (airuleset #557, verified 2026-08-20): the global Tier-0 hook (`block-tier0-local-build.sh`)
-now HARD-BLOCKS every *compiling* cargo shape on this box — `cargo build`/`test`/`check`/`clippy`/
-`doc`/`bench`/`run`, scoped or whole-workspace, `--no-run` or not — including in THIS repo (the block
-message mislabels it "the camera-box repo", but it fires here too). The commands below are RETAINED
-as the intent, but `cargo check`/`clippy`/`test --no-run` are no longer runnable locally.** Locally
-you may run only NON-compiling cargo (`cargo fmt` / `metadata` / `tree` / `clean` / `update`). CI
-(`ci.yml`) is the first place code compiles, runs clippy `-D warnings`, and runs the full test suite.
-
-```bash
-cargo fmt --all --check     # the ONLY cargo check still runnable locally (rustfmt doesn't compile)
-# cargo check / clippy / test --no-run  --> BLOCKED locally; CI runs them
-```
-
-**The local verification net under this Tier-0 block** (proven on #103): `cargo fmt --all --check`
-(rustfmt parses every file incl. `#[cfg]` and test modules, so it catches a broken brace / bad
-literal) PLUS a standalone `rustc --edition 2021 --test scratch.rs` replica of the single module
-under test — extract the module's source to a scratch file, stub any tiny external dep (e.g.
-`use log::warn;` → a `macro_rules! warn { ($($t:tt)*) => {{}}; }`), and run the REAL code's tests
-with no crate build. Prove RED→GREEN that way before pushing. **Two lint classes surface ONLY on CI
-now (clippy is CI-only):** e.g. `clippy::doc-lazy-continuation` fires when a wrapped `///` doc line
-starts with a markdown list marker (`+`/`-`/`*` or `N.`) — a sentence that wraps to `/// + foo` reads
-as a bullet and fails `-D warnings`; keep list markers off wrapped-line starts. `rustc --test` does
-NOT run clippy, so budget one CI round for clippy or eyeball the diff for these.
-
-**Why:** cargo's project-local `target/` has no garbage collection (rust-lang/cargo#5026) — every
-incremental/profile/bin combination accumulates and is never auto-removed, so a local release
-build (or a full `cargo test` run) regrows `target/` unbounded over time. `scripts/purge-target.sh`
-(installed via `scripts/install-git-hooks.sh` as a `pre-push` hook) is the automated backstop: it
-purges `target/` once it crosses a size budget, and always skips while the dantesync daemon/tray
-is running.
+- `clippy::doc-lazy-continuation` fires when a wrapped `///` doc line starts with a markdown list
+  marker (`+`/`-`/`*` or `N.`) — keep list markers off wrapped-line starts.
+- `scripts/purge-target.sh` (a `pre-push` hook via `scripts/install-git-hooks.sh`) purges `target/`
+  past a size budget (cargo has no `target/` GC, rust-lang/cargo#5026); it skips while the
+  dantesync daemon/tray is running.
 
 **Windows cross-compilation** requires Npcap SDK 1.13+ with `LIB` env var set to `npcap-sdk/Lib/x64`.
 
@@ -118,15 +90,13 @@ is running.
   SLEW, the v1.11 MICRO-corrections (≤ 500 µs per 20 s beyond a 2 ms dead band, decided on the
   master's loop from a robust drift+level estimate; a large step only beyond 2 × the step bound),
   the decoupling proof by the bit-identical two-clock bench,
-  the local fallback, seeding every simulated noise source, the standalone-`rustc` replica as a
-  second local net; v1.12: the date corrected ONCE A NIGHT by default, `correction = "daily"`,
+  the local fallback, seeding every simulated noise source; v1.12: the date corrected ONCE A NIGHT by default, `correction = "daily"`,
   the micro mode kept byte-identical, the master's own PTP outage in daily mode; v1.14: a
   grandmaster FREQUENCY step followed in seconds — the open-loop-phase detector, the linearity
   test and the shifted slope against level shifts, the integrator re-seed, the decaying phase pull
   and its applied-rate transient; v1.15: a master restart keeps the fleet date — the saved
   authority state, the restore judged at the first PTP window, the follower hold, the loopback
-  `POST /date/step`; and the lib's own tests, the controller's included, run locally under a
-  `rustc` replica with the real serde built by hand and a small mockall stand-in) →
+  `POST /date/step`) →
   `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
   `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)
@@ -151,7 +121,7 @@ is running.
   bytes in `tests/fixtures/ptpv1/`, the Follow_Up offset that was right only by accident, the
   pre-1.17 misread constant `00:00:00:00:01:00` and its three consumers (the restart restore, the
   report-only follower check, the constant kept on the 31900 wire), report-only sender fields,
-  a read-only tcpdump capture on dev1, the 10-second rustc replica for `ptp` + `date_offset`) →
+  a read-only tcpdump capture on dev1) →
   `.claude/rules/ptpv1-wire-format.md` (auto-loads on its `paths:`)
 - DSCP marking of timesync sockets (#52 — which sockets are markable per platform: Linux ntp_server
   reply YES, Linux rsntp client NO handle, Windows filters IP_TOS; the `dscp<<2` TOS-byte math;

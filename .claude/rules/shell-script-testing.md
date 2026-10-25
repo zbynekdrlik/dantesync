@@ -44,11 +44,10 @@ set `PATH` to just that directory — see `minimal_path_without_cargo()` in
 ## CI's clippy invocation is narrower than camera-box's — do not add `--all-targets` here
 
 `ci.yml`'s actual clippy step is `cargo clippy -- -D warnings -A dead_code` — NOT
-`--all-targets`. Running `cargo clippy --all-targets -- -D warnings` locally (camera-box's own
-convention, which this repo's `## Local Build Policy` deliberately does NOT copy verbatim)
-surfaces 10 pre-existing `field_reassign_with_default` findings inside `src/time_server.rs`'s
+`--all-targets`. Running `cargo clippy --all-targets -- -D warnings` (camera-box's own
+convention, deliberately NOT copied here) surfaces 10 pre-existing `field_reassign_with_default` findings inside `src/time_server.rs`'s
 OWN test code — confirmed identical on `origin/master` via a throwaway `git worktree`, unrelated
-to whatever you're working on, and NOT what CI actually gates on. Use the exact command
-`## Local Build Policy` documents (`cargo clippy -- -D warnings -A dead_code`) for a true signal
+to whatever you're working on, and NOT what CI actually gates on. Use CI's exact command
+(`cargo clippy -- -D warnings -A dead_code`) for a true signal
 on whether YOUR change introduces a new clippy finding; don't chase the `--all-targets` extras as
 your own regression.

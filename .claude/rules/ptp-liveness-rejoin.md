@@ -107,19 +107,14 @@ UUID or sync source, or a > 1 s jump (`DISCONTINUITY_NS`, a GM reboot) — rebas
 the observed base shift, with no wall step. The fleet date moves on a RESTART, which is why the
 re-join exists.
 
-## Testing without a local compile (Tier-0)
+## Testing the re-join
 
-- The pure module runs under a standalone `rustc --edition 2021 --test` replica: replace
-  `use crate::traits::RejoinOutcome;` with a local struct and drop the serde derives.
 - The Linux backend's tests use REAL non-blocking UDP sockets through a scripted
   `PtpSocketFactory`. 319/320 need root, so each fake socket binds an ephemeral port on its OWN
   loopback address, taken from ONE process-wide counter (`127.0.x.y`; tests run in parallel
   threads): with one shared `127.0.0.1` the kernel may hand a new socket the port an old one just
   released, and a "the old address is free" probe flakes. "Closed first" is checked at the moment
-  each new socket opens (`free_at_open`), not afterwards. An std-only `rustc` replica (an `anyhow`
-  shim, `recv_from` in place of the nix `recvmsg`, a `net` stub with `interface_with_ip`) runs them
-  locally: build it from a copy with `//!` turned into `//` and the crate uses swapped for local
-  modules.
+  each new socket opens (`free_at_open`), not afterwards.
 - Controller tests cannot move an `Instant` forward, so a "went quiet N s ago" state is made by
   re-writing the receive history IN TIME ORDER (a fresh `RxWindow`, then one packet N s ago —
   `went_quiet`), never by recording a backdated packet after a current one: the window would count
