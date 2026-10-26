@@ -1,8 +1,224 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(not(windows))]
+//! `dantesync-tray`: the clock-state icon in the system tray (Windows and Linux).
+//!
+//! Both platforms draw the shared view of `dantesync::tray_view` (icon colour, pulse
+//! ring, menu text); only the shell differs. Built with the `tray` feature:
+//! `cargo build --release --features tray --bin dantesync-tray`.
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn main() {
-    println!("This utility is for Windows only.");
+    println!("dantesync-tray runs on Windows and Linux only.");
+}
+
+/// The Linux tray (dantesync#132): a gtk main loop hosts the `tray-icon` indicator
+/// (libayatana-appindicator, which falls back to an XEmbed status icon when no
+/// StatusNotifier host runs, e.g. tint2). A poller thread GETs the daemon's
+/// `127.0.0.1:8898/status` once a second; a 250 ms glib timeout applies the newest
+/// reading and handles the menu. No notifications: the Linux daemon `notify-send`s
+/// the NO DANTE CLOCK alarm itself (dantesync#114).
+#[cfg(target_os = "linux")]
+mod linux_app {
+    use dantesync::tray_view::{self, IconSpec, TrayState, TrayStatus};
+    use gtk::glib;
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+    /// How often the poller reads the status (and the bound of each read).
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    /// How often the gtk thread applies the newest reading and the menu events.
+    const UI_TICK: Duration = Duration::from_millis(250);
+
+    /// Take the per-user single-instance lock: an exclusive non-blocking `flock` on
+    /// the lock file (never through a symlink), held for the process lifetime by the
+    /// returned `File`. `None` when another tray already holds it (a normal exit 0); a
+    /// lock file that cannot be opened ends the process with exit 1.
+    fn single_instance_lock() -> Option<File> {
+        let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let path = tray_view::lock_file_path(xdg.as_deref(), uid);
+        let file = match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "dantesync-tray: cannot open lock file {}: {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        };
+        // SAFETY: flock on a file descriptor this process owns and keeps open.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            Some(file)
+        } else {
+            eprintln!("dantesync-tray: another instance is running, exiting");
+            None
+        }
+    }
+
+    fn icon_from_spec(spec: &IconSpec) -> Icon {
+        Icon::from_rgba(
+            tray_view::render_icon_rgba(spec),
+            tray_view::ICON_SIZE,
+            tray_view::ICON_SIZE,
+        )
+        .expect("a 32x32 RGBA buffer is a valid icon")
+    }
+
+    /// The tray and its read-only menu lines, owned by the gtk thread.
+    struct Ui {
+        tray: TrayIcon,
+        status_i: MenuItem,
+        mode_i: MenuItem,
+        gm_i: MenuItem,
+        shown: IconSpec,
+        state: Option<TrayState>,
+        version: &'static str,
+    }
+
+    impl Ui {
+        /// Show one reading (`None` = the daemon did not answer: offline).
+        fn apply(&mut self, status: Option<&TrayStatus>) {
+            let spec = tray_view::icon_spec(status, false);
+            if !spec.same_look(&self.shown) {
+                if let Err(e) = self.tray.set_icon(Some(icon_from_spec(&spec))) {
+                    eprintln!("dantesync-tray: set_icon failed: {}", e);
+                }
+                self.shown = spec;
+            }
+            let texts = match status {
+                Some(s) => tray_view::status_texts(s, self.version),
+                None => tray_view::offline_texts(self.version),
+            };
+            let state = tray_view::tray_state(status);
+            if self.state != Some(state) {
+                eprintln!(
+                    "dantesync-tray: {} -> {} ({})",
+                    self.state.map(TrayState::label).unwrap_or("START"),
+                    state.label(),
+                    texts.status_line
+                );
+                self.state = Some(state);
+            }
+            // tray-icon 0.14's appindicator backend has no tooltip (a no-op today); kept so
+            // a backend that gains one shows the Windows tooltip text.
+            let _ = self.tray.set_tooltip(Some(texts.tooltip));
+            self.status_i.set_text(texts.status_line);
+            self.mode_i.set_text(texts.mode_line);
+            self.gm_i.set_text(texts.gm_line);
+        }
+    }
+
+    pub fn main() {
+        let _lock = match single_instance_lock() {
+            Some(lock) => lock,
+            None => return,
+        };
+
+        if let Err(e) = gtk::init() {
+            eprintln!(
+                "dantesync-tray: gtk init failed (no X session / DISPLAY?): {}",
+                e
+            );
+            std::process::exit(1);
+        }
+
+        let version = env!("CARGO_PKG_VERSION");
+        let status_i = MenuItem::new("Status: Connecting...", false, None);
+        let mode_i = MenuItem::new("Mode: --", false, None);
+        let gm_i = MenuItem::new("PTP Master: --", false, None);
+        let quit_i = MenuItem::new("Quit", true, None);
+
+        let menu = Menu::new();
+        let separator = PredefinedMenuItem::separator();
+        if let Err(e) = menu.append_items(&[&status_i, &mode_i, &gm_i, &separator, &quit_i]) {
+            eprintln!("dantesync-tray: building the menu failed: {}", e);
+            std::process::exit(1);
+        }
+
+        let connecting = IconSpec::connecting();
+        let tray = match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip(format!("DanteSync v{} - Connecting...", version))
+            .with_icon(icon_from_spec(&connecting))
+            .build()
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("dantesync-tray: creating the tray icon failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // The daemon's own config names a non-default `http_status.port`.
+        let config = std::fs::read_to_string(tray_view::LINUX_CONFIG_PATH).ok();
+        let endpoint = tray_view::status_endpoint_from_config(config.as_deref());
+        eprintln!(
+            "dantesync-tray: v{} polling http://{}/status",
+            version, endpoint
+        );
+        let (tx, rx) = mpsc::channel::<Option<TrayStatus>>();
+        std::thread::spawn(move || loop {
+            let reading = tray_view::fetch_status(endpoint, POLL_INTERVAL);
+            if tx.send(reading).is_err() {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        });
+
+        let mut ui = Ui {
+            tray,
+            status_i,
+            mode_i,
+            gm_i,
+            shown: connecting,
+            state: None,
+            version,
+        };
+        let quit_id = quit_i.id().clone();
+        let menu_events = MenuEvent::receiver();
+
+        glib::timeout_add_local(UI_TICK, move || {
+            // Only the newest reading matters.
+            let mut newest = None;
+            while let Ok(reading) = rx.try_recv() {
+                newest = Some(reading);
+            }
+            if let Some(reading) = newest {
+                ui.apply(reading.as_ref());
+            }
+            while let Ok(event) = menu_events.try_recv() {
+                if event.id == quit_id {
+                    eprintln!("dantesync-tray: quit");
+                    gtk::main_quit();
+                    return glib::ControlFlow::Break;
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+
+        gtk::main();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    linux_app::main();
 }
 
 #[cfg(windows)]
@@ -12,9 +228,12 @@ mod app {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    // dantesync#114: reuse the lib's alarm shape + message composer so the tray
-    // balloon and the daemon log/notify-send stay byte-for-byte the same text.
-    use dantesync::clock_alarm::{compose_message, ClockAlarmStatus, CLOCK_ALARM_TITLE};
+    // dantesync#114: the alarm title is the lib's, so the tray balloon and the daemon
+    // log/notify-send stay byte-for-byte the same text.
+    use dantesync::clock_alarm::CLOCK_ALARM_TITLE;
+    // dantesync#132: the status view, icon, texts and alarm cadence are shared with
+    // the Linux tray.
+    use dantesync::tray_view::{self, AlarmAction, ClockAlarmCadence, IconSpec, TrayStatus};
     use tokio::io::AsyncReadExt;
     use tokio::net::windows::named_pipe::ClientOptions;
     use tray_icon::{
@@ -70,51 +289,6 @@ mod app {
     }
 
     // ========================================================================
-    // SYNC STATUS - Extended struct matching service
-    // ========================================================================
-
-    #[derive(Deserialize, Debug, Clone, Default)]
-    struct SyncStatus {
-        // Core fields
-        pub offset_ns: i64,
-        pub drift_ppm: f64,
-        #[serde(rename = "gm_uuid")]
-        pub _gm_uuid: Option<[u8; 6]>,
-        /// IP address of the PTP grandmaster device
-        #[serde(default)]
-        pub gm_source_ip: Option<std::net::Ipv4Addr>,
-        pub settled: bool,
-        #[serde(rename = "updated_ts")]
-        pub _updated_ts: u64,
-
-        // Extended fields for tray app
-        #[serde(default)]
-        pub is_locked: bool,
-        #[serde(default)]
-        pub smoothed_rate_ppm: f64,
-        #[serde(default)]
-        pub ntp_offset_us: i64,
-        #[serde(default)]
-        pub mode: String,
-        #[serde(default)]
-        pub ntp_failed: bool,
-        #[serde(default)]
-        pub accumulated_phase_us: f64,
-
-        /// dantesync#114: the loud "NO DANTE CLOCK" alarm snapshot. The tray shows
-        /// a balloon per `clock_alarm_interval_s` while `active` (Windows can't
-        /// toast from the session-0 service, so the tray does it here).
-        #[serde(default)]
-        pub clock_alarm: ClockAlarmStatus,
-        #[serde(default = "default_clock_alarm_interval_s")]
-        pub clock_alarm_interval_s: u64,
-    }
-
-    fn default_clock_alarm_interval_s() -> u64 {
-        60
-    }
-
-    // ========================================================================
     // GITHUB RELEASE - For version check
     // ========================================================================
 
@@ -148,7 +322,7 @@ mod app {
 
     #[derive(Debug)]
     enum AppEvent {
-        Update(SyncStatus),
+        Update(TrayStatus),
         Offline,
         NewVersionAvailable(String),
     }
@@ -195,103 +369,17 @@ mod app {
         was_ntp_failed: bool,
         first_update: bool,
         // dantesync#114: per-cadence clock-alarm balloon tracking.
-        last_clock_alarm_toast: Option<Instant>,
-        clock_alarm_since: Option<u64>,
+        clock_alarm: ClockAlarmCadence,
     }
 
-    // ========================================================================
-    // ICON GENERATION - Dynamic with pulsing ring and update badge support
-    // ========================================================================
-
-    /// Generate an icon with optional pulsing ring and update badge
-    /// pulse_intensity: 0.0 = no ring, 1.0 = full ring (based on drift rate)
-    /// show_update_badge: if true, shows orange dot in top-right corner
-    fn generate_icon_full(
-        r: u8,
-        g: u8,
-        b: u8,
-        pulse_intensity: f32,
-        show_update_badge: bool,
-    ) -> Icon {
-        let width = 32;
-        let height = 32;
-        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-
-        let cx = 16.0;
-        let cy = 16.0;
-        let inner_radius = 11.0;
-        let outer_radius = 15.0;
-        let ring_width = outer_radius - inner_radius;
-
-        // Update badge: small orange dot in top-right corner
-        let badge_cx = 25.0;
-        let badge_cy = 7.0;
-        let badge_radius = 5.0;
-
-        for y in 0..height {
-            for x in 0..width {
-                let dx = x as f32 - cx + 0.5;
-                let dy = y as f32 - cy + 0.5;
-                let dist = (dx * dx + dy * dy).sqrt();
-
-                // Check if pixel is in update badge area (takes priority)
-                let badge_dx = x as f32 - badge_cx + 0.5;
-                let badge_dy = y as f32 - badge_cy + 0.5;
-                let badge_dist = (badge_dx * badge_dx + badge_dy * badge_dy).sqrt();
-
-                if show_update_badge && badge_dist <= badge_radius {
-                    // Update badge - orange/amber color with anti-aliasing
-                    let mut alpha = 255u8;
-                    if badge_dist > badge_radius - 1.0 {
-                        alpha = ((badge_radius - badge_dist) * 255.0).max(0.0) as u8;
-                    }
-                    rgba.push(255); // R - orange
-                    rgba.push(152); // G
-                    rgba.push(0); // B
-                    rgba.push(alpha);
-                } else if dist <= inner_radius {
-                    // Main fill - solid color
-                    let mut alpha = 255u8;
-                    if dist > inner_radius - 1.0 {
-                        alpha = ((inner_radius - dist) * 255.0).max(0.0) as u8;
-                    }
-                    rgba.push(r);
-                    rgba.push(g);
-                    rgba.push(b);
-                    rgba.push(alpha);
-                } else if dist <= outer_radius && pulse_intensity > 0.01 {
-                    // Pulsing ring - intensity based on drift rate
-                    let ring_pos = (dist - inner_radius) / ring_width;
-                    // Fade out towards edge
-                    let ring_alpha = ((1.0 - ring_pos) * pulse_intensity * 180.0) as u8;
-                    // Ring color is brighter version of main color
-                    let ring_r = (r as f32 * 1.3).min(255.0) as u8;
-                    let ring_g = (g as f32 * 1.3).min(255.0) as u8;
-                    let ring_b = (b as f32 * 1.3).min(255.0) as u8;
-                    rgba.push(ring_r);
-                    rgba.push(ring_g);
-                    rgba.push(ring_b);
-                    rgba.push(ring_alpha);
-                } else {
-                    // Transparent
-                    rgba.push(0);
-                    rgba.push(0);
-                    rgba.push(0);
-                    rgba.push(0);
-                }
-            }
-        }
-        Icon::from_rgba(rgba, width, height).unwrap()
-    }
-
-    /// Generate icon with optional ring (no badge)
-    fn generate_icon_with_ring(r: u8, g: u8, b: u8, pulse_intensity: f32) -> Icon {
-        generate_icon_full(r, g, b, pulse_intensity, false)
-    }
-
-    /// Generate static icon (no ring, no badge)
-    fn generate_icon(r: u8, g: u8, b: u8) -> Icon {
-        generate_icon_full(r, g, b, 0.0, false)
+    /// The tray icon for a spec from the shared view (dantesync#132).
+    fn icon_from_spec(spec: &IconSpec) -> Icon {
+        Icon::from_rgba(
+            tray_view::render_icon_rgba(spec),
+            tray_view::ICON_SIZE,
+            tray_view::ICON_SIZE,
+        )
+        .unwrap()
     }
 
     // ========================================================================
@@ -356,11 +444,8 @@ mod app {
         menu.append(&quit_i).unwrap();
 
         // Colors (Flat UI / Bootstrap-style)
-        let red_icon = generate_icon(220, 53, 69); // Danger Red - Offline
-        let green_icon = generate_icon(40, 167, 69); // Success Green - Locked
-        let yellow_icon = generate_icon(255, 193, 7); // Warning Yellow - Acquiring
-        let orange_icon = generate_icon(255, 152, 0); // Orange - NTP-only mode (PTP offline)
-        let cyan_icon = generate_icon(0, 188, 212); // Cyan - NANO mode (ultra-precise)
+        // Yellow (acquiring) until the first status arrives.
+        let yellow_icon = icon_from_spec(&IconSpec::connecting());
 
         // Wrap in RefCell so we can explicitly drop it on exit to clean up tray icon
         let tray_icon = RefCell::new(Some(
@@ -400,7 +485,7 @@ mod app {
                                     break;
                                 }
 
-                                match serde_json::from_slice::<SyncStatus>(&buf) {
+                                match serde_json::from_slice::<TrayStatus>(&buf) {
                                     Ok(status) => {
                                         let _ = proxy.send_event(AppEvent::Update(status));
                                     }
@@ -478,8 +563,7 @@ mod app {
             was_ptp_offline: false,
             was_ntp_failed: false,
             first_update: true,
-            last_clock_alarm_toast: None,
-            clock_alarm_since: None,
+            clock_alarm: ClockAlarmCadence::new(),
         });
 
         event_loop.run(move |event, elwt| {
@@ -558,110 +642,35 @@ mod app {
                             // ================================================
                             {
                                 let mut state = notification_state.borrow_mut();
-                                if status.clock_alarm.active {
-                                    let now = Instant::now();
-                                    let interval =
-                                        Duration::from_secs(status.clock_alarm_interval_s.max(10));
-                                    let episode_changed =
-                                        state.clock_alarm_since != status.clock_alarm.since;
-                                    let due = match state.last_clock_alarm_toast {
-                                        None => true,
-                                        Some(t) => now.duration_since(t) >= interval,
-                                    };
-                                    if episode_changed || due {
-                                        show_notification(
-                                            CLOCK_ALARM_TITLE,
-                                            &compose_message(
-                                                &status.clock_alarm.reason,
-                                                status.clock_alarm.since,
-                                            ),
-                                        );
-                                        state.last_clock_alarm_toast = Some(now);
-                                        state.clock_alarm_since = status.clock_alarm.since;
+                                match state.clock_alarm.decide(
+                                    &status.clock_alarm,
+                                    status.clock_alarm_interval_s,
+                                    Instant::now(),
+                                ) {
+                                    AlarmAction::Raise(message) => {
+                                        show_notification(CLOCK_ALARM_TITLE, &message)
                                     }
-                                } else if state.clock_alarm_since.is_some()
-                                    || state.last_clock_alarm_toast.is_some()
-                                {
-                                    // Alarm just cleared — one reassuring toast, then reset.
-                                    show_notification(
-                                        "DanteSync",
-                                        "Dante clock restored — PTP re-locked",
-                                    );
-                                    state.last_clock_alarm_toast = None;
-                                    state.clock_alarm_since = None;
+                                    AlarmAction::Cleared => {
+                                        // Alarm just cleared — one reassuring toast.
+                                        show_notification(
+                                            "DanteSync",
+                                            tray_view::CLOCK_RESTORED_MESSAGE,
+                                        )
+                                    }
+                                    AlarmAction::Quiet => {}
                                 }
                             }
 
                             // ================================================
-                            // ICON SELECTION - Based on mode and drift
+                            // ICON + TEXT - the shared view (dantesync#132)
                             // ================================================
-
-                            // Calculate pulse intensity from drift rate (0-1 range)
-                            // Higher drift rate = more visible ring
-                            let pulse_intensity = (status.smoothed_rate_ppm.abs() / 20.0).min(1.0) as f32;
-
-                            // Check if update is available for badge
                             let has_update = update_available.load(Ordering::Relaxed);
-
-                            let is_nano = status.mode == "NANO";
-                            let is_ptp_offline = status.mode == "NTP-only";
-                            let icon = if is_ptp_offline {
-                                // PTP offline: Orange - running NTP-only sync
-                                generate_icon_full(255, 152, 0, 0.0, has_update)
-                            } else if is_nano {
-                                // NANO mode: Cyan - ultra-precise sync
-                                let nano_pulse = (status.smoothed_rate_ppm.abs() / 5.0).min(1.0) as f32;
-                                generate_icon_full(0, 188, 212, nano_pulse, has_update)
-                            } else if status.is_locked {
-                                // Locked: Green with optional ring if there's drift
-                                generate_icon_full(40, 167, 69, pulse_intensity, has_update)
-                            } else if status.settled {
-                                // Settled but not locked: Yellow with ring
-                                generate_icon_full(255, 193, 7, pulse_intensity.max(0.3), has_update)
-                            } else {
-                                // Not settled: Yellow (connecting)
-                                generate_icon_full(255, 193, 7, 0.0, has_update)
-                            };
-
-                            // ================================================
-                            // STATUS TEXT
-                            // ================================================
-
-                            let mode_str = if status.mode.is_empty() {
-                                if status.is_locked { "LOCK" } else { "ACQ" }
-                            } else {
-                                &status.mode
-                            };
-
-                            // Drift rate display (rate of change, not absolute offset)
-                            let drift_str = format!("{:+.1}us/s", status.smoothed_rate_ppm);
-
-                            // Include accumulated phase error in tooltip when significant (>10µs)
-                            let phase_str = if status.accumulated_phase_us.abs() > 10.0 {
-                                format!("\nAccum. Phase: {:+.0}us", status.accumulated_phase_us)
-                            } else {
-                                String::new()
-                            };
-
-                            // Show PTP grandmaster IP if available
-                            let gm_str = match &status.gm_source_ip {
-                                Some(ip) => format!("\nPTP Master: {}", ip),
-                                None => String::new(),
-                            };
-
-                            let tooltip = format!(
-                                "DanteSync v{}\nMode: {} | Drift: {}\nFreq Adj: {:+.1}ppm\nNTP Offset: {:+}us{}{}",
-                                version, mode_str, drift_str, status.drift_ppm, status.ntp_offset_us, phase_str, gm_str
-                            );
-
-                            let status_text = format!("{} | Drift: {}", mode_str, drift_str);
-                            let mode_text = format!("Mode: {} | Adj: {:+.1}ppm", mode_str, status.drift_ppm);
-
-                            // Format grandmaster IP for menu
-                            let gm_ip_text = match &status.gm_source_ip {
-                                Some(ip) => format!("PTP Master: {}", ip),
-                                None => "PTP Master: --".to_string(),
-                            };
+                            let icon = icon_from_spec(&tray_view::icon_spec(Some(&status), has_update));
+                            let texts = tray_view::status_texts(&status, version);
+                            let tooltip = texts.tooltip;
+                            let status_text = texts.status_line;
+                            let mode_text = texts.mode_line;
+                            let gm_ip_text = texts.gm_line;
 
                             if let Some(ref ti) = *tray_icon.borrow() {
                                 let _ = ti.set_icon(Some(icon));
@@ -688,17 +697,17 @@ mod app {
                                 state.was_locked = false;
                             }
 
-                            // Check if update is available for badge
                             let has_update = update_available.load(Ordering::Relaxed);
-                            let offline_icon = generate_icon_full(220, 53, 69, 0.0, has_update);
+                            let offline_icon = icon_from_spec(&tray_view::icon_spec(None, has_update));
+                            let texts = tray_view::offline_texts(version);
 
                             if let Some(ref ti) = *tray_icon.borrow() {
                                 let _ = ti.set_icon(Some(offline_icon));
-                                let _ = ti.set_tooltip(Some(format!("DanteSync v{}\nService Offline", version)));
+                                let _ = ti.set_tooltip(Some(texts.tooltip));
                             }
-                            status_i.set_text("Service Offline".to_string());
-                            mode_i.set_text("--".to_string());
-                            gm_ip_i.set_text("PTP Master: --".to_string());
+                            status_i.set_text(texts.status_line);
+                            mode_i.set_text(texts.mode_line);
+                            gm_ip_i.set_text(texts.gm_line);
                             // Service is stopped - show Start option
                             start_stop_i.set_text("Start Service".to_string());
                             restart_i.set_enabled(false);

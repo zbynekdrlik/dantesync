@@ -94,13 +94,18 @@ jobs:
             ${{ runner.os }}-cargo-lint-
 
       - name: Install Linux dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libpcap-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libpcap-dev libxdo-dev libayatana-appindicator3-dev
 
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Run Clippy
         run: cargo clippy -- -D warnings -A dead_code
+
+      # dantesync#132: the tray bin needs the `tray` feature (gtk + tray-icon on Linux),
+      # which the plain clippy above leaves out on purpose (the daemon never links gtk).
+      - name: Run Clippy (Linux tray)
+        run: cargo clippy --features tray --bin dantesync-tray -- -D warnings -A dead_code
 
   # ============================================================================
   # Tests
@@ -175,9 +180,10 @@ jobs:
           # winit -> sctk-adwaita -> ab_glyph -> owned_ttf_parser -> ttf-parser. `winit` itself is
           # a [target.'cfg(windows)'.dependencies] entry (dantesync-tray only); its Linux/Wayland
           # client-side-decoration backend is NEVER compiled into ANY shipped artifact — Windows
-          # builds use winit's Win32 backend, and Linux CI only builds `--bin dantesync` (no
-          # tray-icon/winit at all). cargo-audit still flags them because Cargo.lock resolves the
-          # full cross-platform graph regardless of what actually compiles for a given target. No
+          # builds use winit's Win32 backend, and the Linux tray (dantesync#132, `--features tray`)
+          # uses tray-icon's gtk backend, never winit. cargo-audit still flags them because
+          # Cargo.lock resolves the full cross-platform graph regardless of what actually
+          # compiles for a given target. No
           # semver-compatible fix available yet (`cargo update -p quick-xml`/`-p ttf-parser`:
           # 0 packages updated — wayland-scanner 0.31.10 is already latest and still pins
           # quick-xml <0.41). Re-check when wayland-scanner/winit bump their pin.
@@ -262,7 +268,7 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libpcap-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libpcap-dev libxdo-dev libayatana-appindicator3-dev
 
       - name: Cache Npcap SDK (Windows)
         if: runner.os == 'Windows'
@@ -305,9 +311,14 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo build --release --target ${{ matrix.target }}
 
+      # dantesync#132: the same command release.yml publishes `dantesync-tray-linux-amd64` from.
+      - name: Build Tray (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --features tray --bin dantesync-tray --target ${{ matrix.target }}
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release --bin dantesync --bin dantesync-tray --target ${{ matrix.target }}
+        run: cargo build --release --features tray --bin dantesync --bin dantesync-tray --target ${{ matrix.target }}
 
   # ============================================================================
   # Code Coverage

@@ -40,6 +40,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: dantesync
             asset_name: dantesync-linux-amd64
+            tray_artifact_name: dantesync-tray
+            tray_asset_name: dantesync-tray-linux-amd64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: dantesync.exe
@@ -107,15 +109,26 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo build --release --bin dantesync --target ${{ matrix.target }} --verbose
 
+      # dantesync#132: the Linux tray links gtk, so its dev packages are installed only
+      # here; the daemon above is built without the `tray` feature and never links gtk.
+      - name: Install Linux tray dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+
+      - name: Build Tray (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --features tray --bin dantesync-tray --target ${{ matrix.target }} --verbose
+
       - name: Build Main & Tray (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release --bin dantesync --bin dantesync-tray --target ${{ matrix.target }} --verbose
+        run: cargo build --release --features tray --bin dantesync --bin dantesync-tray --target ${{ matrix.target }} --verbose
 
       - name: Rename Artifacts (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+          cp target/${{ matrix.target }}/release/${{ matrix.tray_artifact_name }} ${{ matrix.tray_asset_name }}
 
       - name: Rename Artifacts (Windows)
         if: runner.os == 'Windows'
@@ -129,6 +142,7 @@ jobs:
         shell: bash
         run: |
           sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
+          sha256sum ${{ matrix.tray_asset_name }} > ${{ matrix.tray_asset_name }}.sha256
 
       - name: Generate SHA256 Checksums (Windows)
         if: runner.os == 'Windows'
@@ -148,6 +162,8 @@ jobs:
           path: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
+            ${{ matrix.tray_asset_name }}
+            ${{ matrix.tray_asset_name }}.sha256
           if-no-files-found: error
           retention-days: 1
 

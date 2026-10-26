@@ -1,0 +1,2 @@
+# Byte-exact fixtures: the HTTP fixture's CRLF line endings are the wire format (dantesync#132).
+tests/fixtures/**/*.http -text
