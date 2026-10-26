@@ -66,8 +66,9 @@ pub(crate) enum RecvErrorAction {
 impl RecvErrorAction {
     /// How long to sleep before the next receive. `None` for everything that
     /// is normal: a stalled server answers nobody, and on the fleet's time
-    /// source that is the actual harm a benign reset used to cause.
-    fn backoff(self) -> Option<Duration> {
+    /// source that is the actual harm a benign reset used to cause. dantesync#136: the time
+    /// server's thread backs off the same way.
+    pub(crate) fn backoff(self) -> Option<Duration> {
         match self {
             RecvErrorAction::Idle | RecvErrorAction::Benign => None,
             RecvErrorAction::Backoff => Some(RECV_ERROR_BACKOFF),

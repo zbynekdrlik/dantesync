@@ -1201,9 +1201,17 @@ time server answers on its `time-server` thread (`sync_loop::run` starts and joi
 burst runs on the `ntp-burst` thread (`ntp_burst::NtpBurstThread`, `controller/ntp_check.rs`).
 
 - **The 31900 reply is built from whatever `/status` holds at that instant**, from another thread.
-  A reply can land between a wall step and the status update that follows it (µs): its
-  `now_ptp_ns` is then off by that step, inside `same_time_base`'s 1 s tolerance. Keep publishing
-  everything a reply combines (D, the pending step, the slew) in ONE status write.
+  A reply can land between a wall step and the status update that follows it, and that window is
+  NOT µs on Windows: each `NtSetSystemTime` blocks ~117 ms, a step takes up to
+  `MAX_STEP_ATTEMPTS` = 4 sets (`clock/step.rs`), and `D` is published only after the step returns
+  (`apply_date_step` → `update_shared_status`, `controller/date_sync.rs`) — ~0.1–0.5 s (µs on
+  Linux, one `clock_settime`). A reply built in it pairs the NEW wall with the OLD `D`: the date
+  extension's `now_ptp_ns` (`date_extension_from_status`, wall − `D` in effect) is off by the whole
+  step. A step < 1 s stays inside `same_time_base`'s 1 s tolerance (the follower uses only the
+  announce); a step ≥ 1 s gets that one reply rejected by `same_time_base` — the follower ignores
+  the announce for one poll (1 s) and takes the next. 1.19 never met this (the loop answered
+  between iterations, never mid-step). Keep publishing everything a reply combines (D, the pending
+  step, the slew) in ONE status write.
 - **The time server answers only while the loop runs** (review of PR 137). In 1.19 a dead loop
   answered nobody — followers and camera-box's 200 ms gate read that as an outage; a server thread
   left behind would answer locked/settled/authority from the last snapshot while the clock

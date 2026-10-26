@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **The time server answers on a thread of its own** (`time-server`), from the latest status
     snapshot (read briefly, never held across the send), started with the loop and ended with it
     (within 100 ms of shutdown). Same wire format, same answers (`DSYN` 64 bytes, a padded `DSYX`
-    the base plus the date extension, an unpadded one ignored).
+    the base plus the date extension, an unpadded one ignored). An unexpected receive error pauses
+    it 100 ms, as the NTP server.
   - **It answers only while the sync loop runs**, as when the loop answered itself: it stops with
     the loop however the loop ends (a panicking iteration too — on Windows the process stays up),
     and it does not answer while the loop has not completed an iteration for 3 s (a wedged loop:

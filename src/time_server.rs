@@ -100,10 +100,6 @@ const _: () = assert!(REQUEST_BUF_SIZE >= EXT_REQUEST_SIZE);
 /// one (that busy-spins a core, #340).
 pub const TIME_SERVER_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// dantesync#136 — the pause after an unexpected receive error (the loop before 1.20 retried at
-/// its next pass), so a socket that keeps failing cannot spin a core.
-const RECV_ERROR_PAUSE: Duration = Duration::from_millis(1);
-
 /// dantesync#136 review — the time server answers only while the sync loop has completed an
 /// iteration within this ([`crate::sync_loop::LoopHeartbeat`], monotonic). The status snapshot is
 /// the loop's: a loop dead or wedged for longer leaves it describing a clock that now free-runs.
@@ -247,18 +243,23 @@ impl TimeServer {
                         );
                     }
                 }
-                // The NTP server's classification (#68): nothing within the timeout, a bounced
-                // earlier reply (Windows WSAECONNRESET), or something unexpected.
-                Err(e) => match crate::ntp_server::classify_recv_error(e.kind()) {
-                    RecvErrorAction::Idle => {}
-                    RecvErrorAction::Benign => {
-                        debug!("[TimeServer] Ignoring expected UDP condition: {}", e)
+                // The NTP server's classification and backoff (#68): nothing within the timeout, a
+                // bounced earlier reply (Windows WSAECONNRESET), or something unexpected — then
+                // its 100 ms pause, so a socket that keeps failing (a persistent WSAENETDOWN)
+                // neither spins a core nor logs ~1000 lines/s from this real-time thread.
+                Err(e) => {
+                    let action = crate::ntp_server::classify_recv_error(e.kind());
+                    match action {
+                        RecvErrorAction::Idle => {}
+                        RecvErrorAction::Benign => {
+                            debug!("[TimeServer] Ignoring expected UDP condition: {}", e)
+                        }
+                        RecvErrorAction::Backoff => error!("[TimeServer] Socket error: {}", e),
                     }
-                    RecvErrorAction::Backoff => {
-                        error!("[TimeServer] Socket error: {}", e);
-                        std::thread::sleep(RECV_ERROR_PAUSE);
+                    if let Some(pause) = action.backoff() {
+                        std::thread::sleep(pause);
                     }
-                },
+                }
             }
         }
         debug!("[TimeServer] stopped");
