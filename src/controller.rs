@@ -43,6 +43,10 @@ mod ptp_liveness;
 mod ptp_sender;
 use ptp_sender::{describe_grandmaster, PtpSender};
 
+/// dantesync#136 — the periodic NTP check with its burst off the sync loop (`main`'s `ntp-burst`
+/// thread). A child module like `date_sync`.
+mod ntp_check;
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -859,6 +863,10 @@ where
     /// dantesync#112 — the PTP re-join schedule, the receive rate and `/status.rejoin`, owned by
     /// `controller/ptp_liveness.rs`.
     ptp_liveness: ptp_liveness::PtpLiveness,
+
+    /// dantesync#136 — the periodic NTP burst off the loop (its runner, the burst in flight, the
+    /// wall steps), owned by `controller/ntp_check.rs`.
+    ntp_burst: ntp_check::NtpBurstState,
 }
 
 struct PendingSync {
@@ -1049,6 +1057,7 @@ where
             phase_slew_preserve_streak: 0,
             date_sync,
             ptp_liveness: ptp_liveness::PtpLiveness::default(),
+            ntp_burst: ntp_check::NtpBurstState::default(),
         }
     }
 
@@ -1204,6 +1213,11 @@ where
         if self.boot_ntp_pending() {
             return;
         }
+        // dantesync#136: a burst on its way (the `ntp-burst` thread) — the check waits for it; the
+        // cadence counts from its request, as it counted from the inline burst.
+        if self.ntp_burst_in_flight() {
+            return;
+        }
         // #71: server mode uses a dedicated, UTC-relevant cadence instead of
         // the PTP-vs-Dante-GM lock-quality signal `calculate_adaptive_ntp_interval`
         // is actually driven by (accumulated_phase_error_us tracks this
@@ -1237,8 +1251,24 @@ where
 
         self.last_ntp_check = Instant::now();
 
-        // Query NTP and record offset
-        match self.ntp.get_offset() {
+        // dantesync#136: with a burst runner (`main`'s `ntp-burst` thread) the burst only starts
+        // here and the loop goes on; `service_ntp_burst` applies its result once it is in.
+        // Without one (a test) it is measured here, inline, as before 1.20.
+        if self.start_ntp_burst() {
+            return;
+        }
+        let result = self.ntp.get_offset();
+        self.apply_ntp_check(result);
+    }
+
+    /// The periodic NTP check's reading, by the check's rules (#50 agreement gate, #68/#71/#76/#83
+    /// server mode, #97 slew, #117/#88 date authority) — whether it was measured inline or on the
+    /// `ntp-burst` thread (dantesync#136).
+    pub(in crate::controller) fn apply_ntp_check(
+        &mut self,
+        result: Result<crate::ntp::NtpMeasurement>,
+    ) {
+        match result {
             Ok(measurement) => {
                 let offset = measurement.offset;
                 let sign = measurement.sign;
@@ -1488,7 +1518,7 @@ where
                     let step_dur = Duration::from_micros(step_us.unsigned_abs());
                     let step_sign = if step_us > 0 { 1 } else { -1 };
 
-                    if let Err(e) = self.clock.step_clock(step_dur, step_sign) {
+                    if let Err(e) = self.step_wall(step_dur, step_sign) {
                         warn!("[NTP] Step failed: {}", e);
                     } else {
                         // Clear NTP samples after step to start fresh measurement
@@ -2062,6 +2092,8 @@ where
         // step lands within one loop period of the announced instant on every box.
         // dantesync#134: the boot NTP reading, measured off the loop, applied once it arrives.
         self.service_boot_ntp();
+        // dantesync#136: the periodic NTP burst, measured on its own thread, applied once it is in.
+        self.service_ntp_burst();
         self.service_date_offset();
         // dantesync#126: answer every `POST /date/step` the HTTP route queued (every node answers;
         // only the NTP master can announce the step).
@@ -3554,9 +3586,12 @@ mod tests {
         );
 
         // --- unresolvable case ---
+        // `.invalid` never resolves (RFC 6761): `PtpController::new` resolves the allowlist
+        // with the real resolver first, and a name that resolves on the test host (as
+        // `video-clock.lan` does on a rig machine) would be kept as the previous resolution.
         let status2 = Arc::new(RwLock::new(SyncStatus::default()));
         let mut config2 = SystemConfig::default();
-        config2.gm_allowlist = vec!["video-clock.lan".to_string()];
+        config2.gm_allowlist = vec!["gm-clock.invalid".to_string()];
         let mut controller2 = PtpController::new(
             MockSystemClock::new(),
             MockPtpNetwork::new(),
@@ -3572,13 +3607,13 @@ mod tests {
             let s = status2.read().unwrap();
             assert_eq!(
                 s.gm_allowlist_unresolved,
-                vec!["video-clock.lan".to_string()],
+                vec!["gm-clock.invalid".to_string()],
                 "an unresolvable hostname must be published loudly"
             );
             assert!(s.gm_allowlist_resolved.is_empty());
             assert!(s.clock_alarm.active, "an unresolvable GM raises the alarm");
             assert!(
-                s.clock_alarm.reason.contains("video-clock.lan")
+                s.clock_alarm.reason.contains("gm-clock.invalid")
                     && s.clock_alarm.reason.contains("unresolvable"),
                 "the alarm reason must name the unresolvable hostname, got: {}",
                 s.clock_alarm.reason

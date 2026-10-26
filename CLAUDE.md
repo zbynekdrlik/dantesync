@@ -271,6 +271,8 @@ DanteSync is a high-precision PTP (Precision Time Protocol) synchronization tool
 - **`net.rs`** / **`net_linux.rs`** / **`net_pcap.rs`** / **`net_winsock.rs`** - Network utilities (multicast, timestamping) and the platform PTP receive paths (Linux kernel-timestamped UDP, Windows Npcap), each with `PtpNetwork::rejoin` (#112)
 - **`ptp_rejoin.rs`** - The pure PTP re-join schedule, the receive-rate window and `/status.rejoin` (#112); wired by `controller/ptp_liveness.rs`
 - **`ntp.rs`** - NTP client for UTC alignment
+- **`ntp_burst.rs`** - The periodic NTP burst on its own `ntp-burst` thread (#136); `controller/ntp_check.rs` starts it when the check is due and applies its result
+- **`sync_loop.rs`** - The sync loop `main` drives the controller through, and the UDP 31900 time server's own `time-server` thread (#136)
 - **`status.rs`** - `SyncStatus` struct shared via IPC to tray app (includes `is_locked`, `smoothed_rate_ppm`, `mode`)
 
 ### CRITICAL: Dante Time vs UTC Time

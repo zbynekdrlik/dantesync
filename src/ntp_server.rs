@@ -50,7 +50,7 @@ const REF_ID_LOCL: u32 = 0x4C4F434C;
 /// arrive as `io::Error`, because treating them alike is what made a routine
 /// condition degrade the fleet's time source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecvErrorAction {
+pub(crate) enum RecvErrorAction {
     /// Nothing arrived within the read timeout — the normal idle path.
     Idle,
     /// An EXPECTED, harmless condition: a previously-sent datagram bounced
@@ -66,8 +66,9 @@ enum RecvErrorAction {
 impl RecvErrorAction {
     /// How long to sleep before the next receive. `None` for everything that
     /// is normal: a stalled server answers nobody, and on the fleet's time
-    /// source that is the actual harm a benign reset used to cause.
-    fn backoff(self) -> Option<Duration> {
+    /// source that is the actual harm a benign reset used to cause. dantesync#136: the time
+    /// server's thread backs off the same way.
+    pub(crate) fn backoff(self) -> Option<Duration> {
         match self {
             RecvErrorAction::Idle | RecvErrorAction::Benign => None,
             RecvErrorAction::Backoff => Some(RECV_ERROR_BACKOFF),
@@ -81,8 +82,9 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// #68 — classify a `recv_from` error. Pure, so the policy is unit-tested
 /// directly instead of being inferred from a live socket (WSAECONNRESET in
 /// particular cannot be provoked at all on Linux, where an unconnected UDP
-/// socket never surfaces the ICMP error).
-fn classify_recv_error(kind: std::io::ErrorKind) -> RecvErrorAction {
+/// socket never surfaces the ICMP error). dantesync#136: the time server's thread
+/// classifies its receive errors the same way.
+pub(crate) fn classify_recv_error(kind: std::io::ErrorKind) -> RecvErrorAction {
     match kind {
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => RecvErrorAction::Idle,
         // ConnectionReset  = WSAECONNRESET (Windows, the reported one).
@@ -264,7 +266,7 @@ impl NtpServer {
     /// configured port when bound to port 0 — which is why this exists at all:
     /// it is the seam that lets a test drive a real ephemeral-port server.
     #[cfg(test)]
-    fn local_addr(&self) -> Result<SocketAddr> {
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }
 

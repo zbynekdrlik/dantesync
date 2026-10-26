@@ -56,10 +56,13 @@
 use crate::date_offset::{
     decode_extension, encode_extension, DateAnnounce, DateExtension, SlewSpec,
 };
+use crate::ntp_server::RecvErrorAction;
 use crate::status::SyncStatus;
+use crate::sync_loop::LoopHeartbeat;
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,91 +95,220 @@ pub const EXT_REQUEST_SIZE: usize = RESPONSE_SIZE;
 const REQUEST_BUF_SIZE: usize = 64;
 const _: () = assert!(REQUEST_BUF_SIZE >= EXT_REQUEST_SIZE);
 
+/// dantesync#136 — how long the server's thread waits for a query before it looks at `running`
+/// again (its shutdown latency). A BLOCKING socket with this read timeout, never a non-blocking
+/// one (that busy-spins a core, #340).
+pub const TIME_SERVER_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// dantesync#136 review — the time server answers only while the sync loop has completed an
+/// iteration within this ([`crate::sync_loop::LoopHeartbeat`], monotonic). The status snapshot is
+/// the loop's: a loop dead or wedged for longer leaves it describing a clock that now free-runs.
+/// An iteration normally takes about one poll interval (1 ms / 50 µs, a non-blocking pass); the
+/// longest legitimate one is a coordinated date step on Windows (up to 4 sets of ~117 ms, ~0.5 s),
+/// so 3 s is six times that and still far inside every reader's outage tolerance. A loop stalled
+/// longer answers nobody — as before 1.20, when the loop itself answered.
+pub const STATUS_STALE_AFTER: Duration = Duration::from_secs(3);
+
+/// dantesync#136 review — whether the snapshot is fresh enough to answer from, and the moment that
+/// changes (logged once per transition, never per query).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// Fresh (answer), as at the previous look.
+    Fresh,
+    /// Stale (do not answer), as at the previous look.
+    Stale,
+    /// Just went stale.
+    WentStale,
+    /// Just became fresh again.
+    FreshAgain,
+}
+
+impl Freshness {
+    /// Answer from the snapshot?
+    pub(crate) fn answers(self) -> bool {
+        matches!(self, Freshness::Fresh | Freshness::FreshAgain)
+    }
+}
+
+/// dantesync#136 review — the server's view of the loop's heartbeat: `stale` is what the previous
+/// look saw (initially fresh: `run` creates the heartbeat as it starts the server).
+#[derive(Debug, Default)]
+pub(crate) struct FreshnessGate {
+    stale: bool,
+}
+
+impl FreshnessGate {
+    /// Look at the heartbeat's `age` now.
+    pub(crate) fn look(&mut self, age: Duration) -> Freshness {
+        let stale = age > STATUS_STALE_AFTER;
+        let was_stale = std::mem::replace(&mut self.stale, stale);
+        match (was_stale, stale) {
+            (false, false) => Freshness::Fresh,
+            (true, true) => Freshness::Stale,
+            (false, true) => Freshness::WentStale,
+            (true, false) => Freshness::FreshAgain,
+        }
+    }
+}
+
 /// UDP Time Query Server for network time verification.
 ///
 /// Listens on port 31900 and responds to time queries with precise clock data
 /// including system time, monotonic counter, and sync status.
+///
+/// dantesync#136: it answers on a thread of its own ([`TimeServer::spawn`], `time-server`), from
+/// the latest status snapshot — a query never waits for PTP processing or an NTP burst. Before
+/// 1.20 the sync loop answered between its iterations, so every query waited behind them (200 ms
+/// replies missed under load). It answers only while the sync loop runs
+/// ([`STATUS_STALE_AFTER`], `sync_loop::run`'s guard).
 pub struct TimeServer {
     socket: UdpSocket,
 }
 
 impl TimeServer {
     /// Create a new TimeServer bound to UDP port 31900.
-    ///
-    /// The socket is set to non-blocking mode for integration with the main loop.
     pub fn new() -> Result<Self> {
-        let bind_addr = format!("0.0.0.0:{}", TIME_SERVER_PORT);
-        let socket = UdpSocket::bind(&bind_addr)?;
-        socket.set_nonblocking(true)?;
+        let server = Self::bind(&format!("0.0.0.0:{}", TIME_SERVER_PORT))?;
 
         info!(
             "[TimeServer] Listening on UDP port {} for time queries",
             TIME_SERVER_PORT
         );
 
+        Ok(server)
+    }
+
+    /// A time server bound to `addr` (`new` binds `0.0.0.0:31900`; a test binds an ephemeral
+    /// loopback port). The socket blocks for at most [`TIME_SERVER_READ_TIMEOUT`].
+    pub fn bind(addr: &str) -> Result<Self> {
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_read_timeout(Some(TIME_SERVER_READ_TIMEOUT))?;
         Ok(TimeServer { socket })
     }
 
-    /// Handle pending time query requests.
-    ///
-    /// This is designed to be called from the main sync loop. It processes
-    /// all pending requests without blocking.
-    pub fn handle_requests(&self, status: &Arc<RwLock<SyncStatus>>) {
+    /// The address this server is bound to.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        Ok(self.socket.local_addr()?)
+    }
+
+    /// dantesync#136 — answer on a thread of its own (`time-server`) until `running` clears
+    /// (within [`TIME_SERVER_READ_TIMEOUT`]); the socket closes when the thread ends. A query is
+    /// answered only while the sync loop's `heartbeat` is within [`STATUS_STALE_AFTER`].
+    pub fn spawn(
+        self,
+        status: Arc<RwLock<SyncStatus>>,
+        heartbeat: Arc<LoopHeartbeat>,
+        running: Arc<AtomicBool>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("time-server".to_string())
+            .spawn(move || self.serve(&status, &heartbeat, &running))
+    }
+
+    /// The server's thread: one query at a time, each answered as it arrives — while the sync
+    /// loop runs.
+    fn serve(&self, status: &RwLock<SyncStatus>, heartbeat: &LoopHeartbeat, running: &AtomicBool) {
         let mut buf = [0u8; REQUEST_BUF_SIZE];
-
-        // Process all pending requests (non-blocking)
-        loop {
-            match self.socket.recv_from(&mut buf) {
+        let mut gate = FreshnessGate::default();
+        while running.load(Ordering::SeqCst) {
+            let received = self.socket.recv_from(&mut buf);
+            // Every wake-up (a query, at most every read timeout), so a transition is logged when
+            // it happens, not at the next query.
+            let age = heartbeat.age();
+            let freshness = gate.look(age);
+            match freshness {
+                Freshness::WentStale => warn!(
+                    "[TimeServer] the sync loop has not completed an iteration for {:?} (> {:?}): \
+                     not answering time queries until it does",
+                    age, STATUS_STALE_AFTER
+                ),
+                Freshness::FreshAgain => {
+                    info!("[TimeServer] the sync loop runs again: answering time queries")
+                }
+                Freshness::Fresh | Freshness::Stale => {}
+            }
+            match received {
+                // The snapshot no longer describes the clock: no answer (as from a dead loop).
+                Ok(_) if !freshness.answers() => {}
                 Ok((size, src)) => {
-                    if size >= REQUEST_SIZE {
-                        let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        if magic == REQUEST_MAGIC_EXT && size < EXT_REQUEST_SIZE {
-                            // #88: the extended reply is 112 bytes (104 before the #119 slew
-                            // fields); answering a short request would make every spoofed one an
-                            // amplifier.
-                            debug!(
-                                "[TimeServer] Ignoring an unpadded DSYX request ({} bytes) from {}",
-                                size, src
-                            );
-                        } else if magic == REQUEST_MAGIC || magic == REQUEST_MAGIC_EXT {
-                            let request_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-
-                            // Read status (handle poisoned lock gracefully)
-                            let sync_status = match status.read() {
-                                Ok(guard) => guard.clone(),
-                                Err(e) => {
-                                    warn!("[TimeServer] Status lock poisoned: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            let response = if magic == REQUEST_MAGIC_EXT {
-                                build_response_ext(request_id, &sync_status)
-                            } else {
-                                build_response(request_id, &sync_status).to_vec()
-                            };
-                            if let Err(e) = self.socket.send_to(&response, src) {
-                                debug!("[TimeServer] Failed to send response to {}: {}", src, e);
-                            } else {
-                                debug!("[TimeServer] Responded to {}", src);
-                            }
-                        } else {
-                            debug!(
-                                "[TimeServer] Ignoring packet with invalid magic 0x{:08X} from {}",
-                                magic, src
-                            );
-                        }
+                    // One bad query never ends the server (a panic would leave the daemon running
+                    // and answering nobody).
+                    let answered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        self.answer(&buf[..size], src, status)
+                    }));
+                    if answered.is_err() {
+                        error!(
+                            "[TimeServer] answering {} panicked — the server goes on",
+                            src
+                        );
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No more pending requests
-                    break;
-                }
+                // The NTP server's classification and backoff (#68): nothing within the timeout, a
+                // bounced earlier reply (Windows WSAECONNRESET), or something unexpected — then
+                // its 100 ms pause, so a socket that keeps failing (a persistent WSAENETDOWN)
+                // neither spins a core nor logs ~1000 lines/s from this real-time thread.
                 Err(e) => {
-                    error!("[TimeServer] Socket error: {}", e);
-                    break;
+                    let action = crate::ntp_server::classify_recv_error(e.kind());
+                    match action {
+                        RecvErrorAction::Idle => {}
+                        RecvErrorAction::Benign => {
+                            debug!("[TimeServer] Ignoring expected UDP condition: {}", e)
+                        }
+                        RecvErrorAction::Backoff => error!("[TimeServer] Socket error: {}", e),
+                    }
+                    if let Some(pause) = action.backoff() {
+                        std::thread::sleep(pause);
+                    }
                 }
             }
+        }
+        debug!("[TimeServer] stopped");
+    }
+
+    /// Answer one query (the wire format and the answers as before 1.20).
+    fn answer(&self, request: &[u8], src: SocketAddr, status: &RwLock<SyncStatus>) {
+        if request.len() < REQUEST_SIZE {
+            return;
+        }
+        let magic = u32::from_be_bytes([request[0], request[1], request[2], request[3]]);
+        if magic == REQUEST_MAGIC_EXT && request.len() < EXT_REQUEST_SIZE {
+            // #88: the extended reply is 112 bytes (104 before the #119 slew fields); answering a
+            // short request would make every spoofed one an amplifier.
+            debug!(
+                "[TimeServer] Ignoring an unpadded DSYX request ({} bytes) from {}",
+                request.len(),
+                src
+            );
+            return;
+        }
+        if magic != REQUEST_MAGIC && magic != REQUEST_MAGIC_EXT {
+            debug!(
+                "[TimeServer] Ignoring packet with invalid magic 0x{:08X} from {}",
+                magic, src
+            );
+            return;
+        }
+        let request_id = u32::from_be_bytes([request[4], request[5], request[6], request[7]]);
+
+        // The latest status snapshot, read briefly: the reply is built under the read lock and
+        // the lock is released before the send (never held across I/O).
+        let response = match status.read() {
+            Ok(sync_status) => {
+                if magic == REQUEST_MAGIC_EXT {
+                    build_response_ext(request_id, &sync_status)
+                } else {
+                    build_response(request_id, &sync_status).to_vec()
+                }
+            }
+            Err(e) => {
+                warn!("[TimeServer] Status lock poisoned: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = self.socket.send_to(&response, src) {
+            debug!("[TimeServer] Failed to send response to {}: {}", src, e);
+        } else {
+            debug!("[TimeServer] Responded to {}", src);
         }
     }
 }

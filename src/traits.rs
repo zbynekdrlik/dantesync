@@ -9,6 +9,13 @@ pub trait NtpSource {
     fn get_offset(&self) -> Result<NtpMeasurement>;
 }
 
+/// dantesync#136 — a source shared with the `ntp-burst` thread (`Arc<NtpClient>` in `main`).
+impl<T: NtpSource + ?Sized> NtpSource for std::sync::Arc<T> {
+    fn get_offset(&self) -> Result<NtpMeasurement> {
+        (**self).get_offset()
+    }
+}
+
 /// dantesync#112 — where a [`PtpNetwork::rejoin`] left the PTP receive path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejoinOutcome {

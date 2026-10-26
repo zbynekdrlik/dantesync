@@ -7,6 +7,9 @@ paths:
   - "src/ptp_phase_lock.rs"
   - "src/date_offset.rs"
   - "src/time_server.rs"
+  - "src/sync_loop.rs"
+  - "src/ntp_burst.rs"
+  - "src/controller/ntp_check.rs"
   - "src/controller/date_sync.rs"
   - "src/controller/date_sync/tests.rs"
   - "src/date_offset/tests.rs"
@@ -1189,3 +1192,49 @@ What was learned:
   before the lock, the late reading report-only, the periodic check waiting), the two-clock bench
   `boot.rs` (−21 / +70 ppm boxes, one step each, both on the line). Negative control:
   `BOOT_HOLD_NS = 0` fails the bench, the acquisition test and two controller tests.
+
+## dantesync#136 — the time server and the NTP burst off the sync loop (v1.20)
+
+A DSYX query was answered only when the loop came round, and the periodic NTP burst ran inline:
+every query waited behind PTP processing and the burst (200 ms replies missed under load). Now the
+time server answers on its `time-server` thread (`sync_loop::run` starts and joins it) and the
+burst runs on the `ntp-burst` thread (`ntp_burst::NtpBurstThread`, `controller/ntp_check.rs`).
+
+- **The 31900 reply is built from whatever `/status` holds at that instant**, from another thread.
+  A reply can land between a wall step and the status update that follows it, and that window is
+  NOT µs on Windows: each `NtSetSystemTime` blocks ~117 ms, a step takes up to
+  `MAX_STEP_ATTEMPTS` = 4 sets (`clock/step.rs`), and `D` is published only after the step returns
+  (`apply_date_step` → `update_shared_status`, `controller/date_sync.rs`) — ~0.1–0.5 s (µs on
+  Linux, one `clock_settime`). A reply built in it pairs the NEW wall with the OLD `D`: the date
+  extension's `now_ptp_ns` (`date_extension_from_status`, wall − `D` in effect) is off by the whole
+  step. A step < 1 s stays inside `same_time_base`'s 1 s tolerance (the follower uses only the
+  announce); a step ≥ 1 s gets that one reply rejected by `same_time_base` — the follower ignores
+  the announce for one poll (1 s) and takes the next. 1.19 never met this (the loop answered
+  between iterations, never mid-step). Keep publishing everything a reply combines (D, the pending
+  step, the slew) in ONE status write.
+- **The time server answers only while the loop runs** (review of PR 137). In 1.19 a dead loop
+  answered nobody — followers and camera-box's 200 ms gate read that as an outage; a server thread
+  left behind would answer locked/settled/authority from the last snapshot while the clock
+  free-runs. So `run` holds the thread in a `ServerGuard` (stopped and joined when `run` returns OR
+  unwinds: on Windows the loop runs on the service's thread, a panic there leaves the process up),
+  and the server answers only while the loop's `LoopHeartbeat` (beaten after every iteration,
+  monotonic) is within `STATUS_STALE_AFTER` = 3 s, logging stale ↔ fresh once per transition. NOT
+  `/status.updated_ts`: it is wall-clock seconds (every date step moves it) and written ~1/s only
+  while PTP flows, every 10 s otherwise (an NTP-only node would go silent between ticks).
+- **A burst result is applied by the check's unchanged rules** (`apply_ntp_check`), only later.
+  What the inline burst never met: a wall step while it ran (every step goes through `step_wall`,
+  which counts them; a straddling measurement is dropped) and a boot reading measured again
+  meanwhile (the boot reading wins). Both rules drop MEASUREMENTS only: a failed burst has no
+  samples and always counts (review of PR 137 — a timed-out burst lasts ~15 s; dropping it across
+  a date micro-step held `ntp_failed` back and left `pcap_ntp_active` set). One burst at a time;
+  the cadence counts from its request.
+- **Without a runner the check still measures inline** (the unit tests' controllers; the pinned
+  equivalence test runs both paths side by side). `main` always wires the thread.
+- Tests: `sync_loop/tests.rs` (a DSYX answered while an iteration is held 2 s — red on 1.19; the
+  port freed on shutdown; a panicking iteration takes the server with it; an iteration held past
+  `STATUS_STALE_AFTER` gets no reply, then one again), `time_server/tests.rs` (a backdated
+  heartbeat: no reply, then a reply after a beat; the transition gate),
+  `controller/ntp_check/tests.rs` (the loop's longest pause < 300 ms while a ~1 s burst runs
+  against `ntp_burst::test_support::SlowNtpUpstream`, a real `NtpServer` behind a delaying relay
+  — red on 1.19 at 1.0 s; failed bursts across a step / beside a pending boot reading count),
+  `ntp_burst/tests.rs`.
