@@ -136,8 +136,14 @@ pub struct NtpMeasurement {
 /// dantesync#134 re-review: the server answered "clock unsynchronized" (LI = 3) — rsntp's
 /// `ServerNotSynchronized` (the Windows Npcap transport falls back to rsntp, which says the same).
 pub fn is_server_unsynchronized(e: &anyhow::Error) -> bool {
-    let _ = e;
-    false
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rsntp::SynchronizationError>(),
+            Some(rsntp::SynchronizationError::ProtocolError(
+                rsntp::ProtocolError::ServerNotSynchronized
+            ))
+        )
+    })
 }
 
 pub struct NtpClient {

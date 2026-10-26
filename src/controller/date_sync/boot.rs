@@ -104,12 +104,26 @@ where
 
     /// The boot reading has not arrived yet (and the wait for it is not over).
     pub(in crate::controller) fn boot_ntp_pending(&self) -> bool {
-        self.date_sync.restart.boot_ntp.is_some()
+        self.date_sync.restart.boot_ntp.is_some() || self.date_sync.restart.boot_retry_at.is_some()
     }
 
     /// Every loop iteration: apply the boot NTP reading once it has arrived; give up waiting after
     /// [`BOOT_NTP_WAIT`].
     pub fn service_boot_ntp(&mut self) {
+        // dantesync#134 re-review: a reading refused by an unsynchronized master, asked again.
+        if let Some(at) = self.date_sync.restart.boot_retry_at {
+            if self.on_fleet_date_line() {
+                info!("[NTP] boot reading not asked again: this node is on the fleet date line");
+                self.date_sync.restart.boot_retry_at = None;
+                self.update_shared_status();
+            } else if Instant::now() >= at {
+                self.date_sync.restart.boot_retry_at = None;
+                if let Some(spawn) = self.date_sync.restart.boot_ntp_spawner.as_mut() {
+                    let rx = spawn();
+                    self.start_boot_ntp(rx);
+                }
+            }
+        }
         let Some(wait) = self.date_sync.restart.boot_ntp.as_ref() else {
             return;
         };
@@ -140,6 +154,25 @@ where
     pub(in crate::controller) fn apply_boot_ntp(&mut self, result: BootNtpResult) {
         let measurement = match result {
             Ok(m) => m,
+            Err(e)
+                if e.server_unsynchronized
+                    && !self.ntp_server_mode
+                    && self.date_sync.restart.boot_ntp_spawner.is_some()
+                    && self.date_sync.restart.boot_retries < BOOT_UNSYNC_RETRIES =>
+            {
+                // dantesync#134 re-review: the master answers LI = 3 while its own wall is not
+                // placed (seconds) — ask again shortly instead of starting on the raw wall.
+                self.date_sync.restart.boot_retries += 1;
+                info!(
+                    "[NTP] boot reading refused: {} — asking again in {} s ({}/{})",
+                    e,
+                    BOOT_UNSYNC_RETRY.as_secs(),
+                    self.date_sync.restart.boot_retries,
+                    BOOT_UNSYNC_RETRIES
+                );
+                self.date_sync.restart.boot_retry_at = Some(Instant::now() + BOOT_UNSYNC_RETRY);
+                return;
+            }
             Err(e) => {
                 // Review of PR 135: a failed / timed-out / dead reading is the pre-1.19 "NTP Sync
                 // failed" — the node starts on its current wall (a deferred boot step included),
@@ -248,10 +281,25 @@ where
             (Some(a), Some(own)) => a.in_effect_ns(now.wrapping_sub(own)) == own,
             _ => false,
         };
-        on_line
-            || (!self.boot_ntp_pending()
-                && ds.restart.pending_restore.is_none()
-                && !ds.restart.boot_step_due)
+        if on_line {
+            return true;
+        }
+        // dantesync#134 re-review: a session this master has never yet been on (a restore whose
+        // join step failed and waits for its backoff) is not placed, whatever else is done. Once
+        // placed, "nothing pending" holds (a later PTP outage keeps serving).
+        if ds.authority.is_some() && !ds.restart.wall_placed_once {
+            return false;
+        }
+        !self.boot_ntp_pending()
+            && ds.restart.pending_restore.is_none()
+            && !ds.restart.boot_step_due
+    }
+
+    /// dantesync#134 re-review: every master loop iteration — remember the first placement.
+    pub(in crate::controller) fn note_master_placement(&mut self) {
+        if !self.date_sync.restart.wall_placed_once && self.master_wall_placed() {
+            self.date_sync.restart.wall_placed_once = true;
+        }
     }
 
     /// dantesync#134: this node's wall is on the fleet date line already — the master runs its

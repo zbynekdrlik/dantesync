@@ -688,8 +688,8 @@ impl PcapNtpTransport {
     /// bug this fixes: healthy median, occasional multi-ms-wrong sample).
     pub fn measure_once(&mut self) -> Result<crate::ntp::RawSample> {
         use crate::ntp_packet::{
-            build_client_request, compute_offset_rtt_us, parse_reply, parse_udp_frame,
-            reply_origin_matches_request, systemtime_to_unix_micros,
+            build_client_request, compute_offset_rtt_us, is_unsynchronized_server_reply,
+            parse_reply, parse_udp_frame, reply_origin_matches_request, systemtime_to_unix_micros,
         };
 
         // Drain anything already queued before this request exists -- a
@@ -749,6 +749,12 @@ impl PcapNtpTransport {
                                         reply.origin_ts_us, request_transmit_ts_us
                                     );
                                 }
+                            }
+                            // dantesync#134 re-review: the server says its clock is unsynchronized
+                            // (LI = 3) — no reply will be usable; stop now instead of waiting out
+                            // the timeout (5 samples would block the loop ~2.5 s).
+                            Err(e) if is_unsynchronized_server_reply(payload) => {
+                                return Err(anyhow!("NTP/Npcap: {}", e));
                             }
                             Err(e) => {
                                 debug!(

@@ -79,6 +79,9 @@ pub(in crate::controller) struct RestartState {
     /// dantesync#134 re-review: why the saved state was last rejected provisionally (the wait's
     /// expiry names it).
     pub(in crate::controller) provisional_rejection: Option<String>,
+    /// dantesync#134 re-review: this master's wall has been placed once since start (on its fleet
+    /// line, or its boot reading handled) — only then does "nothing pending" count as placed.
+    pub(in crate::controller) wall_placed_once: bool,
     /// dantesync#134 re-review: a boot reading to ask again (the master was unsynchronized), and
     /// how many times it was asked again.
     pub(in crate::controller) boot_retry_at: Option<Instant>,
@@ -118,6 +121,7 @@ impl RestartState {
             restore_judged_on: None,
             provisional_rejection: None,
             boot_retry_at: None,
+            wall_placed_once: false,
             boot_retries: 0,
             last_saved: None,
             last_saved_at: None,
@@ -133,12 +137,21 @@ impl RestartState {
 /// dantesync#134 re-review — what the end of the wait for PTP says: with no PTP window at all, or
 /// after the saved state was rejected provisionally (an interim grandmaster that never gave way).
 pub(super) fn restore_wait_expiry_message(provisional: Option<&str>) -> String {
-    let _ = provisional;
-    format!(
-        "[DATE] no PTP window {} s after start: the saved fleet date offset is NOT restored — the \
-         boot step runs now and a new authority session starts at seq 1 (the pre-1.15 path)",
-        RESTORE_WAIT_FOR_PTP.as_secs()
-    )
+    match provisional {
+        Some(reason) => format!(
+            "[DATE] the saved fleet date offset was rejected provisionally ({}) and no PTP time \
+             base confirmed it within {} s of start: it is NOT restored — the boot step runs now \
+             and a new authority session starts at seq 1 (the pre-1.15 path)",
+            reason,
+            RESTORE_WAIT_FOR_PTP.as_secs()
+        ),
+        None => format!(
+            "[DATE] no PTP window {} s after start: the saved fleet date offset is NOT restored — \
+             the boot step runs now and a new authority session starts at seq 1 (the pre-1.15 \
+             path)",
+            RESTORE_WAIT_FOR_PTP.as_secs()
+        ),
+    }
 }
 
 fn describe_rejection(r: RestoreRejected) -> String {
@@ -407,12 +420,14 @@ where
                 if !self.date_sync.core.engaged()
                     && !matches!(reason, RestoreRejected::Stale { .. }) =>
             {
+                let why = describe_rejection(reason);
                 warn!(
                     "[DATE] the saved fleet date offset is not restored YET: {} — provisional \
                      before the lock (an interim grandmaster?): no new session, no step; judged \
                      again on the next time base and finally at the PTP lock",
-                    describe_rejection(reason)
+                    why
                 );
+                self.date_sync.restart.provisional_rejection = Some(why);
                 self.date_sync.restart.pending_restore = Some(saved);
                 return false;
             }

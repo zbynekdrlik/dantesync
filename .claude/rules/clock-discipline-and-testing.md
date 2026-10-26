@@ -1178,6 +1178,12 @@ What was learned:
   reject it); an acquiring master adds its phase-lock error to the fleet line's UTC error. Adding
   a field to `PhaseLockCore` grows the bench's `Law` enum past clippy's large-variant bound: it
   is boxed.
+- **Re-review:** "nothing pending" is not "placed" until the master has been on its session once
+  (`wall_placed_once`; a failed join retries only after the 10 s backoff); an LI = 3 reply must
+  END the Npcap round trip (`is_unsynchronized_server_reply`), not be skipped until the 500 ms
+  timeout (5 samples = 2.5 s of a blocked loop); a follower asks an LI = 3 master again
+  (`BootNtpError::server_unsynchronized` from rsntp's `ServerNotSynchronized`, 5 s x 12), every
+  other failure is final.
 - Tests: `ptp_phase_lock` (early anchor, the hold, the 2 ms safety net, a later re-engagement),
   `controller/date_sync/boot_tests.rs` (master with / without a saved state, a follower, a GM lost
   before the lock, the late reading report-only, the periodic check waiting), the two-clock bench

@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     server answers LI = 3 (unsynchronized, new `/status.ntp_server_unsynchronized`) until its wall
     is placed, and the Windows Npcap NTP client rejects LI = 3 like rsntp; an acquiring master
     feeds the fleet line its phase-lock error.
+  - **Re-review:** a master stays "unsynchronized" until it has been on its fleet line once (a
+    restore whose join step failed is not placed); the Windows Npcap NTP client stops at an LI = 3
+    reply at once instead of waiting out its timeout; a follower whose master answers LI = 3 asks
+    again every 5 s (at most 12 times) instead of starting on its raw wall; the end of the 300 s
+    wait names a provisional rejection.
 
 ## [1.18.0] - 2026-10-14
 

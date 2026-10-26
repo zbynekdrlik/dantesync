@@ -131,8 +131,7 @@ pub struct ParsedReply {
 /// dantesync#134 re-review: a full-length server-mode reply whose leap indicator says "clock
 /// unsynchronized" (LI = 3) — the Npcap transport stops waiting on it at once.
 pub fn is_unsynchronized_server_reply(buf: &[u8]) -> bool {
-    let _ = buf;
-    false
+    buf.len() >= NTP_PACKET_LEN && buf[0] & NTP_MODE_MASK == NTP_MODE_SERVER && buf[0] >> 6 == 3
 }
 
 pub fn parse_reply(buf: &[u8]) -> Result<ParsedReply> {

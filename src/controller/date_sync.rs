@@ -851,6 +851,7 @@ where
             self.ensure_date_authority();
             self.tick_date_authority();
             self.realign_master_to_fleet();
+            self.note_master_placement();
             self.realign_offline_daily_master();
             self.save_date_state_if_changed();
             return;
