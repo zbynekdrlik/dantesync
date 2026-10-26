@@ -302,7 +302,11 @@ fn spawn_boot_ntp(
         .spawn(move || {
             let client = ntp::NtpClient::new(&server, &dscp);
             // The loop may have given up waiting (it logs that): a closed channel is fine.
-            let _ = tx.send(client.get_offset().map_err(|e| e.to_string()));
+            let _ = tx.send(
+                client
+                    .get_offset()
+                    .map_err(|e| controller::BootNtpError::from_ntp(&e)),
+            );
         });
     if let Err(e) = spawned {
         warn!("[NTP] could not start the boot-ntp thread: {}", e);

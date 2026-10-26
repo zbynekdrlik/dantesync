@@ -24,7 +24,40 @@ use crate::ntp::NtpMeasurement;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// One boot NTP reading, measured off the loop (`main`'s boot-NTP thread).
-pub type BootNtpResult = std::result::Result<NtpMeasurement, String>;
+pub type BootNtpResult = std::result::Result<NtpMeasurement, BootNtpError>;
+
+/// Why a boot NTP reading failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BootNtpError {
+    pub message: String,
+    /// The server answered "clock unsynchronized" (LI = 3): a master whose own wall is not placed
+    /// yet (dantesync#134 re-review: a follower asks again a few seconds later).
+    pub server_unsynchronized: bool,
+}
+
+impl BootNtpError {
+    /// Any other failure (a timeout, a dead thread, no answer).
+    pub fn other(message: impl Into<String>) -> Self {
+        BootNtpError {
+            message: message.into(),
+            server_unsynchronized: false,
+        }
+    }
+
+    /// The NTP client's error, classified (`crate::ntp::is_server_unsynchronized`).
+    pub fn from_ntp(e: &anyhow::Error) -> Self {
+        BootNtpError {
+            message: e.to_string(),
+            server_unsynchronized: crate::ntp::is_server_unsynchronized(e),
+        }
+    }
+}
+
+impl std::fmt::Display for BootNtpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// The loop waits this long for the boot reading; after it the node goes on as if the boot NTP
 /// had failed (the pre-1.19 "NTP Sync failed" path: the authority starts on the current wall, the
@@ -33,6 +66,11 @@ pub(in crate::controller) const BOOT_NTP_WAIT: Duration = Duration::from_secs(60
 
 /// A boot reading kept for a deferred boot step is used up to this old (the wall was not stepped
 /// since: the saved state skipped it); older, the step is measured again on a thread.
+/// dantesync#134 re-review: a follower whose master answers "unsynchronized" asks again this
+/// often, at most [`BOOT_UNSYNC_RETRIES`] times (~1 min).
+pub(in crate::controller) const BOOT_UNSYNC_RETRY: Duration = Duration::from_secs(5);
+pub(in crate::controller) const BOOT_UNSYNC_RETRIES: usize = 12;
+
 pub(in crate::controller) const BOOT_READING_REUSE: Duration = Duration::from_secs(120);
 
 /// The boot reading still on its way.
@@ -78,11 +116,13 @@ where
         let result = match wait.rx.try_recv() {
             Ok(r) => r,
             Err(TryRecvError::Empty) if wait.since.elapsed() < BOOT_NTP_WAIT => return,
-            Err(TryRecvError::Empty) => Err(format!(
+            Err(TryRecvError::Empty) => Err(BootNtpError::other(format!(
                 "no boot NTP reading within {} s",
                 BOOT_NTP_WAIT.as_secs()
-            )),
-            Err(TryRecvError::Disconnected) => Err("the boot NTP thread ended".to_string()),
+            ))),
+            Err(TryRecvError::Disconnected) => {
+                Err(BootNtpError::other("the boot NTP thread ended"))
+            }
         };
         let waited = wait.since.elapsed();
         self.date_sync.restart.boot_ntp = None;

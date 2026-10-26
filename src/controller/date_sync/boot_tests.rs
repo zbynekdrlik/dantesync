@@ -531,3 +531,141 @@ fn an_acquiring_master_feeds_the_fleet_line_its_phase_lock_error_134() {
     // The wall is 1.5 ms ahead of the line and reads UTC exactly: the line is 1.5 ms behind UTC.
     assert_eq!(c.date_sync.master_utc_error_ns, Some(1_500 * 1_000));
 }
+
+#[test]
+fn an_accepted_restore_whose_join_step_fails_stays_unsynchronized_until_it_lands_134() {
+    // Re-review finding 1: the restore is accepted, but the master's own join step onto the fleet
+    // line fails (it retries after the 10 s backoff). Meanwhile its wall is seconds off the line:
+    // its NTP server must keep answering "unsynchronized".
+    let fleet = wall_now_ns() - PL_PTP_NOW_NS;
+    let (_dir, path) = with_saved(saved(fleet, 2));
+    let mut clock = MockSystemClock::new();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c2 = calls.clone();
+    clock.expect_step_clock().times(2).returning(move |_, _| {
+        if c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Err(anyhow::anyhow!("EPERM"))
+        } else {
+            Ok(())
+        }
+    });
+    let (mut c, tx) = booted(clock, true, Some(&path));
+    // The boot reading is in (skipped for the saved state): nothing else is pending.
+    tx.send(Ok(one_offset(RTC_BEHIND_MS * 1_000, 1)))
+        .expect("send");
+    c.service_boot_ntp();
+    first_windows(&mut c, fleet - RTC_BEHIND_MS * MS);
+    let st = status(&c);
+    assert_eq!(st.date_authority, "master");
+    assert!(st.date_offset_restored);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the join failed"
+    );
+    assert!(
+        st.ntp_server_unsynchronized,
+        "its wall is 3.75 s off the line it publishes"
+    );
+    // The backoff ends, the join lands: synchronized.
+    c.date_sync.step_failed_at = Some(Instant::now() - Duration::from_secs(60));
+    window(&mut c, fleet - RTC_BEHIND_MS * MS, false);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(c.date_sync.core.anchor_ns(), Some(fleet));
+    assert!(!status(&c).ntp_server_unsynchronized);
+    // Once placed, a later PTP outage keeps serving (the fallback holds after the first placement).
+    c.ptp_offline = true;
+    c.on_ptp_offline_edge();
+    c.service_date_offset();
+    assert!(!status(&c).ntp_server_unsynchronized);
+}
+
+/// A boot reading refused because the master's NTP server says it is unsynchronized.
+fn unsynchronized() -> BootNtpResult {
+    Err(BootNtpError {
+        message: "Server reply indicates that the server clock is not synchronized".to_string(),
+        server_unsynchronized: true,
+    })
+}
+
+#[test]
+fn a_follower_asks_an_unsynchronized_master_again_a_few_seconds_later_134() {
+    // Re-review finding 3: the master answers LI = 3 while its own wall is not placed. A follower
+    // must not give its boot reading up and start on its raw wall: it asks again shortly.
+    let (mut c, tx) = booted(steps_once(250 * MS), false, None);
+    let spawned: Arc<std::sync::Mutex<Vec<Sender<BootNtpResult>>>> = Arc::default();
+    let s2 = spawned.clone();
+    c.set_boot_ntp_spawner(Box::new(move || {
+        let (t, r) = channel();
+        s2.lock().unwrap().push(t);
+        r
+    }));
+    tx.send(unsynchronized()).expect("send");
+    c.service_boot_ntp();
+    assert!(c.boot_ntp_pending(), "a retry is scheduled");
+    assert!(spawned.lock().unwrap().is_empty(), "not at once");
+    c.date_sync.restart.boot_retry_at = Some(Instant::now() - Duration::from_millis(1));
+    c.service_boot_ntp();
+    assert_eq!(spawned.lock().unwrap().len(), 1, "asked again");
+    spawned.lock().unwrap()[0]
+        .send(Ok(one_offset(250_000, 1)))
+        .expect("send");
+    c.service_boot_ntp();
+    assert!(!c.boot_ntp_pending(), "the boot step ran");
+}
+
+#[test]
+fn the_retries_of_an_unsynchronized_master_are_bounded_and_other_failures_not_retried_134() {
+    let (mut c, tx) = booted(MockSystemClock::new(), false, None);
+    let spawned: Arc<std::sync::Mutex<Vec<Sender<BootNtpResult>>>> = Arc::default();
+    let s2 = spawned.clone();
+    c.set_boot_ntp_spawner(Box::new(move || {
+        let (t, r) = channel();
+        s2.lock().unwrap().push(t);
+        r
+    }));
+    tx.send(unsynchronized()).expect("send");
+    c.service_boot_ntp();
+    for n in 0..super::boot::BOOT_UNSYNC_RETRIES {
+        assert!(c.boot_ntp_pending(), "retry {n} scheduled");
+        c.date_sync.restart.boot_retry_at = Some(Instant::now() - Duration::from_millis(1));
+        c.service_boot_ntp();
+        spawned.lock().unwrap()[n]
+            .send(unsynchronized())
+            .expect("send");
+        c.service_boot_ntp();
+    }
+    assert!(
+        !c.boot_ntp_pending(),
+        "the budget is spent: on its current wall"
+    );
+    assert_eq!(
+        spawned.lock().unwrap().len(),
+        super::boot::BOOT_UNSYNC_RETRIES
+    );
+    // Any other failure is not retried.
+    let (mut c, tx) = booted(MockSystemClock::new(), false, None);
+    c.set_boot_ntp_spawner(Box::new(|| channel().1));
+    tx.send(Err(BootNtpError::other("timeout"))).expect("send");
+    c.service_boot_ntp();
+    assert!(!c.boot_ntp_pending());
+}
+
+#[test]
+fn the_end_of_the_wait_names_a_provisional_rejection_134() {
+    // Re-review finding 4.
+    let plain = restart::restore_wait_expiry_message(None);
+    assert!(plain.contains("no PTP window"), "{plain}");
+    let named = restart::restore_wait_expiry_message(Some("another time base"));
+    assert!(
+        named.contains("provisionally") && named.contains("another time base"),
+        "{named}"
+    );
+    assert!(!named.contains("no PTP window"), "{named}");
+    // The provisional rejection is kept for it.
+    let fleet = wall_now_ns() - PL_PTP_NOW_NS;
+    let (_dir, path) = with_saved(saved(fleet, 2));
+    let (mut c, _tx) = booted(MockSystemClock::new(), true, Some(&path));
+    first_windows(&mut c, fleet + INTERIM_GM_NS);
+    assert!(c.date_sync.restart.provisional_rejection.is_some());
+}

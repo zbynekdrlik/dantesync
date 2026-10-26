@@ -43,7 +43,7 @@ use crate::date_offset::{
 };
 use crate::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 use crate::time_server::NoAuthority;
-pub use boot::{BootNtpResult, BootNtpSpawner};
+pub use boot::{BootNtpError, BootNtpResult, BootNtpSpawner};
 use daily::log_daily_authority;
 
 /// A reply from the date-offset authority older than this is not acted on (the poller asks once

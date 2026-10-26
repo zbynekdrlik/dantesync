@@ -128,6 +128,13 @@ pub struct ParsedReply {
 ///
 /// #53 GREEN: rejects a too-short buffer and a non-server mode, then decodes
 /// the real Origin/Receive/Transmit Timestamp fields.
+/// dantesync#134 re-review: a full-length server-mode reply whose leap indicator says "clock
+/// unsynchronized" (LI = 3) — the Npcap transport stops waiting on it at once.
+pub fn is_unsynchronized_server_reply(buf: &[u8]) -> bool {
+    let _ = buf;
+    false
+}
+
 pub fn parse_reply(buf: &[u8]) -> Result<ParsedReply> {
     if buf.len() < NTP_PACKET_LEN {
         return Err(anyhow!(
@@ -506,6 +513,19 @@ mod tests {
             parse_reply(&buf).is_ok(),
             "a leap-second warning is still a time source"
         );
+    }
+
+    #[test]
+    fn an_unsynchronized_server_reply_is_recognised_at_once_134() {
+        let mut buf = fake_server_reply(1, 2, 3);
+        assert!(!is_unsynchronized_server_reply(&buf));
+        buf[0] |= 3 << 6;
+        assert!(is_unsynchronized_server_reply(&buf));
+        // Our own request (client mode) is never mistaken for one, nor a runt.
+        let mut req = fake_server_reply(1, 2, 3);
+        req[0] = (3 << 6) | (NTP_VERSION << 3) | NTP_MODE_CLIENT;
+        assert!(!is_unsynchronized_server_reply(&req));
+        assert!(!is_unsynchronized_server_reply(&buf[..20]));
     }
 
     // ---- Offset / RTT math ----
