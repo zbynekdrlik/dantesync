@@ -3586,9 +3586,12 @@ mod tests {
         );
 
         // --- unresolvable case ---
+        // `.invalid` never resolves (RFC 6761): `PtpController::new` resolves the allowlist
+        // with the real resolver first, and a name that resolves on the test host (as
+        // `video-clock.lan` does on a rig machine) would be kept as the previous resolution.
         let status2 = Arc::new(RwLock::new(SyncStatus::default()));
         let mut config2 = SystemConfig::default();
-        config2.gm_allowlist = vec!["video-clock.lan".to_string()];
+        config2.gm_allowlist = vec!["gm-clock.invalid".to_string()];
         let mut controller2 = PtpController::new(
             MockSystemClock::new(),
             MockPtpNetwork::new(),
@@ -3604,13 +3607,13 @@ mod tests {
             let s = status2.read().unwrap();
             assert_eq!(
                 s.gm_allowlist_unresolved,
-                vec!["video-clock.lan".to_string()],
+                vec!["gm-clock.invalid".to_string()],
                 "an unresolvable hostname must be published loudly"
             );
             assert!(s.gm_allowlist_resolved.is_empty());
             assert!(s.clock_alarm.active, "an unresolvable GM raises the alarm");
             assert!(
-                s.clock_alarm.reason.contains("video-clock.lan")
+                s.clock_alarm.reason.contains("gm-clock.invalid")
                     && s.clock_alarm.reason.contains("unresolvable"),
                 "the alarm reason must name the unresolvable hostname, got: {}",
                 s.clock_alarm.reason
