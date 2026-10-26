@@ -475,17 +475,18 @@ fn install_git_hooks_round_trip_invokes_purge_target_successfully() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// CLAUDE.md -- the root fix: an explicit Tier-0 Local Build Policy, replacing the contradictory
-// "prioritize local cargo build" guidance.
+// CLAUDE.md -- the build policy is STATED: since 25.10.2026 (dev1 rebuilt with the capacity for
+// local builds) it is the `## Build & CI` section, which names what CI runs and what release.yml
+// publishes, and keeps the purge-target backstop; the Tier-0 "local cargo is blocked" text and the
+// standalone rustc replica net were retired with it.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn claude_md_has_an_explicit_local_build_policy_section() {
+fn claude_md_has_an_explicit_build_and_ci_section() {
     let claude_md = read("CLAUDE.md");
     assert!(
-        claude_md.contains("## Local Build Policy"),
-        "CLAUDE.md must have an explicit ## Local Build Policy section (absent marker = Tier 0, \
-         but it must be STATED, not left implicit)"
+        claude_md.contains("## Build & CI"),
+        "CLAUDE.md must state its build policy in a ## Build & CI section, not leave it implicit"
     );
 }
 
@@ -507,11 +508,11 @@ fn claude_md_no_longer_instructs_a_local_release_build() {
 }
 
 #[test]
-fn claude_md_local_build_policy_names_the_release_workflow_and_cheap_checks() {
+fn claude_md_build_and_ci_names_the_release_workflow_and_the_purge_backstop() {
     let claude_md = read("CLAUDE.md");
     let section_start = claude_md
-        .find("## Local Build Policy")
-        .expect("Local Build Policy section must exist");
+        .find("## Build & CI")
+        .expect("Build & CI section must exist");
     let section = &claude_md[section_start..];
 
     assert!(
@@ -523,25 +524,13 @@ fn claude_md_local_build_policy_names_the_release_workflow_and_cheap_checks() {
             && section.contains("dantesync-windows-amd64.exe"),
         "must name the actual published release assets"
     );
-    // airuleset #557 (2026-08-20): the global Tier-0 hook blocks every COMPILING cargo shape
-    // locally — the policy now names `cargo fmt` as the only runnable cargo check, explicitly
-    // marks check/clippy/test --no-run as BLOCKED (CI runs them), and documents the standalone
-    // `rustc --test` scratch-replica net.
     assert!(
-        section.contains("cargo fmt"),
-        "Local Build Policy must keep `cargo fmt` as the one runnable local cargo check"
+        section.contains("ci.yml"),
+        "must name ci.yml as what runs on every PR"
     );
     assert!(
-        section.contains("BLOCKED locally"),
-        "Local Build Policy must mark compiling cargo shapes as BLOCKED locally (airuleset #557)"
-    );
-    assert!(
-        section.contains("rustc --edition 2021 --test"),
-        "Local Build Policy must document the standalone rustc scratch-replica verification net"
-    );
-    assert!(
-        section.contains("local release build"),
-        "must explicitly say a local release build has no reason to exist -- CI builds the binaries"
+        section.contains("scripts/purge-target.sh"),
+        "must keep the target/ purge backstop (cargo has no target/ GC)"
     );
 }
 

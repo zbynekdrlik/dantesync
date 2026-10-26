@@ -5,7 +5,7 @@
 //! acquisition on two clocks in `tests/two_clock_bench/boot.rs`.
 
 use super::restart_file;
-use super::restart_tests::{restart_config, status, Ctl};
+use super::restart_tests::{ntp_at, restart_config, status, Ctl};
 use super::tests::{authority_reply, one_offset, with_authority, PL_GM, PL_PTP_NOW_NS};
 use super::*;
 use crate::clock::MockSystemClock;
@@ -36,7 +36,17 @@ fn steps_once(delta_ns: i64) -> MockSystemClock {
 /// handed to a channel (nothing measured inline: the NTP source must not be called before the
 /// reading arrives — `MockNtpSource::new()` panics on any call), NTP server mode on a master.
 fn booted(
+    clock: MockSystemClock,
+    master: bool,
+    path: Option<&Path>,
+) -> (Ctl, Sender<BootNtpResult>) {
+    booted_with(clock, MockNtpSource::new(), master, path)
+}
+
+/// [`booted`] with the NTP source the loop's periodic checks read once the boot reading is in.
+fn booted_with(
     mut clock: MockSystemClock,
+    ntp: MockNtpSource,
     master: bool,
     path: Option<&Path>,
 ) -> (Ctl, Sender<BootNtpResult>) {
@@ -44,7 +54,7 @@ fn booted(
     let mut c = PtpController::new(
         clock,
         MockPtpNetwork::new(),
-        MockNtpSource::new(),
+        ntp,
         Arc::new(RwLock::new(SyncStatus::default())),
         restart_config(),
     );
@@ -93,13 +103,15 @@ fn saved(d: i64, seq: u32) -> DateOffsetState {
 }
 
 /// A master with a saved state placed on the fleet line at its FIRST window: restored, one step.
+/// `ntp` serves the loop's periodic checks after the boot reading.
 fn master_placed_at_the_first_window(
     fleet: i64,
+    ntp: MockNtpSource,
 ) -> (Ctl, Sender<BootNtpResult>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("date-offset.json");
     restart_file::write_atomic(&path, &saved(fleet, 2)).expect("written");
-    let (mut c, tx) = booted(steps_once(RTC_BEHIND_MS * MS), true, Some(&path));
+    let (mut c, tx) = booted_with(steps_once(RTC_BEHIND_MS * MS), ntp, true, Some(&path));
     assert!(c.boot_step_deferred(), "the saved state waits for PTP");
     // The first window: not locked (the rate servo has just started), the wall 3.75 s behind.
     window(&mut c, fleet - RTC_BEHIND_MS * MS, false);
@@ -118,7 +130,7 @@ fn master_placed_at_the_first_window(
 #[test]
 fn a_master_with_a_saved_state_places_the_date_at_the_first_window_with_one_step_134() {
     let fleet = wall_now_ns() - PL_PTP_NOW_NS;
-    let (mut c, tx, _dir) = master_placed_at_the_first_window(fleet);
+    let (mut c, tx, _dir) = master_placed_at_the_first_window(fleet, MockNtpSource::new());
     // The acquisition drift (the rate servo has not removed the oscillator error yet): no step.
     window(&mut c, fleet + 300 * 1_000, false);
     window(&mut c, fleet + 900 * 1_000, false);
@@ -202,7 +214,9 @@ fn a_follower_joins_the_fleet_line_at_its_first_window_and_never_steps_again_134
 #[test]
 fn a_grandmaster_lost_before_the_lock_keeps_the_restored_date_and_takes_no_step_134() {
     let fleet = wall_now_ns() - PL_PTP_NOW_NS;
-    let (mut c, tx, _dir) = master_placed_at_the_first_window(fleet);
+    // After the boot reading the master's periodic NTP checks run (daily mode, its own PTP off:
+    // report-only, they feed the authority).
+    let (mut c, tx, _dir) = master_placed_at_the_first_window(fleet, ntp_at(120));
     tx.send(Ok(one_offset(120, 1))).expect("send");
     c.service_boot_ntp();
     // PTP is gone before the rate servo locked.
