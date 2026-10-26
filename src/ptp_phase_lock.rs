@@ -572,10 +572,10 @@ mod tests {
     #[test]
     fn a_boot_acquisition_lands_on_the_early_anchor_without_any_anchor_event_134() {
         // The strih-snv boot of 24.10.2026: a −21 ppm oscillator, the rate servo walking its word
-        // 0 → −19.5 ppm over 40 s (still 7 µs/s off at 30 s), then the lock. Here a +50 ppm box
+        // 0 → −19.5 ppm over 40 s (still 7 µs/s off at 30 s), then the lock. Here a +70 ppm box
         // with the same servo shape, whose drift at the lock is past 1 ms — the case that needs
         // the hold. After the lock: one continuous engagement on the FIRST window's `D`.
-        for (osc, delay) in [(-21.0f64, 1usize), (50.0, 1), (50.0, 2)] {
+        for (osc, delay) in [(-21.0f64, 1usize), (70.0, 1), (70.0, 2)] {
             let mut c = PhaseLockCore::new();
             let mut p = Plant::new(osc, delay, 0.0);
             let acq_windows = 80; // 40 s
@@ -605,7 +605,10 @@ mod tests {
                     events += 1;
                 }
                 p.advance(out.freq_ppm.expect("engaged"), DT);
-                if n >= 360 {
+                // The rate servo hands over 3 % short (2.1 ppm at 70 ppm): the PI learns that
+                // through its integrator (~100 s, critically damped — today's engagement does the
+                // same), so the phase is judged from 400 s after the lock.
+                if n >= 800 {
                     assert!(
                         p.e_ns.abs() < 50_000.0,
                         "osc {osc} delay {delay}: |e| {} ns at {} s after the lock",

@@ -2,22 +2,24 @@
 //! one step per box, and no second step when the phase lock engages ~30-40 s later.
 //!
 //! The NTP master (its saved fleet D restored, its RTC 3.75 s behind: strih-pp 25.10.2026) and a
-//! follower (40 ms off, a +50 ppm oscillator) boot against one grandmaster. Each box's wall ticks
+//! follower (40 ms off, a +70 ppm oscillator) boot against one grandmaster. Each box's wall ticks
 //! at its oscillator plus the word, each window holds 4 PTP samples (`wall_rx − gm_tx` with the
 //! box's path delay and the software-timestamp noise) and the core gets their median, as the
 //! controller does. Before the lock the RATE servo owns the word; it is stood in by the shape
 //! strih-snv logged on 24.10.2026 (the word walking 0 → −19.5 ppm over 40 s toward a −21 ppm
-//! oscillator, still 7 µs/s off at 30 s): `−osc·(1 − e^(−t/20 s))·0.97`. The controller's 2 s
-//! post-step grace drops 4 windows and holds the word.
+//! oscillator, still 7 µs/s off at 30 s): `−osc·(1 − e^(−t/20 s))`, and it LOCKS once that word
+//! is within [`HANDOVER_PPM`] of the oscillator (the real servo locks on |rate| < 5 ppm for 5
+//! windows): 37 s for −21 ppm, as on strih-snv. The controller's 2 s post-step grace drops 4
+//! windows and holds the word.
 //!
 //! Proven:
 //!
 //! 1. Each box steps ONCE, at its first window (the master onto its saved fleet D, the follower
 //!    onto the master's published D), and no window after it re-anchors (no `Realigned`, so no
-//!    second step) — although the +50 ppm follower drifted past `REANCHOR_ON_ENGAGE_NS` before
+//!    second step) — although the +70 ppm follower drifted past `REANCHOR_ON_ENGAGE_NS` before
 //!    its lock (the case the boot hold exists for).
-//! 2. From 2 minutes after its lock each box is within 50 µs of the fleet line, and the two walls
-//!    within 100 µs of each other (their path delays differ by 33 µs) from 3 minutes on.
+//! 2. From 400 s after its lock each box is within 50 µs of the fleet line, and the two walls
+//!    within 100 µs of each other (their path delays differ by 33 µs).
 //! 3. The pull that retires the acquisition drift keeps the applied word within its bound
 //!    (`ERROR_CLAMP_US / FSTEP_PULL_TAU_S` + the PI) and never reads as a frequency step.
 
@@ -27,6 +29,23 @@ use dantesync::ptp_phase_lock::{ERROR_CLAMP_US, FSTEP_PULL_TAU_S, REANCHOR_ON_EN
 /// The fleet line the saved state carries: `wall = gm + FLEET_D`.
 const FLEET_D: i64 = 1_789_000_000 * S;
 const LOCK_AFTER_MIN_S: f64 = 30.0;
+/// The rate servo stand-in locks once its word is this close to the oscillator (ppm).
+const HANDOVER_PPM: f64 = 3.0;
+/// The stand-in's time constant (s).
+const SERVO_TAU_S: f64 = 20.0;
+
+/// The rate servo stand-in's word at window `w`.
+fn servo_word(osc_ppm: f64, w: u64) -> f64 {
+    let t = (w + 1) as f64 * WINDOW_S;
+    -osc_ppm * (1.0 - (-t / SERVO_TAU_S).exp())
+}
+
+/// The window the stand-in locks at.
+fn lock_window(osc_ppm: f64) -> u64 {
+    (0..)
+        .find(|&w| (servo_word(osc_ppm, w) + osc_ppm).abs() < HANDOVER_PPM)
+        .expect("converges")
+}
 
 struct BootBox {
     label: &'static str,
@@ -34,8 +53,6 @@ struct BootBox {
     delay_ns: f64,
     /// The wall's error vs the fleet line at boot (ns).
     boot_off_ns: i64,
-    /// The rate servo's lock, in windows after the first one.
-    lock_window: u64,
     seed: u64,
 }
 
@@ -88,11 +105,11 @@ fn run_boot(b: &BootBox, windows: u64) -> BootRun {
         let median = samples[SAMPLES_PER_WINDOW / 2];
         let dt = (gm.ns - prev_gm) as f64 / 1e9;
         prev_gm = gm.ns;
-        let locked = w >= b.lock_window;
+        let lock_at = lock_window(b.osc_ppm);
+        let locked = w >= lock_at;
         // The rate servo stand-in (it acquires through the grace as well: a rate, not a phase).
-        let t = (w + 1) as f64 * WINDOW_S;
-        let servo = -b.osc_ppm * (1.0 - (-t / 20.0).exp()) * 0.97;
-        if w == b.lock_window {
+        let servo = servo_word(b.osc_ppm, w);
+        if w == lock_at {
             out.drift_at_lock_ns =
                 (wall.ns - gm.ns) as f64 + b.delay_ns - core.anchor_ns().expect("anchored") as f64;
         }
@@ -140,21 +157,19 @@ fn the_fleet_date_lands_at_the_first_window_and_the_lock_takes_no_second_step_13
         osc_ppm: -21.0,
         delay_ns: 25_000.0,
         boot_off_ns: -3_750 * MS,
-        lock_window: 80,
         seed: 1,
     };
     let follower = BootBox {
-        label: "follower (+40 ms, +50 ppm)",
-        osc_ppm: 50.0,
+        label: "follower (+40 ms, +70 ppm)",
+        osc_ppm: 70.0,
         delay_ns: 58_000.0,
         boot_off_ns: 40 * MS,
-        lock_window: 70,
         seed: 2,
     };
     let windows = 15 * 60 * 2;
     let mut runs = Vec::new();
     for b in [&master, &follower] {
-        assert!(lock_s(b.lock_window) >= LOCK_AFTER_MIN_S);
+        assert!(lock_s(lock_window(b.osc_ppm)) >= LOCK_AFTER_MIN_S);
         let r = run_boot(b, windows);
         assert_eq!(r.steps.len(), 1, "{}: one step: {:?}", b.label, r.steps);
         assert_eq!(r.steps[0].0, 0, "{}: at the first window", b.label);
@@ -168,14 +183,16 @@ fn the_fleet_date_lands_at_the_first_window_and_the_lock_takes_no_second_step_13
             "{}: the pull is not a frequency step",
             b.label
         );
-        // From 2 minutes after the lock: on the fleet line.
-        let from = 240usize;
+        // From 400 s after the lock: on the fleet line. (The rate servo hands over up to 3 ppm
+        // short, and the PI learns that through its integrator, ~100 s critically damped,
+        // exactly as at today's engagement.)
+        let from = 800usize;
         let worst = r.line_err_ns[from..]
             .iter()
             .fold(0.0f64, |m, v| m.max(v.abs()));
         assert!(
             worst < 50_000.0,
-            "{}: |line error| up to {worst} ns from 2 min after the lock",
+            "{}: |line error| up to {worst} ns from 400 s after the lock",
             b.label
         );
         let bound = ERROR_CLAMP_US / FSTEP_PULL_TAU_S + 10.0;
@@ -187,16 +204,15 @@ fn the_fleet_date_lands_at_the_first_window_and_the_lock_takes_no_second_step_13
         );
         runs.push(r);
     }
-    // The +50 ppm follower needed the hold: under the pre-1.19 rule its engagement would have
+    // The +70 ppm follower needed the hold: under the pre-1.19 rule its engagement would have
     // re-anchored and re-joined with a second step.
     assert!(
         runs[1].drift_at_lock_ns.abs() > REANCHOR_ON_ENGAGE_NS as f64,
         "the follower's drift at the lock: {} ns",
         runs[1].drift_at_lock_ns
     );
-    // Both walls on one line (their path delays differ by 33 µs) from 3 minutes after the later
-    // lock.
-    let from = (master.lock_window.max(follower.lock_window) + 360) as usize;
+    // Both walls on one line (their path delays differ by 33 µs) from 400 s after the later lock.
+    let from = (lock_window(master.osc_ppm).max(lock_window(follower.osc_ppm)) + 800) as usize;
     let worst = (from..windows as usize)
         .map(|w| (runs[0].wall_minus_gm[w] - runs[1].wall_minus_gm[w]).abs())
         .max()
