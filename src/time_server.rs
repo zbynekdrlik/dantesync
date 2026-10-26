@@ -56,10 +56,12 @@
 use crate::date_offset::{
     decode_extension, encode_extension, DateAnnounce, DateExtension, SlewSpec,
 };
+use crate::ntp_server::RecvErrorAction;
 use crate::status::SyncStatus;
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,18 +94,30 @@ pub const EXT_REQUEST_SIZE: usize = RESPONSE_SIZE;
 const REQUEST_BUF_SIZE: usize = 64;
 const _: () = assert!(REQUEST_BUF_SIZE >= EXT_REQUEST_SIZE);
 
+/// dantesync#136 — how long the server's thread waits for a query before it looks at `running`
+/// again (its shutdown latency). A BLOCKING socket with this read timeout, never a non-blocking
+/// one (that busy-spins a core, #340).
+pub const TIME_SERVER_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// dantesync#136 — the pause after an unexpected receive error (the loop before 1.20 retried at
+/// its next pass), so a socket that keeps failing cannot spin a core.
+const RECV_ERROR_PAUSE: Duration = Duration::from_millis(1);
+
 /// UDP Time Query Server for network time verification.
 ///
 /// Listens on port 31900 and responds to time queries with precise clock data
 /// including system time, monotonic counter, and sync status.
+///
+/// dantesync#136: it answers on a thread of its own ([`TimeServer::spawn`], `time-server`), from
+/// the latest status snapshot — a query never waits for PTP processing or an NTP burst. Before
+/// 1.20 the sync loop answered between its iterations, so every query waited behind them (200 ms
+/// replies missed under load).
 pub struct TimeServer {
     socket: UdpSocket,
 }
 
 impl TimeServer {
     /// Create a new TimeServer bound to UDP port 31900.
-    ///
-    /// The socket is set to non-blocking mode for integration with the main loop.
     pub fn new() -> Result<Self> {
         let server = Self::bind(&format!("0.0.0.0:{}", TIME_SERVER_PORT))?;
 
@@ -116,10 +130,10 @@ impl TimeServer {
     }
 
     /// A time server bound to `addr` (`new` binds `0.0.0.0:31900`; a test binds an ephemeral
-    /// loopback port).
+    /// loopback port). The socket blocks for at most [`TIME_SERVER_READ_TIMEOUT`].
     pub fn bind(addr: &str) -> Result<Self> {
         let socket = UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
+        socket.set_read_timeout(Some(TIME_SERVER_READ_TIMEOUT))?;
         Ok(TimeServer { socket })
     }
 
@@ -128,66 +142,97 @@ impl TimeServer {
         Ok(self.socket.local_addr()?)
     }
 
-    /// Handle pending time query requests.
-    ///
-    /// This is designed to be called from the main sync loop. It processes
-    /// all pending requests without blocking.
-    pub fn handle_requests(&self, status: &Arc<RwLock<SyncStatus>>) {
-        let mut buf = [0u8; REQUEST_BUF_SIZE];
+    /// dantesync#136 — answer on a thread of its own (`time-server`) until `running` clears
+    /// (within [`TIME_SERVER_READ_TIMEOUT`]); the socket closes when the thread ends.
+    pub fn spawn(
+        self,
+        status: Arc<RwLock<SyncStatus>>,
+        running: Arc<AtomicBool>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("time-server".to_string())
+            .spawn(move || self.serve(&status, &running))
+    }
 
-        // Process all pending requests (non-blocking)
-        loop {
+    /// The server's thread: one query at a time, each answered as it arrives.
+    fn serve(&self, status: &RwLock<SyncStatus>, running: &AtomicBool) {
+        let mut buf = [0u8; REQUEST_BUF_SIZE];
+        while running.load(Ordering::SeqCst) {
             match self.socket.recv_from(&mut buf) {
                 Ok((size, src)) => {
-                    if size >= REQUEST_SIZE {
-                        let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        if magic == REQUEST_MAGIC_EXT && size < EXT_REQUEST_SIZE {
-                            // #88: the extended reply is 112 bytes (104 before the #119 slew
-                            // fields); answering a short request would make every spoofed one an
-                            // amplifier.
-                            debug!(
-                                "[TimeServer] Ignoring an unpadded DSYX request ({} bytes) from {}",
-                                size, src
-                            );
-                        } else if magic == REQUEST_MAGIC || magic == REQUEST_MAGIC_EXT {
-                            let request_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-
-                            // Read status (handle poisoned lock gracefully)
-                            let sync_status = match status.read() {
-                                Ok(guard) => guard.clone(),
-                                Err(e) => {
-                                    warn!("[TimeServer] Status lock poisoned: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            let response = if magic == REQUEST_MAGIC_EXT {
-                                build_response_ext(request_id, &sync_status)
-                            } else {
-                                build_response(request_id, &sync_status).to_vec()
-                            };
-                            if let Err(e) = self.socket.send_to(&response, src) {
-                                debug!("[TimeServer] Failed to send response to {}: {}", src, e);
-                            } else {
-                                debug!("[TimeServer] Responded to {}", src);
-                            }
-                        } else {
-                            debug!(
-                                "[TimeServer] Ignoring packet with invalid magic 0x{:08X} from {}",
-                                magic, src
-                            );
-                        }
+                    // One bad query never ends the server (a panic would leave the daemon running
+                    // and answering nobody).
+                    let answered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        self.answer(&buf[..size], src, status)
+                    }));
+                    if answered.is_err() {
+                        error!(
+                            "[TimeServer] answering {} panicked — the server goes on",
+                            src
+                        );
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No more pending requests
-                    break;
-                }
-                Err(e) => {
-                    error!("[TimeServer] Socket error: {}", e);
-                    break;
+                // The NTP server's classification (#68): nothing within the timeout, a bounced
+                // earlier reply (Windows WSAECONNRESET), or something unexpected.
+                Err(e) => match crate::ntp_server::classify_recv_error(e.kind()) {
+                    RecvErrorAction::Idle => {}
+                    RecvErrorAction::Benign => {
+                        debug!("[TimeServer] Ignoring expected UDP condition: {}", e)
+                    }
+                    RecvErrorAction::Backoff => {
+                        error!("[TimeServer] Socket error: {}", e);
+                        std::thread::sleep(RECV_ERROR_PAUSE);
+                    }
+                },
+            }
+        }
+        debug!("[TimeServer] stopped");
+    }
+
+    /// Answer one query (the wire format and the answers as before 1.20).
+    fn answer(&self, request: &[u8], src: SocketAddr, status: &RwLock<SyncStatus>) {
+        if request.len() < REQUEST_SIZE {
+            return;
+        }
+        let magic = u32::from_be_bytes([request[0], request[1], request[2], request[3]]);
+        if magic == REQUEST_MAGIC_EXT && request.len() < EXT_REQUEST_SIZE {
+            // #88: the extended reply is 112 bytes (104 before the #119 slew fields); answering a
+            // short request would make every spoofed one an amplifier.
+            debug!(
+                "[TimeServer] Ignoring an unpadded DSYX request ({} bytes) from {}",
+                request.len(),
+                src
+            );
+            return;
+        }
+        if magic != REQUEST_MAGIC && magic != REQUEST_MAGIC_EXT {
+            debug!(
+                "[TimeServer] Ignoring packet with invalid magic 0x{:08X} from {}",
+                magic, src
+            );
+            return;
+        }
+        let request_id = u32::from_be_bytes([request[4], request[5], request[6], request[7]]);
+
+        // The latest status snapshot, read briefly: the reply is built under the read lock and
+        // the lock is released before the send (never held across I/O).
+        let response = match status.read() {
+            Ok(sync_status) => {
+                if magic == REQUEST_MAGIC_EXT {
+                    build_response_ext(request_id, &sync_status)
+                } else {
+                    build_response(request_id, &sync_status).to_vec()
                 }
             }
+            Err(e) => {
+                warn!("[TimeServer] Status lock poisoned: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = self.socket.send_to(&response, src) {
+            debug!("[TimeServer] Failed to send response to {}: {}", src, e);
+        } else {
+            debug!("[TimeServer] Responded to {}", src);
         }
     }
 }

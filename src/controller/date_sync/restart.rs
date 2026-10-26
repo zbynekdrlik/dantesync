@@ -317,7 +317,7 @@ where
             return false;
         }
         info!("Stepping clock (NTP)...");
-        if let Err(e) = self.clock.step_clock(offset, sign) {
+        if let Err(e) = self.step_wall(offset, sign) {
             error!("Failed to step clock: {}", e);
             return false;
         }

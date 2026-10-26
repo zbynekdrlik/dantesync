@@ -863,6 +863,10 @@ where
     /// dantesync#112 — the PTP re-join schedule, the receive rate and `/status.rejoin`, owned by
     /// `controller/ptp_liveness.rs`.
     ptp_liveness: ptp_liveness::PtpLiveness,
+
+    /// dantesync#136 — the periodic NTP burst off the loop (its runner, the burst in flight, the
+    /// wall steps), owned by `controller/ntp_check.rs`.
+    ntp_burst: ntp_check::NtpBurstState,
 }
 
 struct PendingSync {
@@ -1053,6 +1057,7 @@ where
             phase_slew_preserve_streak: 0,
             date_sync,
             ptp_liveness: ptp_liveness::PtpLiveness::default(),
+            ntp_burst: ntp_check::NtpBurstState::default(),
         }
     }
 
@@ -1208,6 +1213,11 @@ where
         if self.boot_ntp_pending() {
             return;
         }
+        // dantesync#136: a burst on its way (the `ntp-burst` thread) — the check waits for it; the
+        // cadence counts from its request, as it counted from the inline burst.
+        if self.ntp_burst_in_flight() {
+            return;
+        }
         // #71: server mode uses a dedicated, UTC-relevant cadence instead of
         // the PTP-vs-Dante-GM lock-quality signal `calculate_adaptive_ntp_interval`
         // is actually driven by (accumulated_phase_error_us tracks this
@@ -1241,8 +1251,24 @@ where
 
         self.last_ntp_check = Instant::now();
 
-        // Query NTP and record offset
-        match self.ntp.get_offset() {
+        // dantesync#136: with a burst runner (`main`'s `ntp-burst` thread) the burst only starts
+        // here and the loop goes on; `service_ntp_burst` applies its result once it is in.
+        // Without one (a test) it is measured here, inline, as before 1.20.
+        if self.start_ntp_burst() {
+            return;
+        }
+        let result = self.ntp.get_offset();
+        self.apply_ntp_check(result);
+    }
+
+    /// The periodic NTP check's reading, by the check's rules (#50 agreement gate, #68/#71/#76/#83
+    /// server mode, #97 slew, #117/#88 date authority) — whether it was measured inline or on the
+    /// `ntp-burst` thread (dantesync#136).
+    pub(in crate::controller) fn apply_ntp_check(
+        &mut self,
+        result: Result<crate::ntp::NtpMeasurement>,
+    ) {
+        match result {
             Ok(measurement) => {
                 let offset = measurement.offset;
                 let sign = measurement.sign;
@@ -1492,7 +1518,7 @@ where
                     let step_dur = Duration::from_micros(step_us.unsigned_abs());
                     let step_sign = if step_us > 0 { 1 } else { -1 };
 
-                    if let Err(e) = self.clock.step_clock(step_dur, step_sign) {
+                    if let Err(e) = self.step_wall(step_dur, step_sign) {
                         warn!("[NTP] Step failed: {}", e);
                     } else {
                         // Clear NTP samples after step to start fresh measurement

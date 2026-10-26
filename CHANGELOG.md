@@ -5,6 +5,29 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.20.0] - 2026-10-26
+
+### Changed
+
+- **Time queries and the NTP burst no longer wait for the sync loop (issue #136).** Everything ran
+  in one loop: a UDP 31900 time query (`DSYN` / `DSYX`) was answered only when the loop came round,
+  and every 10-30 s the periodic NTP check ran its burst (5 sequential queries) inline — PTP
+  processing and every time query waited behind it, longer under load on the NIC (a box missed the
+  200 ms reply bound 4 times in 10 minutes).
+  - **The time server answers on a thread of its own** (`time-server`), from the latest status
+    snapshot (read briefly, never held across the send), started with the loop and ended with it
+    (within 100 ms of shutdown). Same wire format, same answers (`DSYN` 64 bytes, a padded `DSYX`
+    the base plus the date extension, an unpadded one ignored).
+  - **The periodic NTP burst runs on its own `ntp-burst` thread**; the loop takes the finished
+    result when it is in and applies it with the unchanged rules (the same filters, gates, step
+    logic and `/status` fields; the same cadence, timeouts and burst filter). One burst at a time;
+    a burst that ran across a wall step (a date or boot step) or arrives while the boot reading is
+    pending is not used (the next check measures again); a thread that cannot start a burst counts
+    as a failed check. The controller and the thread share one NTP client (on Windows one Npcap
+    transport).
+  - The sync loop itself moved from `main` into `sync_loop::run`, where it is tested. No `/status`
+    field, wire format, config key or `--version` output changed.
+
 ## [1.19.0] - 2026-10-26
 
 ### Changed

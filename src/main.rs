@@ -76,14 +76,13 @@ use dantesync::net_linux;
 use dantesync::net_pcap;
 use dantesync::{
     clock, config, controller, date_step_trigger, http_status, net, ntp, ntp_server, status,
-    sync_loop, time_server, traits,
+    sync_loop, time_server,
 };
 
 use config::{HttpStatusConfig, NtpServerConfig, SystemConfig};
 use controller::PtpController;
 use serde::{Deserialize, Serialize};
 use status::SyncStatus;
-use traits::NtpSource;
 
 /// Simplified configuration - only NTP server needs to be managed
 /// All other parameters auto-adjust based on platform defaults
@@ -312,16 +311,6 @@ fn spawn_boot_ntp(
         warn!("[NTP] could not start the boot-ntp thread: {}", e);
     }
     rx
-}
-
-struct RealNtpSource {
-    client: ntp::NtpClient,
-}
-
-impl NtpSource for RealNtpSource {
-    fn get_offset(&self) -> Result<ntp::NtpMeasurement> {
-        self.client.get_offset()
-    }
 }
 
 // Windows uses Npcap for precise packet timestamps with HostHighPrec mode
@@ -632,7 +621,8 @@ fn run_sync_loop(
         info!("[HTTP-Status] Disabled by config");
     }
 
-    // Start UDP Time Query Server for network time verification
+    // UDP Time Query Server for network time verification: bound here, it answers on a thread of
+    // its own once the sync loop starts (dantesync#136, `sync_loop::run`).
     let time_server = match time_server::TimeServer::new() {
         Ok(ts) => Some(ts),
         Err(e) => {
@@ -727,13 +717,30 @@ fn run_sync_loop(
     // dantesync#52: capture the DSCP config before `system_config` is moved into
     // the controller below, so both the client and the server socket can be marked.
     let dscp_config = system_config.dscp.clone();
-    let ntp_source = RealNtpSource {
-        client: ntp::NtpClient::new(ntp_server, &dscp_config),
-    };
+    // dantesync#136: ONE client (on Windows one Npcap transport) for the controller and its
+    // `ntp-burst` thread, which measures the periodic burst off the loop.
+    let ntp_client = Arc::new(ntp::NtpClient::new(ntp_server, &dscp_config));
 
-    let mut controller =
-        PtpController::new(sys_clock, network, ntp_source, status_shared, system_config);
+    let mut controller = PtpController::new(
+        sys_clock,
+        network,
+        ntp_client.clone(),
+        status_shared,
+        system_config,
+    );
     controller.set_date_step_requests(date_step_rx);
+    let burst_client = ntp_client.clone();
+    match dantesync::ntp_burst::NtpBurstThread::spawn(
+        move || burst_client.get_offset(),
+        running.clone(),
+    ) {
+        Ok(burst) => controller.set_ntp_burst_runner(Box::new(burst)),
+        Err(e) => warn!(
+            "[NTP] could not start the ntp-burst thread: {} — the periodic NTP burst runs in the \
+             sync loop (as before 1.20)",
+            e
+        ),
+    }
 
     // dantesync#126: the NTP master's saved fleet date offset skips the boot step below (restored
     // at the first PTP window); any other node removes a leftover one.

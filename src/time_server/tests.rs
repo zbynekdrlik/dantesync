@@ -574,6 +574,61 @@ fn the_server_answers_dsyn_with_64_bytes_and_dsyx_with_the_extension_over_real_u
     sync_loop.join().unwrap();
 }
 
+/// dantesync#136 — the server's own thread ignores what it always ignored (a runt, a foreign
+/// magic, a query while the status lock is poisoned) and answers the next query.
+#[test]
+fn the_server_thread_ignores_junk_and_answers_the_next_query_136() {
+    let server = TimeServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let status = Arc::new(RwLock::new(master_status()));
+    let running = Arc::new(AtomicBool::new(true));
+    let thread = server
+        .spawn(status.clone(), running.clone())
+        .expect("the time-server thread");
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut buf = [0u8; 256];
+
+    client.send_to(b"DSY", addr).unwrap(); // a runt
+    let mut foreign = [0u8; 8];
+    foreign[0..4].copy_from_slice(b"NTPX");
+    client.send_to(&foreign, addr).unwrap(); // a foreign magic
+    let mut req = [0u8; 8];
+    req[0..4].copy_from_slice(b"DSYN");
+    req[4..8].copy_from_slice(&11u32.to_be_bytes());
+    client.send_to(&req, addr).unwrap();
+    let n = reply_within_5s(&client, &mut buf);
+    assert_eq!(n, RESPONSE_SIZE);
+    assert_eq!(
+        u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        11,
+        "the first reply is the DSYN's: the junk before it got none"
+    );
+
+    // A writer that panicked poisons the status: no answer from a status that may be half
+    // written (as before 1.20), and the server goes on.
+    let poisoner = status.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.write().unwrap();
+        panic!("a writer panics while holding the status (test)");
+    })
+    .join();
+    assert!(status.is_poisoned());
+    req[4..8].copy_from_slice(&12u32.to_be_bytes());
+    client.send_to(&req, addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    assert!(
+        client.recv_from(&mut buf).is_err(),
+        "a poisoned status is not answered"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    thread
+        .join()
+        .expect("the time-server thread ends without a panic");
+}
+
 #[test]
 fn test_build_response_phase_clamp() {
     let mut status = SyncStatus::default();

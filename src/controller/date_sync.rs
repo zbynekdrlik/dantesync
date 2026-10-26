@@ -931,7 +931,7 @@ where
         let label = step_kind_label(kind, micro);
         let dur = Duration::from_nanos(delta_ns.unsigned_abs());
         let sign: i8 = if delta_ns > 0 { 1 } else { -1 };
-        if let Err(e) = self.clock.step_clock(dur, sign) {
+        if let Err(e) = self.step_wall(dur, sign) {
             // D is NOT moved and the fleet D is untouched. A follower re-joins after the backoff; the
             // master publishes the fleet D regardless (still feeding the fleet line's UTC error)
             // and steps its own wall to it after the backoff (`realign_master_to_fleet`).

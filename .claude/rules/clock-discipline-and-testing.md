@@ -7,6 +7,9 @@ paths:
   - "src/ptp_phase_lock.rs"
   - "src/date_offset.rs"
   - "src/time_server.rs"
+  - "src/sync_loop.rs"
+  - "src/ntp_burst.rs"
+  - "src/controller/ntp_check.rs"
   - "src/controller/date_sync.rs"
   - "src/controller/date_sync/tests.rs"
   - "src/date_offset/tests.rs"
@@ -1189,3 +1192,25 @@ What was learned:
   before the lock, the late reading report-only, the periodic check waiting), the two-clock bench
   `boot.rs` (−21 / +70 ppm boxes, one step each, both on the line). Negative control:
   `BOOT_HOLD_NS = 0` fails the bench, the acquisition test and two controller tests.
+
+## dantesync#136 — the time server and the NTP burst off the sync loop (v1.20)
+
+A DSYX query was answered only when the loop came round, and the periodic NTP burst ran inline:
+every query waited behind PTP processing and the burst (200 ms replies missed under load). Now the
+time server answers on its `time-server` thread (`sync_loop::run` starts and joins it) and the
+burst runs on the `ntp-burst` thread (`ntp_burst::NtpBurstThread`, `controller/ntp_check.rs`).
+
+- **The 31900 reply is built from whatever `/status` holds at that instant**, from another thread.
+  A reply can land between a wall step and the status update that follows it (µs): its
+  `now_ptp_ns` is then off by that step, inside `same_time_base`'s 1 s tolerance. Keep publishing
+  everything a reply combines (D, the pending step, the slew) in ONE status write.
+- **A burst result is applied by the check's unchanged rules** (`apply_ntp_check`), only later.
+  What the inline burst never met: a wall step while it ran (every step goes through `step_wall`,
+  which counts them; a straddling burst is dropped) and a boot reading measured again meanwhile
+  (the boot reading wins). One burst at a time; the cadence counts from its request.
+- **Without a runner the check still measures inline** (the unit tests' controllers; the pinned
+  equivalence test runs both paths side by side). `main` always wires the thread.
+- Tests: `sync_loop/tests.rs` (a DSYX answered while an iteration is held 2 s — red on 1.19; the
+  port freed on shutdown), `controller/ntp_check/tests.rs` (the loop's longest pause < 300 ms
+  while a ~1 s burst runs against `ntp_burst::test_support::SlowNtpUpstream`, a real
+  `NtpServer` behind a delaying relay — red on 1.19 at 1.0 s), `ntp_burst/tests.rs`.
