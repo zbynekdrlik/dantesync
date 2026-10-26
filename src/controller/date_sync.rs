@@ -43,6 +43,7 @@ use crate::date_offset::{
 };
 use crate::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 use crate::time_server::NoAuthority;
+pub use boot::BootNtpResult;
 use daily::log_daily_authority;
 
 /// A reply from the date-offset authority older than this is not acted on (the poller asks once
@@ -970,6 +971,7 @@ where
     }
 }
 
+mod boot;
 mod daily;
 mod follow;
 mod freq_step;
@@ -981,6 +983,8 @@ mod restart_file;
 mod slew;
 mod trigger;
 
+#[cfg(test)]
+mod boot_tests;
 #[cfg(test)]
 mod daily_tests;
 #[cfg(test)]
