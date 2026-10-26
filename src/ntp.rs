@@ -337,6 +337,14 @@ impl NtpClient {
     }
 }
 
+/// dantesync#136 — `main` hands the controller the same client the `ntp-burst` thread measures
+/// with (one client: one Windows Npcap transport). The inherent `get_offset` above.
+impl crate::traits::NtpSource for NtpClient {
+    fn get_offset(&self) -> Result<NtpMeasurement> {
+        NtpClient::get_offset(self)
+    }
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================

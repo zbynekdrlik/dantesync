@@ -43,6 +43,10 @@ mod ptp_liveness;
 mod ptp_sender;
 use ptp_sender::{describe_grandmaster, PtpSender};
 
+/// dantesync#136 — the periodic NTP check with its burst off the sync loop (`main`'s `ntp-burst`
+/// thread). A child module like `date_sync`.
+mod ntp_check;
+
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -2062,6 +2066,8 @@ where
         // step lands within one loop period of the announced instant on every box.
         // dantesync#134: the boot NTP reading, measured off the loop, applied once it arrives.
         self.service_boot_ntp();
+        // dantesync#136: the periodic NTP burst, measured on its own thread, applied once it is in.
+        self.service_ntp_burst();
         self.service_date_offset();
         // dantesync#126: answer every `POST /date/step` the HTTP route queued (every node answers;
         // only the NTP master can announce the step).

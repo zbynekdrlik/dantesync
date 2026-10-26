@@ -76,7 +76,7 @@ use dantesync::net_linux;
 use dantesync::net_pcap;
 use dantesync::{
     clock, config, controller, date_step_trigger, http_status, net, ntp, ntp_server, status,
-    time_server, traits,
+    sync_loop, time_server, traits,
 };
 
 use config::{HttpStatusConfig, NtpServerConfig, SystemConfig};
@@ -830,8 +830,10 @@ fn run_sync_loop(
     }
 
     let mut last_log = Instant::now();
+    let loop_status = controller.get_status_shared();
 
-    while running.load(Ordering::SeqCst) {
+    // dantesync#136: the loop itself lives in the library (`sync_loop::run`), where it is tested.
+    sync_loop::run(time_server, loop_status, running.clone(), || {
         if last_log.elapsed() >= Duration::from_secs(10) {
             controller.tick_status();
 
@@ -871,23 +873,7 @@ fn run_sync_loop(
         if let Err(e) = controller.process_loop_iteration() {
             warn!("Error in loop: {}", e);
         }
-
-        // Handle UDP time query requests (for network time verification)
-        if let Some(ref ts) = time_server {
-            ts.handle_requests(&controller.get_status_shared());
-        }
-
-        // Platform-specific polling intervals:
-        // - Windows: 50µs tight polling for lower jitter with software timestamps.
-        //   This achieves ~5% CPU usage while maintaining <50µs precision.
-        //   Tested across Intel/AMD systems; tighter values increase CPU without benefit.
-        // - Linux: 1ms is sufficient since we use kernel SO_TIMESTAMPNS which provides
-        //   accurate timestamps regardless of polling frequency.
-        #[cfg(windows)]
-        thread::sleep(Duration::from_micros(50));
-        #[cfg(not(windows))]
-        thread::sleep(Duration::from_millis(1));
-    }
+    });
 
     info!("Sync Loop Exiting.");
     #[cfg(unix)]

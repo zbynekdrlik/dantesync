@@ -105,16 +105,27 @@ impl TimeServer {
     ///
     /// The socket is set to non-blocking mode for integration with the main loop.
     pub fn new() -> Result<Self> {
-        let bind_addr = format!("0.0.0.0:{}", TIME_SERVER_PORT);
-        let socket = UdpSocket::bind(&bind_addr)?;
-        socket.set_nonblocking(true)?;
+        let server = Self::bind(&format!("0.0.0.0:{}", TIME_SERVER_PORT))?;
 
         info!(
             "[TimeServer] Listening on UDP port {} for time queries",
             TIME_SERVER_PORT
         );
 
+        Ok(server)
+    }
+
+    /// A time server bound to `addr` (`new` binds `0.0.0.0:31900`; a test binds an ephemeral
+    /// loopback port).
+    pub fn bind(addr: &str) -> Result<Self> {
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
         Ok(TimeServer { socket })
+    }
+
+    /// The address this server is bound to.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        Ok(self.socket.local_addr()?)
     }
 
     /// Handle pending time query requests.

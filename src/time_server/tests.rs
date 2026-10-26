@@ -511,43 +511,38 @@ fn parse_reply_reads_gm_lock_and_extension_and_rejects_strangers_88() {
     );
 }
 
-/// Run the server's non-blocking dispatch until the client has its reply (bounded: 5 s).
-fn serve_until_reply(
-    server: &TimeServer,
-    status: &Arc<RwLock<SyncStatus>>,
-    client: &UdpSocket,
-    buf: &mut [u8],
-) -> usize {
-    for _ in 0..250 {
-        server.handle_requests(status);
-        if let Ok((n, _)) = client.recv_from(buf) {
-            return n;
-        }
+/// The client's wait for one reply (bounded: 5 s).
+fn reply_within_5s(client: &UdpSocket, buf: &mut [u8]) -> usize {
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    match client.recv_from(buf) {
+        Ok((n, _)) => n,
+        Err(e) => panic!("no reply from the time server within 5 s: {e}"),
     }
-    panic!("no reply from the time server within 5 s");
 }
 
 #[test]
 fn the_server_answers_dsyn_with_64_bytes_and_dsyx_with_the_extension_over_real_udp_88() {
-    // End-to-end over loopback through the real `handle_requests` dispatch. Bind the server
-    // on an ephemeral port (not 31900, which a running daemon may hold).
-    let server = TimeServer {
-        socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
-    };
-    server.socket.set_nonblocking(true).unwrap();
-    let addr = server.socket.local_addr().unwrap();
+    // End-to-end over loopback, served the way the daemon serves it (`crate::sync_loop::run`,
+    // dantesync#136). Bind the server on an ephemeral port (not 31900, which a running daemon may
+    // hold).
+    let server = TimeServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
     let status = Arc::new(RwLock::new(master_status()));
+    let running = Arc::new(AtomicBool::new(true));
+    let loop_running = running.clone();
+    let sync_loop = std::thread::spawn(move || {
+        crate::sync_loop::run(Some(server), status, loop_running, || {})
+    });
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_millis(20)))
-        .unwrap();
 
     let mut old_req = [0u8; 8];
     old_req[0..4].copy_from_slice(b"DSYN");
     old_req[4..8].copy_from_slice(&5u32.to_be_bytes());
     client.send_to(&old_req, addr).unwrap();
     let mut buf = [0u8; 256];
-    let n = serve_until_reply(&server, &status, &client, &mut buf);
+    let n = reply_within_5s(&client, &mut buf);
     assert_eq!(
         n, RESPONSE_SIZE,
         "an old DSYN request gets exactly 64 bytes"
@@ -558,22 +553,25 @@ fn the_server_answers_dsyn_with_64_bytes_and_dsyx_with_the_extension_over_real_u
     short[0..4].copy_from_slice(b"DSYX");
     short[4..8].copy_from_slice(&7u32.to_be_bytes());
     client.send_to(&short, addr).unwrap();
-    for _ in 0..25 {
-        server.handle_requests(&status);
-        assert!(
-            client.recv_from(&mut buf).is_err(),
-            "an unpadded DSYX request got a reply"
-        );
-    }
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    assert!(
+        client.recv_from(&mut buf).is_err(),
+        "an unpadded DSYX request got a reply"
+    );
 
     client.send_to(&build_ext_request(6), addr).unwrap();
-    let n = serve_until_reply(&server, &status, &client, &mut buf);
+    let n = reply_within_5s(&client, &mut buf);
     assert_eq!(n, RESPONSE_SIZE + crate::date_offset::EXT_SIZE_V2);
     let parsed = parse_reply(&buf[..n], 6, Instant::now(), 0).unwrap();
     assert_eq!(
         parsed.ext.unwrap().announce.date_offset_ns,
         1_790_000_000_000_000_000
     );
+
+    running.store(false, Ordering::SeqCst);
+    sync_loop.join().unwrap();
 }
 
 #[test]
