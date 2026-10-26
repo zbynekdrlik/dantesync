@@ -10,9 +10,9 @@
 use crate::status::SyncStatus;
 use crate::time_server::TimeServer;
 use log::{error, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The loop's poll interval:
 /// - Windows: 50µs tight polling for lower jitter with software timestamps.
@@ -25,6 +25,56 @@ pub const POLL_INTERVAL: Duration = Duration::from_micros(50);
 #[cfg(not(windows))]
 pub const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+/// dantesync#136 review — when the sync loop last completed an iteration (monotonic: this daemon
+/// steps its own wall clock). The time server answers only while it is recent
+/// ([`crate::time_server::STATUS_STALE_AFTER`]): the status snapshot it answers from is the loop's.
+#[derive(Debug)]
+pub struct LoopHeartbeat {
+    origin: Instant,
+    /// The last beat, µs after `origin`.
+    last_us: AtomicU64,
+}
+
+impl LoopHeartbeat {
+    /// A heartbeat that beat just now.
+    pub fn new() -> Self {
+        LoopHeartbeat {
+            origin: Instant::now(),
+            last_us: AtomicU64::new(0),
+        }
+    }
+
+    /// A heartbeat whose last beat was `ago` (a test's stale loop).
+    #[cfg(test)]
+    pub(crate) fn last_beat_ago(ago: Duration) -> Self {
+        LoopHeartbeat {
+            origin: Instant::now()
+                .checked_sub(ago)
+                .expect("the monotonic clock reaches that far back"),
+            last_us: AtomicU64::new(0),
+        }
+    }
+
+    /// The loop completed an iteration.
+    pub fn beat(&self) {
+        let now_us = self.origin.elapsed().as_micros() as u64;
+        self.last_us.store(now_us, Ordering::Relaxed);
+    }
+
+    /// How long since the last beat.
+    pub fn age(&self) -> Duration {
+        self.origin
+            .elapsed()
+            .saturating_sub(Duration::from_micros(self.last_us.load(Ordering::Relaxed)))
+    }
+}
+
+impl Default for LoopHeartbeat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Run the sync loop until `running` clears. `time_server` (the UDP 31900 time queries) answers
 /// from `status` on its own thread, started here (after `main` raised the process to real-time
 /// priority, which the thread inherits like the loop) and ended with the loop (within
@@ -35,16 +85,18 @@ pub fn run<F: FnMut()>(
     running: Arc<AtomicBool>,
     mut iterate: F,
 ) {
-    let server_thread = time_server.and_then(|ts| match ts.spawn(status, running.clone()) {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            warn!(
-                "[TimeServer] Could not start its thread: {} (continuing without it)",
-                e
-            );
-            None
-        }
-    });
+    let heartbeat = Arc::new(LoopHeartbeat::new());
+    let server_thread =
+        time_server.and_then(|ts| match ts.spawn(status, heartbeat, running.clone()) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(
+                    "[TimeServer] Could not start its thread: {} (continuing without it)",
+                    e
+                );
+                None
+            }
+        });
 
     while running.load(Ordering::SeqCst) {
         iterate();

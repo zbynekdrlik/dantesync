@@ -58,6 +58,7 @@ use crate::date_offset::{
 };
 use crate::ntp_server::RecvErrorAction;
 use crate::status::SyncStatus;
+use crate::sync_loop::LoopHeartbeat;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -103,6 +104,10 @@ pub const TIME_SERVER_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// its next pass), so a socket that keeps failing cannot spin a core.
 const RECV_ERROR_PAUSE: Duration = Duration::from_millis(1);
 
+/// dantesync#136 review — the time server answers only while the sync loop has completed an
+/// iteration within this ([`crate::sync_loop::LoopHeartbeat`]).
+pub const STATUS_STALE_AFTER: Duration = Duration::from_secs(3);
+
 /// UDP Time Query Server for network time verification.
 ///
 /// Listens on port 31900 and responds to time queries with precise clock data
@@ -147,6 +152,7 @@ impl TimeServer {
     pub fn spawn(
         self,
         status: Arc<RwLock<SyncStatus>>,
+        _heartbeat: Arc<LoopHeartbeat>,
         running: Arc<AtomicBool>,
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()

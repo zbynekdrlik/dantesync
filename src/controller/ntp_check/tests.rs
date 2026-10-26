@@ -282,6 +282,87 @@ fn a_burst_that_arrives_while_the_boot_reading_is_pending_gives_way_to_it_136() 
     assert_eq!(status.read().unwrap().ntp_offset_us, 3_000);
 }
 
+fn failed_burst() -> anyhow::Result<NtpMeasurement> {
+    Err(anyhow::anyhow!("NTP burst: no server response"))
+}
+
+/// Review of PR 137: a FAILED burst has no samples to straddle a step — it counts, as 1.19's
+/// inline one did. A timed-out burst lasts ~15 s; with an upstream that silently drops packets
+/// while date micro-steps keep landing, dropping the failures would hold `ntp_failed` back (and
+/// leave `pcap_ntp_active` set).
+#[test]
+fn a_failed_burst_that_ran_across_a_wall_step_still_counts_as_a_failure_136() {
+    let mut clock = MockSystemClock::new();
+    clock
+        .expect_step_clock()
+        .with(eq(Duration::from_secs(2)), eq(1))
+        .times(3)
+        .returning(|_, _| Ok(()));
+    let mut never = MockNtpSource::new();
+    never.expect_get_offset().times(0);
+    let (mut c, status) = new_controller(clock, MockPtpNetwork::new(), never);
+    let runner = ScriptedRunner::default();
+    c.set_ntp_burst_runner(Box::new(runner.clone()));
+    c.ptp_offline = true;
+    status.write().unwrap().pcap_ntp_active = true;
+
+    for i in 0..3u32 {
+        c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+        c.check_ntp_utc_tracking();
+        assert_eq!(runner.starts(), i + 1, "check {i} started its burst");
+        // The wall is stepped while the burst runs, and the burst fails.
+        assert!(c.step_boot_offset(Duration::from_secs(2), 1));
+        runner.deliver(failed_burst());
+        c.service_ntp_burst();
+        assert_eq!(
+            c.ntp_consecutive_failures,
+            i as usize + 1,
+            "failed burst {i} across a wall step counts as a failed check"
+        );
+        assert!(
+            !status.read().unwrap().pcap_ntp_active,
+            "failed burst {i}: no transport measured anything"
+        );
+    }
+    assert!(
+        status.read().unwrap().ntp_failed,
+        "three failed bursts raise ntp_failed, steps or not"
+    );
+}
+
+/// Review of PR 137: the boot reading comes first for a MEASUREMENT; a failed burst is not one
+/// and counts.
+#[test]
+fn a_failed_burst_counts_while_the_boot_reading_is_pending_136() {
+    let mut never = MockNtpSource::new();
+    never.expect_get_offset().times(0);
+    let (mut c, status) = new_controller(MockSystemClock::new(), MockPtpNetwork::new(), never);
+    let runner = ScriptedRunner::default();
+    c.set_ntp_burst_runner(Box::new(runner.clone()));
+    c.ptp_offline = true;
+    status.write().unwrap().pcap_ntp_active = true;
+
+    c.last_ntp_check = Instant::now() - Duration::from_secs(60);
+    c.check_ntp_utc_tracking();
+    assert_eq!(runner.starts(), 1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.start_boot_ntp(rx);
+
+    runner.deliver(failed_burst());
+    c.service_ntp_burst();
+    assert_eq!(
+        c.ntp_consecutive_failures, 1,
+        "the failed burst counts although the boot reading is pending"
+    );
+    assert!(!status.read().unwrap().pcap_ntp_active);
+
+    // The boot reading still comes first and is applied as always.
+    tx.send(Ok(reading(3_000, 1))).unwrap();
+    c.service_boot_ntp();
+    assert_eq!(status.read().unwrap().ntp_offset_us, 3_000);
+    assert_eq!(c.ntp_consecutive_failures, 0);
+}
+
 #[test]
 fn a_runner_that_cannot_start_a_burst_counts_as_a_failed_check_136() {
     let mut never = MockNtpSource::new();

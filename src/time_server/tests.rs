@@ -583,7 +583,11 @@ fn the_server_thread_ignores_junk_and_answers_the_next_query_136() {
     let status = Arc::new(RwLock::new(master_status()));
     let running = Arc::new(AtomicBool::new(true));
     let thread = server
-        .spawn(status.clone(), running.clone())
+        .spawn(
+            status.clone(),
+            Arc::new(LoopHeartbeat::new()),
+            running.clone(),
+        )
         .expect("the time-server thread");
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut buf = [0u8; 256];
@@ -622,6 +626,52 @@ fn the_server_thread_ignores_junk_and_answers_the_next_query_136() {
         client.recv_from(&mut buf).is_err(),
         "a poisoned status is not answered"
     );
+
+    running.store(false, Ordering::SeqCst);
+    thread
+        .join()
+        .expect("the time-server thread ends without a panic");
+}
+
+/// Review of PR 137: the server answers from the sync loop's status snapshot, so not while the
+/// loop has not completed an iteration for longer than `STATUS_STALE_AFTER` (dead or wedged: the
+/// snapshot no longer describes the clock) — and again once it has.
+#[test]
+fn the_server_does_not_answer_from_a_stale_status_and_answers_again_once_it_is_fresh_136() {
+    let server = TimeServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let status = Arc::new(RwLock::new(master_status()));
+    let running = Arc::new(AtomicBool::new(true));
+    let stale_for = STATUS_STALE_AFTER + Duration::from_secs(7);
+    let heartbeat = Arc::new(LoopHeartbeat::last_beat_ago(stale_for));
+    let thread = server
+        .spawn(status, heartbeat.clone(), running.clone())
+        .expect("the time-server thread");
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut buf = [0u8; 256];
+
+    client.send_to(&build_ext_request(21), addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let stale = client.recv_from(&mut buf).map(|(n, _)| n);
+    if stale.is_ok() {
+        running.store(false, Ordering::SeqCst); // test hygiene: end the server
+    }
+    assert!(
+        stale.is_err(),
+        "the time server answered from a status the sync loop last wrote {:?} ago (bound {:?})",
+        stale_for,
+        STATUS_STALE_AFTER
+    );
+
+    // The loop runs again: the next query is answered (and the stale one never was).
+    heartbeat.beat();
+    client.send_to(&build_ext_request(22), addr).unwrap();
+    let n = reply_within_5s(&client, &mut buf);
+    let parsed = parse_reply(&buf[..n], 22, Instant::now(), 0)
+        .expect("the reply is the fresh query's (the stale one got none)");
+    assert!(parsed.ext.is_some());
 
     running.store(false, Ordering::SeqCst);
     thread
