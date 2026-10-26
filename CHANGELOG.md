@@ -18,12 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     snapshot (read briefly, never held across the send), started with the loop and ended with it
     (within 100 ms of shutdown). Same wire format, same answers (`DSYN` 64 bytes, a padded `DSYX`
     the base plus the date extension, an unpadded one ignored).
+  - **It answers only while the sync loop runs**, as when the loop answered itself: it stops with
+    the loop however the loop ends (a panicking iteration too — on Windows the process stays up),
+    and it does not answer while the loop has not completed an iteration for 3 s (a wedged loop:
+    the snapshot no longer describes the clock), logging each stale ↔ fresh change once.
   - **The periodic NTP burst runs on its own `ntp-burst` thread**; the loop takes the finished
     result when it is in and applies it with the unchanged rules (the same filters, gates, step
     logic and `/status` fields; the same cadence, timeouts and burst filter). One burst at a time;
-    a burst that ran across a wall step (a date or boot step) or arrives while the boot reading is
-    pending is not used (the next check measures again); a thread that cannot start a burst counts
-    as a failed check. The controller and the thread share one NTP client (on Windows one Npcap
+    a measurement that ran across a wall step (a date or boot step) or arrives while the boot
+    reading is pending is not used (the next check measures again); a failed burst always counts
+    as a failed check (`ntp_failed` after three, `pcap_ntp_active` cleared), as the inline one did;
+    a thread that cannot start a burst counts as a failed check. The controller and the thread share one NTP client (on Windows one Npcap
     transport).
   - The sync loop itself moved from `main` into `sync_loop::run`, where it is tested. No `/status`
     field, wire format, config key or `--version` output changed.

@@ -1204,13 +1204,29 @@ burst runs on the `ntp-burst` thread (`ntp_burst::NtpBurstThread`, `controller/n
   A reply can land between a wall step and the status update that follows it (µs): its
   `now_ptp_ns` is then off by that step, inside `same_time_base`'s 1 s tolerance. Keep publishing
   everything a reply combines (D, the pending step, the slew) in ONE status write.
+- **The time server answers only while the loop runs** (review of PR 137). In 1.19 a dead loop
+  answered nobody — followers and camera-box's 200 ms gate read that as an outage; a server thread
+  left behind would answer locked/settled/authority from the last snapshot while the clock
+  free-runs. So `run` holds the thread in a `ServerGuard` (stopped and joined when `run` returns OR
+  unwinds: on Windows the loop runs on the service's thread, a panic there leaves the process up),
+  and the server answers only while the loop's `LoopHeartbeat` (beaten after every iteration,
+  monotonic) is within `STATUS_STALE_AFTER` = 3 s, logging stale ↔ fresh once per transition. NOT
+  `/status.updated_ts`: it is wall-clock seconds (every date step moves it) and written ~1/s only
+  while PTP flows, every 10 s otherwise (an NTP-only node would go silent between ticks).
 - **A burst result is applied by the check's unchanged rules** (`apply_ntp_check`), only later.
   What the inline burst never met: a wall step while it ran (every step goes through `step_wall`,
-  which counts them; a straddling burst is dropped) and a boot reading measured again meanwhile
-  (the boot reading wins). One burst at a time; the cadence counts from its request.
+  which counts them; a straddling measurement is dropped) and a boot reading measured again
+  meanwhile (the boot reading wins). Both rules drop MEASUREMENTS only: a failed burst has no
+  samples and always counts (review of PR 137 — a timed-out burst lasts ~15 s; dropping it across
+  a date micro-step held `ntp_failed` back and left `pcap_ntp_active` set). One burst at a time;
+  the cadence counts from its request.
 - **Without a runner the check still measures inline** (the unit tests' controllers; the pinned
   equivalence test runs both paths side by side). `main` always wires the thread.
 - Tests: `sync_loop/tests.rs` (a DSYX answered while an iteration is held 2 s — red on 1.19; the
-  port freed on shutdown), `controller/ntp_check/tests.rs` (the loop's longest pause < 300 ms
-  while a ~1 s burst runs against `ntp_burst::test_support::SlowNtpUpstream`, a real
-  `NtpServer` behind a delaying relay — red on 1.19 at 1.0 s), `ntp_burst/tests.rs`.
+  port freed on shutdown; a panicking iteration takes the server with it; an iteration held past
+  `STATUS_STALE_AFTER` gets no reply, then one again), `time_server/tests.rs` (a backdated
+  heartbeat: no reply, then a reply after a beat; the transition gate),
+  `controller/ntp_check/tests.rs` (the loop's longest pause < 300 ms while a ~1 s burst runs
+  against `ntp_burst::test_support::SlowNtpUpstream`, a real `NtpServer` behind a delaying relay
+  — red on 1.19 at 1.0 s; failed bursts across a step / beside a pending boot reading count),
+  `ntp_burst/tests.rs`.

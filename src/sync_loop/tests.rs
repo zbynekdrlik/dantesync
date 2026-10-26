@@ -250,3 +250,12 @@ fn a_wedged_sync_loop_s_time_server_waits_until_the_loop_runs_again_136() {
     );
     assert_eq!(fresh, Some(3), "answered again once the loop runs");
 }
+
+#[test]
+fn the_heartbeat_s_age_counts_from_its_last_beat_136() {
+    assert!(LoopHeartbeat::new().age() < Duration::from_secs(1));
+    let heartbeat = LoopHeartbeat::last_beat_ago(Duration::from_secs(10));
+    assert!(heartbeat.age() >= Duration::from_secs(10));
+    heartbeat.beat();
+    assert!(heartbeat.age() < Duration::from_secs(1));
+}

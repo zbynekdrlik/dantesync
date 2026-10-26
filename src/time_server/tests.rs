@@ -679,6 +679,30 @@ fn the_server_does_not_answer_from_a_stale_status_and_answers_again_once_it_is_f
         .expect("the time-server thread ends without a panic");
 }
 
+/// dantesync#136 review — a stale ↔ fresh change is reported once (the server logs it), never per
+/// look; only a fresh snapshot is answered from.
+#[test]
+fn the_freshness_gate_reports_each_transition_once_136() {
+    let mut gate = FreshnessGate::default();
+    let fresh = Duration::from_millis(1);
+    let stale = STATUS_STALE_AFTER + Duration::from_millis(1);
+    assert_eq!(gate.look(fresh), Freshness::Fresh);
+    assert_eq!(
+        gate.look(STATUS_STALE_AFTER),
+        Freshness::Fresh,
+        "the bound itself is still fresh"
+    );
+    assert_eq!(gate.look(stale), Freshness::WentStale);
+    assert_eq!(gate.look(stale), Freshness::Stale);
+    assert_eq!(gate.look(stale * 10), Freshness::Stale);
+    assert_eq!(gate.look(fresh), Freshness::FreshAgain);
+    assert_eq!(gate.look(fresh), Freshness::Fresh);
+    assert!(Freshness::Fresh.answers());
+    assert!(Freshness::FreshAgain.answers());
+    assert!(!Freshness::WentStale.answers());
+    assert!(!Freshness::Stale.answers());
+}
+
 #[test]
 fn test_build_response_phase_clamp() {
     let mut status = SyncStatus::default();

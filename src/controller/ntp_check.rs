@@ -16,6 +16,10 @@
 //!   step, so it is not this wall's offset: not used, the next check measures again;
 //! - **the boot reading measured again meanwhile** (a deferred boot step, an LI = 3 retry) — the
 //!   boot reading comes first (as the inline check never ran while it was pending): not used.
+//!
+//! Both apply to a MEASUREMENT only: a failed burst has no samples, so it always counts as a
+//! failed check (`ntp_consecutive_failures`, `ntp_failed`, `pcap_ntp_active` cleared), as the
+//! inline one did.
 
 use super::*;
 use crate::ntp_burst::NtpBurstRunner;
@@ -78,6 +82,14 @@ where
             return;
         };
         self.ntp_burst.in_flight = None;
+        // dantesync#136 review: a FAILED burst measured nothing — nothing of it can straddle a
+        // step or be superseded by the boot reading. It always counts as a failed check (as the
+        // inline one did), or a timed-out burst (~15 s) that met a date micro-step would hold back
+        // `ntp_failed` and leave `pcap_ntp_active` set.
+        if result.is_err() {
+            self.apply_ntp_check(result);
+            return;
+        }
         if self.boot_ntp_pending() {
             info!(
                 "[NTP] periodic burst not used: the boot NTP reading is on its way (it comes first)"
