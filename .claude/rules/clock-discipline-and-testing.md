@@ -57,6 +57,9 @@ paths:
   - "src/date_step_trigger.rs"
   - "src/http_status.rs"
   - "tests/two_clock_bench/restart.rs"
+  - "src/controller/date_sync/boot.rs"
+  - "src/controller/date_sync/boot_tests.rs"
+  - "tests/two_clock_bench/boot.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -569,15 +572,6 @@ grandmaster (a PCIe card, no clock input) cannot follow UTC, so the date must st
   own tests, and an assertion on a nightly step size elsewhere (authority, controller, bench)
   must expect the rounded value. Avoid an error of exactly an odd multiple of half a quantum in a
   controller test (±300 ms is a tie): the estimate's last ns decides the side.
-- **Tier-0 RED/GREEN of the whole `date_offset` module:** it has no dependencies (only comments
-  say `crate::`), so a scratch `lib.rs` with `pub mod date_offset;` beside symlinks to
-  `src/date_offset.rs` and `src/date_offset/` builds with `rustc --edition 2021 --test lib.rs`
-  in ~3 s (~190 MB) and runs all its tests (115 in 1.16, the authority closed loops included) in
-  ~9 s. `CARGO_PKG_RUST_VERSION=1.70.0 clippy-driver` on the same `lib.rs` lints it like CI
-  (without the env variable `clippy::manual_div_ceil` fires on `slew.rs`: `div_ceil` is newer
-  than the MSRV). The bench runs on the `dantesync` rlib replica (the camera-box-lane gotchas
-  further down; 30/30 in ~20 s). The config, status and controller tests stay CI-only unless
-  you build the #126 full-lib replica.
 
 **What changes by mode:**
 - `on_utc_error`'s abnormal cap is `daily_emergency_ms` (5 s) in daily mode, 2 × the step bound
@@ -857,8 +851,7 @@ actually running the test against the relevant code version — don't trust the 
 way to check an OLDER/BASELINE code path's behavior without a second git checkout: `git show
 <sha>:src/controller.rs > /tmp/baseline.rs`, splice in ONLY the test function you want to run (plus
 any new constants it references), swap it into place over the working tree temporarily, `cargo test
---lib <test_name>` (see `## Local Build Policy` for the `# airuleset:build-ok` one-off bypass this
-needs), read the ACTUAL panic message's number, then restore the real working-tree file. Faster and
+--lib <test_name>`, read the ACTUAL panic message's number, then restore the real working-tree file. Faster and
 safer than a temporary git worktree for a single-file, single-function check.
 
 **The same splicing idea, generalized to produce a genuine RED commit after the tests AND the fix
@@ -897,47 +890,11 @@ than a synthetic repro. This generalizes past clock work too: `spread_us` (issue
 signal) sat unconsulted by the step-decision logic for two full cycles (issues 71 and 76) before
 issue 76 finally used it -- the same "an existing signal was already telling you something" shape.
 
-## Working dantesync from a camera-box Claude session — you CANNOT compile locally at all (#557)
+## Working dantesync from a camera-box Claude session
 
-dantesync runs `cargo test` normally in its OWN session (it is NOT a Tier-0 repo). BUT the usual
-fleet dispatch works it from a **camera-box** session (dantesync is Claude-stewarded but has no
-session of its own), and camera-box's `block-tier0-local-build.sh` PreToolUse hook fires on every
-Bash call keyed on the **session cwd** (the tool payload's `.cwd` = the camera-box checkout), NOT on
-the `cd dantesync &&` inside your command.
-
-**As of airuleset #557 (owner directive 2026-08-18) that hook blocks EVERY compiling cargo shape —
-`build`/`test`/`bench`/`run`/`check`/`clippy`/`doc`/`rustc`, narrow OR whole-workspace, `--no-run`
-or not — as an allowlist inversion (unknown subcommand fails SAFE to blocked). The old `--no-run` +
-exec-the-binary workaround this section used to document is GONE (verified live on #97: `cargo test
---lib --no-run` was blocked), and the `# airuleset:build-ok` / `AIRULESET_ALLOW_LOCAL_BUILD`
-bypasses are disabled for camera-box (#477).** So from a camera-box session you have NO local
-compile, type-check, or test-run path whatsoever.
-
-**Your ONLY local net is `cargo fmt --all --check`** (fmt is on the non-compiling allowlist). It is
-a purely SYNTACTIC tool — it parses every file (following `#[cfg] mod` paths, so it even checks
-Windows-only code), catching a stray brace / broken literal / bad token, but it does NOT type-check.
-Run `cargo fmt --all` then `cargo fmt --all --check` after every edit as your parse-check.
-
-**A second local net: a standalone `rustc` REPLICA (round 5 of #117).** The hook keys on `cargo`;
-plain `rustc` on a scratch file is not a cargo shape. A PURE module (`date_offset.rs`,
-`ptp_phase_lock.rs`, the bench, `time_server.rs` with `log`/`anyhow`/`libc`/`uuid` stubbed) compiles
-and runs its own tests as `rustc --edition 2021 --test`, from a wrapper `mod dantesync { pub mod
-date_offset; … }` in a scratch dir laid out like `src/` (symlinks keep `mod tests;` sibling files
-resolving). Even the CONTROLLER runs this way: strip `serde`, stub the external crates, and drive
-`tests/simulation_e2e.rs` as a binary. That is how the round-5 CI red was diagnosed: the same
-seeds gave the same result on `origin/master`, on the branch and on the branch in legacy mode, so
-the failure was the test's own unseeded noise, not the change. Replica results are evidence, not
-proof: CI still type-checks and runs the real crate.
-
-**A third local net: MSRV-aware clippy on the replica (#119).** The replica runs `rustc`, which
-does not know the crate's MSRV, so a newer std API (`u128::div_ceil`, 1.73 > `rust-version` 1.70)
-passed it and turned CI's Lint red (`clippy::incompatible_msrv`). `clippy-driver` is not a cargo
-shape either: `CARGO_PKG_RUST_VERSION=1.70.0 ~/.cargo/bin/clippy-driver --edition 2021
---crate-type lib --crate-name dantesync <replica>/src/lib.rs -o <scratch>/x.rlib -D warnings -A
-dead_code` reproduces the Lint job on the pure modules (give `-o` a writable path; `/dev/null`
-fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the crate root
-(`tests/x.rs`, which cargo would also build as its own target): use
-`#[path = "<bench>/x.rs"] mod x;` for a submodule of a `tests/*.rs` bench.
+dantesync has no session of its own; the fleet dispatch works it from a **camera-box** session, so
+global PreToolUse hooks key on the **session cwd** (the camera-box checkout), NOT on the
+`cd dantesync &&` inside your command.
 
 **Two gotchas from a worktree-isolated camera-box lane (#119 1.12):**
 - The lane's isolation guard refuses a Bash call it cannot prove stays inside the camera-box
@@ -950,7 +907,7 @@ fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the c
   a run of spaces. CI caught one in a config warning. Write `\\` or use a raw string, then grep
   the result for 8+ spaces inside a string literal.
 
-**Three more from a camera-box session working a dantesync worktree (camera-box issue 1372, v1.14):**
+**Two more from a camera-box session working a dantesync worktree (camera-box issue 1372, v1.14):**
 - Stage with explicit paths, never the all-files flag. The global staging guard reads the
   SESSION's checkout (camera-box), not the `cd` target: an all-files stage in the dantesync
   worktree was refused for a camera-box untracked file, and the whole Bash call (its heredoc
@@ -959,25 +916,16 @@ fails on its temp dir). And an integration test's `mod x;` resolves BESIDE the c
 - A slice tracked on a CAMERA-BOX issue: write "camera-box issue N" in commit messages and PR
   bodies, never `#N`. In this repo the commit gate would look for a dantesync design marker for
   `#N`, and a PR body's `#N` points at the wrong repo. A scope like `feat(freq-step):` passes.
-- The standalone `rustc` replica covers the pure modules AND the whole two-clock bench: build the
-  lib with `--crate-type lib --crate-name dantesync` into an rlib, then run
-  `rustc --test tests/two_clock_bench.rs --extern dantesync=<rlib> -O` (25+ bench tests in ~20 s).
-  Prove each RED on it by stubbing the new behaviour in a copy of the file, commit, restore.
 
-**Everything else is verified by CI, which is your compiler + test runner.** CI (`ci.yml`) triggers
-ONLY on `push`/`pull_request` to `master`/`main` — NOT on a feature-branch push. So to actually
-verify a branch, **open a PR to `master`** (that fires the `pull_request` CI); monitor it to green;
-do NOT merge if your lane is implement-only (the supervisor owns integration/rollout). CI runs, in
-parallel: Version Consistency, Lint (`cargo clippy -- -D warnings -A dead_code` — this is a FULL
-type-check of the lib, so a green Lint proves the production code compiles + is clippy-clean; NOT
-`--all-targets`, so test-code `field_reassign_with_default` is deliberately not gated), Test
-(`cargo test --lib` + `--test '*'` — compiles + runs test code, the only place test-compile errors
-and failing assertions surface), Build Check (Linux + **Windows** — the Windows compile is your only
-proof `#[cfg(windows)]` code builds), Coverage (runs the suite under instrumentation — a green
-Coverage implies the tests compiled AND passed), Security Audit. Because you cannot run tests
-locally, write them with extra care (trace assertion arithmetic against the impl by hand or in a
-throwaway `python3` sim) and expect CI to be the FIRST place a type mistake or a wrong assertion
-shows. Match CI's gate, never a stricter self-imposed `--all-targets`.
+**CI** (`ci.yml`) triggers ONLY on `push`/`pull_request` to `master`/`main` — NOT on a
+feature-branch push. To verify a branch in CI, **open a PR to `master`**; monitor it to green; do
+NOT merge if your lane is implement-only (the supervisor owns integration/rollout). CI runs, in
+parallel: Version Consistency, Lint (`cargo clippy -- -D warnings -A dead_code` — a FULL type-check
+of the lib; NOT `--all-targets`, so test-code `field_reassign_with_default` is deliberately not
+gated), Test (`cargo test --lib` + `--test '*'`), Build Check (Linux + **Windows** — the only proof
+`#[cfg(windows)]` code builds), Coverage, Security Audit. Match CI's gate, never a stricter
+self-imposed `--all-targets`. MSRV is `rust-version` 1.70: a newer std API (`u128::div_ceil`, 1.73)
+turns Lint red (`clippy::incompatible_msrv`).
 
 ## A master's NTP step RATE is a bounded health signal — a storm means the FREQUENCY reference is degraded (#91)
 
@@ -1186,36 +1134,58 @@ next NTP samples. What was learned building the fix:
   double fault's settling. Give the session a seq above 1 before the restart (a step on request):
   with seq 1 on both sides "the same session" and "a new session" read the same.
 
-## A fourth local net: the lib's OWN tests (the controller's too) under a rustc replica (#126)
+## dantesync#134 (v1.19) — the fleet date at the FIRST PTP window, one step, none at the lock
 
-The mockall-based controller tests used to have no local path at all. They run under plain `rustc`
-(not a cargo shape) in about 30 s, ~350 MB:
+The owner (26.10.2026): a boot must sync fast, nothing on a Dante/Blackmagic network waits for a
+settle. strih-pp's boot (25.10.2026) spent 12 s in the blocking boot NTP burst before the PTP loop
+started, then 31 s from the first Sync to the rate servo's `=== LOCKED ===`, and only then
+anchored `D`, restored the saved fleet D and stepped its wall by +3.75 s — under a running OBS.
+What was learned:
 
-- **Real crates from `~/.cargo/registry/src`, one rustc call each** (~18 s, ~280 MB):
-  unicode-ident, proc-macro2 (`--cfg wrap_proc_macro --cfg 'feature="proc-macro"'`), quote, syn
-  (`clone-impls derive parsing printing proc-macro` as `--cfg 'feature="…"'`), serde_derive
-  (`--crate-type proc-macro`, `CARGO_PKG_VERSION_PATCH=228`), serde_core and serde (`--cfg
-  if_docsrs_then_no_serde_core`, `OUT_DIR` holding the build script's `private.rs` written by hand
-  — `pub mod __private228 { pub use crate::private::*; }`, serde's with `use serde_core::__private228
-  as serde_core_private;` —, `feature="std"`, serde `feature="derive"`), itoa, memchr, zmij,
-  serde_json (`--cfg 'fast_arithmetic="64"'`), byteorder, libc. Match the `Cargo.lock` versions.
-- **Stubs:** `log` (macros that `format!` their arguments, so format strings are still checked,
-  plus `log!`/`Level`), `anyhow`, `chrono`, `uuid`, `env_logger`, `tempfile`; and `mockall`: a
-  proc-macro `automock` that re-emits the trait plus an `include!` of a hand-written `Mock…`
-  (FIFO: the first matching, unsaturated expectation; `times` checked on drop) with the `expect_*`
-  / `times` / `with` / `withf` / `returning` / `in_sequence` surface the tests use.
-- **The crate:** a scratch `src/` of symlinks to the lib's modules, `ntp.rs` and `dscp.rs` reduced
-  to their data types (`rsntp`/`socket2` are not needed then). `rustc --test` it with `--extern`
-  for each; `--emit=metadata` without `--test` type-checks the lib, and `CARGO_PKG_RUST_VERSION=1.70.0
-  clippy-driver … -D warnings -A dead_code` reproduces the Lint job on it. Run that clippy on the
-  LIB, never with `--test`: CI's Lint (`cargo clippy -- …`) does not lint test code, and the tests
-  already carry ~50 lints of their own (`field_reassign_with_default` in `config/tests.rs`,
-  `status/tests.rs` and `controller.rs`'s tests, `neg_multiply` in `clock/linux.rs`) — a `--test`
-  run reads as a regression that is not yours (#126 round 3).
-- **Measured on dev1 (#126):** 569 of 571 lib tests pass; the two others are environmental
-  (`clock_alarm` formatting needs the real chrono; `gm_allowlist_hostname_resolution_…_113`
-  resolves `video-clock.lan` on the rig's LAN). A stubbed RED commit is proven the same way:
-  stub the new behaviour in the files, run, commit, restore.
-- It is still a replica: CI type-checks and runs the real crate (Windows included). Main and the
-  Windows-only code are outside it.
-
+- **`D = median(t2 − t1)` needs no rate lock.** It is the absolute offset of two time bases. The
+  core anchors at the first window; everything keyed on `Anchored` (the restore, a new session, a
+  follower's adoption) and `realign_master_to_fleet` (also while `core.acquiring()`) runs then.
+- **The rate servo leaves the phase free while it acquires**, so the wall walks off the early
+  anchor by ∫ rate error: ~0.4 ms on strih-snv's −21 ppm (24.10.2026: word 0 → −19.5 ppm over
+  40 s, still +7 µs/s at 30 s), past 1 ms from ~50-70 ppm. Under the old engagement rule that is a
+  `Realigned` = a SECOND (ms) Join step. The first engagement therefore keeps `D` within
+  `BOOT_HOLD_NS` (= the ±2 ms error clamp) and seeds the pull reference with `e` (the camera-box
+  1372 mechanism: the PI tracks `e − r`, the word carries `−r/τ`, the integrator starts undisturbed
+  at the rate servo's word). Only the FIRST engagement: a lock loss later re-aligns as before.
+- **Engaging the PI from the first window instead was rejected**: it would learn a 21 ppm error
+  through its ~100 s integrator — ~0.8 ms overshoot and minutes off the tick.
+- **A blocking NTP query in the loop is as bad as one before it.** The periodic
+  `check_ntp_utc_tracking` is due at once without a fresh measurement, so it waits for the boot
+  reading too. A deferred boot step (a rejected saved state) uses the boot reading instead of
+  measuring again.
+- **A late boot reading must never step a node off the line it joined** (`on_fleet_date_line`:
+  an authority, or an adopted D): report-only.
+- **Bench stand-ins must hand over like the real servo.** The first bench stand-in locked at a
+  fixed window 11 ppm short — the freq-step detector then (correctly) re-seeded, which read as a
+  failure of the hold. The real servo locks on |rate| < 5 ppm; the stand-in locks within 3 ppm.
+- **Review of PR 135 (fresh context), each a test now:** a boot step before the first window must
+  still drop the samples taken before it (a window mixing both anchors `D` on the old wall: a
+  session on it, then a backward Realigned step; on the legacy servo a ±500 ppm rate) — tested
+  through the REAL sample path (`process_settled_sync`), not a hand-set median; one 4-sample
+  window is not an anchor (`ANCHOR_CONFIRM_WINDOWS` = 3 agreeing within 1 ms, unlocked only); a
+  late boot reading measured before a placement step must never be published (it showed the step
+  as the NTP error and a reference epoch seconds off); NO path may measure NTP inline in the loop
+  (a failed/timed-out/dead reading = start on the current wall, a deferred step reuses the kept
+  reading or a `boot-ntp` thread via `set_boot_ntp_spawner`); a time-base rejection of the saved
+  state before the lock is provisional (`restore_judged_on` = (anchor, engaged)) — rejecting for
+  good on an interim grandmaster would start seq 1 = move the fleet date; the master answers
+  LI = 3 while its wall is not placed (`master_wall_placed`; rsntp and now `ntp_packet::parse_reply`
+  reject it); an acquiring master adds its phase-lock error to the fleet line's UTC error. Adding
+  a field to `PhaseLockCore` grows the bench's `Law` enum past clippy's large-variant bound: it
+  is boxed.
+- **Re-review:** "nothing pending" is not "placed" until the master has been on its session once
+  (`wall_placed_once`; a failed join retries only after the 10 s backoff); an LI = 3 reply must
+  END the Npcap round trip (`is_unsynchronized_server_reply`), not be skipped until the 500 ms
+  timeout (5 samples = 2.5 s of a blocked loop); a follower asks an LI = 3 master again
+  (`BootNtpError::server_unsynchronized` from rsntp's `ServerNotSynchronized`, 5 s x 12), every
+  other failure is final.
+- Tests: `ptp_phase_lock` (early anchor, the hold, the 2 ms safety net, a later re-engagement),
+  `controller/date_sync/boot_tests.rs` (master with / without a saved state, a follower, a GM lost
+  before the lock, the late reading report-only, the periodic check waiting), the two-clock bench
+  `boot.rs` (−21 / +70 ppm boxes, one step each, both on the line). Negative control:
+  `BOOT_HOLD_NS = 0` fails the bench, the acquisition test and two controller tests.

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// status fields). A child module so it can reach the controller's private state without growing
 /// this file; its state is the one `date_sync` field.
 mod date_sync;
+pub use date_sync::{BootNtpError, BootNtpResult, BootNtpSpawner};
 
 /// dantesync#112 — PTP liveness: the multicast re-join while no allowed PTP packet comes, and the
 /// honest `/status` meanwhile. A child module like `date_sync`; its state is the one
@@ -1171,45 +1172,18 @@ where
         }
     }
 
+    /// The boot NTP reading, measured here (blocking). `main` no longer calls it (dantesync#134:
+    /// it measures on its own thread and hands the reading over, `start_boot_ntp`); the rules are
+    /// the same, `apply_boot_ntp`.
     pub fn run_ntp_sync(&mut self, skip: bool) {
         if skip {
             return;
         }
-
-        match self.ntp.get_offset() {
-            Ok(measurement) => {
-                let offset = measurement.offset;
-                let sign = measurement.sign;
-                let sign_str = if sign > 0 { "+" } else { "-" };
-                info!(
-                    "NTP Sync: Offset {}{:?} (spread:{}us samples:{})",
-                    sign_str, offset, measurement.spread_us, measurement.sample_count
-                );
-
-                // #68: the boot measurement is a real measurement — publish it.
-                let offset_us = if sign > 0 {
-                    offset.as_micros() as i64
-                } else {
-                    -(offset.as_micros() as i64)
-                };
-                self.record_ntp_success(offset_us, &measurement);
-
-                if offset.as_millis() > BOOT_STEP_THRESHOLD_MS && self.skip_boot_step_for(offset_us)
-                {
-                    // dantesync#126: the NTP master restores its saved fleet date offset at the
-                    // first PTP lock instead — a restart must not move the fleet date.
-                    info!(
-                        "[DATE] boot step of {}{:?} SKIPPED: the saved fleet date offset is \
-                         restored at the first PTP lock (the date authority corrects the UTC \
-                         error, coordinated, as if the master had not restarted)",
-                        sign_str, offset
-                    );
-                } else {
-                    self.step_boot_offset(offset, sign);
-                }
-            }
-            Err(e) => warn!("NTP Sync failed: {}", e),
-        }
+        let result = self
+            .ntp
+            .get_offset()
+            .map_err(|e| date_sync::BootNtpError::from_ntp(&e));
+        self.apply_boot_ntp(result);
     }
 
     /// Periodic NTP UTC alignment - steps clock to maintain UTC sync
@@ -1225,6 +1199,11 @@ where
     ///
     /// Stepping time does NOT affect the Dante-tuned frequency!
     pub fn check_ntp_utc_tracking(&mut self) {
+        // dantesync#134: not while the boot NTP reading is on its way — this query would block the
+        // loop on the same (still unanswered) upstream; the boot reading comes first.
+        if self.boot_ntp_pending() {
+            return;
+        }
         // #71: server mode uses a dedicated, UTC-relevant cadence instead of
         // the PTP-vs-Dante-GM lock-quality signal `calculate_adaptive_ntp_interval`
         // is actually driven by (accumulated_phase_error_us tracks this
@@ -1776,6 +1755,9 @@ where
             max_step_us,
             effective_stale_window(self.config.ntp_stale_secs).as_secs()
         );
+        // dantesync#134 review: the NTP server reads this snapshot — "unsynchronized" (LI = 3)
+        // from its first reply while this master's wall is not placed yet.
+        self.update_shared_status();
     }
 
     /// Calculate adaptive NTP step threshold based on measured offset variance.
@@ -2078,6 +2060,8 @@ where
         // #88: apply a coordinated date step the moment its instant arrives, and follow the
         // master's announce. Every iteration (1 ms / 50 µs), BEFORE the packet early-returns, so a
         // step lands within one loop period of the announced instant on every box.
+        // dantesync#134: the boot NTP reading, measured off the loop, applied once it arrives.
+        self.service_boot_ntp();
         self.service_date_offset();
         // dantesync#126: answer every `POST /date/step` the HTTP route queued (every node answers;
         // only the NTP master can announce the step).

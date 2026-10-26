@@ -133,6 +133,19 @@ pub struct NtpMeasurement {
     pub pcap_active: bool,
 }
 
+/// dantesync#134 re-review: the server answered "clock unsynchronized" (LI = 3) — rsntp's
+/// `ServerNotSynchronized` (the Windows Npcap transport falls back to rsntp, which says the same).
+pub fn is_server_unsynchronized(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rsntp::SynchronizationError>(),
+            Some(rsntp::SynchronizationError::ProtocolError(
+                rsntp::ProtocolError::ServerNotSynchronized
+            ))
+        )
+    })
+}
+
 pub struct NtpClient {
     server: String,
     // dantesync#53: on Windows, a persistent kernel-timestamped (Npcap)
@@ -331,9 +344,26 @@ impl NtpClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_offset, select_lowest_rtt, summarize_offsets, NtpClient, RawSample,
-        NTP_BURST_ACCEPT_N,
+        filter_offset, is_server_unsynchronized, select_lowest_rtt, summarize_offsets, NtpClient,
+        RawSample, NTP_BURST_ACCEPT_N,
     };
+
+    /// dantesync#134 re-review: the boot reading tells "the server says unsynchronized" (a master
+    /// whose wall is not placed) from every other failure — only that one is asked again.
+    #[test]
+    fn an_unsynchronized_server_is_told_apart_from_other_ntp_failures_134() {
+        let unsync = anyhow::Error::from(rsntp::SynchronizationError::ProtocolError(
+            rsntp::ProtocolError::ServerNotSynchronized,
+        ));
+        assert!(is_server_unsynchronized(&unsync));
+        let other = anyhow::Error::from(rsntp::SynchronizationError::ProtocolError(
+            rsntp::ProtocolError::InvalidTransmitTimestamp,
+        ));
+        assert!(!is_server_unsynchronized(&other));
+        assert!(!is_server_unsynchronized(&anyhow::anyhow!("timeout")));
+        // Wrapped with context it is still the same error.
+        assert!(is_server_unsynchronized(&unsync.context("NTP burst")));
+    }
 
     // Note: the old `test_offset_to_duration_*` tests (dropped here, #53) only
     // mirrored the sign/Duration-split arithmetic inline — they never called a

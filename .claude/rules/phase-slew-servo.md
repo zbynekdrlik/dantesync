@@ -70,18 +70,14 @@ wiring lives in `src/controller.rs` (`slew_phase` / `reset_phase_slew`, the deco
 Every gain/cap/rate number here was chosen by a throwaway closed-loop sim (DC inflow + measurement
 noise, at both the 10 s and 30 s cadences) BEFORE any Rust was written — the same "verify a
 hand-derived number by running it" rule `clock-discipline-and-testing.md` teaches for the step path.
-Because this repo is **Tier-0 (no local cargo build/test)**, the sim is doubly important: it is the
-ONLY pre-CI check of the servo MATH. Reproduce the scenario, print an ENVELOPE (peak |e|,
+Reproduce the scenario, print an ENVELOPE (peak |e|,
 steady-state, integrator value, AND the worst rolling 6-sample spread = the camera-box gate metric),
 and assert against it — a mock returning a constant cannot test a control loop.
 
 **#103 lesson — the sim MUST include transport delay, or it lies.** The #97 sim used a ZERO-delay
 plant and "proved" the deadbeat gains stable; they oscillated in prod. A control-loop sim for THIS
 servo is only faithful with ≥1 sample of loop delay (`e_{n+1} = e_n + (inflow − f_phase_{n-1})·dt`).
-A zero-delay sim is a false-green for any gain change. Verify the actual Rust servo (not just a
-replica) by extracting `src/phase_slew.rs` to a scratch file (stub `log::warn` with a `macro_rules!`)
-and running `rustc --edition 2021 --test scratch.rs` — the module only depends on `log`, so this runs
-the REAL servo law under Tier-0 with no crate build. Prove RED→GREEN this way before pushing.
+A zero-delay sim is a false-green for any gain change.
 
 **#105 lesson — the sim MUST include a HIGH-DC plant AND the step interaction.** #103's sim used only
 low DC (≤23 ppm) and no step, so it missed that the slow tracking integrator cannot hold a ~50 ppm

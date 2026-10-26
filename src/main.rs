@@ -287,6 +287,33 @@ struct Args {
 }
 
 // Concrete Implementations for Traits
+/// dantesync#134 — one boot NTP reading on its own `boot-ntp` thread (its own client: name
+/// resolution, the Windows Npcap transport and the burst all happen there), delivered on the
+/// returned channel. A thread that cannot be started reads as a failed reading.
+fn spawn_boot_ntp(
+    server: &str,
+    dscp: &dantesync::dscp::DscpConfig,
+) -> std::sync::mpsc::Receiver<controller::BootNtpResult> {
+    let (tx, rx) = std::sync::mpsc::channel::<controller::BootNtpResult>();
+    let server = server.to_string();
+    let dscp = dscp.clone();
+    let spawned = thread::Builder::new()
+        .name("boot-ntp".to_string())
+        .spawn(move || {
+            let client = ntp::NtpClient::new(&server, &dscp);
+            // The loop may have given up waiting (it logs that): a closed channel is fine.
+            let _ = tx.send(
+                client
+                    .get_offset()
+                    .map_err(|e| controller::BootNtpError::from_ntp(&e)),
+            );
+        });
+    if let Err(e) = spawned {
+        warn!("[NTP] could not start the boot-ntp thread: {}", e);
+    }
+    rx
+}
+
 struct RealNtpSource {
     client: ntp::NtpClient,
 }
@@ -709,16 +736,26 @@ fn run_sync_loop(
     controller.set_date_step_requests(date_step_rx);
 
     // dantesync#126: the NTP master's saved fleet date offset skips the boot step below (restored
-    // at the first PTP lock); any other node removes a leftover one.
+    // at the first PTP window); any other node removes a leftover one.
     controller.open_date_state(
         std::path::Path::new(DATE_STATE_PATH),
         ntp_server_config.enabled,
     );
 
+    // dantesync#134: the boot NTP reading is measured on its own thread (its own client: name
+    // resolution, the Windows Npcap transport and the burst all happen there) and handed to the
+    // loop, which starts at once — the PTP windows and the fleet date no longer wait for an
+    // upstream that answers slowly at boot (12 s on strih-pp, 25.10.2026).
     if !args.skip_ntp {
         info!("Using NTP Server: {}", ntp_server);
+        controller.start_boot_ntp(spawn_boot_ntp(ntp_server, &dscp_config));
+        // A deferred boot step (a rejected or given-up saved state) measures again the same way,
+        // never inside the loop (review of PR 135).
+        let again_server = ntp_server.to_string();
+        let again_dscp = dscp_config.clone();
+        controller
+            .set_boot_ntp_spawner(Box::new(move || spawn_boot_ntp(&again_server, &again_dscp)));
     }
-    controller.run_ntp_sync(args.skip_ntp);
 
     // Start NTP server if enabled (this machine becomes the time source)
     if ntp_server_config.enabled {

@@ -75,20 +75,3 @@ On dev1 (passwordless sudo, rig video VLAN on `enp2s0`):
 `sudo -n timeout 30 tcpdump -i enp2s0 -c 20 -w <scratch>.pcap 'udp port 319 or udp port 320'`.
 No tshark on dev1. Extract the UDP payloads with a few lines of Python (pcap linktype 1:
 Ethernet 14 + IPv4 IHL + UDP 8). Never restart or reconfigure anything for a capture.
-
-## Local net for `src/ptp.rs` + `src/date_offset/` (Tier-0, no cargo)
-
-A plain-rustc replica in about 10 s:
-1. Build `byteorder` from `~/.cargo/registry/src/*/byteorder-1.5.0/src/lib.rs` with
-   `--cfg 'feature="std"'`.
-2. Stub `anyhow`: an `Error(String)` with a blanket `From<E: std::error::Error>`, `Result<T>`,
-   and an `anyhow!` macro.
-3. Make a scratch crate whose `src/` symlinks `ptp.rs`, `date_offset.rs` and `date_offset/`, plus
-   a `tests` symlink beside `src` (the `include_bytes!("../tests/fixtures/…")` resolves relative to
-   the symlink's place).
-4. Run `rustc --edition 2021 --test src/lib.rs --crate-name dantesync --extern …` (131 tests at
-   1.17). The same lib under `CARGO_PKG_RUST_VERSION=1.70.0 clippy-driver … -D warnings -A
-   dead_code` is the MSRV lint.
-
-The controller, `time_server` and `status` tests stay CI-only. They need the #126 full-lib
-replica in `clock-discipline-and-testing.md`.

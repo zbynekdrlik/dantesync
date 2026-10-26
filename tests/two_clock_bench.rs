@@ -991,3 +991,6 @@ mod scenarios;
 // camera-box issue 1372 (dantesync slice): a grandmaster FREQUENCY step on two clocks.
 #[path = "two_clock_bench/freq_step.rs"]
 mod freq_step;
+
+#[path = "two_clock_bench/boot.rs"]
+mod boot;

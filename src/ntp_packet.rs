@@ -128,12 +128,25 @@ pub struct ParsedReply {
 ///
 /// #53 GREEN: rejects a too-short buffer and a non-server mode, then decodes
 /// the real Origin/Receive/Transmit Timestamp fields.
+/// dantesync#134 re-review: a full-length server-mode reply whose leap indicator says "clock
+/// unsynchronized" (LI = 3) — the Npcap transport stops waiting on it at once.
+pub fn is_unsynchronized_server_reply(buf: &[u8]) -> bool {
+    buf.len() >= NTP_PACKET_LEN && buf[0] & NTP_MODE_MASK == NTP_MODE_SERVER && buf[0] >> 6 == 3
+}
+
 pub fn parse_reply(buf: &[u8]) -> Result<ParsedReply> {
     if buf.len() < NTP_PACKET_LEN {
         return Err(anyhow!(
             "NTP reply too short: {} bytes (need {})",
             buf.len(),
             NTP_PACKET_LEN
+        ));
+    }
+    // dantesync#134 review: LI = 3 is "clock unsynchronized" (RFC 5905) — no time source, as
+    // rsntp rejects it (`ServerNotSynchronized`).
+    if buf[0] >> 6 == 3 {
+        return Err(anyhow!(
+            "NTP reply: the server clock is unsynchronized (LI = 3)"
         ));
     }
     let mode = buf[0] & NTP_MODE_MASK;
@@ -483,6 +496,35 @@ mod tests {
             parse_reply(&buf).is_err(),
             "a mode-3 (client) packet must never be accepted as a server reply"
         );
+    }
+
+    /// dantesync#134: a server that says its clock is unsynchronized (LI = 3: a master whose
+    /// wall is not placed yet) is no time source — the Windows Npcap transport rejects it like
+    /// rsntp does (`ServerNotSynchronized`).
+    #[test]
+    fn parse_reply_rejects_an_unsynchronized_server_134() {
+        let mut buf = fake_server_reply(1, 2, 3);
+        buf[0] |= 3 << 6;
+        assert!(parse_reply(&buf).is_err());
+        let mut buf = fake_server_reply(1, 2, 3);
+        buf[0] |= 1 << 6;
+        assert!(
+            parse_reply(&buf).is_ok(),
+            "a leap-second warning is still a time source"
+        );
+    }
+
+    #[test]
+    fn an_unsynchronized_server_reply_is_recognised_at_once_134() {
+        let mut buf = fake_server_reply(1, 2, 3);
+        assert!(!is_unsynchronized_server_reply(&buf));
+        buf[0] |= 3 << 6;
+        assert!(is_unsynchronized_server_reply(&buf));
+        // Our own request (client mode) is never mistaken for one, nor a runt.
+        let mut req = fake_server_reply(1, 2, 3);
+        req[0] = (3 << 6) | (NTP_VERSION << 3) | NTP_MODE_CLIENT;
+        assert!(!is_unsynchronized_server_reply(&req));
+        assert!(!is_unsynchronized_server_reply(&buf[..20]));
     }
 
     // ---- Offset / RTT math ----

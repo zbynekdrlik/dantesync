@@ -5,6 +5,44 @@ All notable changes to DanteSync will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] - 2026-10-26
+
+### Changed
+
+- **Fast boot sync: the fleet date lands within seconds of the first PTP Sync, not ~50 s later
+  (issue #134, camera-box#1483).** On every boot of the PP date master the wall was stepped by
+  seconds ~50 s after start, under an OBS already running. Two causes, both removed:
+  - **The PTP loop no longer waits for the boot NTP reading.** `main` measured it inline before
+    `Starting PTP Loop...` (12 s to an internet upstream on strih-pp). It is now measured on its
+    own `boot-ntp` thread (its own client: name resolution, Npcap and the burst all happen there)
+    and handed to the loop, which applies it with the unchanged boot-step rules once it arrives
+    (at most 60 s; then the "NTP Sync failed" path). Meanwhile the loop's periodic NTP check waits,
+    and a master without a saved state does not start its authority session. A reading that
+    arrives after the node is already on the fleet date line is report-only.
+  - **The date is placed at the FIRST PTP window, not at the rate servo's lock.** The phase lock
+    anchors `D = median(t2 − t1)` at the first window (it needs no rate lock), so the master
+    restores its saved fleet D and steps its own wall ONCE onto it, or takes its boot step and
+    starts the session; a follower joins the fleet line at its next poll. The FIRST engagement of
+    the phase lock (at the rate servo's lock, ~30-40 s later) keeps that anchor within ±2 ms
+    (`BOOT_HOLD_NS`) and retires the acquisition drift along the existing pull reference (20 s)
+    instead of re-anchoring — no second step. Beyond 2 ms, and on every later re-engagement, the
+    1 ms re-anchor rule applies as before.
+  - **Hardened after review:** an unlocked first anchor needs three agreeing windows (~1.5 s); a
+    boot step always drops the samples taken before it (also before the first window, also on the
+    legacy servo); a late reading on the fleet line is logged, never published; a failed /
+    timed-out / dead reading starts the node on its current wall, a rejected restore reuses the
+    boot reading (else measures again on a thread) — never a blocking NTP query in the loop; a
+    saved state rejected on another time base before the lock is provisional (an interim
+    grandmaster) and judged again on the next time base, finally at the lock; the master's NTP
+    server answers LI = 3 (unsynchronized, new `/status.ntp_server_unsynchronized`) until its wall
+    is placed, and the Windows Npcap NTP client rejects LI = 3 like rsntp; an acquiring master
+    feeds the fleet line its phase-lock error.
+  - **Re-review:** a master stays "unsynchronized" until it has been on its fleet line once (a
+    restore whose join step failed is not placed); the Windows Npcap NTP client stops at an LI = 3
+    reply at once instead of waiting out its timeout; a follower whose master answers LI = 3 asks
+    again every 5 s (at most 12 times) instead of starting on its raw wall; the end of the 300 s
+    wait names a provisional rejection.
+
 ## [1.18.0] - 2026-10-14
 
 ### Added

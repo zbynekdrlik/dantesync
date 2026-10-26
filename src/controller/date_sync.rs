@@ -43,6 +43,7 @@ use crate::date_offset::{
 };
 use crate::ptp_phase_lock::{AnchorEvent, PhaseLockCore};
 use crate::time_server::NoAuthority;
+pub use boot::{BootNtpError, BootNtpResult, BootNtpSpawner};
 use daily::log_daily_authority;
 
 /// A reply from the date-offset authority older than this is not acted on (the poller asks once
@@ -497,8 +498,10 @@ where
     /// while a coordinated step is pending (the scheduler owns that), during the failure backoff,
     /// or mid re-anchor.
     fn realign_master_to_fleet(&mut self) {
+        // dantesync#134: also while the boot acquisition runs (anchored at the first window, the
+        // rate servo still owning the word) — the date is placed at once, not at the lock.
         if !self.date_authority_active()
-            || !self.date_sync.core.engaged()
+            || !(self.date_sync.core.engaged() || self.date_sync.core.acquiring())
             || self.date_sync.core.rebase_pending()
         {
             return;
@@ -609,9 +612,17 @@ where
             // the line that is the reading itself; through the master's own PTP outage (its wall
             // on the local NTP path) or a failed step it keeps the FLEET on UTC — the only error
             // left is the master's free-run drift, ≪ the step bound.
+            // Review of PR 135: while acquiring, the wall is up to the 2 ms boot hold off its own
+            // anchor (the phase error the lock will pull) — the fleet line is that much further.
+            let acquiring_err = if self.date_sync.core.acquiring() {
+                self.date_sync.core.last_error_ns().unwrap_or(0)
+            } else {
+                0
+            };
             let fleet_err = offset_us
                 .saturating_mul(1_000)
-                .wrapping_add(anchor.wrapping_sub(fleet));
+                .wrapping_add(anchor.wrapping_sub(fleet))
+                .wrapping_add(acquiring_err);
             self.date_sync.master_utc_error_ns = Some(fleet_err);
             let daily = self.date_sync.daily();
             // #119 (1.12): a daily-mode master without PTP is still on the fleet line (its D is
@@ -723,6 +734,12 @@ where
         if self.restore_date_authority(anchor, now_wall) || self.date_sync.restart.boot_step_due {
             return;
         }
+        // dantesync#134: a new session starts on the wall the boot step placed — wait for the
+        // boot NTP reading (bounded, `boot.rs`); and a saved state judged provisionally waits for
+        // its next judgement (review of PR 135).
+        if self.boot_ntp_pending() || self.boot_step_deferred() {
+            return;
+        }
         let base = self.date_sync.core.anchor_ns().unwrap_or(anchor);
         let authority = DateAuthority::new(
             anchor,
@@ -758,7 +775,9 @@ where
             AnchorEvent::None => {}
             AnchorEvent::Anchored { anchor_ns } => {
                 info!(
-                    "[PHASE-LOCK] anchored: wall = PTP time + D, D={}ns (grandmaster {})",
+                    "[PHASE-LOCK] anchored at the first PTP window: wall = PTP time + D, D={}ns \
+                     (grandmaster {}) — the date layer works on it now, the phase lock engages at \
+                     the rate servo's lock",
                     anchor_ns, gm_label
                 );
                 self.date_sync.anchor_gm = self.current_gm_uuid;
@@ -832,6 +851,7 @@ where
             self.ensure_date_authority();
             self.tick_date_authority();
             self.realign_master_to_fleet();
+            self.note_master_placement();
             self.realign_offline_daily_master();
             self.save_date_state_if_changed();
             return;
@@ -970,6 +990,7 @@ where
     }
 }
 
+mod boot;
 mod daily;
 mod follow;
 mod freq_step;
@@ -981,6 +1002,8 @@ mod restart_file;
 mod slew;
 mod trigger;
 
+#[cfg(test)]
+mod boot_tests;
 #[cfg(test)]
 mod daily_tests;
 #[cfg(test)]

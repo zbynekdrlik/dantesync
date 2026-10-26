@@ -39,7 +39,13 @@
 //!   core engages once the controller reports PTP lock, taking over the frequency word
 //!   bumplessly (its integrator starts at the rate servo's word), and hands the learned frequency
 //!   back if lock is lost.
-//! - `D` is anchored at the first lock (from the node's own, NTP-coarse-aligned wall), replaced by
+//! - `D` is anchored at the FIRST window, before the lock (dantesync#134: `median(t2 − t1)` is an
+//!   absolute offset of two time bases and needs no rate lock, so the date layer places the fleet
+//!   date seconds after the first Sync instead of ~40 s later). The rate servo leaves the phase
+//!   free while it acquires, so the wall drifts off that anchor by its rate error (~0.4 ms on a
+//!   −21 ppm box, past 1 ms on a 50 ppm one). The FIRST engagement keeps the anchor within
+//!   [`BOOT_HOLD_NS`] and retires the drift along the pull reference — no second step.
+//! - `D` is anchored from the node's own wall (the boot step or the fleet date placed on it), replaced by
 //!   the master's published `D` when the node follows the authority (`set_anchor`), shifted by
 //!   every applied step (`note_step`), and RE-ANCHORED from the continuous wall when the
 //!   grandmaster changes (`request_rebase`) or its time base jumps by more than
@@ -105,6 +111,23 @@ pub const DISCONTINUITY_NS: i64 = 1_000_000_000;
 /// (the wall stays where it is), and the date layer re-aligns it with ONE step: a follower's
 /// next authority poll sees its `D` differ and joins; the master rebases the fleet offset.
 pub const REANCHOR_ON_ENGAGE_NS: i64 = 1_000_000;
+
+/// dantesync#134 — the FIRST engagement after the early anchor (the box anchored `D` at its first
+/// window and placed the fleet date on it while the rate servo was still acquiring) keeps that
+/// anchor up to this far off it (ns), and retires the acquisition drift along the pull reference
+/// ([`FSTEP_PULL_TAU_S`]) instead of re-anchoring: a re-anchor here would be a SECOND date step,
+/// seconds after the first, under every application that started on the placed date. Beyond it
+/// (more than the error clamp) the [`REANCHOR_ON_ENGAGE_NS`] rule applies as before.
+pub const BOOT_HOLD_NS: i64 = ERROR_CLAMP_US as i64 * 1_000;
+
+/// dantesync#134 (review of PR 135) — an UNLOCKED first anchor needs this many consecutive windows
+/// whose medians agree within [`ANCHOR_AGREE_NS`] (one 4-sample window is not trusted alone: an
+/// interim grandmaster at a cold power-up, a bad window). About 1.5 s. A LOCKED window anchors at
+/// once, as before.
+pub const ANCHOR_CONFIRM_WINDOWS: usize = 3;
+
+/// How close (ns) the confirming windows' medians must be to the first of them.
+pub const ANCHOR_AGREE_NS: i64 = 1_000_000;
 
 /// `dt` is clamped to this range (s): a first update or a long gap must not scale the integrator
 /// step by an unbounded interval.
@@ -193,6 +216,12 @@ pub struct PhaseLockCore {
     pull_us: f64,
     freq_steps: u32,
     last_freq_step: Option<FreqStep>,
+    /// dantesync#134: the core has engaged at least once since start (the boot hold applies to
+    /// the first engagement only).
+    engaged_once: bool,
+    /// dantesync#134: the unlocked first anchor being confirmed — the first window's median and
+    /// how many agreeing windows so far.
+    anchor_candidate: Option<(i64, usize)>,
 }
 
 impl PhaseLockCore {
@@ -208,6 +237,12 @@ impl PhaseLockCore {
     /// True while this core owns the frequency word.
     pub fn engaged(&self) -> bool {
         self.engaged
+    }
+
+    /// dantesync#134: anchored, but never engaged yet — the boot acquisition, the rate servo still
+    /// owns the word. The date layer works on the anchor already (it is the fleet date line).
+    pub fn acquiring(&self) -> bool {
+        self.anchor_ns.is_some() && !self.engaged_once
     }
 
     /// The integrator — the learned frequency word (ppm).
@@ -278,6 +313,9 @@ impl PhaseLockCore {
     pub fn request_rebase(&mut self) {
         if self.anchor_ns.is_some() {
             self.rebase_pending = true;
+        } else {
+            // dantesync#134: an early anchor being confirmed starts again in the new time base.
+            self.anchor_candidate = None;
         }
     }
 
@@ -299,16 +337,35 @@ impl PhaseLockCore {
         dt_s: f64,
     ) -> WindowOutcome {
         let mut event = AnchorEvent::None;
+        // dantesync#134: the first engagement after the early anchor holds it (within the hold).
+        let first_engagement = ptp_locked && !self.engaged && !self.engaged_once;
         let anchor = match self.anchor_ns {
             None => {
+                // dantesync#134: anchored at the first windows, locked or not. An unlocked anchor
+                // needs ANCHOR_CONFIRM_WINDOWS agreeing windows; a locked window anchors at once.
                 if !ptp_locked {
-                    return WindowOutcome {
-                        freq_ppm: None,
-                        error_ns: None,
-                        event,
-                        freq_step: None,
+                    let count = match self.anchor_candidate {
+                        Some((first, n))
+                            if median_diff_ns.wrapping_sub(first).abs() <= ANCHOR_AGREE_NS =>
+                        {
+                            self.anchor_candidate = Some((first, n + 1));
+                            n + 1
+                        }
+                        _ => {
+                            self.anchor_candidate = Some((median_diff_ns, 1));
+                            1
+                        }
                     };
+                    if count < ANCHOR_CONFIRM_WINDOWS {
+                        return WindowOutcome {
+                            freq_ppm: None,
+                            error_ns: None,
+                            event,
+                            freq_step: None,
+                        };
+                    }
                 }
+                self.anchor_candidate = None;
                 self.anchor_ns = Some(median_diff_ns);
                 event = AnchorEvent::Anchored {
                     anchor_ns: median_diff_ns,
@@ -325,7 +382,11 @@ impl PhaseLockCore {
                         new_ns: median_diff_ns,
                     };
                     median_diff_ns
-                } else if ptp_locked && !self.engaged && off > REANCHOR_ON_ENGAGE_NS {
+                } else if ptp_locked
+                    && !self.engaged
+                    && off > REANCHOR_ON_ENGAGE_NS
+                    && !(first_engagement && off <= BOOT_HOLD_NS)
+                {
                     self.anchor_ns = Some(median_diff_ns);
                     event = AnchorEvent::Realigned {
                         old_ns: a,
@@ -358,11 +419,21 @@ impl PhaseLockCore {
 
         if !self.engaged {
             self.engaged = true;
+            self.engaged_once = true;
             self.i_ppm = rate_servo_freq_ppm.clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
             self.drop_step_state();
         }
         if event != AnchorEvent::None {
             self.drop_step_state();
+        }
+        if first_engagement && event == AnchorEvent::None {
+            // dantesync#134: the boot hold — the acquisition drift off the early anchor is retired
+            // along the pull reference (the PI tracks `e − r`, the word carries `−r/τ`), so the
+            // integrator starts undisturbed at the rate servo's word and the wall is not stepped.
+            let e_us = e_ns as f64 / 1_000.0;
+            if e_us.abs() >= FSTEP_PULL_DONE_US {
+                self.pull_us = e_us.clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
+            }
         }
 
         let dt = if dt_s.is_finite() {
@@ -479,14 +550,220 @@ mod tests {
         (max_late, last)
     }
 
+    // ---- dantesync#134: the date at the FIRST window, one step, no second one at the lock -----
+
+    /// The windows of a box acquiring with the rate servo (not PTP-locked): the wall drifts off
+    /// the early anchor by the rate error the servo has not removed yet.
+    fn acquire(core: &mut PhaseLockCore, e_ns: i64) -> WindowOutcome {
+        core.on_window(D + e_ns, false, 0.0, DT)
+    }
+
+    /// The early anchor at `D`: [`ANCHOR_CONFIRM_WINDOWS`] agreeing unlocked windows.
+    fn anchor_early(core: &mut PhaseLockCore) {
+        for n in 0..ANCHOR_CONFIRM_WINDOWS {
+            let out = acquire(core, 0);
+            if n + 1 < ANCHOR_CONFIRM_WINDOWS {
+                assert_eq!(out.event, AnchorEvent::None, "window {n}: not yet");
+            } else {
+                assert_eq!(out.event, AnchorEvent::Anchored { anchor_ns: D });
+            }
+        }
+    }
+
     #[test]
-    fn it_does_not_engage_or_anchor_before_ptp_lock() {
+    fn it_anchors_d_after_three_agreeing_windows_before_ptp_lock_but_does_not_engage_134() {
+        // `D = median(t2 − t1)` is an absolute offset of two time bases: valid from the first
+        // windows, the rate servo's lock is not needed for it (the 50 s boot of camera-box 1483).
+        // One 4-sample window is not trusted alone (review of PR 135): three agreeing ones are.
+        assert_eq!(ANCHOR_CONFIRM_WINDOWS, 3);
         let mut c = PhaseLockCore::new();
-        let out = c.on_window(D, false, 12.0, DT);
+        for e in [0, 20_000] {
+            let out = acquire(&mut c, e);
+            assert_eq!(out.event, AnchorEvent::None);
+            assert_eq!(out.error_ns, None);
+            assert_eq!(c.anchor_ns(), None);
+        }
+        let out = acquire(&mut c, 40_000);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Anchored {
+                anchor_ns: D + 40_000
+            },
+            "anchored on the confirming window"
+        );
+        assert_eq!(out.error_ns, Some(0));
+        assert_eq!(out.freq_ppm, None, "the rate servo keeps the word");
+        assert!(!c.engaged());
+        // The acquisition drift is measured against it, still without engaging.
+        let out = acquire(&mut c, 420_000);
+        assert_eq!(out.event, AnchorEvent::None);
+        assert_eq!(out.error_ns, Some(380_000));
         assert_eq!(out.freq_ppm, None);
+    }
+
+    #[test]
+    fn a_window_that_disagrees_restarts_the_early_anchor_134() {
+        // An interim grandmaster, a time-base jump or a bad window: more than
+        // `ANCHOR_AGREE_NS` apart = no anchor, the count restarts from that window.
+        let mut c = PhaseLockCore::new();
+        acquire(&mut c, 0);
+        acquire(&mut c, 0);
+        let out = acquire(&mut c, ANCHOR_AGREE_NS + 1);
         assert_eq!(out.event, AnchorEvent::None);
         assert_eq!(c.anchor_ns(), None);
-        assert!(!c.engaged());
+        acquire(&mut c, ANCHOR_AGREE_NS + 1);
+        let out = acquire(&mut c, ANCHOR_AGREE_NS + 1);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Anchored {
+                anchor_ns: D + ANCHOR_AGREE_NS + 1
+            }
+        );
+        // A requested rebase before the anchor also restarts the count.
+        let mut c = PhaseLockCore::new();
+        acquire(&mut c, 0);
+        acquire(&mut c, 0);
+        c.request_rebase();
+        assert_eq!(acquire(&mut c, 0).event, AnchorEvent::None);
+        assert_eq!(acquire(&mut c, 0).event, AnchorEvent::None);
+        assert!(matches!(
+            acquire(&mut c, 0).event,
+            AnchorEvent::Anchored { .. }
+        ));
+    }
+
+    #[test]
+    fn the_first_engagement_keeps_the_early_anchor_and_pulls_the_drift_no_step_134() {
+        // 1.5 ms of acquisition drift: beyond `REANCHOR_ON_ENGAGE_NS`, which would re-anchor
+        // (`Realigned` = a second date step). The first engagement keeps `D` and retires the
+        // drift along the pull reference instead.
+        let mut c = PhaseLockCore::new();
+        anchor_early(&mut c);
+        acquire(&mut c, 900_000);
+        let out = c.on_window(D + 1_500_000, true, -21.0, DT);
+        assert_eq!(out.event, AnchorEvent::None, "no re-anchor: no second step");
+        assert_eq!(c.anchor_ns(), Some(D));
+        assert_eq!(out.error_ns, Some(1_500_000));
+        assert!(c.engaged());
+        assert!(
+            (c.pull_us() - 1_500.0).abs() < 100.0,
+            "pull {}",
+            c.pull_us()
+        );
+        // Bumpless on the integrator: it starts at the rate servo's word …
+        assert!((c.integrator_ppm() + 21.0).abs() < 1e-9);
+        // … and the word carries the pull's own rate (−r/τ), slowing the fast wall back.
+        let f = out.freq_ppm.expect("engaged");
+        assert!(
+            (f - (-21.0 - 1_500.0 / FSTEP_PULL_TAU_S)).abs() < 1e-6,
+            "word {f}"
+        );
+    }
+
+    #[test]
+    fn beyond_the_boot_hold_the_first_engagement_still_realigns_134() {
+        // Past the ±2 ms error clamp the pull cannot be the answer: one Join step, the old rule.
+        let mut c = PhaseLockCore::new();
+        anchor_early(&mut c);
+        let out = c.on_window(D + 3_000_000, true, 5.0, DT);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Realigned {
+                old_ns: D,
+                new_ns: D + 3_000_000
+            }
+        );
+        assert_eq!(c.pull_us(), 0.0);
+    }
+
+    #[test]
+    fn a_later_re_engagement_keeps_the_realign_rule_bit_for_bit_134() {
+        // Only the FIRST engagement after the early anchor holds: a lock loss later in life
+        // (the clock free-ran on the held word) re-aligns as before.
+        let mut c = PhaseLockCore::new();
+        anchor_early(&mut c);
+        c.on_window(D + 200_000, true, 5.0, DT);
+        c.on_window(D, false, 5.0, DT);
+        let out = c.on_window(D + 1_500_000, true, 5.0, DT);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Realigned {
+                old_ns: D,
+                new_ns: D + 1_500_000
+            }
+        );
+        assert_eq!(c.pull_us(), 0.0);
+        assert!((out.freq_ppm.unwrap() - 5.0).abs() < 1e-9, "bumpless");
+    }
+
+    #[test]
+    fn a_boot_acquisition_lands_on_the_early_anchor_without_any_anchor_event_134() {
+        // The strih-snv boot of 24.10.2026: a −21 ppm oscillator, the rate servo walking its word
+        // 0 → −19.5 ppm over 40 s (still 7 µs/s off at 30 s), then the lock. Here a +70 ppm box
+        // with the same servo shape, whose drift at the lock is past 1 ms — the case that needs
+        // the hold. After the lock: one continuous engagement on the FIRST window's `D`.
+        for (osc, delay) in [(-21.0f64, 1usize), (70.0, 1), (70.0, 2)] {
+            let mut c = PhaseLockCore::new();
+            let mut p = Plant::new(osc, delay, 0.0);
+            let acq_windows = 80; // 40 s
+            let mut anchor = None;
+            for n in 0..acq_windows {
+                let out = c.on_window(D + p.e_ns.round() as i64, false, 0.0, DT);
+                if let AnchorEvent::Anchored { anchor_ns } = out.event {
+                    assert_eq!(n + 1, ANCHOR_CONFIRM_WINDOWS, "osc {osc}");
+                    anchor = Some(anchor_ns);
+                } else {
+                    assert_eq!(out.event, AnchorEvent::None, "osc {osc}: window {n}");
+                }
+                // The rate servo stand-in: the word converges on −osc with τ ≈ 20 s, 1.5 ppm
+                // short of it at the lock.
+                let t = (n + 1) as f64 * DT;
+                let word = -osc * (1.0 - (-t / 20.0).exp()) * 0.97;
+                p.advance(word, DT);
+            }
+            let anchor = anchor.expect("anchored early");
+            // The plant's phase relative to the early anchor (ns).
+            let off = |p: &Plant| (D + p.e_ns.round() as i64 - anchor) as f64;
+            let drift_at_lock = off(&p);
+            if osc > 40.0 {
+                assert!(
+                    drift_at_lock.abs() > REANCHOR_ON_ENGAGE_NS as f64,
+                    "osc {osc}: the hold must be needed here ({drift_at_lock} ns)"
+                );
+            }
+            let handover = -osc * 0.97;
+            let mut events = 0;
+            for n in 0..1_200 {
+                let out = c.on_window(D + p.e_ns.round() as i64, true, handover, DT);
+                if out.event != AnchorEvent::None {
+                    events += 1;
+                }
+                p.advance(out.freq_ppm.expect("engaged"), DT);
+                // The rate servo hands over 3 % short (2.1 ppm at 70 ppm): the PI learns that
+                // through its integrator (~100 s, critically damped — today's engagement does the
+                // same), so the phase is judged from 400 s after the lock.
+                if n >= 800 {
+                    assert!(
+                        off(&p).abs() < 50_000.0,
+                        "osc {osc} delay {delay}: |e| {} ns at {} s after the lock",
+                        off(&p),
+                        n as f64 * DT
+                    );
+                }
+            }
+            assert_eq!(events, 0, "osc {osc}: no re-anchor, no second step");
+            assert_eq!(c.anchor_ns(), Some(anchor), "osc {osc}: the early anchor");
+            assert_eq!(
+                c.freq_steps(),
+                0,
+                "osc {osc}: the pull is not a frequency step"
+            );
+            assert!(
+                (c.integrator_ppm() + osc).abs() < 0.05,
+                "osc {osc}: learned {}",
+                c.integrator_ppm()
+            );
+        }
     }
 
     #[test]

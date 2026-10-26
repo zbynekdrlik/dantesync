@@ -95,7 +95,7 @@ impl PlainPi {
 }
 
 enum Law {
-    Core(PhaseLockCore),
+    Core(Box<PhaseLockCore>),
     Plain(PlainPi),
 }
 
@@ -248,7 +248,7 @@ fn run_world(
 }
 
 fn core() -> Law {
-    Law::Core(PhaseLockCore::new())
+    Law::Core(Box::new(PhaseLockCore::new()))
 }
 
 fn plain() -> Law {
