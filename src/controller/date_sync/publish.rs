@@ -54,6 +54,8 @@ where
         };
         // #126: the master restart kept the fleet date; a follower's hold; the step on request.
         status.date_offset_restored = ds.authority.is_some() && ds.restart.restored;
+        // dantesync#134 review: the master's NTP server answers LI = 3 until its wall is placed.
+        status.ntp_server_unsynchronized = self.ntp_server_mode && !self.master_wall_placed();
         status.date_authority_hold_age_s = if self.holding_date() {
             ds.restart.holding_since.map(|t| t.elapsed().as_secs())
         } else {

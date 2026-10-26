@@ -612,9 +612,17 @@ where
             // the line that is the reading itself; through the master's own PTP outage (its wall
             // on the local NTP path) or a failed step it keeps the FLEET on UTC — the only error
             // left is the master's free-run drift, ≪ the step bound.
+            // Review of PR 135: while acquiring, the wall is up to the 2 ms boot hold off its own
+            // anchor (the phase error the lock will pull) — the fleet line is that much further.
+            let acquiring_err = if self.date_sync.core.acquiring() {
+                self.date_sync.core.last_error_ns().unwrap_or(0)
+            } else {
+                0
+            };
             let fleet_err = offset_us
                 .saturating_mul(1_000)
-                .wrapping_add(anchor.wrapping_sub(fleet));
+                .wrapping_add(anchor.wrapping_sub(fleet))
+                .wrapping_add(acquiring_err);
             self.date_sync.master_utc_error_ns = Some(fleet_err);
             let daily = self.date_sync.daily();
             // #119 (1.12): a daily-mode master without PTP is still on the fleet line (its D is
@@ -727,8 +735,9 @@ where
             return;
         }
         // dantesync#134: a new session starts on the wall the boot step placed — wait for the
-        // boot NTP reading (bounded, `boot.rs`).
-        if self.boot_ntp_pending() {
+        // boot NTP reading (bounded, `boot.rs`); and a saved state judged provisionally waits for
+        // its next judgement (review of PR 135).
+        if self.boot_ntp_pending() || self.boot_step_deferred() {
             return;
         }
         let base = self.date_sync.core.anchor_ns().unwrap_or(anchor);

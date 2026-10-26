@@ -136,6 +136,13 @@ pub fn parse_reply(buf: &[u8]) -> Result<ParsedReply> {
             NTP_PACKET_LEN
         ));
     }
+    // dantesync#134 review: LI = 3 is "clock unsynchronized" (RFC 5905) — no time source, as
+    // rsntp rejects it (`ServerNotSynchronized`).
+    if buf[0] >> 6 == 3 {
+        return Err(anyhow!(
+            "NTP reply: the server clock is unsynchronized (LI = 3)"
+        ));
+    }
     let mode = buf[0] & NTP_MODE_MASK;
     if mode != NTP_MODE_SERVER {
         return Err(anyhow!(

@@ -287,6 +287,29 @@ struct Args {
 }
 
 // Concrete Implementations for Traits
+/// dantesync#134 — one boot NTP reading on its own `boot-ntp` thread (its own client: name
+/// resolution, the Windows Npcap transport and the burst all happen there), delivered on the
+/// returned channel. A thread that cannot be started reads as a failed reading.
+fn spawn_boot_ntp(
+    server: &str,
+    dscp: &dantesync::dscp::DscpConfig,
+) -> std::sync::mpsc::Receiver<controller::BootNtpResult> {
+    let (tx, rx) = std::sync::mpsc::channel::<controller::BootNtpResult>();
+    let server = server.to_string();
+    let dscp = dscp.clone();
+    let spawned = thread::Builder::new()
+        .name("boot-ntp".to_string())
+        .spawn(move || {
+            let client = ntp::NtpClient::new(&server, &dscp);
+            // The loop may have given up waiting (it logs that): a closed channel is fine.
+            let _ = tx.send(client.get_offset().map_err(|e| e.to_string()));
+        });
+    if let Err(e) = spawned {
+        warn!("[NTP] could not start the boot-ntp thread: {}", e);
+    }
+    rx
+}
+
 struct RealNtpSource {
     client: ntp::NtpClient,
 }
@@ -721,17 +744,13 @@ fn run_sync_loop(
     // upstream that answers slowly at boot (12 s on strih-pp, 25.10.2026).
     if !args.skip_ntp {
         info!("Using NTP Server: {}", ntp_server);
-        let (boot_tx, boot_rx) = std::sync::mpsc::channel::<controller::BootNtpResult>();
-        let boot_server = ntp_server.to_string();
-        let boot_dscp = dscp_config.clone();
-        thread::Builder::new()
-            .name("boot-ntp".to_string())
-            .spawn(move || {
-                let client = ntp::NtpClient::new(&boot_server, &boot_dscp);
-                // The loop may have given up waiting (it logs that): a closed channel is fine.
-                let _ = boot_tx.send(client.get_offset().map_err(|e| e.to_string()));
-            })?;
-        controller.start_boot_ntp(boot_rx);
+        controller.start_boot_ntp(spawn_boot_ntp(ntp_server, &dscp_config));
+        // A deferred boot step (a rejected or given-up saved state) measures again the same way,
+        // never inside the loop (review of PR 135).
+        let again_server = ntp_server.to_string();
+        let again_dscp = dscp_config.clone();
+        controller
+            .set_boot_ntp_spawner(Box::new(move || spawn_boot_ntp(&again_server, &again_dscp)));
     }
 
     // Start NTP server if enabled (this machine becomes the time source)

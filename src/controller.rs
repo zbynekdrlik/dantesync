@@ -1752,6 +1752,9 @@ where
             max_step_us,
             effective_stale_window(self.config.ntp_stale_secs).as_secs()
         );
+        // dantesync#134 review: the NTP server reads this snapshot — "unsynchronized" (LI = 3)
+        // from its first reply while this master's wall is not placed yet.
+        self.update_shared_status();
     }
 
     /// Calculate adaptive NTP step threshold based on measured offset variance.

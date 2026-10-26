@@ -1163,6 +1163,21 @@ What was learned:
 - **Bench stand-ins must hand over like the real servo.** The first bench stand-in locked at a
   fixed window 11 ppm short — the freq-step detector then (correctly) re-seeded, which read as a
   failure of the hold. The real servo locks on |rate| < 5 ppm; the stand-in locks within 3 ppm.
+- **Review of PR 135 (fresh context), each a test now:** a boot step before the first window must
+  still drop the samples taken before it (a window mixing both anchors `D` on the old wall: a
+  session on it, then a backward Realigned step; on the legacy servo a ±500 ppm rate) — tested
+  through the REAL sample path (`process_settled_sync`), not a hand-set median; one 4-sample
+  window is not an anchor (`ANCHOR_CONFIRM_WINDOWS` = 3 agreeing within 1 ms, unlocked only); a
+  late boot reading measured before a placement step must never be published (it showed the step
+  as the NTP error and a reference epoch seconds off); NO path may measure NTP inline in the loop
+  (a failed/timed-out/dead reading = start on the current wall, a deferred step reuses the kept
+  reading or a `boot-ntp` thread via `set_boot_ntp_spawner`); a time-base rejection of the saved
+  state before the lock is provisional (`restore_judged_on` = (anchor, engaged)) — rejecting for
+  good on an interim grandmaster would start seq 1 = move the fleet date; the master answers
+  LI = 3 while its wall is not placed (`master_wall_placed`; rsntp and now `ntp_packet::parse_reply`
+  reject it); an acquiring master adds its phase-lock error to the fleet line's UTC error. Adding
+  a field to `PhaseLockCore` grows the bench's `Law` enum past clippy's large-variant bound: it
+  is boxed.
 - Tests: `ptp_phase_lock` (early anchor, the hold, the 2 ms safety net, a later re-engagement),
   `controller/date_sync/boot_tests.rs` (master with / without a saved state, a follower, a GM lost
   before the lock, the late reading report-only, the periodic check waiting), the two-clock bench

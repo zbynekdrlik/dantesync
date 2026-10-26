@@ -227,6 +227,19 @@ impl NtpServer {
         self.status = Some(status);
     }
 
+    /// dantesync#134 review: LI = 3 (unsynchronized) while the master's wall is not placed yet
+    /// (its boot reading pending, its saved fleet date waiting for PTP) — rsntp clients and the
+    /// Npcap transport reject such a reply, so no follower steps to a wall that moves in seconds.
+    fn leap_indicator(&self) -> u8 {
+        match &self.status {
+            Some(status) => match status.read() {
+                Ok(s) if s.ntp_server_unsynchronized => LI_ALARM_UNSYNCHRONIZED,
+                _ => LI_NO_WARNING,
+            },
+            None => LI_NO_WARNING,
+        }
+    }
+
     /// When this host last re-read its own upstream reference (#68), falling
     /// back to server start while nothing has been measured yet — never to the
     /// 1970 epoch a bare `ntp_updated_ts: 0` would produce.
@@ -353,7 +366,7 @@ impl NtpServer {
         let mut response = [0u8; NTP_PACKET_SIZE];
 
         // Byte 0: LI (2 bits) | VN (3 bits) | Mode (3 bits)
-        response[0] = (LI_NO_WARNING << 6) | (version << 3) | MODE_SERVER;
+        response[0] = (self.leap_indicator() << 6) | (version << 3) | MODE_SERVER;
 
         // Byte 1: Stratum
         response[1] = self.stratum;

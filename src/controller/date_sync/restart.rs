@@ -71,6 +71,14 @@ pub(in crate::controller) struct RestartState {
     pub(in crate::controller) cap_ns: i64,
     /// dantesync#134: the boot NTP reading still on its way (`boot.rs`).
     pub(in crate::controller) boot_ntp: Option<super::boot::BootNtpWait>,
+    /// dantesync#134 review: a boot reading the saved state skipped, kept for a deferred boot
+    /// step (and when it was taken).
+    pub(in crate::controller) boot_reading: Option<(crate::ntp::NtpMeasurement, Instant)>,
+    /// dantesync#134 review: `main`'s way to measure the boot reading again on a thread.
+    pub(in crate::controller) boot_ntp_spawner: Option<super::boot::BootNtpSpawner>,
+    /// dantesync#134 review: the (anchor, engaged) the saved state was last judged on — a
+    /// provisional rejection is judged again only when one of them changes.
+    pub(in crate::controller) restore_judged_on: Option<(Option<i64>, bool)>,
     /// The record last written (or read at start): written again when it changes, or after
     /// [`SAVE_HEARTBEAT`] since `last_saved_at`.
     pub(in crate::controller) last_saved: Option<(AuthorityState, [u8; 6])>,
@@ -98,6 +106,9 @@ impl RestartState {
             boot_step_due: false,
             cap_ns: config.date_offset.restore_cap_ns(),
             boot_ntp: None,
+            boot_reading: None,
+            boot_ntp_spawner: None,
+            restore_judged_on: None,
             last_saved: None,
             last_saved_at: None,
             save_failed_at: None,
@@ -297,6 +308,10 @@ where
         if self.boot_ntp_pending() {
             return;
         }
+        // Review of PR 135: a kept boot reading, else a new one on a thread — never inline.
+        if self.deferred_boot_step_off_the_loop() {
+            return;
+        }
         self.date_sync.restart.boot_step_due = false;
         let measurement = match self.ntp.get_offset() {
             Ok(m) => m,
@@ -335,6 +350,19 @@ where
     /// make the restored authority this master's (true). A rejection defers the boot step (false:
     /// no authority until it has run).
     pub(super) fn restore_date_authority(&mut self, anchor: i64, now_wall: i64) -> bool {
+        // Review of PR 135: before the lock a time-base rejection is provisional (an interim
+        // grandmaster at a cold power-up), judged again only when the anchor (a new time base) or
+        // the engagement changes.
+        let judged_on = (
+            self.date_sync.core.anchor_ns(),
+            self.date_sync.core.engaged(),
+        );
+        if self.date_sync.restart.pending_restore.is_none()
+            || self.date_sync.restart.restore_judged_on == Some(judged_on)
+        {
+            return false;
+        }
+        self.date_sync.restart.restore_judged_on = Some(judged_on);
         let Some(saved) = self.date_sync.restart.pending_restore.take() else {
             return false;
         };
@@ -356,6 +384,19 @@ where
         );
         let off = match checked {
             Ok(off) => off,
+            Err(reason)
+                if !self.date_sync.core.engaged()
+                    && !matches!(reason, RestoreRejected::Stale { .. }) =>
+            {
+                warn!(
+                    "[DATE] the saved fleet date offset is not restored YET: {} — provisional \
+                     before the lock (an interim grandmaster?): no new session, no step; judged \
+                     again on the next time base and finally at the PTP lock",
+                    describe_rejection(reason)
+                );
+                self.date_sync.restart.pending_restore = Some(saved);
+                return false;
+            }
             Err(reason) => {
                 warn!(
                     "[DATE] the saved fleet date offset is NOT restored: {} — the boot step runs \

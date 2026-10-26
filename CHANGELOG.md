@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`BOOT_HOLD_NS`) and retires the acquisition drift along the existing pull reference (20 s)
     instead of re-anchoring — no second step. Beyond 2 ms, and on every later re-engagement, the
     1 ms re-anchor rule applies as before.
+  - **Hardened after review:** an unlocked first anchor needs three agreeing windows (~1.5 s); a
+    boot step always drops the samples taken before it (also before the first window, also on the
+    legacy servo); a late reading on the fleet line is logged, never published; a failed /
+    timed-out / dead reading starts the node on its current wall, a rejected restore reuses the
+    boot reading (else measures again on a thread) — never a blocking NTP query in the loop; a
+    saved state rejected on another time base before the lock is provisional (an interim
+    grandmaster) and judged again on the next time base, finally at the lock; the master's NTP
+    server answers LI = 3 (unsynchronized, new `/status.ntp_server_unsynchronized`) until its wall
+    is placed, and the Windows Npcap NTP client rejects LI = 3 like rsntp; an acquiring master
+    feeds the fleet line its phase-lock error.
 
 ## [1.18.0] - 2026-10-14
 

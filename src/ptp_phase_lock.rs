@@ -219,6 +219,9 @@ pub struct PhaseLockCore {
     /// dantesync#134: the core has engaged at least once since start (the boot hold applies to
     /// the first engagement only).
     engaged_once: bool,
+    /// dantesync#134: the unlocked first anchor being confirmed — the first window's median and
+    /// how many agreeing windows so far.
+    anchor_candidate: Option<(i64, usize)>,
 }
 
 impl PhaseLockCore {
@@ -310,6 +313,9 @@ impl PhaseLockCore {
     pub fn request_rebase(&mut self) {
         if self.anchor_ns.is_some() {
             self.rebase_pending = true;
+        } else {
+            // dantesync#134: an early anchor being confirmed starts again in the new time base.
+            self.anchor_candidate = None;
         }
     }
 
@@ -335,7 +341,31 @@ impl PhaseLockCore {
         let first_engagement = ptp_locked && !self.engaged && !self.engaged_once;
         let anchor = match self.anchor_ns {
             None => {
-                // dantesync#134: anchored at the FIRST window, locked or not.
+                // dantesync#134: anchored at the first windows, locked or not. An unlocked anchor
+                // needs ANCHOR_CONFIRM_WINDOWS agreeing windows; a locked window anchors at once.
+                if !ptp_locked {
+                    let count = match self.anchor_candidate {
+                        Some((first, n))
+                            if median_diff_ns.wrapping_sub(first).abs() <= ANCHOR_AGREE_NS =>
+                        {
+                            self.anchor_candidate = Some((first, n + 1));
+                            n + 1
+                        }
+                        _ => {
+                            self.anchor_candidate = Some((median_diff_ns, 1));
+                            1
+                        }
+                    };
+                    if count < ANCHOR_CONFIRM_WINDOWS {
+                        return WindowOutcome {
+                            freq_ppm: None,
+                            error_ns: None,
+                            event,
+                            freq_step: None,
+                        };
+                    }
+                }
+                self.anchor_candidate = None;
                 self.anchor_ns = Some(median_diff_ns);
                 event = AnchorEvent::Anchored {
                     anchor_ns: median_diff_ns,
