@@ -576,7 +576,7 @@ mod tests {
         // An interim grandmaster, a time-base jump or a bad window: more than
         // `ANCHOR_AGREE_NS` apart = no anchor, the count restarts from that window.
         let mut c = PhaseLockCore::new();
-        anchor_early(&mut c);
+        acquire(&mut c, 0);
         acquire(&mut c, 0);
         let out = acquire(&mut c, ANCHOR_AGREE_NS + 1);
         assert_eq!(out.event, AnchorEvent::None);
@@ -591,7 +591,7 @@ mod tests {
         );
         // A requested rebase before the anchor also restarts the count.
         let mut c = PhaseLockCore::new();
-        anchor_early(&mut c);
+        acquire(&mut c, 0);
         acquire(&mut c, 0);
         c.request_rebase();
         assert_eq!(acquire(&mut c, 0).event, AnchorEvent::None);
