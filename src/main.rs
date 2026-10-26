@@ -709,16 +709,30 @@ fn run_sync_loop(
     controller.set_date_step_requests(date_step_rx);
 
     // dantesync#126: the NTP master's saved fleet date offset skips the boot step below (restored
-    // at the first PTP lock); any other node removes a leftover one.
+    // at the first PTP window); any other node removes a leftover one.
     controller.open_date_state(
         std::path::Path::new(DATE_STATE_PATH),
         ntp_server_config.enabled,
     );
 
+    // dantesync#134: the boot NTP reading is measured on its own thread (its own client: name
+    // resolution, the Windows Npcap transport and the burst all happen there) and handed to the
+    // loop, which starts at once — the PTP windows and the fleet date no longer wait for an
+    // upstream that answers slowly at boot (12 s on strih-pp, 25.10.2026).
     if !args.skip_ntp {
         info!("Using NTP Server: {}", ntp_server);
+        let (boot_tx, boot_rx) = std::sync::mpsc::channel::<controller::BootNtpResult>();
+        let boot_server = ntp_server.to_string();
+        let boot_dscp = dscp_config.clone();
+        thread::Builder::new()
+            .name("boot-ntp".to_string())
+            .spawn(move || {
+                let client = ntp::NtpClient::new(&boot_server, &boot_dscp);
+                // The loop may have given up waiting (it logs that): a closed channel is fine.
+                let _ = boot_tx.send(client.get_offset().map_err(|e| e.to_string()));
+            })?;
+        controller.start_boot_ntp(boot_rx);
     }
-    controller.run_ntp_sync(args.skip_ntp);
 
     // Start NTP server if enabled (this machine becomes the time source)
     if ntp_server_config.enabled {

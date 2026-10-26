@@ -498,8 +498,10 @@ where
     /// while a coordinated step is pending (the scheduler owns that), during the failure backoff,
     /// or mid re-anchor.
     fn realign_master_to_fleet(&mut self) {
+        // dantesync#134: also while the boot acquisition runs (anchored at the first window, the
+        // rate servo still owning the word) — the date is placed at once, not at the lock.
         if !self.date_authority_active()
-            || !self.date_sync.core.engaged()
+            || !(self.date_sync.core.engaged() || self.date_sync.core.acquiring())
             || self.date_sync.core.rebase_pending()
         {
             return;
@@ -724,6 +726,11 @@ where
         if self.restore_date_authority(anchor, now_wall) || self.date_sync.restart.boot_step_due {
             return;
         }
+        // dantesync#134: a new session starts on the wall the boot step placed — wait for the
+        // boot NTP reading (bounded, `boot.rs`).
+        if self.boot_ntp_pending() {
+            return;
+        }
         let base = self.date_sync.core.anchor_ns().unwrap_or(anchor);
         let authority = DateAuthority::new(
             anchor,
@@ -759,7 +766,9 @@ where
             AnchorEvent::None => {}
             AnchorEvent::Anchored { anchor_ns } => {
                 info!(
-                    "[PHASE-LOCK] anchored: wall = PTP time + D, D={}ns (grandmaster {})",
+                    "[PHASE-LOCK] anchored at the first PTP window: wall = PTP time + D, D={}ns \
+                     (grandmaster {}) — the date layer works on it now, the phase lock engages at \
+                     the rate servo's lock",
                     anchor_ns, gm_label
                 );
                 self.date_sync.anchor_gm = self.current_gm_uuid;

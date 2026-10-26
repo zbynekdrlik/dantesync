@@ -39,7 +39,13 @@
 //!   core engages once the controller reports PTP lock, taking over the frequency word
 //!   bumplessly (its integrator starts at the rate servo's word), and hands the learned frequency
 //!   back if lock is lost.
-//! - `D` is anchored at the first lock (from the node's own, NTP-coarse-aligned wall), replaced by
+//! - `D` is anchored at the FIRST window, before the lock (dantesync#134: `median(t2 − t1)` is an
+//!   absolute offset of two time bases and needs no rate lock, so the date layer places the fleet
+//!   date seconds after the first Sync instead of ~40 s later). The rate servo leaves the phase
+//!   free while it acquires, so the wall drifts off that anchor by its rate error (~0.4 ms on a
+//!   −21 ppm box, past 1 ms on a 50 ppm one). The FIRST engagement keeps the anchor within
+//!   [`BOOT_HOLD_NS`] and retires the drift along the pull reference — no second step.
+//! - `D` is anchored from the node's own wall (the boot step or the fleet date placed on it), replaced by
 //!   the master's published `D` when the node follows the authority (`set_anchor`), shifted by
 //!   every applied step (`note_step`), and RE-ANCHORED from the continuous wall when the
 //!   grandmaster changes (`request_rebase`) or its time base jumps by more than
@@ -105,6 +111,14 @@ pub const DISCONTINUITY_NS: i64 = 1_000_000_000;
 /// (the wall stays where it is), and the date layer re-aligns it with ONE step: a follower's
 /// next authority poll sees its `D` differ and joins; the master rebases the fleet offset.
 pub const REANCHOR_ON_ENGAGE_NS: i64 = 1_000_000;
+
+/// dantesync#134 — the FIRST engagement after the early anchor (the box anchored `D` at its first
+/// window and placed the fleet date on it while the rate servo was still acquiring) keeps that
+/// anchor up to this far off it (ns), and retires the acquisition drift along the pull reference
+/// ([`FSTEP_PULL_TAU_S`]) instead of re-anchoring: a re-anchor here would be a SECOND date step,
+/// seconds after the first, under every application that started on the placed date. Beyond it
+/// (more than the error clamp) the [`REANCHOR_ON_ENGAGE_NS`] rule applies as before.
+pub const BOOT_HOLD_NS: i64 = ERROR_CLAMP_US as i64 * 1_000;
 
 /// `dt` is clamped to this range (s): a first update or a long gap must not scale the integrator
 /// step by an unbounded interval.
@@ -193,6 +207,9 @@ pub struct PhaseLockCore {
     pull_us: f64,
     freq_steps: u32,
     last_freq_step: Option<FreqStep>,
+    /// dantesync#134: the core has engaged at least once since start (the boot hold applies to
+    /// the first engagement only).
+    engaged_once: bool,
 }
 
 impl PhaseLockCore {
@@ -208,6 +225,12 @@ impl PhaseLockCore {
     /// True while this core owns the frequency word.
     pub fn engaged(&self) -> bool {
         self.engaged
+    }
+
+    /// dantesync#134: anchored, but never engaged yet — the boot acquisition, the rate servo still
+    /// owns the word. The date layer works on the anchor already (it is the fleet date line).
+    pub fn acquiring(&self) -> bool {
+        self.anchor_ns.is_some() && !self.engaged_once
     }
 
     /// The integrator — the learned frequency word (ppm).
@@ -299,16 +322,11 @@ impl PhaseLockCore {
         dt_s: f64,
     ) -> WindowOutcome {
         let mut event = AnchorEvent::None;
+        // dantesync#134: the first engagement after the early anchor holds it (within the hold).
+        let first_engagement = ptp_locked && !self.engaged && !self.engaged_once;
         let anchor = match self.anchor_ns {
             None => {
-                if !ptp_locked {
-                    return WindowOutcome {
-                        freq_ppm: None,
-                        error_ns: None,
-                        event,
-                        freq_step: None,
-                    };
-                }
+                // dantesync#134: anchored at the FIRST window, locked or not.
                 self.anchor_ns = Some(median_diff_ns);
                 event = AnchorEvent::Anchored {
                     anchor_ns: median_diff_ns,
@@ -325,7 +343,11 @@ impl PhaseLockCore {
                         new_ns: median_diff_ns,
                     };
                     median_diff_ns
-                } else if ptp_locked && !self.engaged && off > REANCHOR_ON_ENGAGE_NS {
+                } else if ptp_locked
+                    && !self.engaged
+                    && off > REANCHOR_ON_ENGAGE_NS
+                    && !(first_engagement && off <= BOOT_HOLD_NS)
+                {
                     self.anchor_ns = Some(median_diff_ns);
                     event = AnchorEvent::Realigned {
                         old_ns: a,
@@ -358,11 +380,21 @@ impl PhaseLockCore {
 
         if !self.engaged {
             self.engaged = true;
+            self.engaged_once = true;
             self.i_ppm = rate_servo_freq_ppm.clamp(-FREQ_CLAMP_PPM, FREQ_CLAMP_PPM);
             self.drop_step_state();
         }
         if event != AnchorEvent::None {
             self.drop_step_state();
+        }
+        if first_engagement && event == AnchorEvent::None {
+            // dantesync#134: the boot hold — the acquisition drift off the early anchor is retired
+            // along the pull reference (the PI tracks `e − r`, the word carries `−r/τ`), so the
+            // integrator starts undisturbed at the rate servo's word and the wall is not stepped.
+            let e_us = e_ns as f64 / 1_000.0;
+            if e_us.abs() >= FSTEP_PULL_DONE_US {
+                self.pull_us = e_us.clamp(-ERROR_CLAMP_US, ERROR_CLAMP_US);
+            }
         }
 
         let dt = if dt_s.is_finite() {

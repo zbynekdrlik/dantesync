@@ -96,7 +96,8 @@ on either platform skips `publish` — no release with a missing asset).
   test and the shifted slope against level shifts, the integrator re-seed, the decaying phase pull
   and its applied-rate transient; v1.15: a master restart keeps the fleet date — the saved
   authority state, the restore judged at the first PTP window, the follower hold, the loopback
-  `POST /date/step`) →
+  `POST /date/step`; v1.19: the fleet date placed at the FIRST PTP window with one step, the boot
+  NTP reading off the loop, the first engagement holding the early anchor through the pull) →
   `.claude/rules/clock-discipline-and-testing.md` (auto-loads on
   `src/ptp_phase_lock.rs` / `src/date_offset.rs` / `src/time_server.rs` / their `tests.rs` /
   `tests/two_clock_bench.rs` / `tests/simulation_e2e.rs`)

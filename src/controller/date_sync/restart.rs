@@ -1,19 +1,21 @@
 //! dantesync#126 — a master restart keeps the fleet date: the NTP master saves its authority's
-//! state whenever it changes, and a restarted master restores it at its first PTP lock.
+//! state whenever it changes, and a restarted master restores it at its first PTP window
+//! (dantesync#134: the first window, not the rate servo's lock ~30-40 s later).
 //!
-//! The start-up path (`main` → [`PtpController::load_date_state`] → `run_ntp_sync`):
+//! The start-up path (`main` → [`PtpController::load_date_state`] → the boot NTP reading, which
+//! arrives on a channel since 1.19, `boot.rs`):
 //!
 //! - **A readable saved state** skips the boot step (the date is restored, not re-derived from
-//!   UTC) and keeps the master off its NTP step path until the first lock: its NTP readings are
-//!   report-only meanwhile.
-//! - **At the first lock** ([`PtpController::restore_date_authority`], from
+//!   UTC) and keeps the master off its NTP step path until the first PTP window: its NTP readings
+//!   are report-only meanwhile.
+//! - **At the first PTP window** ([`PtpController::restore_date_authority`], from
 //!   `ensure_date_authority`) the state is judged: a grandmaster known (its UUID is report-only
 //!   since 1.17, dantesync#129), and the first window's `t2 − t1` within the daily emergency cap
 //!   of the saved `D`. Accepted: the authority continues with the same `D`, seq and change in
 //!   flight, and `realign_master_to_fleet` moves ONLY this master's wall onto it (a host reboot's
 //!   RTC wall, the free-run of the restart gap).
 //! - **Rejected** (no grandmaster identity, a stale record, a grandmaster whose uptime is off the
-//!   saved line, a wall seconds off), or **no PTP lock within [`RESTORE_WAIT_FOR_PTP`]**: the
+//!   saved line, a wall seconds off), or **no PTP window within [`RESTORE_WAIT_FOR_PTP`]**: the
 //!   boot step runs then, from the loop ([`PtpController::run_deferred_boot_step`]), and a new
 //!   session starts at seq 1 — the path every master took before 1.15, logged loudly.
 //! - **No file / an unreadable one**: the boot step runs at start, exactly as before.
@@ -34,10 +36,10 @@ use super::*;
 use crate::date_offset::{AuthorityState, DateOffsetState, RestoreRejected};
 use std::path::{Path, PathBuf};
 
-/// A saved state still waiting for the first PTP lock after this long is given up: the boot step
+/// A saved state still waiting for the first PTP window after this long is given up: the boot step
 /// runs and the master takes its NTP path, as before 1.15 (a master whose PTP never comes must
-/// not free-run off UTC for ever). A healthy restart locks in about a minute (strih-lx on
-/// 30.9.2026: 65 s).
+/// not free-run off UTC for ever). A healthy restart sees its first window seconds after the
+/// network is up (1.18 waited for the lock: strih-lx 30.9.2026, 65 s).
 pub(super) const RESTORE_WAIT_FOR_PTP: Duration = Duration::from_secs(300);
 
 /// After a failed save, the next attempt waits this long (the loop runs every 1 ms / 50 µs).
@@ -55,10 +57,10 @@ const SAVE_HEARTBEAT: Duration = Duration::from_secs(600);
 pub(in crate::controller) struct RestartState {
     /// Where the master saves its date offset (`None`: never saved — a follower, a test).
     pub(in crate::controller) path: Option<PathBuf>,
-    /// The saved state read at start, judged at the first PTP lock. While it is here the boot
+    /// The saved state read at start, judged at the first PTP window. While it is here the boot
     /// step and the master's NTP step path are skipped.
     pub(in crate::controller) pending_restore: Option<DateOffsetState>,
-    /// When the saved state was read (the wait for the first lock is bounded).
+    /// When the saved state was read (the wait for the first PTP window is bounded).
     pub(in crate::controller) loaded_at: Instant,
     /// The authority was restored from the saved state (`/status.date_offset_restored`).
     pub(in crate::controller) restored: bool,
@@ -67,6 +69,8 @@ pub(in crate::controller) struct RestartState {
     pub(in crate::controller) boot_step_due: bool,
     /// How far off the saved `D` the first window may read the wall and still restore it (ns).
     pub(in crate::controller) cap_ns: i64,
+    /// dantesync#134: the boot NTP reading still on its way (`boot.rs`).
+    pub(in crate::controller) boot_ntp: Option<super::boot::BootNtpWait>,
     /// The record last written (or read at start): written again when it changes, or after
     /// [`SAVE_HEARTBEAT`] since `last_saved_at`.
     pub(in crate::controller) last_saved: Option<(AuthorityState, [u8; 6])>,
@@ -93,6 +97,7 @@ impl RestartState {
             restored: false,
             boot_step_due: false,
             cap_ns: config.date_offset.restore_cap_ns(),
+            boot_ntp: None,
             last_saved: None,
             last_saved_at: None,
             save_failed_at: None,
@@ -106,7 +111,9 @@ impl RestartState {
 
 fn describe_rejection(r: RestoreRejected) -> String {
     match r {
-        RestoreRejected::NoGrandmaster => "no grandmaster identity at the first lock".to_string(),
+        RestoreRejected::NoGrandmaster => {
+            "no grandmaster identity at the first PTP window".to_string()
+        }
         RestoreRejected::Stale { age_ns } => format!(
             "it is {} h old (the fleet may have had another master since)",
             age_ns / 3_600_000_000_000
@@ -141,7 +148,7 @@ where
 
     /// dantesync#126 — the NTP master reads the fleet date offset it saved before this restart
     /// (`main`, before `run_ntp_sync`), and saves it at `path` from now on. A readable state
-    /// skips the boot step and is restored at the first PTP lock; without one nothing changes.
+    /// skips the boot step and is restored at the first PTP window; without one nothing changes.
     pub fn load_date_state(&mut self, path: PathBuf) {
         let rs = &mut self.date_sync.restart;
         rs.loaded_at = Instant::now();
@@ -154,7 +161,7 @@ where
                 info!(
                     "[DATE] saved fleet date offset found at {}: D={}ns seq {} (grandmaster {}, \
                      saved {} s ago) — the boot step is skipped; it is restored at the first PTP \
-                     lock, so this restart does not move the fleet date",
+                     window, so this restart does not move the fleet date",
                     path.display(),
                     state.authority.d_ns,
                     state.authority.seq,
@@ -179,7 +186,7 @@ where
         rs.path = Some(path);
     }
 
-    /// dantesync#126 — a saved state waits for the first PTP lock: the boot step is skipped.
+    /// dantesync#126 — a saved state waits for the first PTP window: the boot step is skipped.
     pub(in crate::controller) fn boot_step_deferred(&self) -> bool {
         self.date_sync.restart.pending_restore.is_some()
     }
@@ -188,7 +195,7 @@ where
     /// than twice the restore cap off UTC cannot be on the fleet line (the authority keeps the line
     /// within the cap of UTC), so that state could never be restored: it is dropped at once and the
     /// boot step runs at start, instead of the master serving a wall seconds off UTC until its first
-    /// lock rejects it (review round 1).
+    /// window rejects it (review round 1).
     pub(in crate::controller) fn skip_boot_step_for(&mut self, offset_us: i64) -> bool {
         if !self.boot_step_deferred() {
             return false;
@@ -247,7 +254,7 @@ where
         let rs = &mut self.date_sync.restart;
         if rs.pending_restore.is_some() && rs.loaded_at.elapsed() >= RESTORE_WAIT_FOR_PTP {
             warn!(
-                "[DATE] no PTP lock {} s after start: the saved fleet date offset is NOT restored \
+                "[DATE] no PTP window {} s after start: the saved fleet date offset is NOT restored \
                  — the boot step runs now and a new authority session starts at seq 1 (the \
                  pre-1.15 path)",
                 RESTORE_WAIT_FOR_PTP.as_secs()
@@ -283,6 +290,11 @@ where
     /// no disturbance), and the new authority is built on the stepped anchor.
     pub(super) fn run_deferred_boot_step(&mut self) {
         if !self.date_sync.restart.boot_step_due {
+            return;
+        }
+        // dantesync#134: the boot NTP reading is still on its way — it IS this step (`boot.rs`);
+        // measuring again here would block the loop on the same unanswered upstream.
+        if self.boot_ntp_pending() {
             return;
         }
         self.date_sync.restart.boot_step_due = false;

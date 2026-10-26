@@ -57,6 +57,9 @@ paths:
   - "src/date_step_trigger.rs"
   - "src/http_status.rs"
   - "tests/two_clock_bench/restart.rs"
+  - "src/controller/date_sync/boot.rs"
+  - "src/controller/date_sync/boot_tests.rs"
+  - "tests/two_clock_bench/boot.rs"
 ---
 
 # Disciplining a clock here — and how to test one without fooling yourself
@@ -1130,3 +1133,38 @@ next NTP samples. What was learned building the fix:
   restarted master's re-acquisition (its absorbed free-run, ~109 µs at worst) on its own, like the
   double fault's settling. Give the session a seq above 1 before the restart (a step on request):
   with seq 1 on both sides "the same session" and "a new session" read the same.
+
+## dantesync#134 (v1.19) — the fleet date at the FIRST PTP window, one step, none at the lock
+
+The owner (26.10.2026): a boot must sync fast, nothing on a Dante/Blackmagic network waits for a
+settle. strih-pp's boot (25.10.2026) spent 12 s in the blocking boot NTP burst before the PTP loop
+started, then 31 s from the first Sync to the rate servo's `=== LOCKED ===`, and only then
+anchored `D`, restored the saved fleet D and stepped its wall by +3.75 s — under a running OBS.
+What was learned:
+
+- **`D = median(t2 − t1)` needs no rate lock.** It is the absolute offset of two time bases. The
+  core anchors at the first window; everything keyed on `Anchored` (the restore, a new session, a
+  follower's adoption) and `realign_master_to_fleet` (also while `core.acquiring()`) runs then.
+- **The rate servo leaves the phase free while it acquires**, so the wall walks off the early
+  anchor by ∫ rate error: ~0.4 ms on strih-snv's −21 ppm (24.10.2026: word 0 → −19.5 ppm over
+  40 s, still +7 µs/s at 30 s), past 1 ms from ~50-70 ppm. Under the old engagement rule that is a
+  `Realigned` = a SECOND (ms) Join step. The first engagement therefore keeps `D` within
+  `BOOT_HOLD_NS` (= the ±2 ms error clamp) and seeds the pull reference with `e` (the camera-box
+  1372 mechanism: the PI tracks `e − r`, the word carries `−r/τ`, the integrator starts undisturbed
+  at the rate servo's word). Only the FIRST engagement: a lock loss later re-aligns as before.
+- **Engaging the PI from the first window instead was rejected**: it would learn a 21 ppm error
+  through its ~100 s integrator — ~0.8 ms overshoot and minutes off the tick.
+- **A blocking NTP query in the loop is as bad as one before it.** The periodic
+  `check_ntp_utc_tracking` is due at once without a fresh measurement, so it waits for the boot
+  reading too. A deferred boot step (a rejected saved state) uses the boot reading instead of
+  measuring again.
+- **A late boot reading must never step a node off the line it joined** (`on_fleet_date_line`:
+  an authority, or an adopted D): report-only.
+- **Bench stand-ins must hand over like the real servo.** The first bench stand-in locked at a
+  fixed window 11 ppm short — the freq-step detector then (correctly) re-seeded, which read as a
+  failure of the hold. The real servo locks on |rate| < 5 ppm; the stand-in locks within 3 ppm.
+- Tests: `ptp_phase_lock` (early anchor, the hold, the 2 ms safety net, a later re-engagement),
+  `controller/date_sync/boot_tests.rs` (master with / without a saved state, a follower, a GM lost
+  before the lock, the late reading report-only, the periodic check waiting), the two-clock bench
+  `boot.rs` (−21 / +70 ppm boxes, one step each, both on the line). Negative control:
+  `BOOT_HOLD_NS = 0` fails the bench, the acquisition test and two controller tests.
