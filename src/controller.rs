@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// status fields). A child module so it can reach the controller's private state without growing
 /// this file; its state is the one `date_sync` field.
 mod date_sync;
-pub use date_sync::BootNtpResult;
+pub use date_sync::{BootNtpResult, BootNtpSpawner};
 
 /// dantesync#112 — PTP liveness: the multicast re-join while no allowed PTP packet comes, and the
 /// honest `/status` meanwhile. A child module like `date_sync`; its state is the one

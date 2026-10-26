@@ -34,8 +34,12 @@ pub(in crate::controller) const BOOT_NTP_WAIT: Duration = Duration::from_secs(60
 /// The boot reading still on its way.
 pub(in crate::controller) struct BootNtpWait {
     rx: Receiver<BootNtpResult>,
-    since: Instant,
+    pub(in crate::controller) since: Instant,
 }
+
+/// `main`'s way to measure a boot NTP reading again on a thread (dantesync#134 review: a deferred
+/// boot step must never measure inside the loop).
+pub type BootNtpSpawner = Box<dyn FnMut() -> Receiver<BootNtpResult>>;
 
 impl<C, N, S> PtpController<C, N, S>
 where
@@ -49,6 +53,11 @@ where
             rx,
             since: Instant::now(),
         });
+    }
+
+    /// `main`: how to measure the boot reading again on a thread.
+    pub fn set_boot_ntp_spawner(&mut self, spawner: BootNtpSpawner) {
+        let _ = spawner;
     }
 
     /// The boot reading has not arrived yet (and the wait for it is not over).

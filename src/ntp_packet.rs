@@ -485,6 +485,22 @@ mod tests {
         );
     }
 
+    /// dantesync#134: a server that says its clock is unsynchronized (LI = 3: a master whose
+    /// wall is not placed yet) is no time source — the Windows Npcap transport rejects it like
+    /// rsntp does (`ServerNotSynchronized`).
+    #[test]
+    fn parse_reply_rejects_an_unsynchronized_server_134() {
+        let mut buf = fake_server_reply(1, 2, 3);
+        buf[0] |= 3 << 6;
+        assert!(parse_reply(&buf).is_err());
+        let mut buf = fake_server_reply(1, 2, 3);
+        buf[0] |= 1 << 6;
+        assert!(
+            parse_reply(&buf).is_ok(),
+            "a leap-second warning is still a time source"
+        );
+    }
+
     // ---- Offset / RTT math ----
 
     /// #53 GREEN: a perfectly symmetric network path (equal delay each way)

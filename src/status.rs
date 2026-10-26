@@ -393,6 +393,12 @@ pub struct SyncStatus {
     /// (no valid saved state: the boot step ran), and in a pre-1.15 blob.
     #[serde(default)]
     pub date_offset_restored: bool,
+    /// dantesync#134 (the NTP master): its wall is not placed yet — the boot reading is pending, a
+    /// saved fleet date offset waits for the first PTP windows, or a boot step is due. Its NTP
+    /// server then answers with LI = 3 (unsynchronized), so no client steps to the raw wall it
+    /// will leave in seconds. `false` on every other node and in a pre-1.19 blob.
+    #[serde(default)]
+    pub ntp_server_unsynchronized: bool,
     /// dantesync#126 (a follower): whole seconds this node has HELD the fleet date offset since
     /// its master went silent (`date_authority` = `"holding"`); `null` otherwise.
     #[serde(default)]
@@ -586,6 +592,7 @@ impl Default for SyncStatus {
             date_daily_last_step_ms: None,
             // #126: not restored, not holding, no step requested
             date_offset_restored: false,
+            ntp_server_unsynchronized: false,
             date_authority_hold_age_s: None,
             date_step_trigger_last: String::new(),
             // #117: unknown until the controller publishes

@@ -120,6 +120,15 @@ pub const REANCHOR_ON_ENGAGE_NS: i64 = 1_000_000;
 /// (more than the error clamp) the [`REANCHOR_ON_ENGAGE_NS`] rule applies as before.
 pub const BOOT_HOLD_NS: i64 = ERROR_CLAMP_US as i64 * 1_000;
 
+/// dantesync#134 (review of PR 135) — an UNLOCKED first anchor needs this many consecutive windows
+/// whose medians agree within [`ANCHOR_AGREE_NS`] (one 4-sample window is not trusted alone: an
+/// interim grandmaster at a cold power-up, a bad window). About 1.5 s. A LOCKED window anchors at
+/// once, as before.
+pub const ANCHOR_CONFIRM_WINDOWS: usize = 3;
+
+/// How close (ns) the confirming windows' medians must be to the first of them.
+pub const ANCHOR_AGREE_NS: i64 = 1_000_000;
+
 /// `dt` is clamped to this range (s): a first update or a long gap must not scale the integrator
 /// step by an unbounded interval.
 pub const DT_MIN_S: f64 = 0.01;
@@ -519,22 +528,78 @@ mod tests {
         core.on_window(D + e_ns, false, 0.0, DT)
     }
 
+    /// The early anchor at `D`: [`ANCHOR_CONFIRM_WINDOWS`] agreeing unlocked windows.
+    fn anchor_early(core: &mut PhaseLockCore) {
+        for n in 0..ANCHOR_CONFIRM_WINDOWS {
+            let out = acquire(core, 0);
+            if n + 1 < ANCHOR_CONFIRM_WINDOWS {
+                assert_eq!(out.event, AnchorEvent::None, "window {n}: not yet");
+            } else {
+                assert_eq!(out.event, AnchorEvent::Anchored { anchor_ns: D });
+            }
+        }
+    }
+
     #[test]
-    fn it_anchors_d_at_the_first_window_before_ptp_lock_but_does_not_engage_134() {
+    fn it_anchors_d_after_three_agreeing_windows_before_ptp_lock_but_does_not_engage_134() {
         // `D = median(t2 − t1)` is an absolute offset of two time bases: valid from the first
-        // window, the rate servo's lock is not needed for it (the 50 s boot of camera-box 1483).
+        // windows, the rate servo's lock is not needed for it (the 50 s boot of camera-box 1483).
+        // One 4-sample window is not trusted alone (review of PR 135): three agreeing ones are.
+        assert_eq!(ANCHOR_CONFIRM_WINDOWS, 3);
         let mut c = PhaseLockCore::new();
-        let out = c.on_window(D, false, 12.0, DT);
-        assert_eq!(out.event, AnchorEvent::Anchored { anchor_ns: D });
+        for e in [0, 20_000] {
+            let out = acquire(&mut c, e);
+            assert_eq!(out.event, AnchorEvent::None);
+            assert_eq!(out.error_ns, None);
+            assert_eq!(c.anchor_ns(), None);
+        }
+        let out = acquire(&mut c, 40_000);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Anchored {
+                anchor_ns: D + 40_000
+            },
+            "anchored on the confirming window"
+        );
         assert_eq!(out.error_ns, Some(0));
         assert_eq!(out.freq_ppm, None, "the rate servo keeps the word");
-        assert_eq!(c.anchor_ns(), Some(D));
         assert!(!c.engaged());
         // The acquisition drift is measured against it, still without engaging.
         let out = acquire(&mut c, 420_000);
         assert_eq!(out.event, AnchorEvent::None);
-        assert_eq!(out.error_ns, Some(420_000));
+        assert_eq!(out.error_ns, Some(380_000));
         assert_eq!(out.freq_ppm, None);
+    }
+
+    #[test]
+    fn a_window_that_disagrees_restarts_the_early_anchor_134() {
+        // An interim grandmaster, a time-base jump or a bad window: more than
+        // `ANCHOR_AGREE_NS` apart = no anchor, the count restarts from that window.
+        let mut c = PhaseLockCore::new();
+        anchor_early(&mut c);
+        acquire(&mut c, 0);
+        let out = acquire(&mut c, ANCHOR_AGREE_NS + 1);
+        assert_eq!(out.event, AnchorEvent::None);
+        assert_eq!(c.anchor_ns(), None);
+        acquire(&mut c, ANCHOR_AGREE_NS + 1);
+        let out = acquire(&mut c, ANCHOR_AGREE_NS + 1);
+        assert_eq!(
+            out.event,
+            AnchorEvent::Anchored {
+                anchor_ns: D + ANCHOR_AGREE_NS + 1
+            }
+        );
+        // A requested rebase before the anchor also restarts the count.
+        let mut c = PhaseLockCore::new();
+        anchor_early(&mut c);
+        acquire(&mut c, 0);
+        c.request_rebase();
+        assert_eq!(acquire(&mut c, 0).event, AnchorEvent::None);
+        assert_eq!(acquire(&mut c, 0).event, AnchorEvent::None);
+        assert!(matches!(
+            acquire(&mut c, 0).event,
+            AnchorEvent::Anchored { .. }
+        ));
     }
 
     #[test]
@@ -543,7 +608,7 @@ mod tests {
         // (`Realigned` = a second date step). The first engagement keeps `D` and retires the
         // drift along the pull reference instead.
         let mut c = PhaseLockCore::new();
-        acquire(&mut c, 0);
+        anchor_early(&mut c);
         acquire(&mut c, 900_000);
         let out = c.on_window(D + 1_500_000, true, -21.0, DT);
         assert_eq!(out.event, AnchorEvent::None, "no re-anchor: no second step");
@@ -569,7 +634,7 @@ mod tests {
     fn beyond_the_boot_hold_the_first_engagement_still_realigns_134() {
         // Past the ±2 ms error clamp the pull cannot be the answer: one Join step, the old rule.
         let mut c = PhaseLockCore::new();
-        acquire(&mut c, 0);
+        anchor_early(&mut c);
         let out = c.on_window(D + 3_000_000, true, 5.0, DT);
         assert_eq!(
             out.event,
@@ -586,7 +651,7 @@ mod tests {
         // Only the FIRST engagement after the early anchor holds: a lock loss later in life
         // (the clock free-ran on the held word) re-aligns as before.
         let mut c = PhaseLockCore::new();
-        acquire(&mut c, 0);
+        anchor_early(&mut c);
         c.on_window(D + 200_000, true, 5.0, DT);
         c.on_window(D, false, 5.0, DT);
         let out = c.on_window(D + 1_500_000, true, 5.0, DT);
@@ -611,9 +676,13 @@ mod tests {
             let mut c = PhaseLockCore::new();
             let mut p = Plant::new(osc, delay, 0.0);
             let acq_windows = 80; // 40 s
+            let mut anchor = None;
             for n in 0..acq_windows {
                 let out = c.on_window(D + p.e_ns.round() as i64, false, 0.0, DT);
-                if n > 0 {
+                if let AnchorEvent::Anchored { anchor_ns } = out.event {
+                    assert_eq!(n + 1, ANCHOR_CONFIRM_WINDOWS, "osc {osc}");
+                    anchor = Some(anchor_ns);
+                } else {
                     assert_eq!(out.event, AnchorEvent::None, "osc {osc}: window {n}");
                 }
                 // The rate servo stand-in: the word converges on −osc with τ ≈ 20 s, 1.5 ppm
@@ -622,7 +691,10 @@ mod tests {
                 let word = -osc * (1.0 - (-t / 20.0).exp()) * 0.97;
                 p.advance(word, DT);
             }
-            let drift_at_lock = p.e_ns;
+            let anchor = anchor.expect("anchored early");
+            // The plant's phase relative to the early anchor (ns).
+            let off = |p: &Plant| (D + p.e_ns.round() as i64 - anchor) as f64;
+            let drift_at_lock = off(&p);
             if osc > 40.0 {
                 assert!(
                     drift_at_lock.abs() > REANCHOR_ON_ENGAGE_NS as f64,
@@ -642,15 +714,15 @@ mod tests {
                 // same), so the phase is judged from 400 s after the lock.
                 if n >= 800 {
                     assert!(
-                        p.e_ns.abs() < 50_000.0,
+                        off(&p).abs() < 50_000.0,
                         "osc {osc} delay {delay}: |e| {} ns at {} s after the lock",
-                        p.e_ns,
+                        off(&p),
                         n as f64 * DT
                     );
                 }
             }
             assert_eq!(events, 0, "osc {osc}: no re-anchor, no second step");
-            assert_eq!(c.anchor_ns(), Some(D), "osc {osc}: the first window's D");
+            assert_eq!(c.anchor_ns(), Some(anchor), "osc {osc}: the early anchor");
             assert_eq!(
                 c.freq_steps(),
                 0,

@@ -32,6 +32,8 @@ const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 /// LI (Leap Indicator): 0 = no warning
 const LI_NO_WARNING: u8 = 0;
+/// RFC 5905: leap indicator 3 = "unknown (clock unsynchronized)" (dantesync#134).
+const LI_ALARM_UNSYNCHRONIZED: u8 = 3;
 
 /// Mode: 4 = server
 const MODE_SERVER: u8 = 4;
@@ -856,6 +858,33 @@ mod tests {
         // "LOCL" in ASCII
         let bytes = REF_ID_LOCL.to_be_bytes();
         assert_eq!(bytes, [b'L', b'O', b'C', b'L']);
+    }
+
+    #[test]
+    fn a_master_whose_wall_is_not_placed_answers_unsynchronized_134() {
+        // dantesync#134 review: while the master's wall is not placed (its boot reading pending,
+        // its saved fleet date waiting for PTP) it must not serve that wall as synchronized — a
+        // follower's boot step would land on a wall seconds off the line it joins next.
+        let status = Arc::new(std::sync::RwLock::new(crate::status::SyncStatus::default()));
+        let mut server = NtpServer {
+            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            stratum: 3,
+            port: 0,
+            reference_time: SystemTime::now(),
+            status: None,
+            dscp: crate::dscp::DscpConfig::default(),
+        };
+        server.set_status_source(status.clone());
+        let li = |server: &NtpServer| {
+            let r = server.build_response(4, &[0u8; 8], 100, 200).unwrap();
+            (r[0] >> 6) & 0x03
+        };
+        assert_eq!(li(&server), LI_NO_WARNING);
+        status.write().unwrap().ntp_server_unsynchronized = true;
+        assert_eq!(li(&server), LI_ALARM_UNSYNCHRONIZED);
+        assert_eq!(LI_ALARM_UNSYNCHRONIZED, 3);
+        status.write().unwrap().ntp_server_unsynchronized = false;
+        assert_eq!(li(&server), LI_NO_WARNING);
     }
 
     #[test]
